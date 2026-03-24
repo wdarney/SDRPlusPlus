@@ -8,6 +8,7 @@
 #include <dsp/audio/volume.h>
 #include <dsp/convert/stereo_to_mono.h>
 #include <thread>
+#include <chrono>
 #include <ctime>
 #include <gui/gui.h>
 #include <filesystem>
@@ -168,13 +169,11 @@ public:
         writer.setSamplerate(samplerate);
 
         // Open file
-        std::string vfoName = (recMode == RECORDER_MODE_AUDIO) ? selectedStreamName : "";
-        std::string extension = ".wav";
-        std::string expandedPath = expandString(folderSelect.path + "/" + genFileName(nameTemplate, recMode, vfoName) + extension);
-        if (!writer.open(expandedPath)) {
-            flog::error("Failed to open file for recording: {0}", expandedPath);
-            return;
-        }
+        if (!openNewFile()) { return; }
+
+        // Reset silence state
+        inSilence = false;
+        ignoringSilence = false;
 
         // Open audio stream or baseband
         if (recMode == RECORDER_MODE_AUDIO) {
@@ -218,13 +217,32 @@ public:
             delete basebandStream;
         }
 
-        // Close file
-        writer.close();
-        
+        // Close file if open
+        if (fileOpen) {
+            writer.close();
+            fileOpen = false;
+        }
+
+        // Reset silence state
+        inSilence = false;
+        ignoringSilence = false;
+
         recording = false;
     }
 
 private:
+    bool openNewFile() {
+        std::string vfoName = (recMode == RECORDER_MODE_AUDIO) ? selectedStreamName : "";
+        std::string extension = ".wav";
+        std::string expandedPath = expandString(folderSelect.path + "/" + genFileName(nameTemplate, recMode, vfoName) + extension);
+        if (!writer.open(expandedPath)) {
+            flog::error("Failed to open file for recording: {0}", expandedPath);
+            return false;
+        }
+        fileOpen = true;
+        return true;
+    }
+
     static void menuHandler(void* ctx) {
         RecorderModule* _this = (RecorderModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
@@ -319,7 +337,7 @@ private:
             }
             if (_this->recording) { style::endDisabled(); }
 
-            if (ImGui::Checkbox(CONCAT("Ignore silence##_recorder_ignore_silence_", _this->name), &_this->ignoreSilence)) {
+            if (ImGui::Checkbox(CONCAT("Split on silence##_recorder_ignore_silence_", _this->name), &_this->ignoreSilence)) {
                 config.acquire();
                 config.conf[_this->name]["ignoreSilence"] = _this->ignoreSilence;
                 config.release(true);
@@ -519,9 +537,30 @@ private:
                 float val = fabsf(_data[i]);
                 if (val > absMax) { absMax = val; }
             }
-            _this->ignoringSilence = (absMax < SILENCE_LVL);
-            if (_this->ignoringSilence) { return; }
+            bool silent = (absMax < SILENCE_LVL);
+            if (silent) {
+                if (!_this->inSilence) {
+                    _this->inSilence = true;
+                    _this->silenceStart = std::chrono::steady_clock::now();
+                }
+                if (_this->fileOpen) {
+                    auto elapsed = std::chrono::steady_clock::now() - _this->silenceStart;
+                    if (elapsed >= std::chrono::seconds(1)) {
+                        _this->writer.close();
+                        _this->fileOpen = false;
+                        _this->ignoringSilence = true;
+                    }
+                }
+                if (!_this->fileOpen) { return; }
+            } else {
+                _this->ignoringSilence = false;
+                _this->inSilence = false;
+                if (!_this->fileOpen) {
+                    _this->openNewFile();
+                }
+            }
         }
+        if (!_this->fileOpen) { return; }
         _this->writer.write((float*)data, count);
     }
 
@@ -533,9 +572,30 @@ private:
                 float val = fabsf(data[i]);
                 if (val > absMax) { absMax = val; }
             }
-            _this->ignoringSilence = (absMax < SILENCE_LVL);
-            if (_this->ignoringSilence) { return; }
+            bool silent = (absMax < SILENCE_LVL);
+            if (silent) {
+                if (!_this->inSilence) {
+                    _this->inSilence = true;
+                    _this->silenceStart = std::chrono::steady_clock::now();
+                }
+                if (_this->fileOpen) {
+                    auto elapsed = std::chrono::steady_clock::now() - _this->silenceStart;
+                    if (elapsed >= std::chrono::seconds(1)) {
+                        _this->writer.close();
+                        _this->fileOpen = false;
+                        _this->ignoringSilence = true;
+                    }
+                }
+                if (!_this->fileOpen) { return; }
+            } else {
+                _this->ignoringSilence = false;
+                _this->inSilence = false;
+                if (!_this->fileOpen) {
+                    _this->openNewFile();
+                }
+            }
         }
+        if (!_this->fileOpen) { return; }
         _this->writer.write(data, count);
     }
 
@@ -578,7 +638,10 @@ private:
     dsp::stereo_t audioLvl = { -100.0f, -100.0f };
 
     bool recording = false;
+    bool fileOpen = false;
     bool ignoringSilence = false;
+    bool inSilence = false;
+    std::chrono::steady_clock::time_point silenceStart;
     wav::Writer writer;
     std::recursive_mutex recMtx;
     dsp::stream<dsp::complex_t>* basebandStream;
