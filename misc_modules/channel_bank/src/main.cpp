@@ -3,6 +3,7 @@
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
+#include <dsp/multirate/power_decimator.h>
 #include <dsp/demod/am.h>
 #include <dsp/demod/fm.h>
 #include <dsp/demod/ssb.h>
@@ -56,6 +57,8 @@ struct ChannelSlot {
 
     // DSP chain
     dsp::stream<dsp::complex_t>*               iqIn           = nullptr;
+    dsp::channel::FrequencyXlator*             preXlator      = nullptr;
+    dsp::multirate::PowerDecimator<dsp::complex_t>* preDecimator = nullptr;
     dsp::channel::RxVFO*                       vfo            = nullptr;
     dsp::demod::AM<dsp::stereo_t>*             amDemod        = nullptr;
     dsp::demod::FM<dsp::stereo_t>*             fmDemod        = nullptr;
@@ -675,6 +678,19 @@ private:
         }
     }
 
+    // Compute the largest power-of-2 pre-decimation ratio such that the intermediate
+    // sample rate (sr/ratio) stays at or above 192 kHz (= 4 × 48 kHz audio).
+    // This avoids extreme polyphase ratios in the per-channel RxVFO resampler.
+    static unsigned int computePreDecimRatio(double sr) {
+        constexpr double MIN_INTERMEDIATE_SR = 4.0 * 48000.0; // 192 kHz
+        unsigned int maxRatio = dsp::multirate::PowerDecimator<dsp::complex_t>::getMaxRatio();
+        unsigned int ratio = 1;
+        while (ratio * 2 <= maxRatio && (sr / (ratio * 2)) >= MIN_INTERMEDIATE_SR) {
+            ratio *= 2;
+        }
+        return ratio;
+    }
+
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
@@ -714,8 +730,23 @@ private:
                 : offset;
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
-        slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
+
+        // Staged decimation: use a power-of-2 pre-decimator to bring the input
+        // sample rate down to an intermediate rate (>=192 kHz) before the VFO.
+        // This avoids the extreme polyphase ratios (e.g. 8 MHz -> 48 kHz = 500:3)
+        // that cause audio compression/distortion in the RationalResampler.
+        unsigned int preDecimRatio = computePreDecimRatio(lastKnownSr);
+        if (preDecimRatio > 1) {
+            double preDecimSr = lastKnownSr / preDecimRatio;
+            // Translate the target channel to DC first, then decimate, then
+            // hand a zero-offset narrow-band stream to the VFO.
+            slot.preXlator    = new dsp::channel::FrequencyXlator(slot.iqIn, -vfoOff, lastKnownSr);
+            slot.preDecimator = new dsp::multirate::PowerDecimator<dsp::complex_t>(&slot.preXlator->out, preDecimRatio);
+            slot.vfo = new dsp::channel::RxVFO(&slot.preDecimator->out, preDecimSr, audioSr, bw, 0.0);
+        } else {
+            slot.vfo = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
+        }
 
         // Audio LP cutoff = half the channel width (matches VFO filter), capped at 8kHz.
         // Aviation AM voice needs ~3-4kHz; wider channels can carry more.
@@ -757,6 +788,8 @@ private:
         slot.writer.setSampleType(wav::SAMP_TYPE_INT16);
         slot.writer.setSamplerate((uint64_t)audioSr);
 
+        if (slot.preXlator)    { slot.preXlator->start();    }
+        if (slot.preDecimator) { slot.preDecimator->start(); }
         slot.vfo->start();
         if (slot.amDemod)  slot.amDemod->start();
         if (slot.fmDemod)  slot.fmDemod->start();
@@ -775,6 +808,8 @@ private:
         if (slot.fmDemod)  slot.fmDemod->stop();
         if (slot.ssbDemod) slot.ssbDemod->stop();
         slot.vfo->stop();
+        if (slot.preDecimator) { slot.preDecimator->stop(); delete slot.preDecimator; slot.preDecimator = nullptr; }
+        if (slot.preXlator)    { slot.preXlator->stop();    delete slot.preXlator;    slot.preXlator    = nullptr; }
 
         sigpath::iqFrontEnd.unbindIQStream(slot.iqIn);
 
