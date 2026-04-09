@@ -26,6 +26,7 @@ option(OPT_BUILD_NETWORK_SOURCE "Build Network Source Module (no dependencies re
 option(OPT_BUILD_PERSEUS_SOURCE "Build Perseus Source Module (Dependencies: libperseus-sdr)" OFF)
 option(OPT_BUILD_PLUTOSDR_SOURCE "Build PlutoSDR Source Module (Dependencies: libiio, libad9361)" ON)
 option(OPT_BUILD_RFNM_SOURCE "Build RFNM Source Module (Dependencies: librfnm)" OFF)
+option(OPT_BUILD_RX888_SOURCE "Build RX888 MkII Source Module (Dependencies: soapysdr + SoapySDDC driver)" OFF)
 option(OPT_BUILD_RFSPACE_SOURCE "Build RFspace Source Module (no dependencies required)" ON)
 option(OPT_BUILD_RTL_SDR_SOURCE "Build RTL-SDR Source Module (Dependencies: librtlsdr)" ON)
 option(OPT_BUILD_RTL_TCP_SOURCE "Build RTL-TCP Source Module (no dependencies required)" ON)
@@ -218,6 +219,10 @@ endif (OPT_BUILD_SDRPLAY_SOURCE)
 if (OPT_BUILD_SOAPY_SOURCE)
 add_subdirectory("source_modules/soapy_source")
 endif (OPT_BUILD_SOAPY_SOURCE)
+
+if (OPT_BUILD_RX888_SOURCE)
+add_subdirectory("source_modules/rx888_source")
+endif (OPT_BUILD_RX888_SOURCE)
 
 if (OPT_BUILD_SPECTRAN_SOURCE)
 add_subdirectory("source_modules/spectran_source")
