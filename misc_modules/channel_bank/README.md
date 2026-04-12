@@ -23,10 +23,13 @@ A multi-channel auto-demodulator and scanner module for SDR++. Automatically det
 - Automatic wrap-around through all scan stops
 
 ### Recording & Playback
-- **Automatic WAV recording** — captures transmissions to timestamped files
-- **Monitor queue** — plays back recordings through the audio output after capture
-- **Configurable recording gain, minimum TX duration, and tail length**
-- **Silence-based splitting** — separate recordings per transmission
+- **Automatic WAV recording** — captures transmissions to timestamped WAV files with timestamps in the filename
+- **Sequential monitor queue** — recordings are queued and played back in order through the audio output, so you hear every transmission even when multiple channels are active simultaneously
+- **Multi-channel parallel recording** — records from all active channels at once; you never miss a transmission while another is playing back
+- **Silence-based splitting** — each transmission is saved as a separate file, split on silence
+- **Configurable recording gain** — adjust output level of recordings
+- **Minimum TX duration** — discard short recordings (noise bursts, squelch tails) below a configurable threshold
+- **TX tail** — configurable hang time to keep recording briefly after the signal drops, preventing clipped endings
 
 ### Frequency History & Blocking
 - **Frequency log** — tracks every detected frequency with hit count and last-seen time
