@@ -717,14 +717,14 @@ private:
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
 
-        // Audio LP cutoff = half the channel width (matches VFO filter), capped at 8kHz.
-        // Aviation AM voice needs ~3-4kHz; wider channels can carry more.
-        const double audioBw = std::min(bw / 2.0, 8000.0);
+        // AM demod bandwidth = full channel width (same as VFO), matching SDR++ radio module.
+        // SSB/FM use narrower audio bandwidth.
+        const double audioBw = bw / 2.0;
         if (demodMode == DEMOD_AM) {
             slot.amDemod = new dsp::demod::AM<dsp::stereo_t>();
             slot.amDemod->init(&slot.vfo->out,
                 dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER,
-                audioBw, 0.001, 0.00001, 100.0 / audioSr, audioSr);
+                bw, 50.0 / audioSr, 5.0 / audioSr, 100.0 / audioSr, audioSr);
         }
         else if (demodMode == DEMOD_USB || demodMode == DEMOD_LSB) {
             auto ssbMode = (demodMode == DEMOD_USB)
