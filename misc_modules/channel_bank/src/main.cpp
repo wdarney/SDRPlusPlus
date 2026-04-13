@@ -151,6 +151,9 @@ public:
 
         channelSpacing = SPACINGS[std::clamp(spacingId, 0, 5)];
 
+        // Load FM bookmarks so displayName() can show names
+        loadFMConfig();
+
         // Allocate FFTW buffers
         fftIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
         fftOut = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
@@ -1419,9 +1422,8 @@ private:
             {
                 std::lock_guard<std::mutex> lck(_this->channelsMtx);
                 for (auto& [idx, slot] : _this->activeChannels) {
-                    char label[64];
-                    snprintf(label, sizeof(label), "%.3f MHz", slot->freqHz / 1e6);
-                    ImGui::Text("%s", label);
+                    std::string label = _this->displayName(slot->freqHz);
+                    ImGui::Text("%s", label.c_str());
                     ImGui::SameLine();
                     bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
                     if (playing) {
@@ -1461,6 +1463,10 @@ private:
         bool clearAll  = ImGui::SmallButton("Clear All##_cb_clrlog");
         ImGui::SameLine();
         bool clearKeep = ImGui::SmallButton("Clear (keep blocked)##_cb_clrlogkeep");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reload Bookmarks##_cb_reloadbm")) {
+            _this->loadFMConfig();
+        }
 
         bool needSave = false;
 
@@ -1495,14 +1501,14 @@ private:
                 if (ImGui::CollapsingHeader(hdr)) {
                     for (auto& [k, ep] : entries) {
                         FreqEntry& e = *ep;
-                        char label[64];
-                        snprintf(label, sizeof(label), "  %.4f MHz", e.freqHz / 1e6);
+                        std::string dn = _this->displayName(e.freqHz);
+                        std::string label = "  " + dn;
 
                         if (e.blocked)
                             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
 
                         std::string rel = relTime(e.lastSeen);
-                        ImGui::Text("%-18s %5d  %-10s", label, e.count, rel.c_str());
+                        ImGui::Text("%-22s %5d  %-10s", label.c_str(), e.count, rel.c_str());
 
                         if (e.blocked)
                             ImGui::PopStyleColor();
@@ -1562,10 +1568,15 @@ private:
 
     void loadFMConfig() {
         fmLists.clear();
+        std::map<int64_t, std::string> newNames;
         std::string path = root + "/frequency_manager_config.json";
         try {
             std::ifstream f(path);
-            if (!f.is_open()) return;
+            if (!f.is_open()) {
+                std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
+                bookmarkNames.clear();
+                return;
+            }
             nlohmann::json j;
             f >> j;
             if (!j.contains("lists")) return;
@@ -1573,9 +1584,19 @@ private:
                 std::vector<double> freqs;
                 if (listData.contains("bookmarks"))
                     for (auto& [bmName, bm] : listData["bookmarks"].items())
-                        if (bm.contains("frequency"))
-                            freqs.push_back(bm["frequency"].get<double>());
+                        if (bm.contains("frequency")) {
+                            double hz = bm["frequency"].get<double>();
+                            freqs.push_back(hz);
+                            int64_t k = (int64_t)std::round(hz / 1000.0);
+                            // First one wins if duplicates across lists
+                            if (newNames.find(k) == newNames.end())
+                                newNames[k] = bmName;
+                        }
                 if (!freqs.empty()) fmLists[listName] = freqs;
+            }
+            {
+                std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
+                bookmarkNames = std::move(newNames);
             }
         } catch (...) {}
     }
@@ -1683,6 +1704,8 @@ private:
     // FM import UI state (UI thread only)
     bool fmImportOpen = false;
     std::map<std::string, std::vector<double>> fmLists;
+    std::mutex bookmarkNamesMtx;
+    std::map<int64_t, std::string> bookmarkNames;   // freqKey -> "Tower KLAX"
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
@@ -1724,6 +1747,31 @@ private:
     std::mutex                   freqLogMtx;
 
     int64_t freqKey(double hz) { return (int64_t)std::round(hz / 1000.0); }
+
+    // Returns bookmark name if one exists within ±tolerance kHz, else "%.3f MHz"
+    std::string displayName(double hz) {
+        const int64_t tolerance = 5;   // kHz — matches within ±5 kHz
+        int64_t target = freqKey(hz);
+        {
+            std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
+            // Exact hit first
+            auto it = bookmarkNames.find(target);
+            if (it != bookmarkNames.end()) return it->second;
+            // Nearby scan: find closest within tolerance
+            auto lo = bookmarkNames.lower_bound(target - tolerance);
+            auto hi = bookmarkNames.upper_bound(target + tolerance);
+            int64_t bestDist = tolerance + 1;
+            std::string bestName;
+            for (auto jt = lo; jt != hi; ++jt) {
+                int64_t d = std::abs(jt->first - target);
+                if (d < bestDist) { bestDist = d; bestName = jt->second; }
+            }
+            if (!bestName.empty()) return bestName;
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.3f MHz", hz / 1e6);
+        return std::string(buf);
+    }
 
     static std::string relTime(int64_t ts) {
         if (ts == 0) return "never";
