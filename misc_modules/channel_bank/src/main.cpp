@@ -120,6 +120,8 @@ public:
             tailMs = config.conf[name]["tailMs"];
         if (config.conf[name].contains("maxChannels"))
             maxChannels = config.conf[name]["maxChannels"];
+        if (config.conf[name].contains("bwUsage"))
+            bwUsage = config.conf[name]["bwUsage"];
         if (config.conf[name].contains("recPath"))
             folderSelect.setPath(config.conf[name]["recPath"]);
         if (config.conf[name].contains("freqLog")) {
@@ -127,9 +129,10 @@ public:
                 double hz  = j.value("freq", 0.0);
                 FreqEntry e;
                 e.freqHz  = hz;
-                e.count    = j.value("count", 0);
-                e.blocked  = j.value("blocked", false);
-                e.lastSeen = j.value("lastSeen", (int64_t)0);
+                e.count       = j.value("count", 0);
+                e.blocked     = j.value("blocked", false);
+                e.lastSeen    = j.value("lastSeen", (int64_t)0);
+                e.description = j.value("description", std::string());
                 freqLog[freqKey(hz)] = e;
             }
         }
@@ -195,6 +198,8 @@ public:
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
         fftBufPos = 0;
+        avgPower.clear();           // reset spectrum averaging on start
+        globalNoiseFloor = 0.0f;
 
         if (scanMode) {
             computeScanStops();
@@ -406,23 +411,38 @@ private:
 
         // Compute linear power per bin (FFT-shifted, normalised)
         float scale = 1.0f / (float)(FFT_SIZE * FFT_SIZE);
-        std::vector<float> power(FFT_SIZE);
+
+        // Exponential moving average across FFT frames.
+        // alpha ~0.15 gives an effective averaging window of ~7 frames (~24ms at
+        // 2.4MHz SR), which reduces noise variance by ~7x while still reacting
+        // quickly to real signals.
+        constexpr float alpha = 0.15f;
+        bool firstFrame = avgPower.empty();
+        if (firstFrame) avgPower.resize(FFT_SIZE);
         for (int i = 0; i < FFT_SIZE; i++) {
             int k = (i + FFT_SIZE / 2) % FFT_SIZE;
             float re = fftOut[k][0], im = fftOut[k][1];
-            power[i] = (re * re + im * im) * scale;
+            float inst = (re * re + im * im) * scale;
+            avgPower[i] = firstFrame ? inst : (alpha * inst + (1.0f - alpha) * avgPower[i]);
         }
+        // Use the averaged spectrum for all detection
+        std::vector<float>& power = avgPower;
 
         double binHz  = lastKnownSr / FFT_SIZE;
-        // numSlots covers the FULL bandwidth — maxChannels only limits how many
-        // DSP chains get spawned, not how much spectrum we scan.
+        // numSlots covers the FULL bandwidth so we can detect signals anywhere.
+        // bwUsage only controls which slots contribute to the noise floor estimate
+        // (avoids filter rolloff edges inflating it).
         int numSlots  = (int)std::floor(lastKnownSr / channelSpacing);
-        int halfBins  = std::max(1, (int)std::round((channelSpacing * 0.4) / binHz));
+        // Detection window: fixed ~8 kHz bandwidth (matching AM signal width)
+        // regardless of channel spacing, so wider spacings don't dilute the SNR.
+        // Capped to not exceed the slot width.
+        constexpr double DETECT_BW_HZ = 8000.0;
+        int halfBins  = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
 
         // snrLinear computed once per frame
         float snrLinear = powf(10.0f, snrThreshold / 10.0f);
 
-        // Compute per-slot means
+        // Compute per-slot means (using detection window, not full slot width)
         std::vector<float> slotMeans(numSlots);
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
@@ -448,25 +468,31 @@ private:
             newPeakOffsets[s] = ((centroidBin - FFT_SIZE / 2) / FFT_SIZE) * lastKnownSr;
         }
 
-        // Global noise floor — 20th percentile of all slot means.
-        // This is immune to bad initialisation: even if signals are on-air when
-        // the module starts, the quietest 20% of channels are virtually always
-        // noise-only, giving a reliable floor without any warm-up time.
-        // A slow EMA smooths frame-to-frame jitter (fast down, very slow up).
+        // Global noise floor — 20th percentile of CENTER slot means (bwUsage
+        // fraction).  Edge slots are excluded so filter rolloff doesn't inflate
+        // the floor estimate, but those slots can still detect signals.
+        // The spectrum EMA already smooths bin-level noise, so the rawFloor from
+        // the 20th percentile is stable.  We use a simple symmetric EMA here
+        // (fast enough to track real noise changes, slow enough to ignore brief
+        // signal bursts that leak into the 20th percentile).
         {
-            std::vector<float> sorted = slotMeans;
-            std::sort(sorted.begin(), sorted.end());
-            float rawFloor = sorted[std::max(0, (int)(numSlots * 0.20f) - 1)];
+            int edgeSkip = (int)std::round(numSlots * (1.0f - bwUsage) / 2.0f);
+            std::vector<float> centerMeans;
+            for (int s = edgeSkip; s < numSlots - edgeSkip; s++)
+                centerMeans.push_back(slotMeans[s]);
+            if (centerMeans.empty()) centerMeans = {slotMeans[numSlots / 2]};
+            std::sort(centerMeans.begin(), centerMeans.end());
+            float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * 0.20f) - 1)];
             rawFloor = std::max(rawFloor, 1e-30f);
             if (globalNoiseFloor <= 0.0f) {
-                globalNoiseFloor = rawFloor;
+                globalNoiseFloor  = rawFloor;
                 displayNoiseFloor = rawFloor;
-            } else if (rawFloor < globalNoiseFloor) {
-                globalNoiseFloor  = 0.97f * globalNoiseFloor  + 0.03f * rawFloor; // ~1s attack
             } else {
-                globalNoiseFloor  = 0.9995f * globalNoiseFloor + 0.0005f * rawFloor; // very slow rise
+                // Symmetric EMA — tracks both up and down at the same rate.
+                // ~0.05 gives ~20 frame time constant (~70ms at 2.4MHz SR).
+                constexpr float nfAlpha = 0.05f;
+                globalNoiseFloor = nfAlpha * rawFloor + (1.0f - nfAlpha) * globalNoiseFloor;
             }
-            // Separate slow EMA just for the display line — keeps it visually stable
             displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
         }
 
@@ -479,7 +505,7 @@ private:
                 double freqOffset = localFreqs[i] - lastKnownCenter;
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
                 int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
-                int halfBins2 = std::max(1, (int)std::round((channelSpacing * 0.4) / binHz));
+                int halfBins2 = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
                 int lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
                 int hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
                 float sum = 0.0f;
@@ -531,13 +557,23 @@ private:
 
         // Pass 2: non-maximum suppression — when adjacent slots both qualify,
         // only keep the one with higher power (prevents one signal spawning two chains).
+        // Exception: if a channel is already active on a slot, always keep it detected
+        // so it doesn't lose lock due to NMS oscillation between adjacent slots.
         std::set<int> detected;
-        for (int s = 0; s < numSlots; s++) {
-            if (slotVotes[s] < SPAWN_VOTES) { continue; }
-            bool leftStronger  = (s > 0            && slotVotes[s-1] >= SPAWN_VOTES && slotMeans[s-1] > slotMeans[s]);
-            bool rightStronger = (s < numSlots - 1 && slotVotes[s+1] >= SPAWN_VOTES && slotMeans[s+1] > slotMeans[s]);
-            if (leftStronger || rightStronger) { continue; }
-            detected.insert(s);
+        {
+            std::lock_guard<std::mutex> clck(channelsMtx);
+            for (int s = 0; s < numSlots; s++) {
+                if (slotVotes[s] < SPAWN_VOTES) { continue; }
+                // Already-active channels are exempt from NMS — prevents oscillation
+                // when a signal falls between two slots at wider spacings.
+                bool active = (activeChannels.find(s) != activeChannels.end());
+                if (!active) {
+                    bool leftStronger  = (s > 0            && slotVotes[s-1] >= SPAWN_VOTES && slotMeans[s-1] > slotMeans[s]);
+                    bool rightStronger = (s < numSlots - 1 && slotVotes[s+1] >= SPAWN_VOTES && slotMeans[s+1] > slotMeans[s]);
+                    if (leftStronger || rightStronger) { continue; }
+                }
+                detected.insert(s);
+            }
         }
 
         {
@@ -592,17 +628,19 @@ private:
             std::lock_guard<std::mutex> clck(channelsMtx);
 
             // Create or refresh channels for detected slots
+            debugDetectedCount.store((int)current.size());
+            int blkSkip = 0, capSkip = 0;
             for (int idx : current) {
                 auto it = activeChannels.find(idx);
                 if (it == activeChannels.end()) {
                     // New signal — spawn channel (if under cap and not blocked)
-                    if ((int)activeChannels.size() >= maxChannels) { continue; }
+                    if ((int)activeChannels.size() >= maxChannels) { capSkip++; continue; }
                     int    numSlots   = (int)std::floor(lastKnownSr / channelSpacing);
                     double slotOffset = ((double)idx - (double)(numSlots - 1) / 2.0) * channelSpacing;
                     auto   pit        = localPeakOffsets.find(idx);
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
-                    if (isBlocked(slotFreq)) { continue; }
+                    if (isBlocked(slotFreq)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
                     slot->lastDetected  = now;
@@ -615,6 +653,8 @@ private:
                     it->second->signalPresent = true;
                 }
             }
+            debugBlockedSkips.store(blkSkip);
+            debugCapSkips.store(capSkip);
 
             // Mark channels no longer detected; destroy once file is closed
             for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
@@ -1092,6 +1132,24 @@ private:
             config.release(true);
         }
 
+        ImGui::LeftLabel("BW Usage");
+        ImGui::FillWidth();
+        {
+            int bwPct = (int)std::round(_this->bwUsage * 100.0f);
+            if (ImGui::SliderInt(CONCAT("##_cb_bwusage_", _this->name),
+                                 &bwPct, 50, 100, "%d%%")) {
+                bwPct = std::clamp(bwPct, 50, 100);
+                _this->bwUsage = bwPct / 100.0f;
+                config.acquire();
+                config.conf[_this->name]["bwUsage"] = _this->bwUsage;
+                config.release(true);
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Fraction of SDR bandwidth to use.\n"
+                              "Lower = avoids filter rolloff at edges.\n"
+                              "RTL-SDR: 0.9, SDRPlay/Airspy: 0.7-0.8");
+
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
@@ -1210,7 +1268,7 @@ private:
             // Range list
             ImGui::BeginChild(CONCAT("##_cb_sclist_", _this->name), ImVec2(menuWidth, 100), true);
             int toRemoveScan = -1;
-            double stepMHz = (_this->lastKnownSr > 0.0 ? _this->lastKnownSr * 0.9 : 2400000.0) / 1e6;
+            double stepMHz = (_this->lastKnownSr > 0.0 ? _this->lastKnownSr * _this->bwUsage : 2400000.0) / 1e6;
             for (int i = 0; i < (int)_this->scanRanges.size(); i++) {
                 auto& r = _this->scanRanges[i];
                 double spanMHz = (r.stopHz - r.startHz) / 1e6;
@@ -1414,6 +1472,53 @@ private:
             ImGui::Text("Active: %d  Recording: %d", total, recording);
             ImGui::Text("Monitor queue: %d pending", queued);
 
+            // Diagnostic: show noise floor + threshold in dB
+            {
+                float nf = _this->globalNoiseFloor;
+                float th = nf * powf(10.0f, _this->snrThreshold / 10.0f);
+                float nfDb = (nf > 0.0f) ? 10.0f * log10f(nf) : -999.0f;
+                float thDb = (th > 0.0f) ? 10.0f * log10f(th) : -999.0f;
+                int det = _this->debugDetectedCount.load();
+                int blk = _this->debugBlockedSkips.load();
+                int cap = _this->debugCapSkips.load();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+                ImGui::Text("Floor: %.1f dB  Thresh: %.1f dB", nfDb, thDb);
+                ImGui::Text("Det: %d  BlkSkip: %d  CapSkip: %d", det, blk, cap);
+                ImGui::PopStyleColor();
+            }
+
+            // Now-playing description panel (above the active-channel list).
+            // Shows the description of the currently monitored frequency.
+            {
+                int64_t playingKey = _this->currentlyPlayingFreqKey.load();
+                std::string playingName, playingDesc;
+                if (playingKey != 0) {
+                    std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                    auto it = _this->freqLog.find(playingKey);
+                    if (it != _this->freqLog.end()) {
+                        playingName = _this->displayName(it->second.freqHz);
+                        playingDesc = it->second.description;
+                    }
+                }
+                ImGui::BeginChild(CONCAT("##_cb_nowplaying_", _this->name),
+                                  ImVec2(menuWidth, 50), true);
+                if (playingKey != 0 && !playingName.empty()) {
+                    ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Playing: %s", playingName.c_str());
+                    if (!playingDesc.empty()) {
+                        ImGui::TextWrapped("%s", playingDesc.c_str());
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                        ImGui::TextWrapped("(no description — click D in history to add one)");
+                        ImGui::PopStyleColor();
+                    }
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                    ImGui::Text("(nothing playing)");
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
+            }
+
             // Active channel list
             ImGui::Separator();
             bool needSaveFreqLog = false;
@@ -1513,16 +1618,55 @@ private:
                         if (e.blocked)
                             ImGui::PopStyleColor();
 
-                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 40);
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
+                        char editBtn[32];
+                        snprintf(editBtn, sizeof(editBtn), "D##edt_%lld", (long long)k);
+                        if (ImGui::SmallButton(editBtn)) {
+                            _this->descEditKey   = k;
+                            strncpy(_this->descEditBuf, e.description.c_str(), sizeof(_this->descEditBuf) - 1);
+                            _this->descEditBuf[sizeof(_this->descEditBuf) - 1] = '\0';
+                            _this->descEditRequest = true;
+                        }
+                        ImGui::SameLine();
                         char chk[32];
                         snprintf(chk, sizeof(chk), "##blk_%lld", (long long)k);
                         if (ImGui::Checkbox(chk, &e.blocked))
                             needSave = true;
+
+                        // Show description line under the entry if set
+                        if (!e.description.empty()) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.65f, 1.0f));
+                            ImGui::TextWrapped("      %s", e.description.c_str());
+                            ImGui::PopStyleColor();
+                        }
                     }
                 }
             }
         }
         ImGui::EndChild();
+
+        // Description edit popup (opened at parent scope so it actually renders)
+        if (_this->descEditRequest) {
+            ImGui::OpenPopup("##cb_desc_edit_popup");
+            _this->descEditRequest = false;
+        }
+        if (ImGui::BeginPopup("##cb_desc_edit_popup")) {
+            ImGui::Text("Edit description");
+            ImGui::SetNextItemWidth(320.0f);
+            ImGui::InputText("##cb_desc_edit_txt", _this->descEditBuf, sizeof(_this->descEditBuf));
+            if (ImGui::Button("Save##cb_desc_save")) {
+                std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                auto it = _this->freqLog.find(_this->descEditKey);
+                if (it != _this->freqLog.end()) {
+                    it->second.description = _this->descEditBuf;
+                    needSave = true;
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel##cb_desc_cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
 
         // Save outside the lock to avoid deadlock
         if (needSave) _this->saveFreqLog();
@@ -1533,7 +1677,7 @@ private:
     void computeScanStops() {
         scanStops.clear();
         if (lastKnownSr <= 0.0) return;
-        double step = lastKnownSr * 0.9;
+        double step = lastKnownSr * bwUsage;
         for (auto& r : scanRanges) {
             if (r.stopHz <= r.startHz) continue;
             int n = std::max(1, (int)std::ceil((r.stopHz - r.startHz) / step));
@@ -1677,6 +1821,7 @@ private:
     int          tailMs            = 500;   // ms to keep recording after signal gone
     int          maxChannels   = 16;
     double       channelSpacing = 25000.0;
+    float        bwUsage       = 0.8f;      // fraction of SDR bandwidth to use (avoids filter rolloff edges)
 
     // Scan mode
     struct ScanRange { double startHz, stopHz; };
@@ -1701,6 +1846,11 @@ private:
     std::set<int> manualDetected;         // written by DSP, read by mgmt thread
     std::mutex manualDetectedMtx;
 
+    // Description editor (UI thread only)
+    int64_t descEditKey = 0;
+    char    descEditBuf[256] = {};
+    bool    descEditRequest = false;
+
     // FM import UI state (UI thread only)
     bool fmImportOpen = false;
     std::map<std::string, std::vector<double>> fmLists;
@@ -1716,6 +1866,10 @@ private:
     std::vector<float>                      hannWindow;
     std::vector<dsp::complex_t>             fftAccum;
     int                                     fftBufPos      = 0;
+    std::atomic<int>                        debugDetectedCount { 0 };
+    std::atomic<int>                        debugBlockedSkips  { 0 };
+    std::atomic<int>                        debugCapSkips      { 0 };
+    std::vector<float>                      avgPower;           // EMA-smoothed power spectrum
     float                                   globalNoiseFloor  = 0.0f; // 20th-pct noise floor (linear)
     float                                   displayNoiseFloor = 0.0f; // smoothed copy for display only
     std::map<int, int>                      slotVotes;
@@ -1737,10 +1891,11 @@ private:
 
     // Frequency history + blocklist
     struct FreqEntry {
-        double   freqHz   = 0.0;
-        int      count    = 0;
-        bool     blocked  = false;
-        int64_t  lastSeen = 0;     // unix timestamp of most recent recording
+        double       freqHz      = 0.0;
+        int          count       = 0;
+        bool         blocked     = false;
+        int64_t      lastSeen    = 0;     // unix timestamp of most recent recording
+        std::string  description;         // user-editable; lives in channel_bank_config.json
     };
     // keyed by round(freqHz / 1000) — kHz-level uniqueness
     std::map<int64_t, FreqEntry> freqLog;
@@ -1750,7 +1905,9 @@ private:
 
     // Returns bookmark name if one exists within ±tolerance kHz, else "%.3f MHz"
     std::string displayName(double hz) {
-        const int64_t tolerance = 5;   // kHz — matches within ±5 kHz
+        // Tolerance = half the channel spacing (in kHz), so grid-aligned detections
+        // always match the nearest real-channel bookmark regardless of SDR center freq.
+        const int64_t tolerance = std::max((int64_t)5, (int64_t)std::round(channelSpacing / 1000.0 / 2.0));
         int64_t target = freqKey(hz);
         {
             std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
@@ -1803,7 +1960,13 @@ private:
         arr = nlohmann::json::array();
         std::lock_guard<std::mutex> lk(freqLogMtx);
         for (auto& [k, e] : freqLog) {
-            arr.push_back({ {"freq", e.freqHz}, {"count", e.count}, {"blocked", e.blocked}, {"lastSeen", e.lastSeen} });
+            arr.push_back({
+                {"freq", e.freqHz},
+                {"count", e.count},
+                {"blocked", e.blocked},
+                {"lastSeen", e.lastSeen},
+                {"description", e.description},
+            });
         }
         config.release(true);
     }
