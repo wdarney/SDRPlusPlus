@@ -17,6 +17,7 @@
 #include <core.h>
 #include <utils/wav.h>
 #include <fftw3.h>
+#include <rnnoise.h>
 #include <chrono>
 #include <ctime>
 #include <cmath>
@@ -84,6 +85,11 @@ struct ChannelSlot {
     // Lifecycle tracking
     std::chrono::steady_clock::time_point      lastDetected;  // last time FFT saw signal here
     std::atomic<bool>                          signalPresent  { false };
+
+    // RNNoise state (per-slot noise reduction)
+    DenoiseState*  nrState    = nullptr;
+    float          nrInBuf[480] = {};     // RNNoise processes 480 samples (10ms at 48kHz)
+    int            nrInPos    = 0;
 };
 
 class ChannelBankModule : public ModuleManager::Instance {
@@ -122,6 +128,10 @@ public:
             maxChannels = config.conf[name]["maxChannels"];
         if (config.conf[name].contains("bwUsage"))
             bwUsage = config.conf[name]["bwUsage"];
+        if (config.conf[name].contains("noiseReduction"))
+            noiseReduction = config.conf[name]["noiseReduction"];
+        if (config.conf[name].contains("nrMix"))
+            nrMix = config.conf[name]["nrMix"];
         if (config.conf[name].contains("recPath"))
             folderSelect.setPath(config.conf[name]["recPath"]);
         if (config.conf[name].contains("freqLog")) {
@@ -400,6 +410,20 @@ private:
     }
 
     void analyzeSpectrum() {
+        // Check for deferred retune — safely reset DSP-owned state on the DSP thread
+        if (retuneFlag.load()) {
+            lastKnownSr     = pendingRetuneSr;
+            lastKnownCenter = pendingRetuneCenter;
+            fftBufPos        = 0;
+            avgPower.clear();
+            globalNoiseFloor  = 0.0f;
+            displayNoiseFloor = 0.0f;
+            slotVotes.clear();
+            manualVotes.clear();
+            retuneFlag.store(false);
+            return;  // skip this frame — buffers are stale from old tuning
+        }
+
         // Apply Hann window and copy to FFTW input
         for (int i = 0; i < FFT_SIZE; i++) {
             float w = hannWindow[i];
@@ -800,6 +824,12 @@ private:
         slot.writer.setSampleType(wav::SAMP_TYPE_INT16);
         slot.writer.setSamplerate((uint64_t)audioSr);
 
+        // RNNoise noise reduction (per-slot)
+        if (noiseReduction) {
+            slot.nrState = rnnoise_create(nullptr);
+            slot.nrInPos = 0;
+        }
+
         slot.vfo->start();
         if (slot.amDemod)  slot.amDemod->start();
         if (slot.fmDemod)  slot.fmDemod->start();
@@ -845,6 +875,7 @@ private:
         delete slot.vfo;
         delete slot.recFeedStream;
         delete slot.iqIn;
+        if (slot.nrState) { rnnoise_destroy(slot.nrState); slot.nrState = nullptr; }
     }
 
     // ── Audio handler (split-on-silence recording) ───────────────────────────
@@ -933,8 +964,40 @@ private:
             }
             mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * gain, -1.0f, 1.0f);
         }
-        slot->writer.write(mono, count);
-        slot->audioSamplesWritten += count;
+
+        // RNNoise processing — accumulate into 480-sample frames, process,
+        // and write each completed frame to WAV individually.
+        // RNNoise expects/returns samples in int16 range (-32768..32767).
+        if (slot->nrState) {
+            int pos = 0;
+            while (pos < count) {
+                int room = 480 - slot->nrInPos;
+                int take = std::min(room, count - pos);
+                for (int i = 0; i < take; i++)
+                    slot->nrInBuf[slot->nrInPos + i] = mono[pos + i] * 32768.0f;
+                slot->nrInPos += take;
+                pos += take;
+
+                if (slot->nrInPos >= 480) {
+                    float outBuf[480];
+                    rnnoise_process_frame(slot->nrState, outBuf, slot->nrInBuf);
+                    // Blend original (dry) and denoised (wet) based on nrMix
+                    float mix = _this->nrMix;
+                    float nrMono[480];
+                    for (int i = 0; i < 480; i++) {
+                        float dry = slot->nrInBuf[i] / 32768.0f;
+                        float wet = outBuf[i] / 32768.0f;
+                        nrMono[i] = std::clamp(dry * (1.0f - mix) + wet * mix, -1.0f, 1.0f);
+                    }
+                    slot->writer.write(nrMono, 480);
+                    slot->audioSamplesWritten += 480;
+                    slot->nrInPos = 0;
+                }
+            }
+        } else {
+            slot->writer.write(mono, count);
+            slot->audioSamplesWritten += count;
+        }
     }
 
     // ── Playback monitor ─────────────────────────────────────────────────────
@@ -1054,7 +1117,8 @@ private:
         double newCenter = gui::waterfall.getCenterFrequency();
         if (newSr == _this->lastKnownSr && newCenter == _this->lastKnownCenter) { return; }
 
-        // Teardown all active channels and reset — new spectrum, new grid
+        // Teardown all active channels — safe because destroySlot stops the
+        // DSP sinks before freeing, so no audio callback will fire on freed data.
         {
             std::lock_guard<std::mutex> lck(_this->channelsMtx);
             for (auto& [idx, slot] : _this->activeChannels) {
@@ -1067,18 +1131,18 @@ private:
             std::lock_guard<std::mutex> lck(_this->detectedMtx);
             _this->detectedSlots.clear();
         }
-
-        _this->lastKnownSr       = newSr;
-        _this->lastKnownCenter   = newCenter;
-        _this->fftBufPos         = 0;
-        _this->globalNoiseFloor  = 0.0f;
-        _this->displayNoiseFloor = 0.0f;
-        _this->slotVotes.clear();
-        _this->manualVotes.clear();
         {
             std::lock_guard<std::mutex> lk(_this->manualDetectedMtx);
             _this->manualDetected.clear();
         }
+
+        // Store new params but DON'T touch DSP-thread-owned state (slotVotes,
+        // avgPower, fftBufPos, etc.) — set a flag so the DSP thread resets
+        // them safely at the start of its next frame.
+        _this->pendingRetuneSr     = newSr;
+        _this->pendingRetuneCenter = newCenter;
+        _this->retuneFlag.store(true);
+
         // Wake mgmt thread to re-spawn manual channels at new center immediately
         _this->mgmtCv.notify_one();
     }
@@ -1149,6 +1213,37 @@ private:
             ImGui::SetTooltip("Fraction of SDR bandwidth to use.\n"
                               "Lower = avoids filter rolloff at edges.\n"
                               "RTL-SDR: 0.9, SDRPlay/Airspy: 0.7-0.8");
+
+        if (ImGui::Checkbox(CONCAT("Noise Reduction##_cb_nr_", _this->name), &_this->noiseReduction)) {
+            config.acquire();
+            config.conf[_this->name]["noiseReduction"] = _this->noiseReduction;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("RNNoise neural network noise suppression.\n"
+                              "Removes static/hiss from recordings while\n"
+                              "preserving voice clarity. Takes effect on\n"
+                              "new channels (restart to apply to all).");
+
+        if (_this->noiseReduction) {
+            ImGui::LeftLabel("NR Strength");
+            ImGui::FillWidth();
+            {
+                int nrPct = (int)std::round(_this->nrMix * 100.0f);
+                if (ImGui::SliderInt(CONCAT("##_cb_nrmix_", _this->name),
+                                     &nrPct, 0, 100, "%d%%")) {
+                    nrPct = std::clamp(nrPct, 0, 100);
+                    _this->nrMix = nrPct / 100.0f;
+                    config.acquire();
+                    config.conf[_this->name]["nrMix"] = _this->nrMix;
+                    config.release(true);
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("0%% = original audio (no NR)\n"
+                                  "100%% = full noise reduction\n"
+                                  "50-70%% = good balance for weak signals");
+        }
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -1822,6 +1917,8 @@ private:
     int          maxChannels   = 16;
     double       channelSpacing = 25000.0;
     float        bwUsage       = 0.8f;      // fraction of SDR bandwidth to use (avoids filter rolloff edges)
+    bool         noiseReduction = false;    // RNNoise neural noise suppression on recordings
+    float        nrMix          = 0.7f;    // 0=dry (original), 1=full NR
 
     // Scan mode
     struct ScanRange { double startHz, stopHz; };
@@ -1873,6 +1970,11 @@ private:
     float                                   globalNoiseFloor  = 0.0f; // 20th-pct noise floor (linear)
     float                                   displayNoiseFloor = 0.0f; // smoothed copy for display only
     std::map<int, int>                      slotVotes;
+
+    // Deferred retune — set by waterfall thread, consumed by DSP thread
+    std::atomic<bool>                       retuneFlag { false };
+    double                                  pendingRetuneSr     = 0.0;
+    double                                  pendingRetuneCenter = 0.0;
 
     // Detected signals (written by DSP thread, read by mgmt thread)
     std::mutex              detectedMtx;

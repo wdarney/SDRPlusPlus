@@ -2,6 +2,8 @@ build/
 .vscode/
 .vs/
 .idea/
+__pycache__/
+*.pyc
 *.old
 *.dll
 *.exe
