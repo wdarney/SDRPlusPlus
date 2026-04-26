@@ -196,13 +196,20 @@ public:
     ~ChannelBankModule() {
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
+        gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
         if (running) { stop(); }
         fftwf_destroy_plan(fftPlan);
         fftwf_free(fftIn);
         fftwf_free(fftOut);
     }
 
-    void postInit() {}
+    void postInit() {
+        // Hook the main waterfall's FFT-redraw event so we can draw markers
+        // at each currently-active channel's frequency.
+        fftRedrawHandler.handler = fftRedrawHandlerFunc;
+        fftRedrawHandler.ctx     = this;
+        gui::waterfall.onFFTRedraw.bindHandler(&fftRedrawHandler);
+    }
     void enable()  { enabled = true; }
     void disable() { enabled = false; }
     bool isEnabled() { return enabled; }
@@ -1162,6 +1169,81 @@ private:
             remaining    -= bytesRead;
             samplesRead  += samples;
         }
+    }
+
+    // ── Main-waterfall overlay ───────────────────────────────────────────────
+    // Draws a marker on the SDR++ main waterfall for each active channel:
+    //   • red filled dot  = currently recording (file open, signal present)
+    //   • orange ring     = active but in cooldown / silence countdown
+    // Plus a counter in the top-right of the FFT area showing
+    // "Recording: N / Active: M".
+
+    static void fftRedrawHandlerFunc(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
+        ChannelBankModule* _this = (ChannelBankModule*)ctx;
+        if (!_this->enabled || !_this->running) { return; }
+
+        // Snapshot active-channel state under lock; minimise work inside the lock.
+        struct Mark { double freq; bool recording; };
+        std::vector<Mark> marks;
+        int recCount = 0;
+        {
+            std::lock_guard<std::mutex> clck(_this->channelsMtx);
+            marks.reserve(_this->activeChannels.size());
+            for (auto& [idx, slot] : _this->activeChannels) {
+                bool rec = slot->fileOpen;
+                if (rec) recCount++;
+                marks.push_back({ slot->freqHz, rec });
+            }
+        }
+
+        ImDrawList* dl = args.window->DrawList;
+        const float radius = 5.0f;
+        // Place markers ~12 px above the bottom of the FFT area so they don't
+        // clash with frequency-manager bookmark labels at the top.
+        float y = args.max.y - 12.0f;
+
+        for (auto& m : marks) {
+            if (m.freq < args.lowFreq || m.freq > args.highFreq) continue;
+            double x = args.min.x + (m.freq - args.lowFreq) * args.freqToPixelRatio;
+            ImVec2 c((float)x, y);
+
+            if (m.recording) {
+                // Red filled dot with white outline for visibility against waterfall
+                dl->AddCircleFilled(c, radius, IM_COL32(255, 60, 60, 255), 16);
+                dl->AddCircle(c, radius + 1.0f, IM_COL32(255, 255, 255, 255), 16, 1.5f);
+            } else {
+                // Orange ring (no fill) — channel exists but isn't recording right now
+                dl->AddCircle(c, radius, IM_COL32(255, 165, 0, 255), 16, 2.0f);
+            }
+        }
+
+        // Blue diamond at the currently-playing frequency (audio source indicator).
+        // Drawn after the other markers so it sits on top if a recording slot
+        // happens to be at the same freq. Disappears the moment playback ends.
+        int64_t playingKey = _this->currentlyPlayingFreqKey.load();
+        if (playingKey != 0) {
+            double playFreq = (double)playingKey * 1000.0;
+            if (playFreq >= args.lowFreq && playFreq <= args.highFreq) {
+                double x = args.min.x + (playFreq - args.lowFreq) * args.freqToPixelRatio;
+                const float r = 7.0f;
+                ImVec2 top   ((float)x, y - r);
+                ImVec2 right ((float)x + r, y);
+                ImVec2 bot   ((float)x, y + r);
+                ImVec2 left  ((float)x - r, y);
+                dl->AddQuadFilled(top, right, bot, left, IM_COL32(40, 140, 255, 255));
+                dl->AddQuad(top, right, bot, left, IM_COL32(255, 255, 255, 255), 1.5f);
+            }
+        }
+
+        // Counter badge in top-right of the FFT area.
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Rec %d / Act %d", recCount, (int)marks.size());
+        ImVec2 textSize = ImGui::CalcTextSize(buf);
+        ImVec2 padMin(args.max.x - textSize.x - 12.0f, args.min.y + 4.0f);
+        ImVec2 padMax(args.max.x - 4.0f,               args.min.y + textSize.y + 8.0f);
+        dl->AddRectFilled(padMin, padMax, IM_COL32(0, 0, 0, 160), 3.0f);
+        dl->AddText(ImVec2(padMin.x + 4.0f, padMin.y + 2.0f),
+                    IM_COL32(255, 255, 255, 255), buf);
     }
 
     // ── Retune handler ───────────────────────────────────────────────────────
@@ -2212,6 +2294,9 @@ private:
     double lastKnownCenter = 0.0;
 
     EventHandler<double> retuneHandler;
+
+    // Main waterfall draw hook — adds per-channel markers to gui::waterfall
+    EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
 };
 
 MOD_EXPORT void _INIT_() {
