@@ -4,6 +4,7 @@ build/
 .idea/
 __pycache__/
 *.pyc
+android/app/jniLibs/
 *.old
 *.dll
 *.exe
