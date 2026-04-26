@@ -151,6 +151,8 @@ public:
         if (config.conf[name].contains("manualFrequencies"))
             for (auto& j : config.conf[name]["manualFrequencies"])
                 manualFrequencies.push_back(j.get<double>());
+        if (config.conf[name].contains("boundBookmarkList"))
+            boundBookmarkList = config.conf[name]["boundBookmarkList"].get<std::string>();
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -166,6 +168,10 @@ public:
 
         // Load FM bookmarks so displayName() can show names
         loadFMConfig();
+
+        // If a bookmark list was previously bound, populate its cached freqs now
+        if (!boundBookmarkList.empty() && fmLists.count(boundBookmarkList))
+            boundFreqs = fmLists[boundBookmarkList];
 
         // Allocate FFTW buffers
         fftIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
@@ -418,6 +424,7 @@ private:
             avgPower.clear();
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
+            floorHistory.clear();
             slotVotes.clear();
             manualVotes.clear();
             retuneFlag.store(false);
@@ -508,22 +515,35 @@ private:
             std::sort(centerMeans.begin(), centerMeans.end());
             float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * 0.20f) - 1)];
             rawFloor = std::max(rawFloor, 1e-30f);
+
+            // Median-over-N-frames: rejects transient noise pulses (RFI) entirely
+            // unless they last for more than half the buffer. EMA smoothers
+            // partially track every pulse, raising the threshold momentarily and
+            // making detection vulnerable to brief whole-band noise events.
+            // ~30 frames is ~100ms at 2.4MHz SR (FFT_SIZE=8192, ~290 Hz frame
+            // rate); short enough to track real band-condition changes within
+            // half a second, long enough that 50/60/100/120 Hz mains-related
+            // RFI pulses are completely ignored.
+            constexpr size_t FLOOR_HISTORY_LEN = 30;
+            floorHistory.push_back(rawFloor);
+            if (floorHistory.size() > FLOOR_HISTORY_LEN) floorHistory.pop_front();
+
             if (globalNoiseFloor <= 0.0f) {
                 globalNoiseFloor  = rawFloor;
                 displayNoiseFloor = rawFloor;
             } else {
-                // Symmetric EMA — tracks both up and down at the same rate.
-                // ~0.05 gives ~20 frame time constant (~70ms at 2.4MHz SR).
-                constexpr float nfAlpha = 0.05f;
-                globalNoiseFloor = nfAlpha * rawFloor + (1.0f - nfAlpha) * globalNoiseFloor;
+                std::vector<float> sorted(floorHistory.begin(), floorHistory.end());
+                std::nth_element(sorted.begin(),
+                                 sorted.begin() + sorted.size() / 2,
+                                 sorted.end());
+                globalNoiseFloor = sorted[sorted.size() / 2];
             }
             displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
         }
 
         // Manual mode: check configured frequencies instead of grid voting
         if (manualMode) {
-            std::vector<double> localFreqs;
-            { std::lock_guard<std::mutex> lk(manualFreqMtx); localFreqs = manualFrequencies; }
+            std::vector<double> localFreqs = getActiveManualFreqs();
             std::set<int> newDetected;
             for (int i = 0; i < (int)localFreqs.size(); i++) {
                 double freqOffset = localFreqs[i] - lastKnownCenter;
@@ -579,23 +599,60 @@ private:
             else                { votes = std::max(votes - 1, 0); }
         }
 
-        // Pass 2: non-maximum suppression — when adjacent slots both qualify,
-        // only keep the one with higher power (prevents one signal spawning two chains).
-        // Exception: if a channel is already active on a slot, always keep it detected
-        // so it doesn't lose lock due to NMS oscillation between adjacent slots.
+        // Pass 2: non-maximum suppression. We need to prevent two adjacent slots
+        // from being detected for the same physical signal — common at wide
+        // bandwidths (e.g. 10 MHz, ~1.2 kHz bin width) where an AM carrier
+        // straddling two 12.5 kHz slots has its peak energy drift across the
+        // boundary as it modulates.
+        //
+        // Approach: greedy strongest-first selection, respecting both already-
+        // active channels and slots accepted earlier *within this same frame*.
+        // The frame-local accept tracking is critical because activeChannels is
+        // updated by the mgmt thread asynchronously — so checking it alone
+        // doesn't prevent two newly-qualifying adjacent slots from both winning
+        // the same frame.
         std::set<int> detected;
         {
             std::lock_guard<std::mutex> clck(channelsMtx);
+
+            // Always include already-active slots, exempt from NMS, with a much
+            // looser vote threshold than spawning (SPAWN_VOTES). Once a slot is
+            // active we trust it: as long as ANY votes remain, keep it in
+            // `detected` so it (a) keeps its channel alive and (b) blocks
+            // adjacent newcomers via the greedy NMS pass below.
+            //
+            // Why this matters: a signal sitting on a slot boundary can have its
+            // peak energy drift between adjacent slots over time. Without this
+            // looser threshold, slot N's votes briefly dip below SPAWN_VOTES,
+            // its channel "loses lock" to the silence countdown, slot N+1
+            // spawns a fresh channel, and we end up with two overlapping
+            // recordings of the same transmission. Vote decay is symmetric
+            // (one per frame), so a real signal-gone case still tears the
+            // channel down within a few frames once the signal genuinely
+            // disappears.
+            std::vector<int> candidates;
             for (int s = 0; s < numSlots; s++) {
-                if (slotVotes[s] < SPAWN_VOTES) { continue; }
-                // Already-active channels are exempt from NMS — prevents oscillation
-                // when a signal falls between two slots at wider spacings.
                 bool active = (activeChannels.find(s) != activeChannels.end());
-                if (!active) {
-                    bool leftStronger  = (s > 0            && slotVotes[s-1] >= SPAWN_VOTES && slotMeans[s-1] > slotMeans[s]);
-                    bool rightStronger = (s < numSlots - 1 && slotVotes[s+1] >= SPAWN_VOTES && slotMeans[s+1] > slotMeans[s]);
-                    if (leftStronger || rightStronger) { continue; }
+                if (active) {
+                    if (slotVotes[s] > 0) detected.insert(s);
+                    // votes==0 → let the channel die naturally; don't insert
+                } else {
+                    if (slotVotes[s] < SPAWN_VOTES) { continue; }
+                    candidates.push_back(s);
                 }
+            }
+
+            // Sort remaining candidates by power desc — strongest signals win
+            // the right to spawn first.
+            std::sort(candidates.begin(), candidates.end(),
+                      [&](int a, int b) { return slotMeans[a] > slotMeans[b]; });
+
+            // Greedy accept: skip if any neighbor is already active OR already
+            // accepted into `detected` this frame.
+            for (int s : candidates) {
+                bool leftBlocked  = (s > 0            && detected.count(s - 1) > 0);
+                bool rightBlocked = (s < numSlots - 1 && detected.count(s + 1) > 0);
+                if (leftBlocked || rightBlocked) { continue; }
                 detected.insert(s);
             }
         }
@@ -1272,7 +1329,68 @@ private:
 
         // Manual frequency list — editable while running
         if (_this->manualMode) {
+            // Refresh bookmark JSON once per second so newly-added entries
+            // in the Frequency Manager appear here automatically.
+            auto now = std::chrono::steady_clock::now();
+            if (now - _this->lastFmConfigRefresh > std::chrono::seconds(1)) {
+                _this->loadFMConfig();
+                _this->lastFmConfigRefresh = now;
+                std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                if (!_this->boundBookmarkList.empty() && _this->fmLists.count(_this->boundBookmarkList))
+                    _this->boundFreqs = _this->fmLists[_this->boundBookmarkList];
+                else
+                    _this->boundFreqs.clear();
+            }
+
             ImGui::Spacing();
+
+            // Bookmark source dropdown — replaces the old "Import" button.
+            // Selecting a list binds it; its frequencies are scanned alongside
+            // any custom user-entered ones below.
+            ImGui::LeftLabel("Bookmark list");
+            ImGui::FillWidth();
+            char preview[160];
+            if (_this->boundBookmarkList.empty())
+                snprintf(preview, sizeof(preview), "(none)");
+            else
+                snprintf(preview, sizeof(preview), "%s  (%d)",
+                         _this->boundBookmarkList.c_str(), (int)_this->boundFreqs.size());
+            if (ImGui::BeginCombo(CONCAT("##_cb_bmsrc_", _this->name), preview)) {
+                bool noneSel = _this->boundBookmarkList.empty();
+                if (ImGui::Selectable("(none)", noneSel)) {
+                    {
+                        std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                        _this->boundBookmarkList.clear();
+                        _this->boundFreqs.clear();
+                    }
+                    _this->saveManualConfig();
+                }
+                if (_this->fmLists.empty()) {
+                    ImGui::TextDisabled("No lists found");
+                } else {
+                    for (auto& [listName, freqs] : _this->fmLists) {
+                        char lbl[256];
+                        snprintf(lbl, sizeof(lbl), "%s  (%d)",
+                                 listName.c_str(), (int)freqs.size());
+                        bool sel = (listName == _this->boundBookmarkList);
+                        if (ImGui::Selectable(lbl, sel)) {
+                            std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                            _this->boundBookmarkList = listName;
+                            _this->boundFreqs = freqs;
+                            // unlock before saving (saveManualConfig acquires config mutex,
+                            // not manualFreqMtx — but cleaner to release first)
+                        }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    // Save outside the loop to keep popup behaviour clean
+                }
+                ImGui::EndCombo();
+                _this->saveManualConfig();
+            }
+            ImGui::Spacing();
+
+            // Custom additions (manual entries on top of the bookmark list)
+            ImGui::Text("Custom frequencies (MHz):");
             ImGui::SetNextItemWidth(menuWidth - ImGui::CalcTextSize("Add").x - ImGui::GetStyle().ItemSpacing.x * 2 - 8);
             ImGui::InputText(CONCAT("##_cb_freqin_", _this->name), _this->manualFreqInputBuf, sizeof(_this->manualFreqInputBuf));
             ImGui::SameLine();
@@ -1302,36 +1420,6 @@ private:
                 { std::lock_guard<std::mutex> lk(_this->manualFreqMtx); _this->manualFrequencies.erase(_this->manualFrequencies.begin() + toRemove); }
                 _this->saveManualConfig();
             }
-
-            if (ImGui::Button(CONCAT("Import from Frequency Manager##_cb_importfm_", _this->name), ImVec2(menuWidth, 0))) {
-                _this->loadFMConfig();
-                _this->fmImportOpen = true;
-            }
-        }
-
-        if (_this->fmImportOpen) {
-            ImGui::OpenPopup(CONCAT("FM Import##_cb_fmpopup_", _this->name));
-            _this->fmImportOpen = false;
-        }
-        if (ImGui::BeginPopupModal(CONCAT("FM Import##_cb_fmpopup_", _this->name), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("Select a list to import:");
-            ImGui::Spacing();
-            if (_this->fmLists.empty()) {
-                ImGui::TextDisabled("No lists found in frequency_manager_config.json");
-            } else {
-                for (auto& [listName, freqs] : _this->fmLists) {
-                    char lbl[256];
-                    snprintf(lbl, sizeof(lbl), "%s  (%d entries)", listName.c_str(), (int)freqs.size());
-                    if (ImGui::Button(lbl)) {
-                        { std::lock_guard<std::mutex> lk(_this->manualFreqMtx); for (double f : freqs) _this->manualFrequencies.push_back(f); }
-                        _this->saveManualConfig();
-                        ImGui::CloseCurrentPopup();
-                    }
-                }
-            }
-            ImGui::Spacing();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
         }
 
         // ── Scan range list (shown when scan mode selected) ───────────────────
@@ -1802,7 +1890,26 @@ private:
         auto& arr = config.conf[name]["manualFrequencies"];
         arr = nlohmann::json::array();
         for (double f : manualFrequencies) arr.push_back(f);
+        config.conf[name]["boundBookmarkList"] = boundBookmarkList;
         config.release(true);
+    }
+
+    // Build the manual-mode frequency list as the union of user-entered
+    // frequencies and the bound bookmark list (deduped within ±100 Hz).
+    // BOTH the DSP thread (analyzeSpectrum) and the mgmt thread
+    // (manageManualChannels) must use this same view, otherwise the indices
+    // in `manualDetected` don't map to anything and channels never spawn.
+    std::vector<double> getActiveManualFreqs() {
+        std::lock_guard<std::mutex> lk(manualFreqMtx);
+        std::vector<double> out = manualFrequencies;
+        for (double bf : boundFreqs) {
+            bool dup = false;
+            for (double mf : out) {
+                if (std::abs(mf - bf) < 100.0) { dup = true; break; }
+            }
+            if (!dup) out.push_back(bf);
+        }
+        return out;
     }
 
     void loadFMConfig() {
@@ -1846,11 +1953,7 @@ private:
             std::lock_guard<std::mutex> lk(manualDetectedMtx);
             localDetected = manualDetected;
         }
-        std::vector<double> localFreqs;
-        {
-            std::lock_guard<std::mutex> lk(manualFreqMtx);
-            localFreqs = manualFrequencies;
-        }
+        std::vector<double> localFreqs = getActiveManualFreqs();
 
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> clck(channelsMtx);
@@ -1937,7 +2040,10 @@ private:
     // Manual mode
     bool manualMode = false;
     std::mutex manualFreqMtx;
-    std::vector<double> manualFrequencies;
+    std::vector<double> manualFrequencies; // user-entered frequencies (custom additions)
+    std::string boundBookmarkList;         // name of bound FM list, "" = none
+    std::vector<double> boundFreqs;        // cached freqs from boundBookmarkList (refreshed periodically)
+    std::chrono::steady_clock::time_point lastFmConfigRefresh{};
     char manualFreqInputBuf[64] = {};
     std::map<int, int> manualVotes;       // list-index → vote count (DSP thread only)
     std::set<int> manualDetected;         // written by DSP, read by mgmt thread
@@ -1967,8 +2073,9 @@ private:
     std::atomic<int>                        debugBlockedSkips  { 0 };
     std::atomic<int>                        debugCapSkips      { 0 };
     std::vector<float>                      avgPower;           // EMA-smoothed power spectrum
-    float                                   globalNoiseFloor  = 0.0f; // 20th-pct noise floor (linear)
-    float                                   displayNoiseFloor = 0.0f; // smoothed copy for display only
+    float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
+    float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
+    std::deque<float>                       floorHistory;             // ring buffer of recent rawFloor values for median filter
     std::map<int, int>                      slotVotes;
 
     // Deferred retune — set by waterfall thread, consumed by DSP thread
