@@ -27,7 +27,7 @@ enum {
     RECORDER_TYPE_METEOR_DEMODULATOR
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 class SigctlServerModule : public ModuleManager::Instance {
 public:

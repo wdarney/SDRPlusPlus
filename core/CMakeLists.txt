@@ -1,170 +1,71 @@
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.18)
 project(sdrpp_core)
 
 if (USE_INTERNAL_LIBCORRECT)
     add_subdirectory("libcorrect/")
 endif (USE_INTERNAL_LIBCORRECT)
 
-if (USE_BUNDLE_DEFAULTS)
-add_definitions(-DIS_MACOS_BUNDLE)
-endif (USE_BUNDLE_DEFAULTS)
-
 # Main code
 file(GLOB_RECURSE SRC "src/*.cpp" "src/*.c")
 
 add_definitions(-DSDRPP_IS_CORE)
-add_definitions(-DFLOG_ANDROID_TAG="SDR++")
-if (MSVC)
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+add_definitions(-DFLOG_ANDROID_TAG="SDR++") # harmless leftover, used by flog macros
+
+# Backend sources. Only compiled when targeting iOS — UIKit isn't available
+# in the host macOS SDK, so gating this lets developers do partial host
+# builds (modules + DSP + signal_path) for sanity-checking before deploying.
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    file(GLOB_RECURSE BACKEND_SRC
+        "backends/ios/*.cpp"
+        "backends/ios/*.mm"
+        "backends/ios/*.m"
+        "backends/ios/imgui/*.cpp"
+        "backends/ios/imgui/*.mm"
+    )
+else ()
+    set(BACKEND_SRC "backends/ios/host_stub.cpp")
 endif ()
 
-# Configure backend sources
-if (OPT_BACKEND_GLFW)
-    file(GLOB_RECURSE BACKEND_SRC "backends/glfw/*.cpp" "backends/glfw/*.c")
-endif (OPT_BACKEND_GLFW)
-if (OPT_BACKEND_ANDROID)
-    file(GLOB_RECURSE BACKEND_SRC "backends/android/*.cpp" "backends/android/*.c")
-    set(BACKEND_SRC ${BACKEND_SRC} ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
-endif (OPT_BACKEND_ANDROID)
-
-# Add code to dyn lib
-add_library(sdrpp_core SHARED ${SRC} ${BACKEND_SRC})
-
-# Set compiler options
+add_library(sdrpp_core STATIC ${SRC} ${BACKEND_SRC})
 target_compile_options(sdrpp_core PRIVATE ${SDRPP_COMPILER_FLAGS})
 
-# Set the install prefix
-target_compile_definitions(sdrpp_core PUBLIC INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
-
-# Include core headers
+# Includes
 target_include_directories(sdrpp_core PUBLIC "src/")
 target_include_directories(sdrpp_core PUBLIC "src/imgui")
+target_include_directories(sdrpp_core PUBLIC "backends/ios")
+target_include_directories(sdrpp_core PUBLIC "backends/ios/imgui")
 
-# Configure backend includes and libraries
-if (OPT_BACKEND_GLFW)
-    target_include_directories(sdrpp_core PUBLIC "backends/glfw")
-    target_include_directories(sdrpp_core PUBLIC "backends/glfw/imgui")
-
-    if (MSVC)
-        # GLFW3
-        find_package(glfw3 CONFIG REQUIRED)
-        target_link_libraries(sdrpp_core PUBLIC glfw)
-    else()
-        find_package(PkgConfig)
-        pkg_check_modules(GLFW3 REQUIRED glfw3)
-
-        target_include_directories(sdrpp_core PUBLIC ${GLFW3_INCLUDE_DIRS})
-        target_link_directories(sdrpp_core PUBLIC ${GLFW3_LIBRARY_DIRS})
-        target_link_libraries(sdrpp_core PUBLIC ${GLFW3_LIBRARIES})
-    endif()
-endif (OPT_BACKEND_GLFW)
-if (OPT_BACKEND_ANDROID)
-    target_include_directories(sdrpp_core PUBLIC "backends/android")
-    target_include_directories(sdrpp_core PUBLIC "backends/android/imgui")
-endif (OPT_BACKEND_ANDROID)
-
-# Link to libcorrect
+# libcorrect
 if (USE_INTERNAL_LIBCORRECT)
     target_include_directories(sdrpp_core PUBLIC "libcorrect/include")
     target_link_libraries(sdrpp_core PUBLIC correct_static)
 endif (USE_INTERNAL_LIBCORRECT)
 
-if (OPT_OVERRIDE_STD_FILESYSTEM)
-    target_include_directories(sdrpp_core PUBLIC "std_replacement")
-endif (OPT_OVERRIDE_STD_FILESYSTEM)
-
-if (MSVC)
-    # Lib path
-    target_link_directories(sdrpp_core PUBLIC "C:/Program Files/PothosSDR/lib/")
-
-    # Misc headers
-    target_include_directories(sdrpp_core PUBLIC "C:/Program Files/PothosSDR/include/")
-
-    # Volk
-    target_link_libraries(sdrpp_core PUBLIC volk)
-
-    # OpenGL
-    find_package(OpenGL REQUIRED)
-    target_link_libraries(sdrpp_core PUBLIC OpenGL::GL)
-
-    # GLFW3
-    find_package(glfw3 CONFIG REQUIRED)
-    target_link_libraries(sdrpp_core PUBLIC glfw)
-
-    # FFTW3
-    find_package(FFTW3f CONFIG REQUIRED)
-    target_link_libraries(sdrpp_core PUBLIC FFTW3::fftw3f)
-
-    # WinSock2
-    target_link_libraries(sdrpp_core PUBLIC wsock32 ws2_32 iphlpapi)
-
-    # ZSTD
-    find_package(zstd CONFIG REQUIRED)
-    target_link_libraries(sdrpp_core PUBLIC zstd::libzstd_shared)
-elseif (ANDROID)
-    target_include_directories(sdrpp_core PUBLIC
-        /sdr-kit/${ANDROID_ABI}/include
-        ${ANDROID_NDK}/sources/android/native_app_glue
-    )
-
+# Apple frameworks needed by the iOS Metal backend (skipped on host builds).
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_link_libraries(sdrpp_core PUBLIC
-        /sdr-kit/${ANDROID_ABI}/lib/libvolk.so
-        /sdr-kit/${ANDROID_ABI}/lib/libfftw3f.so
-        /sdr-kit/${ANDROID_ABI}/lib/libzstd.so
-        android
-        EGL
-        GLESv3
-        log
+        "-framework UIKit"
+        "-framework Foundation"
+        "-framework Metal"
+        "-framework MetalKit"
+        "-framework QuartzCore"
+        "-framework CoreGraphics"
     )
-else()
-    find_package(PkgConfig)
-    find_package(OpenGL REQUIRED)
-
-    pkg_check_modules(FFTW3 REQUIRED fftw3f)
-    pkg_check_modules(VOLK REQUIRED volk)
-    pkg_check_modules(GLFW3 REQUIRED glfw3)
-    pkg_check_modules(LIBZSTD REQUIRED libzstd)
-
-    target_include_directories(sdrpp_core PUBLIC
-        ${OPENGL_INCLUDE_DIRS}
-        ${FFTW3_INCLUDE_DIRS}
-        ${GLFW3_INCLUDE_DIRS}
-        ${VOLK_INCLUDE_DIRS}
-        ${LIBZSTD_INCLUDE_DIRS}
-    )
-    
-    target_link_directories(sdrpp_core PUBLIC
-        ${OPENGL_LIBRARY_DIRS}
-        ${FFTW3_LIBRARY_DIRS}
-        ${GLFW3_LIBRARY_DIRS}
-        ${VOLK_LIBRARY_DIRS}
-        ${LIBZSTD_LIBRARY_DIRS}
-    )
-
-    target_link_libraries(sdrpp_core PUBLIC
-        ${OPENGL_LIBRARIES}
-        ${FFTW3_LIBRARIES}
-        ${GLFW3_LIBRARIES}
-        ${VOLK_LIBRARIES}
-        ${LIBZSTD_LIBRARIES}
-    )
-
-    if (NOT USE_INTERNAL_LIBCORRECT)
-        pkg_check_modules(CORRECT REQUIRED libcorrect)
-        target_include_directories(sdrpp_core PUBLIC ${CORRECT_INCLUDE_DIRS})
-        target_link_directories(sdrpp_core PUBLIC ${CORRECT_LIBRARY_DIRS})
-        target_link_libraries(sdrpp_core PUBLIC ${CORRECT_LIBRARIES})
-    endif (NOT USE_INTERNAL_LIBCORRECT)
-
-    if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-        target_link_libraries(sdrpp_core PUBLIC stdc++fs)
-    endif ()
-
 endif ()
 
-set(CORE_FILES ${RUNTIME_OUTPUT_DIRECTORY} PARENT_SCOPE)
+# Cross-compiled deps live under SDRPP_IOS_DEPS_ROOT (see ios/README.md).
+# Required: fftw3f, zstd. Optional: volk (link only if present, otherwise the
+# generic fallback in the DSP layer is used).
+if (NOT DEFINED SDRPP_IOS_DEPS_ROOT)
+    message(FATAL_ERROR "SDRPP_IOS_DEPS_ROOT must point to the iOS prebuilt deps dir — see ios/README.md")
+endif ()
+target_include_directories(sdrpp_core PUBLIC "${SDRPP_IOS_DEPS_ROOT}/include")
+target_link_directories(sdrpp_core PUBLIC    "${SDRPP_IOS_DEPS_ROOT}/lib")
+target_link_libraries(sdrpp_core PUBLIC fftw3f zstd)
 
-# cmake .. "-DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake"
-
-# Install directives
-install(TARGETS sdrpp_core DESTINATION lib)
+find_library(_VOLK_LIB NAMES volk PATHS "${SDRPP_IOS_DEPS_ROOT}/lib" NO_DEFAULT_PATH)
+if (_VOLK_LIB)
+    target_link_libraries(sdrpp_core PUBLIC volk)
+else ()
+    message(WARNING "VOLK not found in SDRPP_IOS_DEPS_ROOT/lib — DSP will use generic kernels")
+endif ()

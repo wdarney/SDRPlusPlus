@@ -35,7 +35,7 @@ struct WaterfallBookmark {
     FrequencyBookmark bookmark;
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 const char* demodModeList[] = {
     "NFM",

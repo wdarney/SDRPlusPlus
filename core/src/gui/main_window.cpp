@@ -120,16 +120,12 @@ void MainWindow::init() {
     auto modList = core::configManager.conf["moduleInstances"].items();
     core::configManager.release();
 
-    // Load additional modules specified through config
+    // Load additional modules specified through config. In static-link mode
+    // these resolve via the registry — see ModuleManager::loadModule.
     for (auto const& path : modules) {
-#ifndef __ANDROID__
-        std::string apath = std::filesystem::absolute(path).string();
-        flog::info("Loading {0}", apath);
+        flog::info("Loading {0}", path);
         LoadingScreen::show("Loading " + std::filesystem::path(path).filename().string());
-        core::moduleManager.loadModule(apath);
-#else
         core::moduleManager.loadModule(path);
-#endif
     }
 
     // Create module instances

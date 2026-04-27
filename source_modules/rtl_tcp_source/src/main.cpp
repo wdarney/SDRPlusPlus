@@ -19,7 +19,7 @@ SDRPP_MOD_INFO{
     /* Max instances    */ 1
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 class RTLTCPSourceModule : public ModuleManager::Instance {
 public:

@@ -4,29 +4,27 @@
 #include <json.hpp>
 #include <utils/event.h>
 
-#ifdef _WIN32
-#ifdef SDRPP_IS_CORE
-#define SDRPP_EXPORT extern "C" __declspec(dllexport)
-#else
-#define SDRPP_EXPORT extern "C" __declspec(dllimport)
-#endif
-#else
-#define SDRPP_EXPORT extern
-#endif
+// iOS fork: modules are statically linked into the main binary, no dlopen.
+// Each module's TUs get SDRPP_MODULE_TOKEN=<name>_ injected by
+// sdrpp_module.cmake, which renames the four fixed C entry-points and the
+// _INFO_ symbol so multiple modules don't collide.
 
-#ifdef _WIN32
-#include <Windows.h>
-#define MOD_EXPORT           extern "C" __declspec(dllexport)
-#define SDRPP_MOD_EXTENTSION ".dll"
-#else
-#include <dlfcn.h>
+#define SDRPP_EXPORT extern
+
 #define MOD_EXPORT extern "C"
-#ifdef __APPLE__
 #define SDRPP_MOD_EXTENTSION ".dylib"
-#else
-#define SDRPP_MOD_EXTENTSION ".so"
+
+#ifndef SDRPP_MODULE_TOKEN
+// Core itself includes module.h. Tokens only matter inside module TUs.
+#define SDRPP_MODULE_TOKEN _sdrpp_unscoped_
 #endif
-#endif
+#define _SDRPP_TOK_CAT2(a, b) a##b
+#define _SDRPP_TOK_CAT(a, b)  _SDRPP_TOK_CAT2(a, b)
+#define _INIT_                _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _INIT_)
+#define _CREATE_INSTANCE_     _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _CREATE_INSTANCE_)
+#define _DELETE_INSTANCE_     _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _DELETE_INSTANCE_)
+#define _END_                 _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _END_)
+#define _INFO_                _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _INFO_)
 
 class ModuleManager {
 public:
@@ -50,11 +48,9 @@ public:
     };
 
     struct Module_t {
-#ifdef _WIN32
-        HMODULE handle;
-#else
+        // No dlopen handle — kept for ABI parity with old code paths and as a
+        // stable identity (the _INFO_ pointer) for the operator== check.
         void* handle;
-#endif
         ModuleManager::ModuleInfo_t* info;
         void (*init)();
         ModuleManager::Instance* (*createInstance)(std::string name);
@@ -77,7 +73,18 @@ public:
         ModuleManager::Instance* instance;
     };
 
+    // Resolve a module by name (the ".dylib" suffix is tolerated for backward
+    // compatibility with config files). The module must already be registered
+    // via registerStatic() — see core/src/static_modules.cpp (generated).
     ModuleManager::Module_t loadModule(std::string path);
+
+    ModuleManager::Module_t registerStatic(
+        ModuleInfo_t* info,
+        void (*init)(),
+        Instance* (*createInstance)(std::string),
+        void (*deleteInstance)(Instance*),
+        void (*end)()
+    );
 
     int createInstance(std::string name, std::string module);
     int deleteInstance(std::string name);

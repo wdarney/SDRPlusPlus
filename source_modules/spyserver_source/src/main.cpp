@@ -44,7 +44,7 @@ const int streamFormatsBitCount[] = {
     32
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 class SpyServerSourceModule : public ModuleManager::Instance {
 public:

@@ -26,7 +26,7 @@ SDRPP_MOD_INFO{
     /* Max instances    */ -1
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 std::string genFileName(std::string prefix, std::string suffix) {
     time_t now = time(0);

@@ -14,23 +14,13 @@
 #include <filesystem>
 #include <gui/menus/theme.h>
 #include <backend.h>
+#include <static_modules.h>
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb_image_resize.h>
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
 
-#ifdef _WIN32
-#include <Windows.h>
-#endif
-
-#ifndef INSTALL_PREFIX
-#ifdef __APPLE__
-#define INSTALL_PREFIX "/usr/local"
-#else
-#define INSTALL_PREFIX "/usr"
-#endif
-#endif
 
 namespace core {
     ConfigManager configManager;
@@ -61,12 +51,6 @@ namespace core {
 int sdrpp_main(int argc, char* argv[]) {
     flog::info("SDR++ v" VERSION_STR);
 
-#ifdef IS_MACOS_BUNDLE
-    // If this is a MacOS .app, CD to the correct directory
-    auto execPath = std::filesystem::absolute(argv[0]);
-    chdir(execPath.parent_path().string().c_str());
-#endif
-
     // Define command line options and parse arguments
     core::args.defineAll();
     if (core::args.parse(argc, argv) < 0) { return -1; } 
@@ -78,14 +62,6 @@ int sdrpp_main(int argc, char* argv[]) {
     }
 
     bool serverMode = (bool)core::args["server"];
-
-#ifdef _WIN32
-    // Free console if the user hasn't asked for a console and not in server mode
-    if (!core::args["con"].b() && !serverMode) { FreeConsole(); }
-
-    // Set error mode to avoid abnoxious popups
-    SetErrorMode(SEM_NOOPENFILEERRORBOX | SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
-#endif
 
     // Check root directory
     std::string root = (std::string)core::args["root"];
@@ -162,77 +138,32 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["menuWidth"] = 300;
     defConfig["min"] = -120.0;
 
-    // Module instances
-    defConfig["moduleInstances"]["Airspy Source"]["module"] = "airspy_source";
-    defConfig["moduleInstances"]["Airspy Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["AirspyHF+ Source"]["module"] = "airspyhf_source";
-    defConfig["moduleInstances"]["AirspyHF+ Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["Audio Source"]["module"] = "audio_source";
-    defConfig["moduleInstances"]["Audio Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["BladeRF Source"]["module"] = "bladerf_source";
-    defConfig["moduleInstances"]["BladeRF Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["Dragon Labs Source"]["module"] = "dragonlabs_source";
-    defConfig["moduleInstances"]["Dragon Labs Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["File Source"]["module"] = "file_source";
-    defConfig["moduleInstances"]["File Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["FobosSDR Source"]["module"] = "fobossdr_source";
-    defConfig["moduleInstances"]["FobosSDR Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["HackRF Source"]["module"] = "hackrf_source";
-    defConfig["moduleInstances"]["HackRF Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["Harogic Source"]["module"] = "harogic_source";
-    defConfig["moduleInstances"]["Harogic Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["Hermes Source"]["module"] = "hermes_source";
-    defConfig["moduleInstances"]["Hermes Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["HydraSDR Source"]["module"] = "hydrasdr_source";
-    defConfig["moduleInstances"]["HydraSDR Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["LimeSDR Source"]["module"] = "limesdr_source";
-    defConfig["moduleInstances"]["LimeSDR Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["Network Source"]["module"] = "network_source";
-    defConfig["moduleInstances"]["Network Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["PerseusSDR Source"]["module"] = "perseus_source";
-    defConfig["moduleInstances"]["PerseusSDR Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["PlutoSDR Source"]["module"] = "plutosdr_source";
-    defConfig["moduleInstances"]["PlutoSDR Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["RFNM Source"]["module"] = "rfnm_source";
-    defConfig["moduleInstances"]["RFNM Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["RFspace Source"]["module"] = "rfspace_source";
-    defConfig["moduleInstances"]["RFspace Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["RTL-SDR Source"]["module"] = "rtl_sdr_source";
-    defConfig["moduleInstances"]["RTL-SDR Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["RTL-TCP Source"]["module"] = "rtl_tcp_source";
-    defConfig["moduleInstances"]["RTL-TCP Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["SDRplay Source"]["module"] = "sdrplay_source";
-    defConfig["moduleInstances"]["SDRplay Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["SDR++ Server Source"]["module"] = "sdrpp_server_source";
+    // Module instances — iOS client-only set.
+    defConfig["moduleInstances"]["File Source"]["module"]          = "file_source";
+    defConfig["moduleInstances"]["File Source"]["enabled"]         = true;
+    defConfig["moduleInstances"]["Network Source"]["module"]       = "network_source";
+    defConfig["moduleInstances"]["Network Source"]["enabled"]      = true;
+    defConfig["moduleInstances"]["RTL-TCP Source"]["module"]       = "rtl_tcp_source";
+    defConfig["moduleInstances"]["RTL-TCP Source"]["enabled"]      = true;
+    defConfig["moduleInstances"]["SDR++ Server Source"]["module"]  = "sdrpp_server_source";
     defConfig["moduleInstances"]["SDR++ Server Source"]["enabled"] = true;
     defConfig["moduleInstances"]["Spectran HTTP Source"]["module"] = "spectran_http_source";
-    defConfig["moduleInstances"]["Spectran HTTP Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["SpyServer Source"]["module"] = "spyserver_source";
-    defConfig["moduleInstances"]["SpyServer Source"]["enabled"] = true;
-    defConfig["moduleInstances"]["USRP Source"]["module"] = "usrp_source";
-    defConfig["moduleInstances"]["USRP Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["Spectran HTTP Source"]["enabled"]= true;
+    defConfig["moduleInstances"]["SpyServer Source"]["module"]     = "spyserver_source";
+    defConfig["moduleInstances"]["SpyServer Source"]["enabled"]    = true;
 
-    defConfig["moduleInstances"]["Audio Sink"] = "audio_sink";
+    defConfig["moduleInstances"]["Audio Sink"]   = "coreaudio_sink";
     defConfig["moduleInstances"]["Network Sink"] = "network_sink";
 
-    defConfig["moduleInstances"]["Radio"] = "radio";
-
+    defConfig["moduleInstances"]["Radio"]             = "radio";
     defConfig["moduleInstances"]["Frequency Manager"] = "frequency_manager";
-    defConfig["moduleInstances"]["Recorder"] = "recorder";
-    defConfig["moduleInstances"]["Rigctl Server"] = "rigctl_server";
-    // defConfig["moduleInstances"]["Rigctl Client"] = "rigctl_client";
-    // TODO: Enable rigctl_client when ready
-    // defConfig["moduleInstances"]["Scanner"] = "scanner";
-    // TODO: Enable scanner when ready
+    defConfig["moduleInstances"]["Recorder"]          = "recorder";
 
 
     // Themes
     defConfig["theme"] = "Dark";
-#ifdef __ANDROID__
-    defConfig["uiScale"] = 3.0f;
-#else
-    defConfig["uiScale"] = 1.0f;
-#endif
+    // Touch UI on iPhone/iPad — bigger hit targets.
+    defConfig["uiScale"] = 2.0f;
 
     defConfig["modules"] = json::array();
 
@@ -263,25 +194,13 @@ int sdrpp_main(int argc, char* argv[]) {
 
     defConfig["vfoColors"]["Radio"] = "#FFFFFF";
 
-#ifdef __ANDROID__
     defConfig["lockMenuOrder"] = true;
-#else
-    defConfig["lockMenuOrder"] = false;
-#endif
 
-#if defined(_WIN32)
-    defConfig["modulesDirectory"] = "./modules";
-    defConfig["resourcesDirectory"] = "./res";
-#elif defined(IS_MACOS_BUNDLE)
-    defConfig["modulesDirectory"] = "../Plugins";
-    defConfig["resourcesDirectory"] = "../Resources";
-#elif defined(__ANDROID__)
-    defConfig["modulesDirectory"] = root + "/modules";
+    // iOS sandbox: everything lives under <appSupport>. modulesDirectory is
+    // unused (modules are statically linked) but the loader still needs a
+    // valid path to scan harmlessly.
+    defConfig["modulesDirectory"]   = root + "/modules";
     defConfig["resourcesDirectory"] = root + "/res";
-#else
-    defConfig["modulesDirectory"] = INSTALL_PREFIX "/lib/sdrpp/plugins";
-    defConfig["resourcesDirectory"] = INSTALL_PREFIX "/share/sdrpp";
-#endif
 
     // Load config
     flog::info("Loading config");
@@ -290,35 +209,15 @@ int sdrpp_main(int argc, char* argv[]) {
     core::configManager.enableAutoSave();
     core::configManager.acquire();
 
-    // Android can't load just any .so file. This means we have to hardcode the name of the modules
-#ifdef __ANDROID__
-    int modCount = 0;
+    // Static-link mode: register every module compiled into the binary, then
+    // seed the "modules" config list so main_window's loader resolves them by
+    // name. loadModule() short-circuits to the registry — see module.cpp.
+    registerStaticModules();
     core::configManager.conf["modules"] = json::array();
-
-    core::configManager.conf["modules"][modCount++] = "airspy_source.so";
-    core::configManager.conf["modules"][modCount++] = "airspyhf_source.so";
-    core::configManager.conf["modules"][modCount++] = "hackrf_source.so";
-    core::configManager.conf["modules"][modCount++] = "hermes_source.so";
-    core::configManager.conf["modules"][modCount++] = "hydrasdr_source.so";
-    core::configManager.conf["modules"][modCount++] = "plutosdr_source.so";
-    core::configManager.conf["modules"][modCount++] = "rfspace_source.so";
-    core::configManager.conf["modules"][modCount++] = "rtl_sdr_source.so";
-    core::configManager.conf["modules"][modCount++] = "rtl_tcp_source.so";
-    core::configManager.conf["modules"][modCount++] = "sdrpp_server_source.so";
-    core::configManager.conf["modules"][modCount++] = "spyserver_source.so";
-
-    core::configManager.conf["modules"][modCount++] = "network_sink.so";
-    core::configManager.conf["modules"][modCount++] = "audio_sink.so";
-
-    core::configManager.conf["modules"][modCount++] = "m17_decoder.so";
-    core::configManager.conf["modules"][modCount++] = "meteor_demodulator.so";
-    core::configManager.conf["modules"][modCount++] = "radio.so";
-
-    core::configManager.conf["modules"][modCount++] = "frequency_manager.so";
-    core::configManager.conf["modules"][modCount++] = "recorder.so";
-    core::configManager.conf["modules"][modCount++] = "rigctl_server.so";
-    core::configManager.conf["modules"][modCount++] = "scanner.so";
-#endif
+    int modCount = 0;
+    for (auto const& [name, _mod] : core::moduleManager.modules) {
+        core::configManager.conf["modules"][modCount++] = name + std::string(SDRPP_MOD_EXTENTSION);
+    }
 
     // Fix missing elements in config
     for (auto const& item : defConfig.items()) {
@@ -399,24 +298,21 @@ int sdrpp_main(int argc, char* argv[]) {
 
     flog::info("Ready.");
 
-    // Run render loop (TODO: CHECK RETURN VALUE)
+    // Run render loop. On iOS this parks on UIApplication's runloop and never
+    // returns under normal use; the shutdown path below exists only as a
+    // theoretical clean-exit. iOS apps are killed by the OS, not via main().
     backend::renderLoop();
 
-    // On android, none of this shutdown should happen due to the way the UI works
-#ifndef __ANDROID__
-    // Shut down all modules
     for (auto& [name, mod] : core::moduleManager.modules) {
         mod.end();
     }
 
-    // Terminate backend (TODO: CHECK RETURN VALUE)
     backend::end();
 
     sigpath::iqFrontEnd.stop();
 
     core::configManager.disableAutoSave();
     core::configManager.save();
-#endif
 
     flog::info("Exiting successfully");
     return 0;
