@@ -1,5 +1,6 @@
 #include <imgui.h>
 #include <module.h>
+#include <frequency_manager_interface.h>
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
@@ -151,8 +152,15 @@ public:
         if (config.conf[name].contains("manualFrequencies"))
             for (auto& j : config.conf[name]["manualFrequencies"])
                 manualFrequencies.push_back(j.get<double>());
-        if (config.conf[name].contains("boundBookmarkList"))
-            boundBookmarkList = config.conf[name]["boundBookmarkList"].get<std::string>();
+        if (config.conf[name].contains("boundBookmarkLists")) {
+            for (auto& j : config.conf[name]["boundBookmarkLists"])
+                boundBookmarkLists.insert(j.get<std::string>());
+        }
+        else if (config.conf[name].contains("boundBookmarkList")) {
+            // Migrate legacy single-list config
+            std::string s = config.conf[name]["boundBookmarkList"].get<std::string>();
+            if (!s.empty()) boundBookmarkLists.insert(s);
+        }
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -169,9 +177,8 @@ public:
         // Load FM bookmarks so displayName() can show names
         loadFMConfig();
 
-        // If a bookmark list was previously bound, populate its cached freqs now
-        if (!boundBookmarkList.empty() && fmLists.count(boundBookmarkList))
-            boundFreqs = fmLists[boundBookmarkList];
+        // Populate cached freqs from all bound lists
+        rebuildBoundFreqs();
 
         // Allocate FFTW buffers
         fftIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
@@ -1393,16 +1400,20 @@ private:
         bool isManual = _this->manualMode;
         bool isScan   = _this->scanMode;
         if (ImGui::RadioButton(CONCAT("Auto##_cb_auto_", _this->name), isAuto)) {
+            if (_this->manualMode) _this->restoreWaterfallVisibility();
             _this->manualMode = false; _this->scanMode = false;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Manual##_cb_manual_", _this->name), isManual)) {
             _this->manualMode = true; _this->scanMode = false;
+            if (!_this->boundBookmarkLists.empty())
+                _this->applyWaterfallVisibility();
             _this->saveManualConfig(); _this->saveScanConfig();
         }
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Scan##_cb_scan_", _this->name), isScan)) {
+            if (_this->manualMode) _this->restoreWaterfallVisibility();
             _this->manualMode = false; _this->scanMode = true;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
@@ -1418,56 +1429,64 @@ private:
                 _this->loadFMConfig();
                 _this->lastFmConfigRefresh = now;
                 std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
-                if (!_this->boundBookmarkList.empty() && _this->fmLists.count(_this->boundBookmarkList))
-                    _this->boundFreqs = _this->fmLists[_this->boundBookmarkList];
-                else
-                    _this->boundFreqs.clear();
+                _this->rebuildBoundFreqs();
             }
 
             ImGui::Spacing();
 
-            // Bookmark source dropdown — replaces the old "Import" button.
-            // Selecting a list binds it; its frequencies are scanned alongside
-            // any custom user-entered ones below.
-            ImGui::LeftLabel("Bookmark list");
+            // Bookmark source dropdown — multi-select: tick any number of FM
+            // lists; their frequencies are scanned alongside manual entries.
+            // Ticking a list also hides all other FM bookmark groups on the
+            // main waterfall so only the selected lists are visible.
+            ImGui::LeftLabel("Bookmark lists");
             ImGui::FillWidth();
-            char preview[160];
-            if (_this->boundBookmarkList.empty())
-                snprintf(preview, sizeof(preview), "(none)");
-            else
-                snprintf(preview, sizeof(preview), "%s  (%d)",
-                         _this->boundBookmarkList.c_str(), (int)_this->boundFreqs.size());
-            if (ImGui::BeginCombo(CONCAT("##_cb_bmsrc_", _this->name), preview)) {
-                bool noneSel = _this->boundBookmarkList.empty();
-                if (ImGui::Selectable("(none)", noneSel)) {
-                    {
-                        std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
-                        _this->boundBookmarkList.clear();
-                        _this->boundFreqs.clear();
+            {
+                char preview[160];
+                int  nSelected = (int)_this->boundBookmarkLists.size();
+                int  nFreqs    = (int)_this->boundFreqs.size();
+                if (nSelected == 0)
+                    snprintf(preview, sizeof(preview), "(none)");
+                else if (nSelected == 1)
+                    snprintf(preview, sizeof(preview), "%s  (%d)",
+                             _this->boundBookmarkLists.begin()->c_str(), nFreqs);
+                else
+                    snprintf(preview, sizeof(preview), "%d lists  (%d freqs)",
+                             nSelected, nFreqs);
+
+                if (ImGui::BeginCombo(CONCAT("##_cb_bmsrc_", _this->name), preview)) {
+                    if (_this->fmLists.empty()) {
+                        ImGui::TextDisabled("No FM lists found");
                     }
-                    _this->saveManualConfig();
-                }
-                if (_this->fmLists.empty()) {
-                    ImGui::TextDisabled("No lists found");
-                } else {
-                    for (auto& [listName, freqs] : _this->fmLists) {
-                        char lbl[256];
-                        snprintf(lbl, sizeof(lbl), "%s  (%d)",
-                                 listName.c_str(), (int)freqs.size());
-                        bool sel = (listName == _this->boundBookmarkList);
-                        if (ImGui::Selectable(lbl, sel)) {
-                            std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
-                            _this->boundBookmarkList = listName;
-                            _this->boundFreqs = freqs;
-                            // unlock before saving (saveManualConfig acquires config mutex,
-                            // not manualFreqMtx — but cleaner to release first)
+                    else {
+                        bool anyChange = false;
+                        for (auto& [listName, freqs] : _this->fmLists) {
+                            bool checked = (_this->boundBookmarkLists.count(listName) > 0);
+                            char lbl[256];
+                            snprintf(lbl, sizeof(lbl), "%s  (%d)",
+                                     listName.c_str(), (int)freqs.size());
+                            // DontClosePopups: keep the dropdown open for multi-select
+                            if (ImGui::Selectable(lbl, checked,
+                                                  ImGuiSelectableFlags_DontClosePopups)) {
+                                std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                                if (checked)
+                                    _this->boundBookmarkLists.erase(listName);
+                                else
+                                    _this->boundBookmarkLists.insert(listName);
+                                _this->rebuildBoundFreqs();
+                                anyChange = true;
+                            }
                         }
-                        if (sel) ImGui::SetItemDefaultFocus();
+                        if (anyChange) {
+                            // Apply or restore waterfall visibility
+                            if (_this->boundBookmarkLists.empty())
+                                _this->restoreWaterfallVisibility();
+                            else
+                                _this->applyWaterfallVisibility();
+                            _this->saveManualConfig();
+                        }
                     }
-                    // Save outside the loop to keep popup behaviour clean
+                    ImGui::EndCombo();
                 }
-                ImGui::EndCombo();
-                _this->saveManualConfig();
             }
             ImGui::Spacing();
 
@@ -1972,12 +1991,53 @@ private:
         auto& arr = config.conf[name]["manualFrequencies"];
         arr = nlohmann::json::array();
         for (double f : manualFrequencies) arr.push_back(f);
-        config.conf[name]["boundBookmarkList"] = boundBookmarkList;
+        auto& arr2 = config.conf[name]["boundBookmarkLists"];
+        arr2 = nlohmann::json::array();
+        for (auto& s : boundBookmarkLists) arr2.push_back(s);
         config.release(true);
     }
 
+    // Rebuild boundFreqs as the deduplicated union of all boundBookmarkLists.
+    // Caller must hold manualFreqMtx (or call from constructor before threads start).
+    void rebuildBoundFreqs() {
+        boundFreqs.clear();
+        for (auto& listName : boundBookmarkLists) {
+            auto it = fmLists.find(listName);
+            if (it == fmLists.end()) continue;
+            for (double f : it->second) {
+                bool dup = false;
+                for (double bf : boundFreqs)
+                    if (std::abs(bf - f) < 100.0) { dup = true; break; }
+                if (!dup) boundFreqs.push_back(f);
+            }
+        }
+    }
+
+    // Hide all FM waterfall bookmark groups except the selected ones.
+    // Saves original visibility states the first time it's called.
+    // Safe no-op if FM is not loaded (fm_iface calls return false).
+    void applyWaterfallVisibility() {
+        if (!waterfallStateSaved) {
+            savedShowOnWaterfall.clear();
+            for (auto& n : fm_iface::getListNames())
+                savedShowOnWaterfall[n] = fm_iface::isListShownOnWaterfall(n);
+            waterfallStateSaved = true;
+        }
+        for (auto& n : fm_iface::getListNames())
+            fm_iface::setListShownOnWaterfall(n, boundBookmarkLists.count(n) > 0);
+    }
+
+    // Restore FM waterfall visibility to the states saved by applyWaterfallVisibility().
+    void restoreWaterfallVisibility() {
+        if (!waterfallStateSaved) return;
+        for (auto& [n, v] : savedShowOnWaterfall)
+            fm_iface::setListShownOnWaterfall(n, v);
+        savedShowOnWaterfall.clear();
+        waterfallStateSaved = false;
+    }
+
     // Build the manual-mode frequency list as the union of user-entered
-    // frequencies and the bound bookmark list (deduped within ±100 Hz).
+    // frequencies and the bound bookmark lists (deduped within ±100 Hz).
     // BOTH the DSP thread (analyzeSpectrum) and the mgmt thread
     // (manageManualChannels) must use this same view, otherwise the indices
     // in `manualDetected` don't map to anything and channels never spawn.
@@ -2122,9 +2182,12 @@ private:
     // Manual mode
     bool manualMode = false;
     std::mutex manualFreqMtx;
-    std::vector<double> manualFrequencies; // user-entered frequencies (custom additions)
-    std::string boundBookmarkList;         // name of bound FM list, "" = none
-    std::vector<double> boundFreqs;        // cached freqs from boundBookmarkList (refreshed periodically)
+    std::vector<double>   manualFrequencies;    // user-entered frequencies (custom additions)
+    std::set<std::string> boundBookmarkLists;   // names of bound FM bookmark lists
+    std::vector<double>   boundFreqs;           // union of boundBookmarkLists (refreshed periodically)
+    // Waterfall visibility save/restore (Option A)
+    std::map<std::string, bool> savedShowOnWaterfall; // saved FM visibility states before Manual mode
+    bool                        waterfallStateSaved = false;
     std::chrono::steady_clock::time_point lastFmConfigRefresh{};
     char manualFreqInputBuf[64] = {};
     std::map<int, int> manualVotes;       // list-index → vote count (DSP thread only)
@@ -2136,8 +2199,7 @@ private:
     char    descEditBuf[256] = {};
     bool    descEditRequest = false;
 
-    // FM import UI state (UI thread only)
-    bool fmImportOpen = false;
+    // FM list cache (populated by loadFMConfig, UI thread only)
     std::map<std::string, std::vector<double>> fmLists;
     std::mutex bookmarkNamesMtx;
     std::map<int64_t, std::string> bookmarkNames;   // freqKey -> "Tower KLAX"

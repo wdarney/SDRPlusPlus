@@ -16,10 +16,11 @@ list(APPEND SRC ${RNNOISE_SRC})
 
 include(${SDRPP_MODULE_CMAKE})
 
-# RNNoise needs its own include path and C flags
+# RNNoise + cross-module FM interface
 target_include_directories(channel_bank PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../frequency_manager/src
 )
 # Force C compilation and suppress warnings for third-party RNNoise sources
 set_source_files_properties(${RNNOISE_SRC} PROPERTIES

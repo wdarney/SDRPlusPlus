@@ -81,12 +81,69 @@ public:
         gui::menu.registerEntry(name, menuHandler, this, NULL);
         gui::waterfall.onFFTRedraw.bindHandler(&fftRedrawHandler);
         gui::waterfall.onInputProcess.bindHandler(&inputHandler);
+
+        // Register cross-module interface (see frequency_manager_interface.h).
+        core::modComManager.registerInterface(name, "frequency_manager", fmComHandler, this);
     }
 
     ~FrequencyManagerModule() {
+        core::modComManager.unregisterInterface("frequency_manager");
         gui::menu.removeEntry(name);
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
         gui::waterfall.onInputProcess.unbindHandler(&inputHandler);
+    }
+
+    // ── Cross-module API (see frequency_manager_interface.h) ────────────────
+    // Commands are dispatched via core::modComManager "frequency_manager".
+
+    static void fmComHandler(int code, void* in, void* out, void* ctx) {
+        FrequencyManagerModule* _this = (FrequencyManagerModule*)ctx;
+        switch (code) {
+            case 0: { // FM_IFACE_CMD_SET_SHOWN
+                struct SetShownArgs { const std::string* listName; bool shown; };
+                auto* args = (SetShownArgs*)in;
+                *(bool*)out = _this->ifaceSetListShownOnWaterfall(*args->listName, args->shown);
+                break;
+            }
+            case 1: { // FM_IFACE_CMD_IS_SHOWN
+                *(bool*)out = _this->ifaceIsListShownOnWaterfall(*(const std::string*)in);
+                break;
+            }
+            case 2: { // FM_IFACE_CMD_GET_NAMES
+                *(std::vector<std::string>*)out = _this->ifaceGetListNames();
+                break;
+            }
+        }
+    }
+
+    bool ifaceSetListShownOnWaterfall(const std::string& listName, bool shown) {
+        config.acquire();
+        if (!config.conf["lists"].contains(listName)) {
+            config.release();
+            return false;
+        }
+        config.conf["lists"][listName]["showOnWaterfall"] = shown;
+        config.release(true);
+        refreshWaterfallBookmarks();
+        return true;
+    }
+
+    bool ifaceIsListShownOnWaterfall(const std::string& listName) {
+        bool out = false;
+        config.acquire();
+        if (config.conf["lists"].contains(listName)) {
+            out = (bool)config.conf["lists"][listName]["showOnWaterfall"];
+        }
+        config.release();
+        return out;
+    }
+
+    std::vector<std::string> ifaceGetListNames() {
+        std::vector<std::string> out;
+        config.acquire();
+        for (auto& [k, _] : config.conf["lists"].items()) out.push_back(k);
+        config.release();
+        return out;
     }
 
     void postInit() {}
@@ -863,3 +920,4 @@ MOD_EXPORT void _END_() {
     config.disableAutoSave();
     config.save();
 }
+
