@@ -753,16 +753,22 @@ private:
         const double audioBw = std::min(bw / 2.0, 8000.0);
         if (demodMode == DEMOD_AM) {
             slot.amDemod = new dsp::demod::AM<dsp::stereo_t>();
+            // AGC time constants: ~1s attack, ~2s decay.
+            // A fast attack (e.g. 0.001 = 21ms) tracks the audio envelope and
+            // causes audible dynamic compression. Carrier-mode AGC must be slow
+            // so it only normalises long-term carrier level, not modulation.
+            const double agcAttack = 1.0 / (audioSr * 1.0);   // ~1 second
+            const double agcDecay  = 1.0 / (audioSr * 2.0);   // ~2 seconds
             slot.amDemod->init(&slot.vfo->out,
                 dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER,
-                audioBw, 0.001, 0.00001, 100.0 / audioSr, audioSr);
+                audioBw, agcAttack, agcDecay, 100.0 / audioSr, audioSr);
         }
         else if (demodMode == DEMOD_USB || demodMode == DEMOD_LSB) {
             auto ssbMode = (demodMode == DEMOD_USB)
                 ? dsp::demod::SSB<dsp::stereo_t>::Mode::USB
                 : dsp::demod::SSB<dsp::stereo_t>::Mode::LSB;
             slot.ssbDemod = new dsp::demod::SSB<dsp::stereo_t>();
-            slot.ssbDemod->init(&slot.vfo->out, ssbMode, ssbBw, audioSr, 0.001, 0.00001);
+            slot.ssbDemod->init(&slot.vfo->out, ssbMode, ssbBw, audioSr, 1.0/(audioSr*1.0), 1.0/(audioSr*2.0));
         }
         else {
             double demodBw = (demodMode == DEMOD_WFM) ? 150000.0 : audioBw;
