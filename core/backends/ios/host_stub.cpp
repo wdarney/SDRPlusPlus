@@ -21,6 +21,13 @@ namespace backend {
     void iosTouchMoved(double, double)        {}
     void iosTouchEnded(double, double)        {}
     bool iosWantsKeyboard()                   { return false; }
+    void iosTypeChar(unsigned)                {}
+    void iosTypeBackspace()                   {}
+    void iosWheel(double, double)             {}
+    void iosRightClickAt(double, double)      {}
+    void iosPanBegan(double, double)          {}
+    void iosPanMoved(double, double)          {}
+    void iosPanEnded()                        {}
 
     static std::string g_appFilesDir;
     std::string iosAppFilesDir()              { return g_appFilesDir; }

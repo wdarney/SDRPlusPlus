@@ -153,6 +153,50 @@ namespace backend {
 
     bool iosWantsKeyboard() { return g_imguiInitialized && ImGui::GetIO().WantTextInput; }
 
+    // Pump a unicode codepoint typed into the host's UITextField shim into
+    // ImGui's input stream. Called from UITextFieldDelegate methods.
+    void iosTypeChar(unsigned codepoint) {
+        if (!g_imguiInitialized) return;
+        ImGui::GetIO().AddInputCharacter(codepoint);
+    }
+
+    void iosTypeBackspace() {
+        if (!g_imguiInitialized) return;
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_Backspace, true);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_Backspace, false);
+    }
+
+    void iosWheel(double dx, double dy) {
+        if (!g_imguiInitialized) return;
+        ImGui::GetIO().AddMouseWheelEvent((float)dx, (float)dy);
+    }
+
+    void iosRightClickAt(double x, double y) {
+        if (!g_imguiInitialized) return;
+        // Synthesise a right-button click at (x,y). One frame is enough — the
+        // ImGui frame after this will see the down+up pair and open whatever
+        // context menu the widget under the cursor registered.
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddMousePosEvent((float)x, (float)y);
+        io.AddMouseButtonEvent(1, true);
+        io.AddMouseButtonEvent(1, false);
+    }
+
+    // Pan state lives here so the host doesn't have to track it. Two-finger
+    // pan deltas accumulate into g_panX/g_panY, which a later patch can
+    // wire into a waterfall-pan handler in main_window.cpp.
+    static double g_panX = 0.0, g_panY = 0.0;
+    static bool   g_panActive = false;
+
+    void iosPanBegan(double, double) { g_panX = 0.0; g_panY = 0.0; g_panActive = true; }
+    void iosPanMoved(double dx, double dy) {
+        if (!g_panActive) return;
+        g_panX += dx;
+        g_panY += dy;
+        // No ImGui forwarding yet — see header comment.
+    }
+    void iosPanEnded() { g_panActive = false; }
+
     std::string iosAppFilesDir() { return g_appFilesDir; }
     void        iosSetAppFilesDir(const std::string& p) { g_appFilesDir = p; }
 }

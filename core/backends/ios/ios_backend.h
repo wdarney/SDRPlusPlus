@@ -29,6 +29,28 @@ namespace backend {
     // / resignFirstResponder on its input shim view.
     bool iosWantsKeyboard();
 
+    // Text input from the host's hidden UITextField. UTF-32 codepoint per
+    // call; the host decodes UITextField's `replacementString:` for us.
+    void iosTypeChar(unsigned codepoint);
+    void iosTypeBackspace();
+
+    // Pinch gesture -> mouse wheel ticks. dy > 0 for zoom-in (matches the
+    // desktop scroll convention used by the waterfall zoom handler).
+    void iosWheel(double dx, double dy);
+
+    // Long-press translation. iOS has no native right click; we emit a
+    // synthetic right-mouse-button down/up pair when a UILongPressGesture
+    // recognizer fires, so ImGui's standard right-click context menus work.
+    void iosRightClickAt(double x, double y);
+
+    // Two-finger pan. Forwarded as a delta in screen pixels — the host
+    // tracks gesture state and only sends incremental movement. SDR++'s
+    // waterfall doesn't read this directly today; the hook exists so a
+    // dedicated handler in main_window.cpp can be wired up later.
+    void iosPanBegan(double x, double y);
+    void iosPanMoved(double dx, double dy);
+    void iosPanEnded();
+
     // App-files dir injected by the host (NSApplicationSupportDirectory) so
     // sdrpp_main can be invoked with -r <path>.
     std::string iosAppFilesDir();
