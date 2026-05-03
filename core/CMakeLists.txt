@@ -5,8 +5,12 @@ if (USE_INTERNAL_LIBCORRECT)
     add_subdirectory("libcorrect/")
 endif (USE_INTERNAL_LIBCORRECT)
 
-# Main code
+# Main code. Exclude server.cpp — that's the SDR++ *server* mode which an
+# iOS client never runs, and which is the only consumer of zstd's compressor.
+# The server:: namespace functions still referenced from core.cpp /
+# signal_path/source.cpp get no-op stubs from server_ios_stub.cpp instead.
 file(GLOB_RECURSE SRC "src/*.cpp" "src/*.c")
+list(FILTER SRC EXCLUDE REGEX "src/server\\.cpp$")
 
 add_definitions(-DSDRPP_IS_CORE)
 add_definitions(-DFLOG_ANDROID_TAG="SDR++") # harmless leftover, used by flog macros
