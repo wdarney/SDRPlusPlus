@@ -27,8 +27,12 @@ set_target_properties(SDRPP_iOS PROPERTIES
 )
 
 # Bundle the /res tree so ViewController.mm can copy it on first launch.
-set_source_files_properties(
-    "${CMAKE_SOURCE_DIR}/root/res"
-    PROPERTIES MACOSX_PACKAGE_LOCATION Resources
+# CMake's MACOSX_PACKAGE_LOCATION on a directory was a no-op; instead use a
+# post-build copy. cp -R lands the entire bandplans/colormaps/fonts/icons/
+# themes tree under .app/res, which is where copyBundleResources: looks.
+add_custom_command(TARGET SDRPP_iOS POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/root/res"
+            "$<TARGET_BUNDLE_DIR:SDRPP_iOS>/res"
+    COMMENT "Copying SDR++ resources (bandplans/colormaps/fonts/icons/themes)"
 )
-target_sources(SDRPP_iOS PRIVATE "${CMAKE_SOURCE_DIR}/root/res")

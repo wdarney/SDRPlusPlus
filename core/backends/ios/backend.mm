@@ -63,9 +63,19 @@ namespace backend {
 
     void beginFrame() {
         if (!g_mtkView || !g_renderPassDesc) return;
+
+        // ImGui_ImplMetal_Init builds the fonts texture once. If SDR++ adds
+        // custom fonts later (style::loadFonts is called after backend::init),
+        // the atlas is dirtied but the GPU texture is stale. NewFrame's sanity
+        // check asserts the atlas is built, so we lazily rebuild here.
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.Fonts->IsBuilt()) {
+            ImGui_ImplMetal_DestroyFontsTexture();
+            ImGui_ImplMetal_CreateFontsTexture(g_device);
+        }
+
         ImGui_ImplMetal_NewFrame(g_renderPassDesc);
 
-        ImGuiIO& io = ImGui::GetIO();
         CGSize sz = g_mtkView.drawableSize;
         io.DisplaySize = ImVec2((float)sz.width / io.DisplayFramebufferScale.x,
                                 (float)sz.height / io.DisplayFramebufferScale.y);
