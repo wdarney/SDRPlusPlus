@@ -21,3 +21,8 @@ source_modules/badgesdr_source
 decoder_modules/mystery_decoder
 decoder_modules/tetra_decoder
 misc_modules/modulation_monitor
+
+# Cross-compiled iOS deps (output of ios/build_deps.sh) and CMake build dirs.
+# Per-host artifacts, never checked in.
+/build-ios-deps-*/
+/build-ios-*/

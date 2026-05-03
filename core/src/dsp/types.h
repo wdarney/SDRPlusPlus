@@ -1,5 +1,7 @@
 #pragma once
 #include <math.h>
+#include <type_traits>      // std::is_same_v used pervasively in DSP templates;
+                            // not pulled in transitively under the iOS SDK.
 #include "math/constants.h"
 
 namespace dsp {

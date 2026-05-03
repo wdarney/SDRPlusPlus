@@ -26,12 +26,25 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
         "backends/ios/imgui/*.cpp"
         "backends/ios/imgui/*.mm"
     )
+    # imgui_impl_metal.mm and our backend.mm both rely on ARC features
+    # (__weak, autoreleased blocks). Apply -fobjc-arc to all .mm/.m sources
+    # in the iOS backend — there is no non-ARC Obj-C++ in the iOS path so
+    # this is safe to set globally per file.
+    foreach (_src ${BACKEND_SRC})
+        if (_src MATCHES "\\.mm?$")
+            set_source_files_properties(${_src} PROPERTIES
+                COMPILE_FLAGS "-fobjc-arc")
+        endif ()
+    endforeach ()
 else ()
     set(BACKEND_SRC "backends/ios/host_stub.cpp")
 endif ()
 
 add_library(sdrpp_core STATIC ${SRC} ${BACKEND_SRC})
 target_compile_options(sdrpp_core PRIVATE ${SDRPP_COMPILER_FLAGS})
+# Public C++17 — consumers (modules, the iOS app target) need this too.
+# DSP templates use std::is_same_v / `if constexpr`, which are C++17.
+target_compile_features(sdrpp_core PUBLIC cxx_std_17)
 
 # Includes
 target_include_directories(sdrpp_core PUBLIC "src/")
@@ -45,7 +58,9 @@ if (USE_INTERNAL_LIBCORRECT)
     target_link_libraries(sdrpp_core PUBLIC correct_static)
 endif (USE_INTERNAL_LIBCORRECT)
 
-# Apple frameworks needed by the iOS Metal backend (skipped on host builds).
+# Apple frameworks needed by core + the iOS Metal backend (skipped on host).
+# Done at core scope (rather than per-OBJECT-library) so PRIVATE link entries
+# on OBJECT libs don't get silently dropped during transitive linking.
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_link_libraries(sdrpp_core PUBLIC
         "-framework UIKit"
@@ -54,6 +69,16 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
         "-framework MetalKit"
         "-framework QuartzCore"
         "-framework CoreGraphics"
+        # OpenGL ES — icons.cpp and waterfall.cpp store ImGui textures via
+        # glGenTextures / glBindTexture / glTexImage2D. The Metal renderer
+        # ignores these handles, but the call sites still need to link.
+        "-framework OpenGLES"
+        # AudioToolbox / AVFoundation — coreaudio_sink uses AudioUnit. These
+        # belong with the module but per-OBJECT-lib frameworks don't reach
+        # the final exe link, so they're hoisted here.
+        "-framework AudioToolbox"
+        "-framework AVFoundation"
+        "-framework CoreAudio"
     )
 endif ()
 
