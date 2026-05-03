@@ -58,18 +58,13 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
 endif ()
 
 # Cross-compiled deps live under SDRPP_IOS_DEPS_ROOT (see ios/README.md).
-# Required: fftw3f, zstd. Optional: volk (link only if present, otherwise the
-# generic fallback in the DSP layer is used).
+# Only libzstd is needed externally — VOLK and FFTW3 are replaced by
+# Accelerate-backed shims under ios/volk_shim/ and ios/fftw_shim/.
 if (NOT DEFINED SDRPP_IOS_DEPS_ROOT)
     message(FATAL_ERROR "SDRPP_IOS_DEPS_ROOT must point to the iOS prebuilt deps dir — see ios/README.md")
 endif ()
 target_include_directories(sdrpp_core PUBLIC "${SDRPP_IOS_DEPS_ROOT}/include")
 target_link_directories(sdrpp_core PUBLIC    "${SDRPP_IOS_DEPS_ROOT}/lib")
-target_link_libraries(sdrpp_core PUBLIC fftw3f zstd)
+target_link_libraries(sdrpp_core PUBLIC zstd)
 
-find_library(_VOLK_LIB NAMES volk PATHS "${SDRPP_IOS_DEPS_ROOT}/lib" NO_DEFAULT_PATH)
-if (_VOLK_LIB)
-    target_link_libraries(sdrpp_core PUBLIC volk)
-else ()
-    message(WARNING "VOLK not found in SDRPP_IOS_DEPS_ROOT/lib — DSP will use generic kernels")
-endif ()
+target_link_libraries(sdrpp_core PUBLIC volk_shim fftw_shim)

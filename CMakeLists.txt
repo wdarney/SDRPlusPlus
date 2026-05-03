@@ -40,6 +40,10 @@ else ()
 endif ()
 set(SDRPP_MODULE_COMPILER_FLAGS ${SDRPP_COMPILER_FLAGS})
 
+# ---- Accelerate-backed shims (must come before core) --------------------
+add_subdirectory("ios/volk_shim")
+add_subdirectory("ios/fftw_shim")
+
 # ---- Core ----------------------------------------------------------------
 add_subdirectory("core")
 
