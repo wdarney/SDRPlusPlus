@@ -204,6 +204,7 @@ public:
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
+        restoreWaterfallVisibility();  // always restore on unload, safe no-op if not saved
         if (running) { stop(); }
         fftwf_destroy_plan(fftPlan);
         fftwf_free(fftIn);
@@ -218,7 +219,7 @@ public:
         gui::waterfall.onFFTRedraw.bindHandler(&fftRedrawHandler);
     }
     void enable()  { enabled = true; }
-    void disable() { enabled = false; }
+    void disable() { enabled = false; restoreWaterfallVisibility(); }
     bool isEnabled() { return enabled; }
 
     void start() {
@@ -271,6 +272,9 @@ public:
         std::lock_guard<std::mutex> lck(runMtx);
         if (!running) { return; }
         running = false;
+
+        // Restore FM waterfall visibility before tearing down
+        if (manualMode) restoreWaterfallVisibility();
 
         // Stop playback thread — stopWriter() unblocks any pending swap() call
         playbackRunning = false;
