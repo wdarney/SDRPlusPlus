@@ -781,7 +781,7 @@ private:
                         std::lock_guard<std::mutex> plk(playbackMtx);
                         int64_t fk = freqKey(slot->freqHz);
                         for (auto& entry : playbackQueue)
-                            if (freqKey(entry.second) == fk) { isQueued = true; break; }
+                            if (freqKey(entry.freqHz) == fk) { isQueued = true; break; }
                     }
                     if (elapsed > cooldownSec && !slot->fileOpen && !isPlaying && !isQueued) {
                         flog::info("[ChannelBank] Destroying slot {0}", it->first);
@@ -980,14 +980,7 @@ private:
         // detection is unreliable — the FFT already knows if a signal is there.
         if (slot->signalPresent.load()) {
             slot->inSilence = false;
-            // Respect the global recording-enabled toggle
-            if (!slot->fileOpen && _this->recordingEnabled) { _this->openNewFile(*slot); }
-            // If recording was disabled mid-transmission, close the open file immediately
-            if (slot->fileOpen && !_this->recordingEnabled) {
-                slot->writer.close();
-                slot->fileOpen = false;
-                std::remove(slot->currentFilePath.c_str());  // discard the partial file
-            }
+            if (!slot->fileOpen) { _this->openNewFile(*slot); }
         }
         else {
             // Signal gone — start 1-second grace before closing file
@@ -1016,7 +1009,8 @@ private:
                         _this->saveFreqLog();
                         if (!slot->currentFilePath.empty()) {
                             std::lock_guard<std::mutex> lk(_this->playbackMtx);
-                            _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz});
+                            // deleteAfter=true when recording is disabled — play it back but don't keep the file
+                            _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, !_this->recordingEnabled});
                             _this->playbackCv.notify_one();
                         }
                     }
@@ -1093,12 +1087,14 @@ private:
 
         while (playbackRunning) {
             std::string path;
-            double      playFreq = 0.0;
+            double      playFreq    = 0.0;
+            bool        deleteAfter = false;
             {
                 std::lock_guard<std::mutex> lk(playbackMtx);
                 if (!playbackQueue.empty()) {
-                    path     = playbackQueue.front().first;
-                    playFreq = playbackQueue.front().second;
+                    path        = playbackQueue.front().path;
+                    playFreq    = playbackQueue.front().freqHz;
+                    deleteAfter = playbackQueue.front().deleteAfter;
                     playbackQueue.pop_front();
                 }
             }
@@ -1107,6 +1103,7 @@ private:
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
+                if (deleteAfter) { std::remove(path.c_str()); }
             } else {
                 // Write silence to keep monitorStream continuously flowing.
                 // swap() naturally throttles to the consumer's 48 kHz read rate.
@@ -2367,7 +2364,8 @@ private:
     DisplaySnapshot  displaySnap;
 
     // Playback queue + monitor output
-    std::deque<std::pair<std::string,double>> playbackQueue;
+    struct PlaybackEntry { std::string path; double freqHz; bool deleteAfter; };
+    std::deque<PlaybackEntry> playbackQueue;
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
