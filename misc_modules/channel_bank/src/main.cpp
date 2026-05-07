@@ -161,6 +161,8 @@ public:
             std::string s = config.conf[name]["boundBookmarkList"].get<std::string>();
             if (!s.empty()) boundBookmarkLists.insert(s);
         }
+        if (config.conf[name].contains("recordingEnabled"))
+            recordingEnabled = config.conf[name]["recordingEnabled"];
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -978,7 +980,14 @@ private:
         // detection is unreliable — the FFT already knows if a signal is there.
         if (slot->signalPresent.load()) {
             slot->inSilence = false;
-            if (!slot->fileOpen) { _this->openNewFile(*slot); }
+            // Respect the global recording-enabled toggle
+            if (!slot->fileOpen && _this->recordingEnabled) { _this->openNewFile(*slot); }
+            // If recording was disabled mid-transmission, close the open file immediately
+            if (slot->fileOpen && !_this->recordingEnabled) {
+                slot->writer.close();
+                slot->fileOpen = false;
+                std::remove(slot->currentFilePath.c_str());  // discard the partial file
+            }
         }
         else {
             // Signal gone — start 1-second grace before closing file
@@ -1692,6 +1701,16 @@ private:
             config.release(true);
         }
 
+        // Global recording enable/disable toggle
+        if (ImGui::Checkbox(CONCAT("Enable Recording##_cb_recen_", _this->name),
+                            &_this->recordingEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["recordingEnabled"] = _this->recordingEnabled;
+            config.release(true);
+        }
+
+        if (!_this->recordingEnabled) { style::beginDisabled(); }
+
         // Record gain (live)
         ImGui::LeftLabel("Rec Gain");
         ImGui::FillWidth();
@@ -1730,6 +1749,8 @@ private:
                 config.release(true);
             }
         }
+
+        if (!_this->recordingEnabled) { style::endDisabled(); }
 
         // Start / Stop
         if (!_this->running) {
@@ -2160,6 +2181,7 @@ private:
     int          ssbBfoHz      = 0;         // BFO trim for USB/LSB; positive = pitch up
     float        snrThreshold  = 4.0f;      // dB above noise floor
     float        cooldownSec   = 5.0f;      // seconds before destroying a quiet channel
+    bool         recordingEnabled  = true;   // global recording on/off toggle
     float        recGain       = 0.25f;     // linear gain applied before WAV write (~-12dB)
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
