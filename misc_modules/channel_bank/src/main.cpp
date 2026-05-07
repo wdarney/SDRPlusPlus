@@ -436,6 +436,10 @@ private:
     }
 
     void analyzeSpectrum() {
+        // Refresh center frequency every frame — free (single double load) and ensures
+        // PPM changes or other mid-session corrections are picked up without a full retune.
+        lastKnownCenter = gui::waterfall.getCenterFrequency();
+
         // Check for deferred retune — safely reset DSP-owned state on the DSP thread
         if (retuneFlag.load()) {
             lastKnownSr     = pendingRetuneSr;
