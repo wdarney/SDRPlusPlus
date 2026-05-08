@@ -46,6 +46,11 @@ foreach(LINE IN LISTS LINES)
         continue()
     endif()
     get_filename_component(LIB_NAME "${DEP}" NAME)
+    # Known version substitutions: build machine may have an older minor version
+    # than what is bundled in the .app (e.g. libvolk.3.1 built here, 3.2 bundled).
+    if(LIB_NAME STREQUAL "libvolk.3.1.dylib")
+        set(LIB_NAME "libvolk.3.2.dylib")
+    endif()
     message(STATUS "  Rewriting ${DEP} -> @rpath/${LIB_NAME}")
     execute_process(
         COMMAND ${INSTALL_NAME_TOOL} -change "${DEP}" "@rpath/${LIB_NAME}" "${DYLIB}"
