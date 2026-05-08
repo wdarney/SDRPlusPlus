@@ -44,3 +44,16 @@ else()
     target_link_libraries(channel_bank PRIVATE ${FFTW3F_LIBRARIES})
     target_include_directories(channel_bank PRIVATE ${FFTW3F_INCLUDE_DIRS})
 endif()
+
+# macOS: rewrite any hardcoded pkg-config / MacPorts / Homebrew library paths
+# to @rpath so the dylib is portable inside the .app bundle. The main sdrpp
+# executable exposes @loader_path/../Frameworks via LC_RPATH, which all
+# plugins inherit at load time. Uses a cmake -P script to avoid shell escaping.
+if (APPLE AND NOT ANDROID)
+    add_custom_command(TARGET channel_bank POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DDYLIB=$<TARGET_FILE:channel_bank>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/fix_rpath.cmake
+        COMMENT "Fixing channel_bank library paths for macOS bundle portability"
+    )
+endif()
