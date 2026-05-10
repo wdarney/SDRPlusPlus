@@ -23,5 +23,11 @@
     <key>NSAppTransportSecurity</key>
     <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
     <key>UIRequiresFullScreen</key><true/>
+    <!-- Opt in to full-screen on all modern iPhones/iPads. Without this key
+         (or UILaunchStoryboardName) iOS runs the app in 320×480 compatibility
+         mode, letterboxing on any larger screen. UILaunchScreen (iOS 14+) is
+         the dictionary alternative to a compiled .storyboard resource. -->
+    <key>UILaunchScreen</key>
+    <dict/>
 </dict>
 </plist>
