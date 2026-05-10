@@ -34,7 +34,20 @@ namespace backend {
     static id<MTLDevice>          g_device            = nil;
     static id<MTLCommandQueue>    g_commandQueue      = nil;
     static MTLRenderPassDescriptor* g_renderPassDesc  = nil;
-    static bool                   g_imguiInitialized  = false;
+    // Both flags are written from the sdrpp_main background thread and read
+    // from the Metal draw delegate on the main thread. Atomics ensure the
+    // main thread sees a consistent view without data races.
+    // g_imguiInitialized gates ALL ImGui calls (beginFrame, input hooks, etc.)
+    // g_mainWindowReady is set at the same time; kept for future fine-grained use.
+    static std::atomic<bool>      g_imguiInitialized{false};
+    static std::atomic<bool>      g_mainWindowReady{false};
+    // Set to true by beginFrame(), cleared by render(). Ensures render() never
+    // calls ImGui::Render() without a matching prior ImGui::NewFrame(). Both
+    // beginFrame() and render() are main-thread-only so no atomic needed.
+    static bool                   g_frameStarted{false};
+    // Drawable acquired in beginFrame() and consumed in render(). Stored here
+    // so render() doesn't need to call currentDrawable a second time.
+    static id<CAMetalDrawable>    g_currentDrawable   = nil;
     static std::string            g_appFilesDir;
 
     // Single-touch -> ImGui mouse cursor, matching the Android approach.
@@ -53,16 +66,51 @@ namespace backend {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = NULL; // no settings file in the iOS sandbox
-        io.DisplayFramebufferScale = ImVec2((float)[UIScreen mainScreen].nativeScale,
-                                            (float)[UIScreen mainScreen].nativeScale);
+        // DisplaySize and DisplayFramebufferScale are set per-frame in beginFrame()
+        // from g_mtkView.bounds/contentScaleFactor (main-thread UIKit calls).
+        // Do NOT read nativeScale here — this runs on the sdrpp_main background
+        // thread and nativeScale is UIKit which must be called on the main thread.
 
         ImGui_ImplMetal_Init(g_device);
-        g_imguiInitialized = true;
+        // Do NOT set g_imguiInitialized here. The draw loop must not call
+        // ImGui::NewFrame() until after style::loadFonts() has finished
+        // dirtying the atlas and gui::mainWindow.init() has completed.
+        // iosSetMainWindowReady() sets the flag after all that is done.
         return 0;
     }
 
+    bool isRenderThread() { return [[NSThread currentThread] isMainThread]; }
+
     void beginFrame() {
+        // All Metal/ImGui frame work must happen on the main thread (MTKView
+        // drawable ownership). LoadingScreen::show() calls us from the background
+        // sdrpp_main thread during init — skip silently.
+        if (!isRenderThread()) return;
         if (!g_mtkView || !g_renderPassDesc) return;
+
+        // Acquire the drawable first so we can prime the render pass descriptor
+        // with a real texture. ImGui_ImplMetal_NewFrame captures the framebuffer
+        // descriptor (incl. sampleCount) from g_renderPassDesc — if the texture
+        // is nil at that point, sampleCount=0 and pipeline state creation fails.
+        g_currentDrawable = g_mtkView.currentDrawable;
+        if (!g_currentDrawable) return;
+        g_renderPassDesc.colorAttachments[0].texture = g_currentDrawable.texture;
+
+        // On the first few frames log the actual drawable texture dimensions so
+        // we can verify the Metal layer is sized correctly.
+        static int s_texLog = 0;
+        if (++s_texLog <= 2) {
+            NSUInteger tw = g_currentDrawable.texture.width;
+            NSUInteger th = g_currentDrawable.texture.height;
+            CGRect b      = g_mtkView.bounds;
+            CGFloat sc    = g_mtkView.contentScaleFactor;
+            // Use NSLog for reliable float output — flog ignores printf format specs.
+            NSLog(@"[SDR++] beginFrame: drawable=%dx%d, viewBounds=%.0fx%.0f, scale=%.1f, "
+                  @"logicalSize=%.0fx%.0f",
+                  (int)tw, (int)th,
+                  b.size.width, b.size.height, (double)sc,
+                  (double)tw / (double)sc, (double)th / (double)sc);
+        }
 
         // ImGui_ImplMetal_Init builds the fonts texture once. If SDR++ adds
         // custom fonts later (style::loadFonts is called after backend::init),
@@ -74,23 +122,40 @@ namespace backend {
             ImGui_ImplMetal_CreateFontsTexture(g_device);
         }
 
+        // Now the render pass has a valid texture → correct sampleCount.
         ImGui_ImplMetal_NewFrame(g_renderPassDesc);
 
-        CGSize sz = g_mtkView.drawableSize;
-        io.DisplaySize = ImVec2((float)sz.width / io.DisplayFramebufferScale.x,
-                                (float)sz.height / io.DisplayFramebufferScale.y);
-        io.DeltaTime   = 1.0f / 60.0f; // TODO: real delta from timestamps
+        // DisplaySize = logical size in points. DisplayFramebufferScale = pixels/point.
+        // Derive from the drawable texture's pixel dimensions (authoritative) and
+        // the view's contentScaleFactor. This is more reliable than view.bounds,
+        // which may lag if autoresizing hasn't completed or if drawableSize was
+        // set explicitly via iosResize() independent of the view's bounds.
+        NSUInteger texW  = g_currentDrawable.texture.width;
+        NSUInteger texH  = g_currentDrawable.texture.height;
+        CGFloat    scale = g_mtkView.contentScaleFactor;
+        if (scale < 1.0f) scale = 1.0f; // safety: contentScaleFactor is never < 1
+        io.DisplaySize             = ImVec2((float)texW / (float)scale,
+                                            (float)texH / (float)scale);
+        io.DisplayFramebufferScale = ImVec2((float)scale, (float)scale);
+        io.DeltaTime               = 1.0f / 60.0f; // TODO: real delta from timestamps
 
         io.AddMousePosEvent((float)g_mouseX, (float)g_mouseY);
         io.AddMouseButtonEvent(0, g_mouseDown);
 
         ImGui::NewFrame();
+        g_frameStarted = true;
     }
 
     void render(bool /*vsync*/) {
+        // Only render if beginFrame() actually ran on the main thread and
+        // successfully acquired a drawable.
+        if (!g_frameStarted) return;
+        g_frameStarted = false;
+
         ImGui::Render();
 
-        id<CAMetalDrawable> drawable = g_mtkView.currentDrawable;
+        id<CAMetalDrawable> drawable = g_currentDrawable;
+        g_currentDrawable = nil;
         if (!drawable) return;
 
         id<MTLCommandBuffer> cb = [g_commandQueue commandBuffer];
@@ -99,7 +164,7 @@ namespace backend {
                               gui::themeManager.clearColor.y,
                               gui::themeManager.clearColor.z,
                               gui::themeManager.clearColor.w);
-        g_renderPassDesc.colorAttachments[0].texture     = drawable.texture;
+        // texture is already set from beginFrame(); keep other fields consistent.
         g_renderPassDesc.colorAttachments[0].loadAction  = MTLLoadActionClear;
         g_renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
 
@@ -117,19 +182,25 @@ namespace backend {
     void setMouseScreenPos(double, double)       { /* no-op on iOS */ }
 
     int renderLoop() {
-        // The UIApplicationMain runloop drives drawing via MTKViewDelegate ->
-        // iosDrawFrame(). Block here until the app is requested to exit; iOS
-        // apps don't really exit, so this just parks the calling thread.
+        // The UIApplicationMain runloop drives drawing via MTKViewDelegate →
+        // iosDrawFrame(). We just need to park this background thread forever
+        // so the cleanup code below renderLoop() never runs (iOS apps are killed
+        // by the OS, not via main()).
+        //
+        // NOTE: [[NSRunLoop currentRunLoop] run] returns immediately on a
+        // background thread that has no input sources — do NOT use it here.
+        // Use a semaphore that is never signalled instead.
         flog::info("iOS renderLoop parked (UIApplication drives draws)");
-        [[NSRunLoop currentRunLoop] run];
+        dispatch_semaphore_t park = dispatch_semaphore_create(0);
+        dispatch_semaphore_wait(park, DISPATCH_TIME_FOREVER);
         return 0;
     }
 
     int end() {
-        if (g_imguiInitialized) {
+        if (g_imguiInitialized.load()) {
             ImGui_ImplMetal_Shutdown();
             ImGui::DestroyContext();
-            g_imguiInitialized = false;
+            g_imguiInitialized.store(false);
         }
         return 0;
     }
@@ -139,12 +210,61 @@ namespace backend {
         g_device         = g_mtkView.device;
         g_commandQueue   = [g_device newCommandQueue];
         g_renderPassDesc = [MTLRenderPassDescriptor new];
+
+        // Diagnostic: log initial view geometry. Use NSLog (not flog) so the
+        // numbers are guaranteed correct — flog ignores printf format specs like
+        // {:.0f} and can misinterpret argument order.
+        {
+            CGRect b   = g_mtkView.bounds;
+            CGFloat sc = g_mtkView.contentScaleFactor;
+            CGSize ds  = g_mtkView.drawableSize;
+            CGRect sb  = [UIScreen mainScreen].bounds;
+            NSLog(@"[SDR++] iosAttachView: screen=%.0fx%.0f, "
+                  @"viewBounds=%.0fx%.0f, scale=%.1f, drawableSize=%.0fx%.0f",
+                  sb.size.width, sb.size.height,
+                  b.size.width, b.size.height,
+                  (double)sc,
+                  ds.width, ds.height);
+        }
+    }
+
+    void iosSetMainWindowReady() {
+        // Called from sdrpp_main after gui::mainWindow.init() finishes.
+        // style::loadFonts() has run and the atlas is dirty. Build the font
+        // texture now (on whichever thread called us — still the sdrpp_main
+        // background thread) so the very first iosDrawFrame() sees IsBuilt().
+        ImGui_ImplMetal_CreateFontsTexture(g_device);
+        g_mainWindowReady = true;
+        g_imguiInitialized = true;   // unblock the draw loop
     }
 
     void iosDrawFrame() {
-        if (!g_imguiInitialized) return;
+        if (!g_imguiInitialized) return;  // blocks until iosSetMainWindowReady
+
+        // Log the first few frames so we can diagnose black-screen issues.
+        static int s_framesSinceInit = 0;
+        ++s_framesSinceInit;
+        if (s_framesSinceInit <= 3) {
+            flog::info("iosDrawFrame: frame {} after init", s_framesSinceInit);
+        }
+
         beginFrame();
+
+        // Only draw if beginFrame() actually acquired a drawable and called
+        // ImGui::NewFrame(). Without a frame in flight, ImGui::Begin() asserts.
+        if (!g_frameStarted) {
+            if (s_framesSinceInit <= 3) {
+                flog::warn("iosDrawFrame: beginFrame skipped (no drawable?), frame {}", s_framesSinceInit);
+            }
+            render(); // harmless no-op; keeps render() always paired with beginFrame() call
+            return;
+        }
+
         ImGuiIO& io = ImGui::GetIO();
+        if (s_framesSinceInit <= 3) {
+            NSLog(@"[SDR++] iosDrawFrame frame %d: DisplaySize=%.0fx%.0f",
+                  s_framesSinceInit, (double)io.DisplaySize.x, (double)io.DisplaySize.y);
+        }
         if (io.DisplaySize.x > 0 && io.DisplaySize.y > 0) {
             ImGui::SetNextWindowPos(ImVec2(0, 0));
             ImGui::SetNextWindowSize(io.DisplaySize);
@@ -209,4 +329,9 @@ namespace backend {
 
     std::string iosAppFilesDir() { return g_appFilesDir; }
     void        iosSetAppFilesDir(const std::string& p) { g_appFilesDir = p; }
+
+    // Expose the Metal device for Metal-aware code (icons_metal.mm, etc.)
+    // that cannot include Metal.h from a plain C++ TU. Returns nil before
+    // iosAttachView() has been called.
+    void* iosGetMetalDevicePtr() { return (__bridge void*)g_device; }
 }

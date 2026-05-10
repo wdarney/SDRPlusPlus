@@ -28,7 +28,12 @@ int sdrpp_main(int argc, char* argv[]);
     [super viewDidLoad];
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    self.mtkView = [[MTKView alloc] initWithFrame:self.view.bounds device:device];
+    // Use the screen bounds for the initial frame rather than self.view.bounds.
+    // In viewDidLoad, auto-layout hasn't run yet so self.view.bounds is the
+    // default UIKit placeholder size (320×320) rather than the real screen size.
+    // UIScreen.mainScreen.bounds is always the logical screen dimensions.
+    CGRect initialFrame = [UIScreen mainScreen].bounds;
+    self.mtkView = [[MTKView alloc] initWithFrame:initialFrame device:device];
     self.mtkView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
     self.mtkView.delegate         = self;

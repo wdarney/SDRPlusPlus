@@ -7,6 +7,7 @@
 
 namespace backend {
     int  init(std::string)       { return 0; }
+    bool isRenderThread()        { return true; }
     void beginFrame()            {}
     void render(bool)            {}
     void getMouseScreenPos(double& x, double& y) { x = 0; y = 0; }
@@ -29,7 +30,10 @@ namespace backend {
     void iosPanMoved(double, double)          {}
     void iosPanEnded()                        {}
 
+    void iosSetMainWindowReady()               {}
+
     static std::string g_appFilesDir;
     std::string iosAppFilesDir()              { return g_appFilesDir; }
     void        iosSetAppFilesDir(const std::string& p) { g_appFilesDir = p; }
+    void*       iosGetMetalDevicePtr()        { return nullptr; }
 }

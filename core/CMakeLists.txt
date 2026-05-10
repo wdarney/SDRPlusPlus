@@ -11,6 +11,11 @@ endif (USE_INTERNAL_LIBCORRECT)
 # signal_path/source.cpp get no-op stubs from server_ios_stub.cpp instead.
 file(GLOB_RECURSE SRC "src/*.cpp" "src/*.c")
 list(FILTER SRC EXCLUDE REGEX "src/server\\.cpp$")
+# On iOS, icons are loaded via Metal (backends/ios/icons_metal.mm).
+# Exclude the OpenGL implementation to avoid duplicate symbol errors.
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    list(FILTER SRC EXCLUDE REGEX "src/gui/icons\\.cpp$")
+endif ()
 
 add_definitions(-DSDRPP_IS_CORE)
 add_definitions(-DFLOG_ANDROID_TAG="SDR++") # harmless leftover, used by flog macros

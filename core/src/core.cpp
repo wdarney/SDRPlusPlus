@@ -15,6 +15,7 @@
 #include <gui/menus/theme.h>
 #include <backend.h>
 #include <static_modules.h>
+#include "ios_backend.h"
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb_image_resize.h>
@@ -209,6 +210,13 @@ int sdrpp_main(int argc, char* argv[]) {
     core::configManager.enableAutoSave();
     core::configManager.acquire();
 
+    // iOS: rewrite the absolute resource/modules paths every launch. The
+    // app's data container UUID changes on reinstall (and on simulator
+    // restore), so a path baked into a persisted config.json will be stale.
+    // root itself is the *current* container's <Library/Application Support>.
+    core::configManager.conf["resourcesDirectory"] = defConfig["resourcesDirectory"];
+    core::configManager.conf["modulesDirectory"]   = defConfig["modulesDirectory"];
+
     // Static-link mode: register every module compiled into the binary, then
     // seed the "modules" config list so main_window's loader resolves them by
     // name. loadModule() short-circuits to the registry — see module.cpp.
@@ -295,6 +303,11 @@ int sdrpp_main(int argc, char* argv[]) {
     bandplan::loadColorTable(bandColors);
 
     gui::mainWindow.init();
+
+    // Signal the Metal draw loop that it can now call gui::mainWindow.draw().
+    // This must come after init() — the draw delegate runs at 60 Hz on the
+    // main thread and would crash on uninitialised state without this gate.
+    backend::iosSetMainWindowReady();
 
     flog::info("Ready.");
 

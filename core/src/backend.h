@@ -9,4 +9,9 @@ namespace backend {
     void setMouseScreenPos(double x, double y);
     int renderLoop();
     int end();
+
+    // Returns true when it is safe to call beginFrame()/render() to produce a
+    // visible frame. On iOS this is the main thread (MTKView delegate thread);
+    // on all other platforms it is always true.
+    bool isRenderThread();
 }

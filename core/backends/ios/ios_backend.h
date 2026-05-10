@@ -51,8 +51,19 @@ namespace backend {
     void iosPanMoved(double dx, double dy);
     void iosPanEnded();
 
+    // Called from sdrpp_main after gui::mainWindow.init() returns. Until this
+    // is called, iosDrawFrame() clears the screen but skips the SDR++ UI
+    // pass — prevents drawing an uninitialised mainWindow on the render thread.
+    void iosSetMainWindowReady();
+
     // App-files dir injected by the host (NSApplicationSupportDirectory) so
     // sdrpp_main can be invoked with -r <path>.
     std::string iosAppFilesDir();
     void        iosSetAppFilesDir(const std::string& path);
+
+    // Returns the id<MTLDevice> as void* so Metal-aware .mm files can obtain
+    // it without the ios_backend.h header pulling in <Metal/Metal.h> (which
+    // breaks inclusion from plain C++ TUs). Cast with __bridge id<MTLDevice>.
+    // Returns nullptr before iosAttachView() is called.
+    void* iosGetMetalDevicePtr();
 }
