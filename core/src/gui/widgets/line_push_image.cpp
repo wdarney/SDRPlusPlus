@@ -1,4 +1,5 @@
 #include <gui/widgets/line_push_image.h>
+#include <ios_backend.h>
 
 namespace ImGui {
     LinePushImage::LinePushImage(int frameWidth, int reservedIncrement) {
@@ -7,7 +8,13 @@ namespace ImGui {
         frameBuffer = (uint8_t*)malloc(_frameWidth * _reservedIncrement * 4);
         reservedCount = reservedIncrement;
 
-        glGenTextures(1, &textureId);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        textureId = nullptr; // created lazily in updateTexture()
+#else
+        GLuint glId;
+        glGenTextures(1, &glId);
+        textureId = (ImTextureID)(intptr_t)glId;
+#endif
     }
 
     void LinePushImage::draw(const ImVec2& size_arg) {
@@ -37,7 +44,7 @@ namespace ImGui {
             updateTexture();
         }
 
-        window->DrawList->AddImage((void*)(intptr_t)textureId, min, ImVec2(min.x + width, min.y + height));
+        window->DrawList->AddImage(textureId, min, ImVec2(min.x + width, min.y + height));
     }
 
     uint8_t* LinePushImage::acquireNextLine(int count) {
@@ -79,11 +86,16 @@ namespace ImGui {
     }
 
     void LinePushImage::updateTexture() {
-        glBindTexture(GL_TEXTURE_2D, textureId);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        backend::iosUpdateTexture(&textureId, _frameWidth, _lineCount, frameBuffer);
+#else
+        GLuint glId = (GLuint)(intptr_t)textureId;
+        glBindTexture(GL_TEXTURE_2D, glId);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _frameWidth, _lineCount, 0, GL_RGBA, GL_UNSIGNED_BYTE, frameBuffer);
+#endif
     }
 
 }

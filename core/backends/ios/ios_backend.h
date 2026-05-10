@@ -6,6 +6,7 @@
 //
 
 #include <string>
+#include <imgui.h> // ImTextureID
 
 namespace backend {
     // Called by the host UIViewController once the CAMetalLayer-backed view is
@@ -66,4 +67,16 @@ namespace backend {
     // breaks inclusion from plain C++ TUs). Cast with __bridge id<MTLDevice>.
     // Returns nullptr before iosAttachView() is called.
     void* iosGetMetalDevicePtr();
+
+    // Dynamic-texture management for widgets that upload pixel data every
+    // frame (waterfall, image viewer, line_push_image, etc.).
+    //
+    // iosUpdateTexture() creates or replaces a GPU texture large enough for
+    // w×h RGBA8 pixels, then uploads `rgba` (may be nullptr to skip upload).
+    // The caller passes &textureId; if the stored handle is nullptr or the
+    // dimensions changed, the old texture is released and a new one created.
+    //
+    // On non-iOS builds host_stub.cpp provides a no-op stub — those builds
+    // use the existing glTexImage2D path which is guarded by TARGET_OS_IPHONE.
+    void iosUpdateTexture(ImTextureID* texId, int w, int h, const void* rgba);
 }

@@ -36,4 +36,9 @@ namespace backend {
     std::string iosAppFilesDir()              { return g_appFilesDir; }
     void        iosSetAppFilesDir(const std::string& p) { g_appFilesDir = p; }
     void*       iosGetMetalDevicePtr()        { return nullptr; }
+
+    // iosUpdateTexture is only called from #if TARGET_OS_IPHONE blocks in widget
+    // .cpp files, so this stub is never reached on non-iOS builds. It exists
+    // solely so the symbol resolves at link time.
+    void iosUpdateTexture(ImTextureID*, int, int, const void*) {}
 }

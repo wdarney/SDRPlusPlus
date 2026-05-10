@@ -7,6 +7,7 @@
 #include <utils/flog.h>
 #include <gui/gui.h>
 #include <gui/style.h>
+#include <ios_backend.h> // backend::iosUpdateTexture (iOS Metal path)
 
 float DEFAULT_COLOR_MAP[][3] = {
     { 0x00, 0x00, 0x20 },
@@ -114,7 +115,13 @@ namespace ImGui {
     }
 
     void WaterFall::init() {
-        glGenTextures(1, &textureId);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        textureId = nullptr; // created lazily by iosUpdateTexture on first updateWaterfallTexture()
+#else
+        GLuint glId;
+        glGenTextures(1, &glId);
+        textureId = (ImTextureID)(intptr_t)glId;
+#endif
     }
 
     void WaterFall::drawFFT() {
@@ -212,7 +219,7 @@ namespace ImGui {
         }
         {
             std::lock_guard<std::mutex> lck(texMtx);
-            window->DrawList->AddImage((void*)(intptr_t)textureId, wfMin, wfMax);
+            window->DrawList->AddImage(textureId, wfMin, wfMax);
         }
         
         ImVec2 mPos = ImGui::GetMousePos();
@@ -703,11 +710,17 @@ namespace ImGui {
 
     void WaterFall::updateWaterfallTexture() {
         std::lock_guard<std::mutex> lck(texMtx);
-        glBindTexture(GL_TEXTURE_2D, textureId);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        backend::iosUpdateTexture(&textureId, dataWidth, waterfallHeight,
+                                  (const void*)waterfallFb);
+#else
+        GLuint glId = (GLuint)(intptr_t)textureId;
+        glBindTexture(GL_TEXTURE_2D, glId);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dataWidth, waterfallHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, (uint8_t*)waterfallFb);
+#endif
     }
 
     void WaterFall::onPositionChange() {

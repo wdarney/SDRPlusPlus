@@ -315,6 +315,56 @@ namespace backend {
     // Pan state lives here so the host doesn't have to track it. Two-finger
     // pan deltas accumulate into g_panX/g_panY, which a later patch can
     // wire into a waterfall-pan handler in main_window.cpp.
+    // Dynamic textures used by waterfall / image / line_push_image widgets.
+    // Strong ARC references prevent deallocation while the ImTextureID handle
+    // (a non-owning __bridge void*) is still live in ImGui's draw lists.
+    static NSMutableArray<id<MTLTexture>>* g_dynamicTextures = nil;
+
+    void iosUpdateTexture(ImTextureID* texId, int w, int h, const void* rgba) {
+        if (!g_device || w <= 0 || h <= 0) return;
+        if (!g_dynamicTextures) g_dynamicTextures = [NSMutableArray new];
+
+        // Check whether the existing texture can be reused (right size).
+        if (*texId) {
+            id<MTLTexture> existing = (__bridge id<MTLTexture>)*texId;
+            if ((int)existing.width == w && (int)existing.height == h) {
+                if (rgba) {
+                    [existing replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
+                                 mipmapLevel:0
+                                   withBytes:rgba
+                               bytesPerRow:(NSUInteger)(w * 4)];
+                }
+                return;
+            }
+            // Size changed — release old texture and fall through to create.
+            [g_dynamicTextures removeObject:existing];
+            *texId = nullptr;
+        }
+
+        // Create a new MTLTexture. MTLStorageModeShared allows CPU writes
+        // (replaceRegion:) without a blit encoder — no extra synchronisation.
+        MTLTextureDescriptor* desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:(NSUInteger)w
+                                                              height:(NSUInteger)h
+                                                           mipmapped:NO];
+        desc.usage       = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+
+        id<MTLTexture> tex = [g_device newTextureWithDescriptor:desc];
+        if (!tex) { flog::error("iosUpdateTexture: newTextureWithDescriptor failed ({}x{})", w, h); return; }
+
+        if (rgba) {
+            [tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
+                     mipmapLevel:0
+                       withBytes:rgba
+                     bytesPerRow:(NSUInteger)(w * 4)];
+        }
+
+        [g_dynamicTextures addObject:tex];   // ARC retention
+        *texId = (__bridge void*)tex;        // non-owning ImTextureID
+    }
+
     static double g_panX = 0.0, g_panY = 0.0;
     static bool   g_panActive = false;
 
