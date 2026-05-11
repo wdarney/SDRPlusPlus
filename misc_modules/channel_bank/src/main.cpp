@@ -1710,8 +1710,6 @@ private:
             config.release(true);
         }
 
-        if (!_this->recordingEnabled) { style::beginDisabled(); }
-
         // Record gain (live)
         ImGui::LeftLabel("Rec Gain");
         ImGui::FillWidth();
@@ -1751,7 +1749,6 @@ private:
             }
         }
 
-        if (!_this->recordingEnabled) { style::endDisabled(); }
 
         // Start / Stop
         if (!_this->running) {
