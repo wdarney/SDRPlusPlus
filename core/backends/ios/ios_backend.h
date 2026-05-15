@@ -73,6 +73,18 @@ namespace backend {
     // Callable from plain C++ — implemented in backend.mm (Obj-C++).
     bool iosIsIPad();
 
+    // On-device speech recognition bridge (Speech.framework, iOS 13+).
+    // iosTranscribeCreate returns an opaque handle; all other functions are no-ops if handle is null.
+    bool        iosTranscribeIsAvailable();
+    void        iosTranscribeRequestPermission();
+    void*       iosTranscribeCreate(double sampleRate);
+    void        iosTranscribeAppend(void* handle, const float* samples, int count);
+    void        iosTranscribeEndAudio(void* handle);   // signal end of audio; final result follows
+    void        iosTranscribeCancel(void* handle);
+    std::string iosTranscribeGetText(void* handle);    // latest partial or final text
+    bool        iosTranscribeIsFinal(void* handle);
+    void        iosTranscribeDestroy(void* handle);
+
     // Play an audio file via AVAudioPlayer (bypasses the kAudioUnitSubType_RemoteIO
     // singleton limitation — only one CoreAudioSink AudioUnit can exist at a time,
     // so a second sink used for channel-bank monitor playback fails silently).

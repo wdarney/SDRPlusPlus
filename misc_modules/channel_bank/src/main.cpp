@@ -90,6 +90,11 @@ struct ChannelSlot {
     bool    warmupSignalLost   = false; // if signal drops during warmup, restart the clock
     int     fileTrimSamples    = 0;    // discard first 200ms after file open before writing
 
+    // Transcription (iOS only — uses SFSpeechRecognizer on-device)
+    void*       transcribeHandle       = nullptr;
+    std::string liveTranscript;          // latest partial text (polled by mgmt thread)
+    std::string pendingTranscriptPath;   // WAV path whose transcript we're waiting for
+
     // Lifecycle tracking
     std::chrono::steady_clock::time_point      lastDetected;  // last time FFT saw signal here
     std::atomic<bool>                          signalPresent  { false };
@@ -455,6 +460,18 @@ public:
         slot.audioSamplesWritten  = 0;
         slot.fileTrimSamples      = 3840; // skip first 80ms — covers SSB AGC attack (~5 time-constants)
         slot.recFadeRemaining     = 960;  // 20ms fade-in at 48kHz — enough to suppress PTT click
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        if (backend::iosTranscribeIsAvailable()) {
+            if (slot.transcribeHandle) {
+                backend::iosTranscribeCancel(slot.transcribeHandle);
+                backend::iosTranscribeDestroy(slot.transcribeHandle);
+                slot.transcribeHandle = nullptr;
+            }
+            slot.transcribeHandle = backend::iosTranscribeCreate(48000.0);
+            slot.liveTranscript.clear();
+            slot.pendingTranscriptPath.clear();
+        }
+#endif
         return true;
     }
 
@@ -1042,6 +1059,43 @@ private:
                     }
                 }
             }
+
+            // Poll transcription sessions: update live text, finalize when done.
+            {
+                std::lock_guard<std::mutex> clck(channelsMtx);
+                for (auto& [idx, slot] : activeChannels) {
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                    if (!slot->transcribeHandle) continue;
+                    slot->liveTranscript = backend::iosTranscribeGetText(slot->transcribeHandle);
+                    if (backend::iosTranscribeIsFinal(slot->transcribeHandle)) {
+                        std::string text    = slot->liveTranscript;
+                        std::string wavPath = slot->pendingTranscriptPath;
+                        double      freqHz  = slot->freqHz;
+                        backend::iosTranscribeDestroy(slot->transcribeHandle);
+                        slot->transcribeHandle = nullptr;
+                        slot->liveTranscript.clear();
+                        if (!text.empty() && !wavPath.empty()) {
+                            // Write sidecar .txt (fast — small file)
+                            std::string txtPath = wavPath;
+                            if (txtPath.size() > 4)
+                                txtPath = txtPath.substr(0, txtPath.size() - 4) + ".txt";
+                            if (FILE* f = fopen(txtPath.c_str(), "w")) {
+                                fprintf(f, "%s\n", text.c_str());
+                                fclose(f);
+                            }
+                            // Update freqLog description (saved immediately)
+                            {
+                                std::lock_guard<std::mutex> lk(freqLogMtx);
+                                auto& entry = freqLog[freqKey(freqHz)];
+                                if (entry.freqHz == 0.0) entry.freqHz = freqHz;
+                                entry.description = text;
+                            }
+                            saveFreqLog();
+                        }
+                    }
+#endif
+                }
+            }
         }
     }
 
@@ -1191,6 +1245,13 @@ private:
         delete slot.recFeedStream;
         delete slot.iqIn;
         if (slot.nrState) { rnnoise_destroy(slot.nrState); slot.nrState = nullptr; }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        if (slot.transcribeHandle) {
+            backend::iosTranscribeCancel(slot.transcribeHandle);
+            backend::iosTranscribeDestroy(slot.transcribeHandle);
+            slot.transcribeHandle = nullptr;
+        }
+#endif
     }
 
     // ── Audio handler (split-on-silence recording) ───────────────────────────
@@ -1239,9 +1300,23 @@ private:
                     if (signalMs < (int64_t)_this->minTransmissionMs) {
                         flog::info("[ChannelBank] Discarding short recording ({0}ms < {1}ms threshold)", signalMs, _this->minTransmissionMs);
                         std::remove(slot->currentFilePath.c_str());
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                        if (slot->transcribeHandle) {
+                            backend::iosTranscribeCancel(slot->transcribeHandle);
+                            backend::iosTranscribeDestroy(slot->transcribeHandle);
+                            slot->transcribeHandle = nullptr;
+                        }
+#endif
                     } else {
                         flog::info("[ChannelBank] Keeping recording ({0}ms >= {1}ms threshold) slot {2}", signalMs, _this->minTransmissionMs, slot->gridIdx);
                         normalizeWavFile(slot->currentFilePath);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                        if (slot->transcribeHandle) {
+                            slot->pendingTranscriptPath = slot->currentFilePath;
+                            backend::iosTranscribeEndAudio(slot->transcribeHandle);
+                            // Don't destroy yet — management thread polls for final result
+                        }
+#endif
                         // Log the frequency and queue for playback
                         _this->logRecording(slot->freqHz);
                         _this->saveFreqLog();
@@ -1284,6 +1359,13 @@ private:
             }
             mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * gain, -1.0f, 1.0f);
         }
+
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // Feed demodulated audio to the transcription session.
+        if (slot->transcribeHandle) {
+            backend::iosTranscribeAppend(slot->transcribeHandle, mono, count);
+        }
+#endif
 
         // RNNoise processing — accumulate into 480-sample frames, process,
         // and write each completed frame to WAV individually.
@@ -1343,8 +1425,16 @@ private:
 
             if (!path.empty()) {
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
+                {
+                    std::lock_guard<std::mutex> lk(currentlyPlayingFileMtx);
+                    currentlyPlayingFilePath = path;
+                }
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
+                {
+                    std::lock_guard<std::mutex> lk(currentlyPlayingFileMtx);
+                    currentlyPlayingFilePath.clear();
+                }
                 if (deleteAfter) { std::remove(path.c_str()); }
             } else {
                 // Write silence to keep monitorStream continuously flowing.
@@ -2154,21 +2244,71 @@ private:
                         playingDesc = it->second.description;
                     }
                 }
+                // Load transcript from sidecar when the playing file changes
+                static std::string s_cachedPlayPath;
+                static std::string s_cachedPlayTranscript;
+                {
+                    std::string curPath;
+                    {
+                        std::lock_guard<std::mutex> lk(_this->currentlyPlayingFileMtx);
+                        curPath = _this->currentlyPlayingFilePath;
+                    }
+                    if (curPath != s_cachedPlayPath) {
+                        s_cachedPlayPath = curPath;
+                        s_cachedPlayTranscript.clear();
+                        if (!curPath.empty() && curPath.size() > 4) {
+                            std::string txtPath = curPath.substr(0, curPath.size() - 4) + ".txt";
+                            if (FILE* f = fopen(txtPath.c_str(), "r")) {
+                                char buf[4096] = {};
+                                fread(buf, 1, sizeof(buf) - 1, f);
+                                fclose(f);
+                                s_cachedPlayTranscript = buf;
+                                while (!s_cachedPlayTranscript.empty() &&
+                                       s_cachedPlayTranscript.back() == '\n')
+                                    s_cachedPlayTranscript.pop_back();
+                            }
+                        }
+                    }
+                }
+
                 ImGui::BeginChild(CONCAT("##_cb_nowplaying_", _this->name),
-                                  ImVec2(menuWidth, 50), true);
+                                  ImVec2(menuWidth, 120), true);
                 if (playingKey != 0 && !playingName.empty()) {
                     ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.35f, 1.0f), "Playing: %s", playingName.c_str());
-                    if (!playingDesc.empty()) {
+                    if (!s_cachedPlayTranscript.empty()) {
+                        ImGui::TextWrapped("%s", s_cachedPlayTranscript.c_str());
+                    } else if (!playingDesc.empty()) {
                         ImGui::TextWrapped("%s", playingDesc.c_str());
                     } else {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-                        ImGui::TextWrapped("(no description — click D in history to add one)");
+                        ImGui::TextWrapped("(no transcript yet)");
                         ImGui::PopStyleColor();
                     }
                 } else {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-                    ImGui::Text("(nothing playing)");
-                    ImGui::PopStyleColor();
+                    // Show live partial transcript for any currently recording channel
+                    bool showedLive = false;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                    {
+                        std::lock_guard<std::mutex> clck(_this->channelsMtx);
+                        for (auto& [idx, slot] : _this->activeChannels) {
+                            if (!slot->liveTranscript.empty()) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.2f, 1.0f));
+                                ImGui::Text("Live: %s", _this->displayName(slot->freqHz).c_str());
+                                ImGui::PopStyleColor();
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+                                ImGui::TextWrapped("%s", slot->liveTranscript.c_str());
+                                ImGui::PopStyleColor();
+                                showedLive = true;
+                                break; // show only first active transcript
+                            }
+                        }
+                    }
+#endif
+                    if (!showedLive) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                        ImGui::Text("(nothing playing)");
+                        ImGui::PopStyleColor();
+                    }
                 }
                 ImGui::EndChild();
             }
@@ -2208,6 +2348,16 @@ private:
                         entry.blocked = blocked;
                         needSaveFreqLog = true;
                     }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                    if (!slot->liveTranscript.empty()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.9f, 0.65f, 1.0f));
+                        // Truncate to first 80 chars for the list view
+                        std::string preview = slot->liveTranscript;
+                        if (preview.size() > 80) preview = preview.substr(0, 77) + "...";
+                        ImGui::TextWrapped("      %s", preview.c_str());
+                        ImGui::PopStyleColor();
+                    }
+#endif
                 }
             }
             ImGui::EndChild();
@@ -2769,6 +2919,8 @@ private:
     struct PlaybackEntry { std::string path; double freqHz; bool deleteAfter; };
     std::deque<PlaybackEntry> playbackQueue;
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
+    std::string                     currentlyPlayingFilePath;
+    std::mutex                      currentlyPlayingFileMtx;
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
     std::thread                     playbackThread;

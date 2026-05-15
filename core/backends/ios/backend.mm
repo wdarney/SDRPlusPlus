@@ -14,6 +14,7 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <Speech/Speech.h>
 
 #include <cmath>
 
@@ -31,6 +32,91 @@
 // Provide imgui_impl_metal.h alongside this file. See backends/ios/imgui/README.md
 // for the vendored copy from the Dear ImGui distribution.
 #include "imgui/imgui_impl_metal.h"
+
+@interface CBTranscriptionSession : NSObject
+- (instancetype)initWithSampleRate:(double)sr;
+- (void)appendSamples:(const float*)samples count:(int)count;
+- (void)endAudio;   // no more samples — triggers final recognition
+- (void)cancel;
+@property (atomic, copy, readonly) NSString* latestText;
+@property (atomic, readonly) BOOL isFinal;
+@end
+
+@implementation CBTranscriptionSession {
+    SFSpeechRecognizer*                    _recognizer;
+    SFSpeechAudioBufferRecognitionRequest* _request;
+    SFSpeechRecognitionTask*               _task;
+    AVAudioFormat*                         _format;
+    NSString*                              _latestText;
+    BOOL                                   _isFinal;
+    BOOL                                   _cancelled;
+}
+
+@synthesize latestText = _latestText;
+@synthesize isFinal    = _isFinal;
+
+- (instancetype)initWithSampleRate:(double)sr {
+    self = [super init];
+    if (!self) return nil;
+    _latestText = @"";
+    _isFinal    = NO;
+    _cancelled  = NO;
+    _recognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"en-US"]];
+    if (!_recognizer || !_recognizer.isAvailable) return nil;
+
+    _request = [[SFSpeechAudioBufferRecognitionRequest alloc] init];
+    _request.requiresOnDeviceRecognition = YES;
+    _request.shouldReportPartialResults  = YES;
+    if (@available(iOS 16, *)) { _request.addsPunctuation = YES; }
+
+    _format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                               sampleRate:sr
+                                                 channels:1
+                                              interleaved:NO];
+
+    __weak typeof(self) ws = self;
+    _task = [_recognizer recognitionTaskWithRequest:_request
+                                     resultHandler:^(SFSpeechRecognitionResult* result, NSError* err) {
+        typeof(self) ss = ws;
+        if (!ss || ss->_cancelled) return;
+        if (result) {
+            @synchronized(ss) {
+                ss->_latestText = [result.bestTranscription.formattedString copy] ?: @"";
+                if (result.isFinal) ss->_isFinal = YES;
+            }
+        }
+        (void)err; // cancellation errors are expected; log only unexpected ones
+    }];
+    return _task ? self : nil;
+}
+
+- (void)appendSamples:(const float*)samples count:(int)count {
+    if (_cancelled || _isFinal || count <= 0) return;
+    AVAudioPCMBuffer* buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:_format
+                                                          frameCapacity:(AVAudioFrameCount)count];
+    if (!buf) return;
+    buf.frameLength = (AVAudioFrameCount)count;
+    memcpy(buf.floatChannelData[0], samples, (size_t)count * sizeof(float));
+    [_request appendAudioPCMBuffer:buf];
+}
+
+- (void)endAudio {
+    if (!_cancelled) [_request endAudio];
+}
+
+- (void)cancel {
+    _cancelled = YES;
+    [_task cancel];
+    [_request endAudio];
+}
+
+- (NSString*)latestText {
+    @synchronized(self) { return _latestText; }
+}
+- (BOOL)isFinal {
+    @synchronized(self) { return _isFinal; }
+}
+@end
 
 namespace backend {
     static MTKView*               g_mtkView           = nil;
@@ -339,6 +425,10 @@ namespace backend {
                   (double)sc,
                   ds.width, ds.height);
         }
+
+        // Request Speech recognition permission early so it is granted by the time
+        // channel_bank starts a transcription session.
+        [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus){}];
     }
 
     void iosSetMainWindowReady() {
@@ -709,5 +799,55 @@ namespace backend {
 
     bool iosIsIPad() {
         return (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad);
+    }
+
+    bool iosTranscribeIsAvailable() {
+        return ([SFSpeechRecognizer authorizationStatus] ==
+                SFSpeechRecognizerAuthorizationStatusAuthorized);
+    }
+
+    void iosTranscribeRequestPermission() {
+        [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus) {}];
+    }
+
+    void* iosTranscribeCreate(double sampleRate) {
+        if ([SFSpeechRecognizer authorizationStatus] !=
+            SFSpeechRecognizerAuthorizationStatusAuthorized) return nullptr;
+        CBTranscriptionSession* s = [[CBTranscriptionSession alloc] initWithSampleRate:sampleRate];
+        if (!s) return nullptr;
+        return (__bridge_retained void*)s;
+    }
+
+    void iosTranscribeAppend(void* handle, const float* samples, int count) {
+        if (!handle) return;
+        [(__bridge CBTranscriptionSession*)handle appendSamples:samples count:count];
+    }
+
+    void iosTranscribeEndAudio(void* handle) {
+        if (!handle) return;
+        [(__bridge CBTranscriptionSession*)handle endAudio];
+    }
+
+    void iosTranscribeCancel(void* handle) {
+        if (!handle) return;
+        [(__bridge CBTranscriptionSession*)handle cancel];
+    }
+
+    std::string iosTranscribeGetText(void* handle) {
+        if (!handle) return {};
+        NSString* t = [(__bridge CBTranscriptionSession*)handle latestText];
+        return t ? std::string(t.UTF8String) : std::string();
+    }
+
+    bool iosTranscribeIsFinal(void* handle) {
+        if (!handle) return false;
+        return [(__bridge CBTranscriptionSession*)handle isFinal] == YES;
+    }
+
+    void iosTranscribeDestroy(void* handle) {
+        if (!handle) return;
+        CBTranscriptionSession* s = (__bridge_transfer CBTranscriptionSession*)handle;
+        [s cancel];
+        (void)s; // ARC releases
     }
 }

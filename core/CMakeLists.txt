@@ -84,6 +84,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
         "-framework AudioToolbox"
         "-framework AVFoundation"
         "-framework CoreAudio"
+        "-framework Speech"
     )
 endif ()
 
