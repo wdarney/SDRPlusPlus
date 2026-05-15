@@ -975,6 +975,11 @@ private:
                 localPeakOffsets = slotPeakOffsets;
             }
 
+        // Finalized transcripts collected under channelsMtx, processed after release.
+        struct FinalTranscript { std::string text, wavPath; double freqHz; };
+        std::vector<FinalTranscript> finals;
+
+        {
             auto now = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> clck(channelsMtx);
 
@@ -1067,44 +1072,48 @@ private:
                 }
             }
 
-            // Poll transcription sessions: update live text, finalize when done.
-            {
-                std::lock_guard<std::mutex> clck(channelsMtx);
-                for (auto& [idx, slot] : activeChannels) {
+            // Poll transcription sessions: update live text, collect finals.
+            // channelsMtx is already held by clck above — do NOT lock it again here.
+            // Finalized transcripts are collected into `finals` and written outside
+            // this scope so saveFreqLog() is never called while channelsMtx is held.
+            for (auto& [idx, slot] : activeChannels) {
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                    if (!slot->transcribeHandle) continue;
-                    slot->liveTranscript = backend::iosTranscribeGetText(slot->transcribeHandle);
-                    if (backend::iosTranscribeIsFinal(slot->transcribeHandle)) {
-                        std::string text    = slot->liveTranscript;
-                        std::string wavPath = slot->pendingTranscriptPath;
-                        double      freqHz  = slot->freqHz;
-                        backend::iosTranscribeDestroy(slot->transcribeHandle);
-                        slot->transcribeHandle = nullptr;
-                        slot->liveTranscript.clear();
-                        if (!text.empty() && !wavPath.empty()) {
-                            // Write sidecar .txt (fast — small file)
-                            std::string txtPath = wavPath;
-                            if (txtPath.size() > 4)
-                                txtPath = txtPath.substr(0, txtPath.size() - 4) + ".txt";
-                            if (FILE* f = fopen(txtPath.c_str(), "w")) {
-                                fprintf(f, "%s\n", text.c_str());
-                                fclose(f);
-                            }
-                            // Update freqLog description (saved immediately)
-                            {
-                                std::lock_guard<std::mutex> lk(freqLogMtx);
-                                auto& entry = freqLog[freqKey(freqHz)];
-                                if (entry.freqHz == 0.0) entry.freqHz = freqHz;
-                                entry.description = text;
-                            }
-                            saveFreqLog();
-                        }
-                    }
-#endif
+                if (!slot->transcribeHandle) continue;
+                slot->liveTranscript = backend::iosTranscribeGetText(slot->transcribeHandle);
+                if (backend::iosTranscribeIsFinal(slot->transcribeHandle)) {
+                    finals.push_back({ slot->liveTranscript,
+                                       slot->pendingTranscriptPath,
+                                       slot->freqHz });
+                    backend::iosTranscribeDestroy(slot->transcribeHandle);
+                    slot->transcribeHandle = nullptr;
+                    slot->liveTranscript.clear();
                 }
+#endif
             }
-        }
-    }
+        } // channelsMtx released here
+
+        // Write .txt sidecars and persist freqLog OUTSIDE channelsMtx so
+        // saveFreqLog() can safely acquire the config mutex without risking
+        // lock-order inversion (ABBA deadlock) with the UI thread.
+        for (auto& fin : finals) {
+            if (fin.text.empty() || fin.wavPath.empty()) continue;
+            std::string txtPath = fin.wavPath;
+            if (txtPath.size() > 4)
+                txtPath = txtPath.substr(0, txtPath.size() - 4) + ".txt";
+            if (FILE* f = fopen(txtPath.c_str(), "w")) {
+                fprintf(f, "%s\n", fin.text.c_str());
+                fclose(f);
+            }
+            {
+                std::lock_guard<std::mutex> lk(freqLogMtx);
+                auto& entry = freqLog[freqKey(fin.freqHz)];
+                if (entry.freqHz == 0.0) entry.freqHz = fin.freqHz;
+                entry.description = fin.text;
+            }
+            saveFreqLog();
+        } // end for (finals)
+        } // end while (mgmtRunning)
+    } // end managementThreadFunc
 
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
