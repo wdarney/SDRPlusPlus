@@ -254,6 +254,13 @@ public:
         std::lock_guard<std::mutex> lck(runMtx);
         if (running) { return; }
 
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // Trigger the speech recognition permission dialog now — at a natural
+        // moment when the user has just pressed Start — rather than at app
+        // launch where it caused watchdog kills. No-op if already granted.
+        backend::iosTranscribeRequestPermission();
+#endif
+
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
         fftBufPos = 0;

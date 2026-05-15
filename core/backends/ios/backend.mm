@@ -423,9 +423,10 @@ namespace backend {
                   ds.width, ds.height);
         }
 
-        // Request Speech recognition permission early so it is granted by the time
-        // channel_bank starts a transcription session.
-        [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus){}];
+        // Do NOT request speech recognition permission here — showing a system
+        // dialog during view attachment can trigger watchdog kills if the main
+        // run loop isn't fully set up yet.  iosTranscribeRequestPermission() is
+        // called lazily by the channel bank module when it is first enabled.
     }
 
     void iosSetMainWindowReady() {
@@ -804,12 +805,21 @@ namespace backend {
     }
 
     void iosTranscribeRequestPermission() {
-        [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus) {}];
+        // Must run on the main thread — dispatching ensures this is safe to call
+        // from any thread (DSP thread, management thread, etc.).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus) {}];
+        });
     }
 
     void* iosTranscribeCreate(double sampleRate) {
-        if ([SFSpeechRecognizer authorizationStatus] !=
-            SFSpeechRecognizerAuthorizationStatusAuthorized) return nullptr;
+        SFSpeechRecognizerAuthorizationStatus status = [SFSpeechRecognizer authorizationStatus];
+        if (status == SFSpeechRecognizerAuthorizationStatusNotDetermined) {
+            // Trigger permission dialog (dispatched to main thread — non-blocking).
+            iosTranscribeRequestPermission();
+            return nullptr;  // Will succeed on next recording once user grants permission
+        }
+        if (status != SFSpeechRecognizerAuthorizationStatusAuthorized) return nullptr;
         CBTranscriptionSession* s = [[CBTranscriptionSession alloc] initWithSampleRate:sampleRate];
         if (!s) return nullptr;
         return (__bridge_retained void*)s;
