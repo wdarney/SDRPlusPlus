@@ -52,9 +52,6 @@
     BOOL                                   _cancelled;
 }
 
-@synthesize latestText = _latestText;
-@synthesize isFinal    = _isFinal;
-
 - (instancetype)initWithSampleRate:(double)sr {
     self = [super init];
     if (!self) return nil;
@@ -74,10 +71,10 @@
                                                  channels:1
                                               interleaved:NO];
 
-    __weak typeof(self) ws = self;
+    __weak CBTranscriptionSession* ws = self;
     _task = [_recognizer recognitionTaskWithRequest:_request
                                      resultHandler:^(SFSpeechRecognitionResult* result, NSError* err) {
-        typeof(self) ss = ws;
+        CBTranscriptionSession* ss = ws;
         if (!ss || ss->_cancelled) return;
         if (result) {
             @synchronized(ss) {
