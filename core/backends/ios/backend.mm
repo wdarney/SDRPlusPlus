@@ -97,19 +97,7 @@
                                                           frameCapacity:(AVAudioFrameCount)count];
     if (!buf) return;
     buf.frameLength = (AVAudioFrameCount)count;
-
-    // Pre-emphasis: y[n] = x[n] - α·x[n-1]
-    // Compensates for the spectral tilt of narrow-band radio audio by boosting
-    // high-frequency consonant energy that the ASR model relies on most.
-    // α=0.97 is the standard value used in telephone/radio speech processing.
-    float* dst  = buf.floatChannelData[0];
-    float  prev = _prevSample;
-    for (int i = 0; i < count; i++) {
-        dst[i] = samples[i] - 0.97f * prev;
-        prev   = samples[i];
-    }
-    _prevSample = prev;
-
+    memcpy(buf.floatChannelData[0], samples, (size_t)count * sizeof(float));
     [_request appendAudioPCMBuffer:buf];
 }
 
