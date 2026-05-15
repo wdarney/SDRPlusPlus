@@ -189,6 +189,8 @@ public:
                 watchedFreqs.insert(j.get<int64_t>());
         if (config.conf[name].contains("recordingEnabled"))
             recordingEnabled = config.conf[name]["recordingEnabled"];
+        if (config.conf[name].contains("transcriptionEnabled"))
+            transcriptionEnabled = config.conf[name]["transcriptionEnabled"];
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -1328,7 +1330,7 @@ private:
                         // Start file-based transcription on the normalised WAV.
                         // Better accuracy than live streaming: consistent levels,
                         // full-utterance context, no 1110 "No speech detected" errors.
-                        if (backend::iosTranscribeIsAvailable()) {
+                        if (_this->transcriptionEnabled && backend::iosTranscribeIsAvailable()) {
                             if (slot->transcribeHandle) {
                                 backend::iosTranscribeCancel(slot->transcribeHandle);
                                 backend::iosTranscribeDestroy(slot->transcribeHandle);
@@ -2156,6 +2158,14 @@ private:
             config.conf[_this->name]["recordingEnabled"] = _this->recordingEnabled;
             config.release(true);
         }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        if (ImGui::Checkbox(CONCAT("Enable Transcription##_cb_txcr_", _this->name),
+                            &_this->transcriptionEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["transcriptionEnabled"] = _this->transcriptionEnabled;
+            config.release(true);
+        }
+#endif
 
         // Record gain (live)
         ImGui::LeftLabel("Rec Gain");
@@ -2704,7 +2714,8 @@ private:
     int          ssbBfoHz      = 0;         // BFO trim for USB/LSB; positive = pitch up
     float        snrThreshold  = 4.0f;      // dB above noise floor
     float        cooldownSec   = 5.0f;      // seconds before destroying a quiet channel
-    bool         recordingEnabled  = true;   // global recording on/off toggle
+    bool         recordingEnabled      = true;   // global recording on/off toggle
+    bool         transcriptionEnabled  = true;   // speech-to-text on/off toggle (iOS only)
     float        recGain       = 0.25f;     // linear gain applied before WAV write (~-12dB)
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
