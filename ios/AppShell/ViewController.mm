@@ -1,5 +1,6 @@
 #import "ViewController.h"
 #import <Metal/Metal.h>
+#import <AVFoundation/AVFoundation.h>
 
 #include <core.h>
 #include <backend.h>
@@ -11,9 +12,55 @@
 // Forward decl from src/main.cpp -> core/src/core.cpp.
 int sdrpp_main(int argc, char* argv[]);
 
+// ---------------------------------------------------------------------------
+// SDRMTKView — MTKView that conforms to UIKeyInput so the view itself can
+// become first responder and receive soft-keyboard text without a hidden
+// UITextField shim. UIKeyInput is the standard iOS API for in-app keyboard
+// capture (used by game engines, terminal emulators, etc.).
+// ---------------------------------------------------------------------------
+@interface SDRMTKView : MTKView <UIKeyInput>
+@end
+
+@implementation SDRMTKView
+
+- (BOOL)canBecomeFirstResponder { return YES; }
+
+// UIKeyInput — called for every character typed on the soft keyboard.
+- (BOOL)hasText { return YES; } // always YES so Delete key is always enabled
+
+- (void)insertText:(NSString*)text {
+    if (!text.length) return;
+    if ([text isEqualToString:@"\n"]) {
+        // Return/Done key — inject Enter then let ImGui clear focus.
+        backend::iosTypeChar('\n');
+        return;
+    }
+    [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                             options:NSStringEnumerationByComposedCharacterSequences
+                          usingBlock:^(NSString* s, NSRange r, NSRange er, BOOL* stop) {
+        const char* utf8 = [s UTF8String];
+        if (!utf8) return;
+        // Decode first Unicode codepoint from UTF-8.
+        unsigned cp = 0;
+        unsigned char c = (unsigned char)utf8[0];
+        if      (c < 0x80) cp = c;
+        else if (c < 0xE0) cp = ((c & 0x1F) << 6)  | (utf8[1] & 0x3F);
+        else if (c < 0xF0) cp = ((c & 0x0F) << 12) | ((utf8[1] & 0x3F) << 6) | (utf8[2] & 0x3F);
+        else               cp = ((c & 0x07) << 18) | ((utf8[1] & 0x3F) << 12) | ((utf8[2] & 0x3F) << 6) | (utf8[3] & 0x3F);
+        backend::iosTypeChar(cp);
+    }];
+}
+
+- (void)deleteBackward {
+    backend::iosTypeBackspace();
+}
+
+@end
+
+// ---------------------------------------------------------------------------
+
 @interface ViewController ()
-@property (nonatomic, strong) MTKView*                  mtkView;
-@property (nonatomic, strong) UITextField*              inputShim;
+@property (nonatomic, strong) SDRMTKView*               mtkView;
 @property (nonatomic, strong) UIPinchGestureRecognizer* pinch;
 @property (nonatomic, strong) UILongPressGestureRecognizer* longPress;
 @property (nonatomic, strong) UIPanGestureRecognizer*   twoFingerPan;
@@ -27,42 +74,53 @@ int sdrpp_main(int argc, char* argv[]);
 - (void)viewDidLoad {
     [super viewDidLoad];
 
+    // Configure AVAudioSession for background playback here — on the main
+    // thread, before sdrpp_main starts. iOS requires the session category to
+    // be set on the main thread for UIBackgroundModes:audio to work reliably.
+    // The coreaudio_sink module also calls setActive:YES when it starts audio;
+    // this early call ensures the category is correct even if the sink hasn't
+    // started yet when the user backgrounds the app.
+    {
+        NSError* audioErr = nil;
+        AVAudioSession* sess = [AVAudioSession sharedInstance];
+        if (![sess setCategory:AVAudioSessionCategoryPlayback error:&audioErr]) {
+            NSLog(@"[SDR++] AVAudioSession setCategory failed: %@", audioErr.localizedDescription);
+        }
+        if (![sess setActive:YES error:&audioErr]) {
+            NSLog(@"[SDR++] AVAudioSession setActive failed: %@", audioErr.localizedDescription);
+        }
+
+        // Observe interruptions (phone calls, other apps taking audio focus).
+        // On interruption-end, reactivate the session so the DSP/audio chain
+        // resumes automatically without user interaction.
+        [[NSNotificationCenter defaultCenter]
+            addObserver:self
+               selector:@selector(handleAudioInterruption:)
+                   name:AVAudioSessionInterruptionNotification
+                 object:sess];
+    }
+
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    // Use the screen bounds for the initial frame rather than self.view.bounds.
-    // In viewDidLoad, auto-layout hasn't run yet so self.view.bounds is the
-    // default UIKit placeholder size (320×320) rather than the real screen size.
-    // UIScreen.mainScreen.bounds is always the logical screen dimensions.
     CGRect initialFrame = [UIScreen mainScreen].bounds;
-    self.mtkView = [[MTKView alloc] initWithFrame:initialFrame device:device];
+    self.mtkView = [[SDRMTKView alloc] initWithFrame:initialFrame device:device];
     self.mtkView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
     self.mtkView.delegate         = self;
     self.mtkView.preferredFramesPerSecond = 60;
     [self.view addSubview:self.mtkView];
 
-    // Hidden text field captures soft-keyboard input. Sized 1×1 and offscreen
-    // so it never paints; iOS still routes characters to its delegate.
-    self.inputShim = [[UITextField alloc] initWithFrame:CGRectMake(-100, -100, 1, 1)];
-    self.inputShim.delegate              = self;
-    self.inputShim.autocorrectionType    = UITextAutocorrectionTypeNo;
-    self.inputShim.autocapitalizationType= UITextAutocapitalizationTypeNone;
-    [self.view addSubview:self.inputShim];
-
-    // Pinch -> mouse wheel scroll, used by ImGui's waterfall zoom logic.
+    // Pinch -> mouse wheel scroll (waterfall zoom).
     self.pinch = [[UIPinchGestureRecognizer alloc]
                     initWithTarget:self action:@selector(onPinch:)];
     [self.mtkView addGestureRecognizer:self.pinch];
 
-    // Long-press -> right-click. minimumPressDuration matches iOS's own
-    // context-menu delay so the gesture feels native.
+    // Long-press -> right-click context menu.
     self.longPress = [[UILongPressGestureRecognizer alloc]
                         initWithTarget:self action:@selector(onLongPress:)];
     self.longPress.minimumPressDuration = 0.5;
     [self.mtkView addGestureRecognizer:self.longPress];
 
-    // Two-finger pan. Coexists with the single-touch path (which routes to
-    // ImGui as the mouse cursor) so a one-finger drag still means "drag the
-    // ImGui widget" while two fingers means "pan the waterfall".
+    // Two-finger pan (waterfall scroll).
     self.twoFingerPan = [[UIPanGestureRecognizer alloc]
                             initWithTarget:self action:@selector(onTwoFingerPan:)];
     self.twoFingerPan.minimumNumberOfTouches = 2;
@@ -71,9 +129,11 @@ int sdrpp_main(int argc, char* argv[]);
 
     backend::iosAttachView((__bridge void*)self.mtkView);
 
-    // Resource and config dirs both live under <appSupport>. The bundle's /res
-    // tree is copied here on first launch by copyBundleResources.
-    NSString* docs = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+    // Use the Documents directory as the SDR++ root so that config files and
+    // recordings are visible in Files → On My iPhone → SDR++ Client.
+    // (UIFileSharingEnabled in Info.plist exposes Documents, not Application
+    // Support, so this is required for file access without a Mac.)
+    NSString* docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
     backend::iosSetAppFilesDir(std::string([docs UTF8String]));
 
@@ -114,15 +174,15 @@ int sdrpp_main(int argc, char* argv[]);
     if (!self.coreStarted) return;
     backend::iosDrawFrame();
 
-    // Sync soft keyboard visibility with ImGui's want-text-input flag every
-    // frame. Cheap on iOS — becomeFirstResponder when already first responder
-    // is a no-op.
+    // Sync soft-keyboard visibility with ImGui's WantTextInput flag.
+    // SDRMTKView conforms to UIKeyInput so becoming first responder shows the
+    // system keyboard and routes insertText:/deleteBackward: directly to us.
     BOOL want = backend::iosWantsKeyboard();
     if (want && !self.keyboardVisible) {
-        [self.inputShim becomeFirstResponder];
+        [self.mtkView becomeFirstResponder];
         self.keyboardVisible = YES;
     } else if (!want && self.keyboardVisible) {
-        [self.inputShim resignFirstResponder];
+        [self.mtkView resignFirstResponder];
         self.keyboardVisible = NO;
     }
 }
@@ -153,10 +213,6 @@ int sdrpp_main(int argc, char* argv[]);
 #pragma mark - Gestures
 
 - (void)onPinch:(UIPinchGestureRecognizer*)g {
-    // Forward pinch as a mouse-wheel event at the gesture centroid. ImGui's
-    // waterfall reads MouseWheel under the cursor, so warp the cursor first.
-    // velocity is "scale / second"; at 60 fps that's roughly the wheel delta
-    // we want, with a small damping factor for control.
     if (g.state == UIGestureRecognizerStateBegan ||
         g.state == UIGestureRecognizerStateChanged) {
         CGPoint c = [g locationInView:self.mtkView];
@@ -166,9 +222,6 @@ int sdrpp_main(int argc, char* argv[]);
 }
 
 - (void)onLongPress:(UILongPressGestureRecognizer*)g {
-    // Fire one synthetic right-click on UIGestureRecognizerStateBegan. iOS
-    // continues to send State{Changed,Ended} as the user holds — ignore them
-    // so we don't open the context menu repeatedly.
     if (g.state == UIGestureRecognizerStateBegan) {
         CGPoint p = [g locationInView:self.mtkView];
         backend::iosRightClickAt(p.x, p.y);
@@ -197,30 +250,18 @@ int sdrpp_main(int argc, char* argv[]);
     }
 }
 
-#pragma mark - UITextFieldDelegate
+#pragma mark - Audio session interruption
 
-- (BOOL)textField:(UITextField*)tf
-        shouldChangeCharactersInRange:(NSRange)range
-        replacementString:(NSString*)string {
-    if (string.length == 0) {
-        backend::iosTypeBackspace();
-        return NO;
+- (void)handleAudioInterruption:(NSNotification*)notification {
+    NSInteger type = [notification.userInfo[AVAudioSessionInterruptionTypeKey] integerValue];
+    if (type == AVAudioSessionInterruptionTypeEnded) {
+        // Phone call ended, Siri dismissed, etc. — reactivate the session so
+        // the CoreAudio render callback (and therefore background DSP) resumes.
+        NSError* err = nil;
+        if (![[AVAudioSession sharedInstance] setActive:YES error:&err]) {
+            NSLog(@"[SDR++] AVAudioSession re-activate failed: %@", err.localizedDescription);
+        }
     }
-    [string enumerateSubstringsInRange:NSMakeRange(0, string.length)
-                               options:NSStringEnumerationByComposedCharacterSequences
-                            usingBlock:^(NSString* s, NSRange r, NSRange er, BOOL* stop) {
-        const char* utf8 = [s UTF8String];
-        if (!utf8) return;
-        // Decode UTF-8 to a single codepoint (handles ASCII trivially).
-        unsigned cp = 0;
-        unsigned char c = (unsigned char)utf8[0];
-        if (c < 0x80)        cp = c;
-        else if (c < 0xE0)   cp = ((c & 0x1F) << 6) | (utf8[1] & 0x3F);
-        else if (c < 0xF0)   cp = ((c & 0x0F) << 12) | ((utf8[1] & 0x3F) << 6) | (utf8[2] & 0x3F);
-        else                 cp = ((c & 0x07) << 18) | ((utf8[1] & 0x3F) << 12) | ((utf8[2] & 0x3F) << 6) | (utf8[3] & 0x3F);
-        backend::iosTypeChar(cp);
-    }];
-    return NO;
 }
 
 @end

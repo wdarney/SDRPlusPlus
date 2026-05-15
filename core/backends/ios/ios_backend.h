@@ -5,6 +5,7 @@
 // core's `namespace backend` interface.
 //
 
+#include <atomic>
 #include <string>
 #include <imgui.h> // ImTextureID
 
@@ -67,6 +68,43 @@ namespace backend {
     // breaks inclusion from plain C++ TUs). Cast with __bridge id<MTLDevice>.
     // Returns nullptr before iosAttachView() is called.
     void* iosGetMetalDevicePtr();
+
+    // Returns true when running on an iPad (any model / size class).
+    // Callable from plain C++ — implemented in backend.mm (Obj-C++).
+    bool iosIsIPad();
+
+    // Play an audio file via AVAudioPlayer (bypasses the kAudioUnitSubType_RemoteIO
+    // singleton limitation — only one CoreAudioSink AudioUnit can exist at a time,
+    // so a second sink used for channel-bank monitor playback fails silently).
+    // Blocks the calling thread until playback finishes or *stop_flag becomes false.
+    // Safe to call from any background thread; no run loop required in the caller.
+    void iosPlayRecordingFile(const char* path, const std::atomic<bool>* stop_flag);
+
+    // Tells the touch classifier where the FFT/waterfall horizontal resize
+    // divider is (Y in logical points). Vertical drags that start within ~20pt
+    // of this line are treated as widget drags rather than scroll gestures, so
+    // the ImGui resize handler receives mouse events. Call every draw frame from
+    // the waterfall widget. Pass -1 to disable (e.g. when waterfall is hidden).
+    void iosSetResizeDividerY(float y);
+
+    // Registers the current width of the left-column controls panel (logical
+    // pts). Call every frame from main_window.cpp so the touch classifier can
+    // decide whether a gesture started inside the panel without reading ImGui
+    // context from the touch thread (which would be a data race).
+    void iosSetMenuWidth(float w);
+
+    // Registers the left edge (logical pts) of the right WaterfallControls
+    // column so vertical drags there are classified as DRAG (not SCROLL),
+    // allowing the Zoom/Min/Max VSliders to be dragged.  Pass FLT_MAX when
+    // the column is hidden.
+    void iosSetRightPanelX(float x);
+
+    // Returns the accumulated vertical panel-scroll delta since the last call
+    // and atomically resets it to zero. Call once per frame from inside
+    // BeginChild("Left Column") and apply via ImGui::SetScrollY.
+    // Positive value → scroll content downward (iOS natural: finger up →
+    // content moves up → Scroll.y increases).
+    float iosTakePanelScrollDelta();
 
     // Dynamic-texture management for widgets that upload pixel data every
     // frame (waterfall, image viewer, line_push_image, etc.).

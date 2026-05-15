@@ -8,7 +8,14 @@ set(APP_SHELL_SRC
     AppShell/ViewController.mm
 )
 
-add_executable(SDRPP_iOS MACOSX_BUNDLE ${APP_SHELL_SRC})
+# Asset catalog — contains AppIcon; listed as a source so CMake/Xcode
+# compiles it via actool and embeds the result in the app bundle.
+set(ASSET_CATALOG "${CMAKE_CURRENT_SOURCE_DIR}/Assets.xcassets")
+set_source_files_properties("${ASSET_CATALOG}" PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources
+)
+
+add_executable(SDRPP_iOS MACOSX_BUNDLE ${APP_SHELL_SRC} "${ASSET_CATALOG}")
 
 target_link_libraries(SDRPP_iOS PRIVATE sdrpp_app)
 
@@ -24,6 +31,7 @@ set_target_properties(SDRPP_iOS PROPERTIES
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "14.0"
     XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC "YES"
     XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "iPhone Developer"
+    XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
 )
 
 # Bundle the /res tree so ViewController.mm can copy it on first launch.

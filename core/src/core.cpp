@@ -1,4 +1,10 @@
 #include <server.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#ifndef TARGET_OS_IPHONE
+#define TARGET_OS_IPHONE 0
+#endif
 #include "imgui.h"
 #include <stdio.h>
 #include <gui/main_window.h>
@@ -216,6 +222,18 @@ int sdrpp_main(int argc, char* argv[]) {
     // root itself is the *current* container's <Library/Application Support>.
     core::configManager.conf["resourcesDirectory"] = defConfig["resourcesDirectory"];
     core::configManager.conf["modulesDirectory"]   = defConfig["modulesDirectory"];
+    // Force mobile-appropriate UI sizing on every launch regardless of any
+    // persisted value. defConfig["uiScale"]=2.0 is sized for a 1080p desktop;
+    // 1.0 fits a 393 pt wide iPhone screen.
+    // On iPad (typically 1024+ pt wide) use a wider default menu panel.
+    core::configManager.conf["uiScale"] = 1.0f;
+#if TARGET_OS_IPHONE
+    // iosIsIPad() is implemented in backend.mm (Obj-C++) so it can call
+    // UIDevice without dragging UIKit into this C++ translation unit.
+    core::configManager.conf["menuWidth"] = backend::iosIsIPad() ? 280 : 200;
+#else
+    core::configManager.conf["menuWidth"] = 200;
+#endif
 
     // Static-link mode: register every module compiled into the binary, then
     // seed the "modules" config list so main_window's loader resolves them by

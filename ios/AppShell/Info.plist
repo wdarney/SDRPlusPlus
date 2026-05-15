@@ -3,6 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundleExecutable</key><string>SDRPP_iOS</string>
     <key>CFBundleIdentifier</key><string>org.sdrpp.client</string>
     <key>CFBundleName</key><string>SDR++</string>
@@ -22,6 +23,12 @@
     <!-- Network sources connect to remote SDR servers (rtl_tcp, SpyServer, ...). -->
     <key>NSAppTransportSecurity</key>
     <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+    <!-- Background audio: keeps the CoreAudio render callback alive when the
+         app is backgrounded. AVAudioSession is already AVAudioSessionCategoryPlayback
+         in coreaudio_sink. MTKView auto-pauses its display link when inactive,
+         so rendering stops while DSP + audio continue uninterrupted. -->
+    <key>UIBackgroundModes</key>
+    <array><string>audio</string></array>
     <key>UIRequiresFullScreen</key><true/>
     <!-- Opt in to full-screen on all modern iPhones/iPads. Without this key
          (or UILaunchStoryboardName) iOS runs the app in 320×480 compatibility
@@ -29,5 +36,10 @@
          the dictionary alternative to a compiled .storyboard resource. -->
     <key>UILaunchScreen</key>
     <dict/>
+    <!-- Expose the app's Documents folder in the Files app so recordings made
+         by the channel_bank module (stored under Application Support/recordings)
+         can be copied off the device without a Mac. -->
+    <key>UIFileSharingEnabled</key><true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key><true/>
 </dict>
 </plist>

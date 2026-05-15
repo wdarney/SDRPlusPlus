@@ -37,8 +37,15 @@ namespace backend {
     void        iosSetAppFilesDir(const std::string& p) { g_appFilesDir = p; }
     void*       iosGetMetalDevicePtr()        { return nullptr; }
 
-    // iosUpdateTexture is only called from #if TARGET_OS_IPHONE blocks in widget
-    // .cpp files, so this stub is never reached on non-iOS builds. It exists
-    // solely so the symbol resolves at link time.
+    // iosUpdateTexture / iosSetResizeDividerY are only called from
+    // #if TARGET_OS_IPHONE blocks, so these stubs are never reached on non-iOS
+    // builds — they exist solely so the symbols resolve at link time.
     void iosUpdateTexture(ImTextureID*, int, int, const void*) {}
+    void iosSetResizeDividerY(float) {}
+    void iosSetMenuWidth(float) {}
+    void iosSetRightPanelX(float) {}
+    float iosTakePanelScrollDelta() { return 0.0f; }
+
+    bool iosIsIPad() { return false; }
+    void iosPlayRecordingFile(const char*, const std::atomic<bool>*) {}
 }

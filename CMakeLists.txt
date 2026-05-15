@@ -6,26 +6,27 @@ project(sdrpp)
 
 # Modules are built into the main binary and selected here. Defaults match the
 # "useful for a remote-server iOS client" set; flip OFF to slim further.
-option(OPT_BUILD_FILE_SOURCE          "WAV file source"                                ON)
-option(OPT_BUILD_NETWORK_SOURCE       "Raw IQ over TCP/UDP"                            ON)
-option(OPT_BUILD_RTL_TCP_SOURCE       "rtl_tcp protocol"                               ON)
+option(OPT_BUILD_FILE_SOURCE          "WAV file source"                                OFF)
+option(OPT_BUILD_NETWORK_SOURCE       "Raw IQ over TCP/UDP"                            OFF)
+option(OPT_BUILD_RTL_TCP_SOURCE       "rtl_tcp protocol"                               OFF)
 option(OPT_BUILD_SDRPP_SERVER_SOURCE  "SDR++ server protocol"                          ON)
-option(OPT_BUILD_SPECTRAN_HTTP_SOURCE "Aaronia Spectran HTTP source"                   ON)
-option(OPT_BUILD_SPYSERVER_SOURCE     "SpyServer protocol"                             ON)
+option(OPT_BUILD_SPECTRAN_HTTP_SOURCE "Aaronia Spectran HTTP source"                   OFF)
+option(OPT_BUILD_SPYSERVER_SOURCE     "SpyServer protocol"                             OFF)
 
-option(OPT_BUILD_NETWORK_SINK         "UDP/TCP audio sink"                             ON)
+option(OPT_BUILD_NETWORK_SINK         "UDP/TCP audio sink"                             OFF)
 option(OPT_BUILD_COREAUDIO_SINK       "CoreAudio sink (iOS/macOS)"                     ON)
 
 option(OPT_BUILD_METEOR_DEMODULATOR   "Meteor weather satellite demodulator"           OFF)
 option(OPT_BUILD_PAGER_DECODER        "POCSAG/FLEX pager decoder"                      OFF)
 option(OPT_BUILD_RADIO                "Main AM/FM/SSB demodulator"                     ON)
 
+option(OPT_BUILD_CHANNEL_BANK         "SNR-triggered multi-channel recorder"           ON)
 option(OPT_BUILD_FREQUENCY_MANAGER    "Frequency bookmarks"                            ON)
 option(OPT_BUILD_IQ_EXPORTER          "IQ recorder/exporter"                           OFF)
-option(OPT_BUILD_RECORDER             "Audio + baseband recorder"                      ON)
+option(OPT_BUILD_RECORDER             "Audio + baseband recorder"                      OFF)
 option(OPT_BUILD_RIGCTL_CLIENT        "Rigctl client (panadapter)"                     OFF)
 option(OPT_BUILD_RIGCTL_SERVER        "Rigctl backend"                                 OFF)
-option(OPT_BUILD_SCANNER              "Frequency scanner"                              ON)
+option(OPT_BUILD_SCANNER              "Frequency scanner"                              OFF)
 
 option(USE_INTERNAL_LIBCORRECT        "Use the bundled libcorrect"                     ON)
 
@@ -68,6 +69,7 @@ _sdrpp_maybe_add(OPT_BUILD_METEOR_DEMODULATOR   "decoder_modules/meteor_demodula
 _sdrpp_maybe_add(OPT_BUILD_PAGER_DECODER        "decoder_modules/pager_decoder")
 _sdrpp_maybe_add(OPT_BUILD_RADIO                "decoder_modules/radio")
 
+_sdrpp_maybe_add(OPT_BUILD_CHANNEL_BANK         "misc_modules/channel_bank")
 _sdrpp_maybe_add(OPT_BUILD_FREQUENCY_MANAGER    "misc_modules/frequency_manager")
 _sdrpp_maybe_add(OPT_BUILD_IQ_EXPORTER          "misc_modules/iq_exporter")
 _sdrpp_maybe_add(OPT_BUILD_RECORDER             "misc_modules/recorder")

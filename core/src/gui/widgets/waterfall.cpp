@@ -267,7 +267,13 @@ namespace ImGui {
         bool mouseClicked = ImGui::ButtonBehavior(ImRect(fftAreaMin, wfMax), GetID("WaterfallID"), &mouseHovered, &mouseHeld,
                                                   ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_PressedOnClick);
 
-        mouseInFFTResize = (dragOrigin.x > widgetPos.x && dragOrigin.x < widgetPos.x + widgetSize.x && dragOrigin.y >= widgetPos.y + newFFTAreaHeight - (2.0f * style::uiScale) && dragOrigin.y <= widgetPos.y + newFFTAreaHeight + (2.0f * style::uiScale));
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // Finger-friendly grab zone: 15 pt each side of the FFT/waterfall split line.
+        const float fftResizeHalf = 15.0f;
+#else
+        const float fftResizeHalf = 2.0f * style::uiScale;
+#endif
+        mouseInFFTResize = (dragOrigin.x > widgetPos.x && dragOrigin.x < widgetPos.x + widgetSize.x && dragOrigin.y >= widgetPos.y + newFFTAreaHeight - fftResizeHalf && dragOrigin.y <= widgetPos.y + newFFTAreaHeight + fftResizeHalf);
         mouseInFreq = IS_IN_AREA(dragOrigin, freqAreaMin, freqAreaMax);
         mouseInFFT = IS_IN_AREA(dragOrigin, fftAreaMin, fftAreaMax);
         mouseInWaterfall = IS_IN_AREA(dragOrigin, wfMin, wfMax);
@@ -302,10 +308,17 @@ namespace ImGui {
 
         bool targetFound = false;
 
-        // If the mouse was clicked anywhere in the waterfall, check if the resize was clicked
+        // If the mouse was clicked anywhere in the waterfall, check if the resize was clicked.
+        // Use the already-computed `mouseClicked` (return of ButtonBehavior) rather than
+        // ImGui::IsMouseClicked — newer ImGui claims mouse-button ownership via SetKeyOwner
+        // inside ButtonBehavior, which causes IsMouseClicked to return false for all
+        // subsequent callers in the same frame.
         if (mouseInFFTResize) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // Use IsMouseDown rather than mouseClicked/IsMouseClicked — IsMouseDown reads raw
+            // IO state and cannot be "consumed" by any widget's SetKeyOwner call.  The
+            // !fftResizeSelect guard ensures we only arm the drag once per touch sequence.
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && !fftResizeSelect) {
                 fftResizeSelect = true;
                 targetFound = true;
             }
@@ -563,17 +576,22 @@ namespace ImGui {
     }
 
     bool WaterFall::calculateVFOSignalInfo(float* fftLine, WaterfallVFO* _vfo, float& strength, float& snr) {
-        if (fftLine == NULL || fftLines <= 0) { return false; }
+        if (fftLine == NULL || fftLines <= 0 || rawFFTSize <= 0) { return false; }
 
         // Calculate FFT index data
         double vfoMinSizeFreq = _vfo->centerOffset - _vfo->bandwidth;
         double vfoMinFreq = _vfo->centerOffset - (_vfo->bandwidth / 2.0);
         double vfoMaxFreq = _vfo->centerOffset + (_vfo->bandwidth / 2.0);
         double vfoMaxSizeFreq = _vfo->centerOffset + _vfo->bandwidth;
-        int vfoMinSideOffset = std::clamp<int>(((vfoMinSizeFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, rawFFTSize);
-        int vfoMinOffset = std::clamp<int>(((vfoMinFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, rawFFTSize);
-        int vfoMaxOffset = std::clamp<int>(((vfoMaxFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, rawFFTSize);
-        int vfoMaxSideOffset = std::clamp<int>(((vfoMaxSizeFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, rawFFTSize);
+        // Clamp to [0, rawFFTSize-1]: fftLine has rawFFTSize elements so the
+        // last valid index is rawFFTSize-1. The "Calculate max" loop below uses
+        // `i <= vfoMaxOffset` (inclusive upper bound), so clamping to rawFFTSize
+        // would cause fftLine[rawFFTSize] — a one-past-the-end read → crash.
+        int lastIdx = rawFFTSize - 1;
+        int vfoMinSideOffset = std::clamp<int>(((vfoMinSizeFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, lastIdx);
+        int vfoMinOffset = std::clamp<int>(((vfoMinFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, lastIdx);
+        int vfoMaxOffset = std::clamp<int>(((vfoMaxFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, lastIdx);
+        int vfoMaxSideOffset = std::clamp<int>(((vfoMaxSizeFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, lastIdx);
 
         double avg = 0;
         float max = -INFINITY;
@@ -849,6 +867,41 @@ namespace ImGui {
         window->DrawList->AddRectFilled(widgetPos, widgetEndPos, bg);
         window->DrawList->AddRect(widgetPos, widgetEndPos, IM_COL32(50, 50, 50, 255), 0.0, 0, style::uiScale);
         window->DrawList->AddLine(ImVec2(widgetPos.x, freqAreaMax.y), ImVec2(widgetPos.x + widgetSize.x, freqAreaMax.y), IM_COL32(50, 50, 50, 255), style::uiScale);
+
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // Register divider Y with the touch classifier so vertical drags near
+        // it are treated as widget drags (not panel scrolls). Must be called
+        // every frame because the divider moves when the user resizes the FFT.
+        backend::iosSetResizeDividerY(waterfallVisible
+            ? widgetPos.y + newFFTAreaHeight
+            : -1.0f);
+
+        // Draw a visible grab handle at the FFT/waterfall split so the user
+        // can see where to touch.  A pill-shaped grip sits centred on the
+        // divider line and is drawn after the background fill so it's always
+        // on top of the spectrum content.
+        if (waterfallVisible) {
+            float divY     = widgetPos.y + newFFTAreaHeight;
+            float cx       = widgetPos.x + widgetSize.x * 0.5f;
+            // Pill dimensions
+            float pillW    = 44.0f;
+            float pillH    = 5.0f;
+            float pillR    = pillH * 0.5f;
+            // Semi-transparent background badge so the dots show over any colour
+            float badgeW   = pillW + 14.0f;
+            float badgeH   = pillH + 10.0f;
+            float badgeR   = badgeH * 0.5f;
+            window->DrawList->AddRectFilled(
+                ImVec2(cx - badgeW * 0.5f, divY - badgeH * 0.5f),
+                ImVec2(cx + badgeW * 0.5f, divY + badgeH * 0.5f),
+                IM_COL32(0, 0, 0, 100), badgeR);
+            // Pill / grip indicator (iOS-style drag handle)
+            window->DrawList->AddRectFilled(
+                ImVec2(cx - pillW * 0.5f, divY - pillR),
+                ImVec2(cx + pillW * 0.5f, divY + pillR),
+                IM_COL32(180, 180, 180, 200), pillR);
+        }
+#endif
 
         if (!gui::mainWindow.lockWaterfallControls) {
             inputHandled = false;

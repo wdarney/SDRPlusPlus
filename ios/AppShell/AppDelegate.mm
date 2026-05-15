@@ -14,16 +14,21 @@
     return YES;
 }
 
-// Stop streaming when the app loses focus. iOS will throttle / suspend audio
-// IO and CPU shortly after, so leaving a network source active will at best
-// hammer the radio and at worst hang the receive thread on a socket read
-// that never returns. This mirrors what desktop SDR++ users do manually.
+// With UIBackgroundModes:audio (declared in Info.plist) iOS grants the app
+// full background execution: network I/O, DSP threads, and the CoreAudio
+// render callback all continue running. We intentionally do NOT stop the
+// source here — the user expects audio to continue after pressing home.
+//
+// applicationWillResignActive fires for transient interruptions too (phone
+// calls, Siri, Control Center), so stopping there would be overly aggressive.
+// AVAudioSession interruption handling in ViewController re-activates the
+// session when focus returns.
 - (void)applicationWillResignActive:(UIApplication*)application {
-    gui::mainWindow.setPlayState(false);
+    // no-op: keep DSP + audio running
 }
 
 - (void)applicationDidEnterBackground:(UIApplication*)application {
-    gui::mainWindow.setPlayState(false);
+    // no-op: UIBackgroundModes:audio keeps us alive
 }
 
 @end
