@@ -660,11 +660,20 @@ private:
         // channels, and don't block NMS so adjacent real signals can still be
         // detected.
         {
-            // Target ~2 s of FFT frames so the window captures at least one PTT
-            // gap (typical scanners: 0.5–3 s between transmissions).  Capped at
-            // 600 to limit memory at high sample rates (≥ 3 MHz → ≈ 0.5 s min).
-            const int   SPUR_HISTORY = std::clamp((int)(lastKnownSr / FFT_SIZE * 2.0), 60, 600);
-            constexpr float SPUR_RATIO = 1.5f;   // max/min < 1.5× (< 1.76 dB) → spur
+            // Target ~5 s of FFT frames so transient voice transmissions (which
+            // always go quiet eventually) don't get misidentified as spurs.
+            // Hardware birdies/spurs are truly constant — 2 s was too short and
+            // caused strong consistent voice signals to be incorrectly flagged.
+            // Capped at 1500 to limit memory at high sample rates.
+            const int   SPUR_HISTORY = std::clamp((int)(lastKnownSr / FFT_SIZE * 5.0), 150, 1500);
+
+            // Real hardware spurs (DC offset, ADC clock leak, IQ-mirror images)
+            // have near-zero power variation — typically < 0.2 dB.  Voice signals,
+            // even consistent ATC readbacks, vary by several dB due to inter-word
+            // gaps and amplitude modulation of the carrier.  Using 1.1× (< 0.4 dB)
+            // instead of the old 1.5× (< 1.76 dB) prevents strong voice signals
+            // from being misclassified as spurs and having their recordings cut off.
+            constexpr float SPUR_RATIO = 1.1f;
 
             // Evict history maps that grew stale after a spacing/SR change
             if ((int)slotMeanHistory.size() > numSlots + 4) slotMeanHistory.clear();
@@ -681,10 +690,8 @@ private:
                 float mx = *std::max_element(hist.begin(), hist.end());
                 // mn > localFloor[s]: the slot was NEVER quiet in the window
                 // (every frame was above the noise floor — no PTT gap occurred).
-                // mx/mn < SPUR_RATIO: power barely changed (< 1.76 dB variation).
-                // Together these reliably identify hardware spurs / filter rolloff
-                // without needing a current-frame threshold check (which can flip
-                // when the local floor fluctuates at band edges).
+                // mx/mn < SPUR_RATIO: power barely changed (< 0.4 dB variation).
+                // Together these reliably identify hardware spurs / filter rolloff.
                 if (mn > localFloor[s] && mx / mn < SPUR_RATIO)
                     confirmedSpurs.insert(s);
             }
@@ -861,20 +868,22 @@ private:
             // channel down within a few frames once the signal genuinely
             // disappears.
             //
-            // Exception: confirmed spur slots are NOT added to `detected` even
-            // when active — their votes drain to zero (spur loop above), so the
-            // existing channel tears down naturally without blocking neighbors.
+            // Active spur slots: we DO include them in `detected` (ignore the
+            // spur flag) so a recording that is already in progress is never
+            // cut off mid-transmission by the spur detector.  The file closes
+            // naturally once the real signal disappears and the tail expires.
+            // Spur status is only used to prevent SPAWNING new channels.
             std::vector<int> candidates;
             for (int s = 0; s < numSlots; s++) {
                 bool active = (activeChannels.find(s) != activeChannels.end());
                 bool isSpur = confirmedSpurs.count(s) > 0;
                 if (active) {
-                    // Spur channels: not inserted → signalPresent → false → file closes → torn down
-                    if (slotVotes[s] > 0 && !isSpur) detected.insert(s);
-                    // votes==0 or spur → let the channel die naturally; don't insert
+                    // Keep active channel as long as any votes remain.
+                    // Spur flag is intentionally ignored here — it only blocks spawns.
+                    if (slotVotes[s] > 0) detected.insert(s);
                 } else {
                     if (slotVotes[s] < SPAWN_VOTES) { continue; }
-                    if (isSpur) { continue; } // never re-spawn a confirmed spur
+                    if (isSpur) { continue; } // never spawn a confirmed spur
                     candidates.push_back(s);
                 }
             }
