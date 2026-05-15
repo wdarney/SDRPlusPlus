@@ -1376,16 +1376,11 @@ private:
             mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * gain, -1.0f, 1.0f);
         }
 
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-        // Feed demodulated audio to the transcription session.
-        if (slot->transcribeHandle) {
-            backend::iosTranscribeAppend(slot->transcribeHandle, mono, count);
-        }
-#endif
-
         // RNNoise processing — accumulate into 480-sample frames, process,
         // and write each completed frame to WAV individually.
         // RNNoise expects/returns samples in int16 range (-32768..32767).
+        // Transcription is fed the same audio that goes to the WAV file so
+        // NR-cleaned audio (if enabled) reaches the speech recogniser too.
         if (slot->nrState) {
             int pos = 0;
             while (pos < count) {
@@ -1409,12 +1404,20 @@ private:
                     }
                     slot->writer.write(nrMono, 480);
                     slot->audioSamplesWritten += 480;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                    if (slot->transcribeHandle)
+                        backend::iosTranscribeAppend(slot->transcribeHandle, nrMono, 480);
+#endif
                     slot->nrInPos = 0;
                 }
             }
         } else {
             slot->writer.write(mono, count);
             slot->audioSamplesWritten += count;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+            if (slot->transcribeHandle)
+                backend::iosTranscribeAppend(slot->transcribeHandle, mono, count);
+#endif
         }
     }
 
