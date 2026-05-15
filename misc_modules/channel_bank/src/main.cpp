@@ -468,16 +468,14 @@ public:
         slot.fileTrimSamples      = 3840; // skip first 80ms — covers SSB AGC attack (~5 time-constants)
         slot.recFadeRemaining     = 960;  // 20ms fade-in at 48kHz — enough to suppress PTT click
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-        if (backend::iosTranscribeIsAvailable()) {
-            if (slot.transcribeHandle) {
-                backend::iosTranscribeCancel(slot.transcribeHandle);
-                backend::iosTranscribeDestroy(slot.transcribeHandle);
-                slot.transcribeHandle = nullptr;
-            }
-            slot.transcribeHandle = backend::iosTranscribeCreate(48000.0);
-            slot.liveTranscript.clear();
-            slot.pendingTranscriptPath.clear();
+        // Cancel any in-flight file transcription from the previous recording.
+        if (slot.transcribeHandle) {
+            backend::iosTranscribeCancel(slot.transcribeHandle);
+            backend::iosTranscribeDestroy(slot.transcribeHandle);
+            slot.transcribeHandle = nullptr;
         }
+        slot.liveTranscript.clear();
+        slot.pendingTranscriptPath.clear();
 #endif
         return true;
     }
@@ -1327,10 +1325,18 @@ private:
                         flog::info("[ChannelBank] Keeping recording ({0}ms >= {1}ms threshold) slot {2}", signalMs, _this->minTransmissionMs, slot->gridIdx);
                         normalizeWavFile(slot->currentFilePath);
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                        if (slot->transcribeHandle) {
+                        // Start file-based transcription on the normalised WAV.
+                        // Better accuracy than live streaming: consistent levels,
+                        // full-utterance context, no 1110 "No speech detected" errors.
+                        if (backend::iosTranscribeIsAvailable()) {
+                            if (slot->transcribeHandle) {
+                                backend::iosTranscribeCancel(slot->transcribeHandle);
+                                backend::iosTranscribeDestroy(slot->transcribeHandle);
+                            }
                             slot->pendingTranscriptPath = slot->currentFilePath;
-                            backend::iosTranscribeEndAudio(slot->transcribeHandle);
-                            // Don't destroy yet — management thread polls for final result
+                            slot->liveTranscript.clear();
+                            slot->transcribeHandle = backend::iosTranscribeFile(
+                                slot->currentFilePath.c_str());
                         }
 #endif
                         // Log the frequency and queue for playback
@@ -1404,20 +1410,12 @@ private:
                     }
                     slot->writer.write(nrMono, 480);
                     slot->audioSamplesWritten += 480;
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                    if (slot->transcribeHandle)
-                        backend::iosTranscribeAppend(slot->transcribeHandle, nrMono, 480);
-#endif
                     slot->nrInPos = 0;
                 }
             }
         } else {
             slot->writer.write(mono, count);
             slot->audioSamplesWritten += count;
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-            if (slot->transcribeHandle)
-                backend::iosTranscribeAppend(slot->transcribeHandle, mono, count);
-#endif
         }
     }
 
@@ -2311,7 +2309,7 @@ private:
                     {
                         std::lock_guard<std::mutex> clck(_this->channelsMtx);
                         for (auto& [idx, slot] : _this->activeChannels) {
-                            if (slot->fileOpen && !slot->liveTranscript.empty()) {
+                            if (slot->transcribeHandle && !slot->liveTranscript.empty()) {
                                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.2f, 1.0f));
                                 ImGui::Text("Live: %s", _this->displayName(slot->freqHz).c_str());
                                 ImGui::PopStyleColor();
@@ -2369,7 +2367,7 @@ private:
                         needSaveFreqLog = true;
                     }
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                    if (slot->fileOpen && !slot->liveTranscript.empty()) {
+                    if (slot->transcribeHandle && !slot->liveTranscript.empty()) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.9f, 0.65f, 1.0f));
                         // Truncate to first 80 chars for the list view
                         std::string preview = slot->liveTranscript;

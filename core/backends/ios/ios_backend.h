@@ -74,12 +74,14 @@ namespace backend {
     bool iosIsIPad();
 
     // On-device speech recognition bridge (Speech.framework, iOS 13+).
-    // iosTranscribeCreate returns an opaque handle; all other functions are no-ops if handle is null.
+    // File-based speech recognition (SFSpeechURLRecognitionRequest).
+    // Transcribes a WAV file after recording is complete — better accuracy than
+    // live streaming because the normalised file has consistent levels and the
+    // model has full-utterance context. Handle is opaque; all other functions
+    // are no-ops if handle is null.
     bool        iosTranscribeIsAvailable();
     void        iosTranscribeRequestPermission();
-    void*       iosTranscribeCreate(double sampleRate);
-    void        iosTranscribeAppend(void* handle, const float* samples, int count);
-    void        iosTranscribeEndAudio(void* handle);   // signal end of audio; final result follows
+    void*       iosTranscribeFile(const char* path);   // start transcription of a WAV file
     void        iosTranscribeCancel(void* handle);
     std::string iosTranscribeGetText(void* handle);    // latest partial or final text
     bool        iosTranscribeIsFinal(void* handle);

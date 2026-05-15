@@ -33,50 +33,43 @@
 // for the vendored copy from the Dear ImGui distribution.
 #include "imgui/imgui_impl_metal.h"
 
+// File-based transcription session — uses SFSpeechURLRecognitionRequest on a
+// finished, normalised WAV file rather than streaming raw samples during recording.
+// Advantages: normalised levels, full-utterance context, simpler code, no 1110
+// "No speech detected" errors from under-threshold streaming audio.
 @interface CBTranscriptionSession : NSObject
-- (instancetype)initWithSampleRate:(double)sr;
-- (void)appendSamples:(const float*)samples count:(int)count;
-- (void)endAudio;   // no more samples — triggers final recognition
+- (instancetype)initWithFileURL:(NSURL*)url;
 - (void)cancel;
 @property (atomic, copy, readonly) NSString* latestText;
 @property (atomic, readonly) BOOL isFinal;
 @end
 
 @implementation CBTranscriptionSession {
-    SFSpeechRecognizer*                    _recognizer;
-    SFSpeechAudioBufferRecognitionRequest* _request;
-    SFSpeechRecognitionTask*               _task;
-    AVAudioFormat*                         _format;
-    NSString*                              _latestText;
-    BOOL                                   _isFinal;
-    BOOL                                   _cancelled;
-    float                                  _prevSample; // pre-emphasis filter state
+    SFSpeechRecognizer*            _recognizer;
+    SFSpeechURLRecognitionRequest* _request;
+    SFSpeechRecognitionTask*       _task;
+    NSString*                      _latestText;
+    BOOL                           _isFinal;
+    BOOL                           _cancelled;
 }
 
-- (instancetype)initWithSampleRate:(double)sr {
+- (instancetype)initWithFileURL:(NSURL*)url {
     self = [super init];
     if (!self) return nil;
-    _latestText  = @"";
-    _isFinal     = NO;
-    _cancelled   = NO;
-    _prevSample  = 0.0f;
+    _latestText = @"";
+    _isFinal    = NO;
+    _cancelled  = NO;
+
     _recognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"en-US"]];
     if (!_recognizer || !_recognizer.isAvailable) {
-        NSLog(@"[CBTranscription] recognizer unavailable (available=%d)", _recognizer ? (int)_recognizer.isAvailable : -1);
+        NSLog(@"[CBTranscription] recognizer unavailable");
         return nil;
     }
 
-    _request = [[SFSpeechAudioBufferRecognitionRequest alloc] init];
-    // On-device recognition — no rate limits, works offline.
-    // Less accurate than cloud but safe for high-volume monitoring (50+ tx/min).
+    _request = [[SFSpeechURLRecognitionRequest alloc] initWithURL:url];
     _request.requiresOnDeviceRecognition = YES;
     _request.shouldReportPartialResults  = YES;
     if (@available(iOS 16, *)) { _request.addsPunctuation = YES; }
-
-    _format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
-                                               sampleRate:sr
-                                                 channels:1
-                                              interleaved:NO];
 
     __weak CBTranscriptionSession* ws = self;
     _task = [_recognizer recognitionTaskWithRequest:_request
@@ -85,56 +78,28 @@
         if (!ss || ss->_cancelled) return;
         @synchronized(ss) {
             if (result) {
-                // Only update text if the new string is non-empty — preserves the
-                // last good partial if a subsequent empty final result arrives after
-                // a "No speech detected" error (kAFAssistantErrorDomain 1110).
                 NSString* text = result.bestTranscription.formattedString;
                 if (text.length > 0) ss->_latestText = [text copy];
                 if (result.isFinal) ss->_isFinal = YES;
             }
             if (err && !ss->_isFinal) {
-                // Error with no final result — mark done so the session gets cleaned up.
-                // _latestText retains the best partial accumulated before the error.
-                NSLog(@"[CBTranscription] recognition error %ld: %@",
-                      (long)err.code, err.localizedDescription);
+                NSLog(@"[CBTranscription] error %ld: %@", (long)err.code, err.localizedDescription);
                 ss->_isFinal = YES;
             }
         }
     }];
-    if (!_task) { NSLog(@"[CBTranscription] failed to start recognition task"); return nil; }
-    NSLog(@"[CBTranscription] session started (sr=%.0f)", sr);
+    if (!_task) { NSLog(@"[CBTranscription] failed to start task for %@", url.lastPathComponent); return nil; }
+    NSLog(@"[CBTranscription] started: %@", url.lastPathComponent);
     return self;
-}
-
-- (void)appendSamples:(const float*)samples count:(int)count {
-    if (_cancelled || _isFinal || count <= 0) return;
-    AVAudioPCMBuffer* buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:_format
-                                                          frameCapacity:(AVAudioFrameCount)count];
-    if (!buf) return;
-    buf.frameLength = (AVAudioFrameCount)count;
-    memcpy(buf.floatChannelData[0], samples, (size_t)count * sizeof(float));
-    [_request appendAudioPCMBuffer:buf];
-}
-
-- (void)endAudio {
-    if (!_cancelled) {
-        NSLog(@"[CBTranscription] endAudio — partial so far: '%@'", _latestText);
-        [_request endAudio];
-    }
 }
 
 - (void)cancel {
     _cancelled = YES;
     [_task cancel];
-    [_request endAudio];
 }
 
-- (NSString*)latestText {
-    @synchronized(self) { return _latestText; }
-}
-- (BOOL)isFinal {
-    @synchronized(self) { return _isFinal; }
-}
+- (NSString*)latestText { @synchronized(self) { return _latestText; } }
+- (BOOL)isFinal         { @synchronized(self) { return _isFinal; } }
 @end
 
 namespace backend {
@@ -834,27 +799,17 @@ namespace backend {
         });
     }
 
-    void* iosTranscribeCreate(double sampleRate) {
+    void* iosTranscribeFile(const char* path) {
         SFSpeechRecognizerAuthorizationStatus status = [SFSpeechRecognizer authorizationStatus];
         if (status == SFSpeechRecognizerAuthorizationStatusNotDetermined) {
-            // Trigger permission dialog (dispatched to main thread — non-blocking).
             iosTranscribeRequestPermission();
-            return nullptr;  // Will succeed on next recording once user grants permission
+            return nullptr;
         }
         if (status != SFSpeechRecognizerAuthorizationStatusAuthorized) return nullptr;
-        CBTranscriptionSession* s = [[CBTranscriptionSession alloc] initWithSampleRate:sampleRate];
+        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        CBTranscriptionSession* s = [[CBTranscriptionSession alloc] initWithFileURL:url];
         if (!s) return nullptr;
         return (__bridge_retained void*)s;
-    }
-
-    void iosTranscribeAppend(void* handle, const float* samples, int count) {
-        if (!handle) return;
-        [(__bridge CBTranscriptionSession*)handle appendSamples:samples count:count];
-    }
-
-    void iosTranscribeEndAudio(void* handle) {
-        if (!handle) return;
-        [(__bridge CBTranscriptionSession*)handle endAudio];
     }
 
     void iosTranscribeCancel(void* handle) {
