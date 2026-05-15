@@ -61,7 +61,10 @@
     _cancelled   = NO;
     _prevSample  = 0.0f;
     _recognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"en-US"]];
-    if (!_recognizer || !_recognizer.isAvailable) return nil;
+    if (!_recognizer || !_recognizer.isAvailable) {
+        NSLog(@"[CBTranscription] recognizer unavailable (available=%d)", _recognizer ? (int)_recognizer.isAvailable : -1);
+        return nil;
+    }
 
     _request = [[SFSpeechAudioBufferRecognitionRequest alloc] init];
     // On-device recognition — no rate limits, works offline.
@@ -80,15 +83,22 @@
                                      resultHandler:^(SFSpeechRecognitionResult* result, NSError* err) {
         CBTranscriptionSession* ss = ws;
         if (!ss || ss->_cancelled) return;
-        if (result) {
-            @synchronized(ss) {
+        @synchronized(ss) {
+            if (result) {
                 ss->_latestText = [result.bestTranscription.formattedString copy] ?: @"";
                 if (result.isFinal) ss->_isFinal = YES;
             }
+            if (err && !ss->_isFinal) {
+                // Error with no final result — mark done so the session gets cleaned up.
+                // Retain whatever partial text accumulated so far.
+                NSLog(@"[CBTranscription] recognition error: %@", err);
+                ss->_isFinal = YES;
+            }
         }
-        (void)err; // cancellation errors are expected; log only unexpected ones
     }];
-    return _task ? self : nil;
+    if (!_task) { NSLog(@"[CBTranscription] failed to start recognition task"); return nil; }
+    NSLog(@"[CBTranscription] session started (sr=%.0f)", sr);
+    return self;
 }
 
 - (void)appendSamples:(const float*)samples count:(int)count {
@@ -102,7 +112,10 @@
 }
 
 - (void)endAudio {
-    if (!_cancelled) [_request endAudio];
+    if (!_cancelled) {
+        NSLog(@"[CBTranscription] endAudio — partial so far: '%@'", _latestText);
+        [_request endAudio];
+    }
 }
 
 - (void)cancel {
