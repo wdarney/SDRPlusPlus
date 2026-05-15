@@ -2263,7 +2263,9 @@ private:
                         playingDesc = it->second.description;
                     }
                 }
-                // Load transcript from sidecar when the playing file changes
+                // Load (or re-check) transcript sidecar for the currently playing file.
+                // Re-checks every frame while the transcript is missing so it appears
+                // as soon as recognition finalizes, even mid-playback.
                 static std::string s_cachedPlayPath;
                 static std::string s_cachedPlayTranscript;
                 {
@@ -2272,7 +2274,8 @@ private:
                         std::lock_guard<std::mutex> lk(_this->currentlyPlayingFileMtx);
                         curPath = _this->currentlyPlayingFilePath;
                     }
-                    if (curPath != s_cachedPlayPath) {
+                    // Reload when path changes OR when transcript is still missing
+                    if (curPath != s_cachedPlayPath || (s_cachedPlayTranscript.empty() && !curPath.empty())) {
                         s_cachedPlayPath = curPath;
                         s_cachedPlayTranscript.clear();
                         if (!curPath.empty() && curPath.size() > 4) {
@@ -2296,11 +2299,9 @@ private:
                     ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.35f, 1.0f), "Playing: %s", playingName.c_str());
                     if (!s_cachedPlayTranscript.empty()) {
                         ImGui::TextWrapped("%s", s_cachedPlayTranscript.c_str());
-                    } else if (!playingDesc.empty()) {
-                        ImGui::TextWrapped("%s", playingDesc.c_str());
                     } else {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-                        ImGui::TextWrapped("(no transcript yet)");
+                        ImGui::TextWrapped("(transcript pending...)");
                         ImGui::PopStyleColor();
                     }
                 } else {
