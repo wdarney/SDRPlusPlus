@@ -15,6 +15,7 @@
 #import <MetalKit/MetalKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Speech/Speech.h>
+#import <MediaPlayer/MediaPlayer.h>
 
 #include <cmath>
 
@@ -51,14 +52,64 @@
     NSString*                      _latestText;
     BOOL                           _isFinal;
     BOOL                           _cancelled;
+    NSURL*                         _paddedTempURL; // silence-padded copy, deleted on finish
+}
+
+// Build a silence-padded copy of sourceURL and return its URL, or nil on failure.
+// Apple's on-device VAD requires the total audio to be >= ~3 s; we pad to at
+// least 4 s so even a 600 ms clip has enough context.  The temp file is written
+// to NSTemporaryDirectory() and is owned by this session.
+- (NSURL*)makePaddedCopyOf:(NSURL*)sourceURL {
+    // Read raw samples (skip standard 44-byte PCM header).
+    NSData* wavData = [NSData dataWithContentsOfURL:sourceURL];
+    if (!wavData || wavData.length <= 44) return nil;
+    const int16_t* samples    = (const int16_t*)((const uint8_t*)wavData.bytes + 44);
+    int            sampleCount = (int)((wavData.length - 44) / sizeof(int16_t));
+
+    // Pad enough silence so total duration >= 4 s (192 000 samples @ 48 kHz).
+    const int kTargetSamples = 4 * 48000;
+    int       padEachSide    = std::max(0, (kTargetSamples - sampleCount) / 2);
+    // Always add at least 250 ms each side to give the VAD a clean run-in.
+    padEachSide = std::max(padEachSide, 12000);
+
+    int      totalOut   = padEachSide + sampleCount + padEachSide;
+    uint32_t dataBytes  = (uint32_t)(totalOut * 2);
+    uint32_t riffSize   = 36 + dataBytes;
+
+    NSMutableData* out = [NSMutableData dataWithCapacity:44 + dataBytes];
+    // RIFF header
+    const uint32_t sr = 48000; const uint16_t ch = 1, bps = 16, fmt = 1;
+    const uint16_t blk = ch * bps / 8; const uint32_t br = sr * blk;
+    [out appendBytes:"RIFF" length:4]; [out appendBytes:&riffSize  length:4];
+    [out appendBytes:"WAVE" length:4]; [out appendBytes:"fmt " length:4];
+    uint32_t fmtSz = 16; [out appendBytes:&fmtSz length:4];
+    [out appendBytes:&fmt length:2]; [out appendBytes:&ch  length:2];
+    [out appendBytes:&sr  length:4]; [out appendBytes:&br  length:4];
+    [out appendBytes:&blk length:2]; [out appendBytes:&bps length:2];
+    [out appendBytes:"data" length:4]; [out appendBytes:&dataBytes length:4];
+    // Leading silence
+    std::vector<int16_t> zeros(padEachSide, 0);
+    [out appendBytes:zeros.data() length:padEachSide * 2];
+    // Speech samples
+    [out appendBytes:samples length:sampleCount * 2];
+    // Trailing silence
+    [out appendBytes:zeros.data() length:padEachSide * 2];
+
+    NSString* tmpName = [NSString stringWithFormat:@"cb_transcribe_%@.wav",
+                         [[NSUUID UUID] UUIDString]];
+    NSURL* tmpURL = [[NSURL fileURLWithPath:NSTemporaryDirectory()]
+                     URLByAppendingPathComponent:tmpName];
+    if (![out writeToURL:tmpURL atomically:YES]) return nil;
+    return tmpURL;
 }
 
 - (instancetype)initWithFileURL:(NSURL*)url {
     self = [super init];
     if (!self) return nil;
-    _latestText = @"";
-    _isFinal    = NO;
-    _cancelled  = NO;
+    _latestText    = @"";
+    _isFinal       = NO;
+    _cancelled     = NO;
+    _paddedTempURL = nil;
 
     _recognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"en-US"]];
     if (!_recognizer || !_recognizer.isAvailable) {
@@ -66,8 +117,23 @@
         return nil;
     }
 
-    _request = [[SFSpeechURLRecognitionRequest alloc] initWithURL:url];
-    _request.requiresOnDeviceRecognition = YES;
+    // Submit a padded copy so the VAD has enough context (see makePaddedCopyOf:).
+    // Fall back to the original file if the temp write fails.
+    NSURL* submitURL = [self makePaddedCopyOf:url];
+    if (submitURL) {
+        _paddedTempURL = submitURL;
+    } else {
+        NSLog(@"[CBTranscription] padding failed, using original: %@", url.lastPathComponent);
+        submitURL = url;
+    }
+
+    _request = [[SFSpeechURLRecognitionRequest alloc] initWithURL:submitURL];
+    // Only require on-device recognition if the model is actually available.
+    // Setting this to YES when the model isn't downloaded causes the task to
+    // fail immediately with no transcript.
+    if (@available(iOS 13, *)) {
+        _request.requiresOnDeviceRecognition = _recognizer.supportsOnDeviceRecognition;
+    }
     _request.shouldReportPartialResults  = YES;
     if (@available(iOS 16, *)) { _request.addsPunctuation = YES; }
 
@@ -80,11 +146,23 @@
             if (result) {
                 NSString* text = result.bestTranscription.formattedString;
                 if (text.length > 0) ss->_latestText = [text copy];
-                if (result.isFinal) ss->_isFinal = YES;
+                if (result.isFinal) {
+                    ss->_isFinal = YES;
+                    NSLog(@"[CBTranscription] final: \"%@\" ← %@",
+                          ss->_latestText, url.lastPathComponent);
+                    if (ss->_paddedTempURL)
+                        [[NSFileManager defaultManager] removeItemAtURL:ss->_paddedTempURL error:nil];
+                }
             }
             if (err && !ss->_isFinal) {
-                NSLog(@"[CBTranscription] error %ld: %@", (long)err.code, err.localizedDescription);
+                // 1110 = kAFSpeechRecognitionErrorCodeNoSpeech
+                if (err.code == 1110)
+                    NSLog(@"[CBTranscription] no speech: %@", url.lastPathComponent);
+                else
+                    NSLog(@"[CBTranscription] error %ld: %@", (long)err.code, err.localizedDescription);
                 ss->_isFinal = YES;
+                if (ss->_paddedTempURL)
+                    [[NSFileManager defaultManager] removeItemAtURL:ss->_paddedTempURL error:nil];
             }
         }
     }];
@@ -96,6 +174,8 @@
 - (void)cancel {
     _cancelled = YES;
     [_task cancel];
+    if (_paddedTempURL)
+        [[NSFileManager defaultManager] removeItemAtURL:_paddedTempURL error:nil];
 }
 
 - (NSString*)latestText { @synchronized(self) { return _latestText; } }
@@ -833,5 +913,33 @@ namespace backend {
         CBTranscriptionSession* s = (__bridge_transfer CBTranscriptionSession*)handle;
         [s cancel];
         (void)s; // ARC releases
+    }
+
+    // -----------------------------------------------------------------------
+    // MPNowPlayingInfoCenter — Dynamic Island / Lock Screen widget
+    // -----------------------------------------------------------------------
+    void iosSetNowPlaying(const char* title, const char* subtitle) {
+        NSString* titleStr    = title    ? [NSString stringWithUTF8String:title]    : @"SDR++";
+        NSString* subtitleStr = subtitle ? [NSString stringWithUTF8String:subtitle] : @"Monitoring";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MPNowPlayingInfoCenter* center = [MPNowPlayingInfoCenter defaultCenter];
+            NSMutableDictionary* info = [NSMutableDictionary dictionary];
+            info[MPMediaItemPropertyTitle]              = titleStr;
+            info[MPMediaItemPropertyArtist]             = subtitleStr;
+            info[MPNowPlayingInfoPropertyIsLiveStream]  = @YES;
+            // playbackRate = 1.0 signals "actively playing" to the OS.
+            // Do NOT set center.playbackState — that requires the private
+            // com.apple.mediaremote.set-playback-state entitlement.
+            info[MPNowPlayingInfoPropertyPlaybackRate]  = @1.0;
+            center.nowPlayingInfo = info;
+        });
+    }
+
+    void iosClearNowPlaying() {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Setting nowPlayingInfo to nil removes the Dynamic Island / Lock
+            // Screen widget. Avoid center.playbackState — private entitlement.
+            [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = nil;
+        });
     }
 }

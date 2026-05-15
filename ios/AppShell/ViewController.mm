@@ -1,6 +1,8 @@
 #import "ViewController.h"
 #import <Metal/Metal.h>
 #import <AVFoundation/AVFoundation.h>
+#import <MediaPlayer/MediaPlayer.h>
+#import <Speech/Speech.h>
 
 #include <core.h>
 #include <backend.h>
@@ -74,6 +76,13 @@ int sdrpp_main(int argc, char* argv[]);
 - (void)viewDidLoad {
     [super viewDidLoad];
 
+    // Request speech recognition permission NOW — on first install the system
+    // dialog fires here, before any AudioUnit has been created.  If we deferred
+    // this to channel_bank start(), the dialog would arrive mid-session and
+    // trigger an AVAudioSession interruption that kills the running AudioUnit.
+    // On subsequent launches the permission is already granted; this is a no-op.
+    [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus) {}];
+
     // Configure AVAudioSession for background playback here — on the main
     // thread, before sdrpp_main starts. iOS requires the session category to
     // be set on the main thread for UIBackgroundModes:audio to work reliably.
@@ -98,6 +107,32 @@ int sdrpp_main(int argc, char* argv[]);
                selector:@selector(handleAudioInterruption:)
                    name:AVAudioSessionInterruptionNotification
                  object:sess];
+    }
+
+    // Register MPRemoteCommandCenter handlers — required by iOS for the
+    // Dynamic Island and Lock Screen "Now Playing" widget to appear at all.
+    // Without at least play+pause+toggle registered, iOS refuses to show the
+    // widget even when MPNowPlayingInfoCenter has data.  The channel bank
+    // calls iosSetNowPlaying / iosClearNowPlaying to populate/clear the info;
+    // the handlers themselves are effectively no-ops for a live SDR stream.
+    {
+        MPRemoteCommandCenter* rcc = [MPRemoteCommandCenter sharedCommandCenter];
+        // play / pause / toggle — AirPods and headset buttons send these.
+        [rcc.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent*) {
+            return MPRemoteCommandHandlerStatusSuccess;
+        }];
+        [rcc.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent*) {
+            return MPRemoteCommandHandlerStatusSuccess;
+        }];
+        [rcc.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent*) {
+            return MPRemoteCommandHandlerStatusSuccess;
+        }];
+        // Disable commands that don't apply to a live stream.
+        rcc.nextTrackCommand.enabled      = NO;
+        rcc.previousTrackCommand.enabled  = NO;
+        rcc.changePlaybackPositionCommand.enabled = NO;
+        rcc.skipForwardCommand.enabled    = NO;
+        rcc.skipBackwardCommand.enabled   = NO;
     }
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();

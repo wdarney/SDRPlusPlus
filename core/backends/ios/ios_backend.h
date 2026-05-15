@@ -120,6 +120,20 @@ namespace backend {
     // content moves up → Scroll.y increases).
     float iosTakePanelScrollDelta();
 
+    // Now-Playing / Dynamic Island integration (MediaPlayer.framework).
+    //
+    // iosSetNowPlaying() populates MPNowPlayingInfoCenter so iOS shows the app
+    // in the Dynamic Island, Lock Screen widget, and Control Centre when the
+    // channel bank is active.  title / subtitle are UTF-8.  subtitle is shown
+    // as the "artist" line in the lock-screen player.
+    // iosClearNowPlaying() removes the entry and hides the widget.
+    //
+    // Both are safe to call from any thread — they dispatch to the main queue.
+    // MPRemoteCommandCenter handlers are registered once by ViewController at
+    // app launch (required by iOS for the widget to appear at all).
+    void iosSetNowPlaying(const char* title, const char* subtitle);
+    void iosClearNowPlaying();
+
     // Dynamic-texture management for widgets that upload pixel data every
     // frame (waterfall, image viewer, line_push_image, etc.).
     //

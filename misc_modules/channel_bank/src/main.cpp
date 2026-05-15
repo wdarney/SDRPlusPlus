@@ -257,10 +257,15 @@ public:
         if (running) { return; }
 
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-        // Trigger the speech recognition permission dialog now — at a natural
-        // moment when the user has just pressed Start — rather than at app
-        // launch where it caused watchdog kills. No-op if already granted.
+        // Permission is requested at app launch (ViewController.mm) so the
+        // system dialog fires before any AudioUnit exists. This call is kept
+        // as a safety net only (no-op once permission is granted).
         backend::iosTranscribeRequestPermission();
+        // Populate MPNowPlayingInfoCenter so the Dynamic Island and Lock Screen
+        // widget show the app as "actively monitoring" when the channel bank
+        // is running. iOS will keep the app alive in the background as long as
+        // the audio session is active AND nowPlayingInfo is non-nil.
+        backend::iosSetNowPlaying("SDR++ Channel Bank", "Monitoring");
 #endif
 
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
@@ -324,6 +329,12 @@ public:
         std::lock_guard<std::mutex> lck(runMtx);
         if (!running) { return; }
         running = false;
+
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // Remove the now-playing entry so the Dynamic Island / Lock Screen
+        // widget disappears when monitoring is stopped.
+        backend::iosClearNowPlaying();
+#endif
 
         // Restore FM waterfall visibility before tearing down
         if (manualMode) restoreWaterfallVisibility();
@@ -965,132 +976,137 @@ private:
             mgmtCv.wait_for(ulck, std::chrono::milliseconds(250));
             if (!mgmtRunning) { break; }
 
-            if (manualMode) { manageManualChannels(); continue; }
+            // Finalized transcripts collected under channelsMtx, processed after.
+            struct FinalTranscript { std::string text, wavPath; double freqHz; };
+            std::vector<FinalTranscript> finals;
 
-            std::set<int>         current;
-            std::map<int, double> localPeakOffsets;
-            {
-                std::lock_guard<std::mutex> lck(detectedMtx);
-                current          = detectedSlots;
-                localPeakOffsets = slotPeakOffsets;
-            }
-
-        // Finalized transcripts collected under channelsMtx, processed after release.
-        struct FinalTranscript { std::string text, wavPath; double freqHz; };
-        std::vector<FinalTranscript> finals;
-
-        {
-            auto now = std::chrono::steady_clock::now();
-            std::lock_guard<std::mutex> clck(channelsMtx);
-
-            // Create or refresh channels for detected slots
-            debugDetectedCount.store((int)current.size());
-            int blkSkip = 0, capSkip = 0;
-            for (int idx : current) {
-                auto it = activeChannels.find(idx);
-                if (it == activeChannels.end()) {
-                    // New signal — spawn channel (if under cap and not blocked)
-                    if ((int)activeChannels.size() >= maxChannels) { capSkip++; continue; }
-                    int    numSlots   = (int)std::floor(lastKnownSr / channelSpacing);
-                    double slotOffset = ((double)idx - (double)(numSlots - 1) / 2.0) * channelSpacing;
-                    auto   pit        = localPeakOffsets.find(idx);
-                    double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
-                    double slotFreq   = lastKnownCenter + slotOffset;
-                    if (isBlocked(slotFreq)) { blkSkip++; continue; }
-                    flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
-                    auto* slot = new ChannelSlot();
-                    slot->lastDetected  = now;
-                    slot->signalPresent = true;
-                    initSlot(*slot, idx, numSlots, peakOffHz);
-                    activeChannels[idx] = slot;
-                }
-                else {
-                    it->second->lastDetected  = now;
-                    it->second->signalPresent = true;
-                }
-            }
-            debugBlockedSkips.store(blkSkip);
-            debugCapSkips.store(capSkip);
-
-            // Mark channels no longer detected; destroy once file is closed
-            for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
-                auto* slot = it->second;
-
-                // Immediately tear down blocked channels
-                if (isBlocked(slot->freqHz)) {
-                    flog::info("[ChannelBank] Destroying blocked slot {0}", it->first);
-                    destroySlot(*slot);
-                    delete slot;
-                    it = activeChannels.erase(it);
-                    continue;
+            if (manualMode) {
+                // manageManualChannels() acquires + releases channelsMtx internally.
+                manageManualChannels();
+            } else {
+                // Auto-scan: snapshot detected slots outside channelsMtx.
+                std::set<int>         current;
+                std::map<int, double> localPeakOffsets;
+                {
+                    std::lock_guard<std::mutex> lck(detectedMtx);
+                    current          = detectedSlots;
+                    localPeakOffsets = slotPeakOffsets;
                 }
 
-                bool detected = current.count(it->first) > 0;
-                if (!detected) {
-                    slot->signalPresent = false;
-                    float elapsed = std::chrono::duration<float>(
-                        now - slot->lastDetected).count();
-                    bool isPlaying = (currentlyPlayingFreqKey.load() == freqKey(slot->freqHz));
-                    bool isQueued  = false;
-                    {
-                        std::lock_guard<std::mutex> plk(playbackMtx);
-                        int64_t fk = freqKey(slot->freqHz);
-                        for (auto& entry : playbackQueue)
-                            if (freqKey(entry.freqHz) == fk) { isQueued = true; break; }
+                auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> clck(channelsMtx);
+
+                // Create or refresh channels for detected slots
+                debugDetectedCount.store((int)current.size());
+                int blkSkip = 0, capSkip = 0;
+                for (int idx : current) {
+                    auto it = activeChannels.find(idx);
+                    if (it == activeChannels.end()) {
+                        if ((int)activeChannels.size() >= maxChannels) { capSkip++; continue; }
+                        int    numSlots   = (int)std::floor(lastKnownSr / channelSpacing);
+                        double slotOffset = ((double)idx - (double)(numSlots - 1) / 2.0) * channelSpacing;
+                        auto   pit        = localPeakOffsets.find(idx);
+                        double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
+                        double slotFreq   = lastKnownCenter + slotOffset;
+                        if (isBlocked(slotFreq)) { blkSkip++; continue; }
+                        flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
+                        auto* slot = new ChannelSlot();
+                        slot->lastDetected  = now;
+                        slot->signalPresent = true;
+                        initSlot(*slot, idx, numSlots, peakOffHz);
+                        activeChannels[idx] = slot;
                     }
-                    if (elapsed > cooldownSec && !slot->fileOpen && !isPlaying && !isQueued) {
-                        flog::info("[ChannelBank] Destroying slot {0}", it->first);
+                    else {
+                        it->second->lastDetected  = now;
+                        it->second->signalPresent = true;
+                    }
+                }
+                debugBlockedSkips.store(blkSkip);
+                debugCapSkips.store(capSkip);
+
+                // Mark channels no longer detected; destroy once file is closed
+                for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
+                    auto* slot = it->second;
+                    if (isBlocked(slot->freqHz)) {
+                        flog::info("[ChannelBank] Destroying blocked slot {0}", it->first);
                         destroySlot(*slot);
                         delete slot;
                         it = activeChannels.erase(it);
                         continue;
                     }
+                    bool detected = current.count(it->first) > 0;
+                    if (!detected) {
+                        slot->signalPresent = false;
+                        float elapsed = std::chrono::duration<float>(
+                            now - slot->lastDetected).count();
+                        bool isPlaying = (currentlyPlayingFreqKey.load() == freqKey(slot->freqHz));
+                        bool isQueued  = false;
+                        {
+                            std::lock_guard<std::mutex> plk(playbackMtx);
+                            int64_t fk = freqKey(slot->freqHz);
+                            for (auto& entry : playbackQueue)
+                                if (freqKey(entry.freqHz) == fk) { isQueued = true; break; }
+                        }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                        bool hasPendingTranscript = (slot->transcribeHandle != nullptr);
+#else
+                        bool hasPendingTranscript = false;
+#endif
+                        if (elapsed > cooldownSec && !slot->fileOpen && !isPlaying
+                                && !isQueued && !hasPendingTranscript) {
+                            flog::info("[ChannelBank] Destroying slot {0}", it->first);
+                            destroySlot(*slot);
+                            delete slot;
+                            it = activeChannels.erase(it);
+                            continue;
+                        }
+                    }
+                    ++it;
                 }
-                ++it;
-            }
 
-            // Scan mode: advance to next stop once the band has been quiet long enough
-            if (scanMode && !scanStops.empty()) {
-                bool anyActive = false;
-                for (auto& [idx, slot] : activeChannels)
-                    if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
-                if (anyActive) {
-                    scanStopHadSignal = true;
-                    lastSignalTime = now;
-                } else {
-                    float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
-                    float timeout = scanStopHadSignal ? scanQuietSec : scanNoSignalSec;
-                    if (elapsed >= timeout) {
-                        scanStopIdx = (scanStopIdx + 1) % (int)scanStops.size();
-                        scanStopHadSignal = false;
-                        flog::info("[ChannelBank] Scan: advancing to stop {0} at {1:.3f}MHz",
-                                   scanStopIdx, scanStops[scanStopIdx] / 1e6);
-                        gui::waterfall.setCenterFrequency(scanStops[scanStopIdx]);
-                        gui::waterfall.centerFreqMoved = true;
+                // Scan mode: advance to next stop
+                if (scanMode && !scanStops.empty()) {
+                    bool anyActive = false;
+                    for (auto& [idx, slot] : activeChannels)
+                        if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
+                    if (anyActive) {
+                        scanStopHadSignal = true;
                         lastSignalTime = now;
+                    } else {
+                        float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
+                        float timeout = scanStopHadSignal ? scanQuietSec : scanNoSignalSec;
+                        if (elapsed >= timeout) {
+                            scanStopIdx = (scanStopIdx + 1) % (int)scanStops.size();
+                            scanStopHadSignal = false;
+                            flog::info("[ChannelBank] Scan: advancing to stop {0} at {1:.3f}MHz",
+                                       scanStopIdx, scanStops[scanStopIdx] / 1e6);
+                            gui::waterfall.setCenterFrequency(scanStops[scanStopIdx]);
+                            gui::waterfall.centerFreqMoved = true;
+                            lastSignalTime = now;
+                        }
                     }
                 }
-            }
+            } // end auto-scan branch
 
-            // Poll transcription sessions: update live text, collect finals.
-            // channelsMtx is already held by clck above — do NOT lock it again here.
-            // Finalized transcripts are collected into `finals` and written outside
-            // this scope so saveFreqLog() is never called while channelsMtx is held.
-            for (auto& [idx, slot] : activeChannels) {
+            // Poll transcription sessions — runs for BOTH manual and auto-scan.
+            // Acquire channelsMtx here (manageManualChannels already released it).
+            {
+                std::lock_guard<std::mutex> clck(channelsMtx);
+                for (auto& [idx, slot] : activeChannels) {
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                if (!slot->transcribeHandle) continue;
-                slot->liveTranscript = backend::iosTranscribeGetText(slot->transcribeHandle);
-                if (backend::iosTranscribeIsFinal(slot->transcribeHandle)) {
-                    finals.push_back({ slot->liveTranscript,
-                                       slot->pendingTranscriptPath,
-                                       slot->freqHz });
-                    backend::iosTranscribeDestroy(slot->transcribeHandle);
-                    slot->transcribeHandle = nullptr;
-                    slot->liveTranscript.clear();
-                }
+                    if (!slot->transcribeHandle) continue;
+                    slot->liveTranscript = backend::iosTranscribeGetText(slot->transcribeHandle);
+                    if (backend::iosTranscribeIsFinal(slot->transcribeHandle)) {
+                        finals.push_back({ slot->liveTranscript,
+                                           slot->pendingTranscriptPath,
+                                           slot->freqHz });
+                        backend::iosTranscribeDestroy(slot->transcribeHandle);
+                        slot->transcribeHandle = nullptr;
+                        slot->liveTranscript.clear();
+                    }
 #endif
-            }
-        } // channelsMtx released here
+                }
+            } // channelsMtx released here
 
         // Write .txt sidecars and persist freqLog OUTSIDE channelsMtx so
         // saveFreqLog() can safely acquire the config mutex without risking
@@ -1448,12 +1464,30 @@ private:
                     std::lock_guard<std::mutex> lk(currentlyPlayingFileMtx);
                     currentlyPlayingFilePath = path;
                 }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                // Update the Dynamic Island / Lock Screen subtitle to show the
+                // frequency that is currently playing. Format: "123.450 MHz".
+                {
+                    char freqBuf[48];
+                    double mhz = playFreq / 1e6;
+                    std::string bmName = bookmarkNameForFilename(playFreq);
+                    if (!bmName.empty())
+                        snprintf(freqBuf, sizeof(freqBuf), "%s  %.4f MHz", bmName.c_str(), mhz);
+                    else
+                        snprintf(freqBuf, sizeof(freqBuf), "%.4f MHz", mhz);
+                    backend::iosSetNowPlaying("SDR++ Channel Bank", freqBuf);
+                }
+#endif
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
                 {
                     std::lock_guard<std::mutex> lk(currentlyPlayingFileMtx);
                     currentlyPlayingFilePath.clear();
                 }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                // Playback finished — revert to generic "Monitoring" subtitle.
+                backend::iosSetNowPlaying("SDR++ Channel Bank", "Monitoring");
+#endif
                 if (deleteAfter) { std::remove(path.c_str()); }
             } else {
                 // Write silence to keep monitorStream continuously flowing.
@@ -2258,85 +2292,78 @@ private:
                 ImGui::PopStyleColor();
             }
 
-            // Now-playing description panel (above the active-channel list).
-            // Shows the description of the currently monitored frequency.
+            // Now-playing / last-played transcript panel.
+            //
+            // Transcription always arrives AFTER playback finishes (recognition
+            // takes 3-10 s; recordings are typically 1-5 s). The .txt-sidecar
+            // approach therefore never had the file in time. Instead we:
+            //   • Read description directly from freqLog (updated by the mgmt
+            //     thread when iosTranscribeIsFinal fires).
+            //   • Keep the last-played item visible after playback ends so the
+            //     transcript appears naturally when recognition catches up.
+            //   • Show "(pending…)" only while an active transcribeHandle exists
+            //     for that frequency — once null, description is the truth.
             {
                 int64_t playingKey = _this->currentlyPlayingFreqKey.load();
-                std::string playingName, playingDesc;
-                if (playingKey != 0) {
+
+                // Statics: persist the last played frequency across frames so
+                // the panel stays populated after playback ends.
+                static int64_t     s_lastKey  = 0;
+                static std::string s_lastName;
+
+                if (playingKey != 0) { s_lastKey = playingKey; }
+
+                // Look up name + description for the displayed key (last played).
+                std::string dispName, dispDesc;
+                if (s_lastKey != 0) {
                     std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                    auto it = _this->freqLog.find(playingKey);
+                    auto it = _this->freqLog.find(s_lastKey);
                     if (it != _this->freqLog.end()) {
-                        playingName = _this->displayName(it->second.freqHz);
-                        playingDesc = it->second.description;
-                    }
-                }
-                // Load (or re-check) transcript sidecar for the currently playing file.
-                // Re-checks every frame while the transcript is missing so it appears
-                // as soon as recognition finalizes, even mid-playback.
-                static std::string s_cachedPlayPath;
-                static std::string s_cachedPlayTranscript;
-                {
-                    std::string curPath;
-                    {
-                        std::lock_guard<std::mutex> lk(_this->currentlyPlayingFileMtx);
-                        curPath = _this->currentlyPlayingFilePath;
-                    }
-                    // Reload when path changes OR when transcript is still missing
-                    if (curPath != s_cachedPlayPath || (s_cachedPlayTranscript.empty() && !curPath.empty())) {
-                        s_cachedPlayPath = curPath;
-                        s_cachedPlayTranscript.clear();
-                        if (!curPath.empty() && curPath.size() > 4) {
-                            std::string txtPath = curPath.substr(0, curPath.size() - 4) + ".txt";
-                            if (FILE* f = fopen(txtPath.c_str(), "r")) {
-                                char buf[4096] = {};
-                                fread(buf, 1, sizeof(buf) - 1, f);
-                                fclose(f);
-                                s_cachedPlayTranscript = buf;
-                                while (!s_cachedPlayTranscript.empty() &&
-                                       s_cachedPlayTranscript.back() == '\n')
-                                    s_cachedPlayTranscript.pop_back();
-                            }
-                        }
+                        dispName = _this->displayName(it->second.freqHz);
+                        dispDesc = it->second.description;
+                        s_lastName = dispName;
+                    } else {
+                        dispName = s_lastName; // fallback if entry not yet in log
                     }
                 }
 
+                // Is there an active transcription handle for this key?
+                // (means a new transcript is in-flight and description is stale)
+                bool transcriptPending = false;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                {
+                    std::lock_guard<std::mutex> clck(_this->channelsMtx);
+                    for (auto& [idx, slot] : _this->activeChannels) {
+                        if (_this->freqKey(slot->freqHz) == s_lastKey && slot->transcribeHandle) {
+                            transcriptPending = true;
+                            break;
+                        }
+                    }
+                }
+#endif
+
                 ImGui::BeginChild(CONCAT("##_cb_nowplaying_", _this->name),
                                   ImVec2(menuWidth, 120), true);
-                if (playingKey != 0 && !playingName.empty()) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.35f, 1.0f), "Playing: %s", playingName.c_str());
-                    if (!s_cachedPlayTranscript.empty()) {
-                        ImGui::TextWrapped("%s", s_cachedPlayTranscript.c_str());
+                if (s_lastKey != 0 && !dispName.empty()) {
+                    if (playingKey != 0) {
+                        ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.35f, 1.0f),
+                                           "Playing: %s", dispName.c_str());
                     } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+                        ImGui::Text("Last: %s", dispName.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                    if (!dispDesc.empty()) {
+                        ImGui::TextWrapped("%s", dispDesc.c_str());
+                    } else if (transcriptPending) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
                         ImGui::TextWrapped("(transcript pending...)");
                         ImGui::PopStyleColor();
                     }
                 } else {
-                    // Show live partial transcript for any currently recording channel
-                    bool showedLive = false;
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                    {
-                        std::lock_guard<std::mutex> clck(_this->channelsMtx);
-                        for (auto& [idx, slot] : _this->activeChannels) {
-                            if (slot->transcribeHandle && !slot->liveTranscript.empty()) {
-                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.2f, 1.0f));
-                                ImGui::Text("Live: %s", _this->displayName(slot->freqHz).c_str());
-                                ImGui::PopStyleColor();
-                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
-                                ImGui::TextWrapped("%s", slot->liveTranscript.c_str());
-                                ImGui::PopStyleColor();
-                                showedLive = true;
-                                break; // show only first active transcript
-                            }
-                        }
-                    }
-#endif
-                    if (!showedLive) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-                        ImGui::Text("(nothing playing)");
-                        ImGui::PopStyleColor();
-                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                    ImGui::Text("(nothing playing)");
+                    ImGui::PopStyleColor();
                 }
                 ImGui::EndChild();
             }
