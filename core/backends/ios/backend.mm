@@ -85,13 +85,18 @@
         if (!ss || ss->_cancelled) return;
         @synchronized(ss) {
             if (result) {
-                ss->_latestText = [result.bestTranscription.formattedString copy] ?: @"";
+                // Only update text if the new string is non-empty — preserves the
+                // last good partial if a subsequent empty final result arrives after
+                // a "No speech detected" error (kAFAssistantErrorDomain 1110).
+                NSString* text = result.bestTranscription.formattedString;
+                if (text.length > 0) ss->_latestText = [text copy];
                 if (result.isFinal) ss->_isFinal = YES;
             }
             if (err && !ss->_isFinal) {
                 // Error with no final result — mark done so the session gets cleaned up.
-                // Retain whatever partial text accumulated so far.
-                NSLog(@"[CBTranscription] recognition error: %@", err);
+                // _latestText retains the best partial accumulated before the error.
+                NSLog(@"[CBTranscription] recognition error %ld: %@",
+                      (long)err.code, err.localizedDescription);
                 ss->_isFinal = YES;
             }
         }
