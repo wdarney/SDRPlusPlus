@@ -2310,7 +2310,7 @@ private:
                     {
                         std::lock_guard<std::mutex> clck(_this->channelsMtx);
                         for (auto& [idx, slot] : _this->activeChannels) {
-                            if (!slot->liveTranscript.empty()) {
+                            if (slot->fileOpen && !slot->liveTranscript.empty()) {
                                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.2f, 1.0f));
                                 ImGui::Text("Live: %s", _this->displayName(slot->freqHz).c_str());
                                 ImGui::PopStyleColor();
@@ -2368,7 +2368,7 @@ private:
                         needSaveFreqLog = true;
                     }
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-                    if (!slot->liveTranscript.empty()) {
+                    if (slot->fileOpen && !slot->liveTranscript.empty()) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.9f, 0.65f, 1.0f));
                         // Truncate to first 80 chars for the list view
                         std::string preview = slot->liveTranscript;
