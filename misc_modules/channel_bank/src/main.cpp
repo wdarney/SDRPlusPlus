@@ -453,8 +453,8 @@ public:
         slot.fileOpen             = true;
         slot.fileOpenTime         = std::chrono::steady_clock::now();
         slot.audioSamplesWritten  = 0;
-        slot.fileTrimSamples      = 9600; // skip first 200ms from WAV file
-        slot.recFadeRemaining     = 4800;   // 100ms fade-in at 48kHz — suppresses PTT click and filter ring
+        slot.fileTrimSamples      = 3840; // skip first 80ms — covers SSB AGC attack (~5 time-constants)
+        slot.recFadeRemaining     = 960;  // 20ms fade-in at 48kHz — enough to suppress PTT click
         return true;
     }
 
@@ -591,15 +591,15 @@ private:
             float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * 0.20f) - 1)];
             rawFloor = std::max(rawFloor, 1e-30f);
 
-            // Median-over-N-frames: rejects transient noise pulses (RFI) entirely
-            // unless they last for more than half the buffer. EMA smoothers
-            // partially track every pulse, raising the threshold momentarily and
-            // making detection vulnerable to brief whole-band noise events.
-            // ~30 frames is ~100ms at 2.4MHz SR (FFT_SIZE=8192, ~290 Hz frame
-            // rate); short enough to track real band-condition changes within
-            // half a second, long enough that 50/60/100/120 Hz mains-related
-            // RFI pulses are completely ignored.
-            constexpr size_t FLOOR_HISTORY_LEN = 30;
+            // 10th-percentile over ~1 s of history: immune to broadband impulsive
+            // noise (lightning, static) that elevates the whole band temporarily.
+            // The 10th percentile picks from the quietest ~10% of recent frames;
+            // even a 500 ms continuous noise burst only contaminates half the 300-
+            // frame buffer, so the estimate stays anchored to quiet conditions.
+            // NOTE: globalNoiseFloor is only used for the visual threshold line and
+            // the diagnostic display — detection uses per-slot localFloor (below),
+            // which is self-relative and robust to whole-band noise by construction.
+            constexpr size_t FLOOR_HISTORY_LEN = 300;
             floorHistory.push_back(rawFloor);
             if (floorHistory.size() > FLOOR_HISTORY_LEN) floorHistory.pop_front();
 
@@ -608,12 +608,17 @@ private:
                 displayNoiseFloor = rawFloor;
             } else {
                 std::vector<float> sorted(floorHistory.begin(), floorHistory.end());
-                std::nth_element(sorted.begin(),
-                                 sorted.begin() + sorted.size() / 2,
-                                 sorted.end());
-                globalNoiseFloor = sorted[sorted.size() / 2];
+                int pIdx = std::max(0, (int)(sorted.size() * 0.10f) - 1);
+                std::nth_element(sorted.begin(), sorted.begin() + pIdx, sorted.end());
+                globalNoiseFloor = std::max(sorted[pIdx], 1e-30f);
             }
-            displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
+            // Asymmetric EMA: snaps down fast when conditions improve, rises slowly
+            // so brief noise events don't push the display threshold upward.
+            if (globalNoiseFloor < displayNoiseFloor) {
+                displayNoiseFloor = 0.92f * displayNoiseFloor + 0.08f * globalNoiseFloor;
+            } else {
+                displayNoiseFloor = 0.997f * displayNoiseFloor + 0.003f * globalNoiseFloor;
+            }
         }
 
         // Per-slot local noise floor — sliding-window 20th percentile.
@@ -1244,11 +1249,11 @@ private:
         }
         if (!slot->fileOpen) { return; }
 
-        // Discard the first 200ms after file open — by that point the AGC has
-        // settled on the carrier so there's no spike written into the file.
+        // Discard the first 80ms after file open — covers ~5 SSB AGC attack time-
+        // constants (τ=21ms) so the level is settled before we write to the file.
         // Still count these samples toward audioSamplesWritten so the min-duration
         // check reflects the actual transmission length, not just the post-trim
-        // portion (without this, a 300ms threshold effectively requires 500ms).
+        // portion (without this, a 300ms threshold effectively requires 380ms).
         if (slot->fileTrimSamples > 0) {
             slot->fileTrimSamples = std::max(0, slot->fileTrimSamples - count);
             slot->audioSamplesWritten += count;
@@ -1258,7 +1263,7 @@ private:
         // Apply recording gain + fade-in, then mix stereo down to mono in-place.
         // AM output is identical on L and R so averaging is lossless; it also
         // halves the file size with no audible difference.
-        const int totalFade = 4800;
+        const int totalFade = 960;
         float* mono = (float*)data;  // safe: mono[i] written before data[i] is needed
         for (int i = 0; i < count; i++) {
             float gain = _this->recGain;
@@ -1436,24 +1441,39 @@ private:
         if (!_this->enabled || !_this->running) { return; }
 
         // Snapshot active-channel state under lock; minimise work inside the lock.
-        struct Mark { double freq; bool recording; };
+        int64_t playingKey = _this->currentlyPlayingFreqKey.load();
+        struct Mark { double freq; bool recording; bool playing; };
         std::vector<Mark> marks;
         int recCount = 0;
+        bool playingKeyAccountedFor = false;
         {
             std::lock_guard<std::mutex> clck(_this->channelsMtx);
             marks.reserve(_this->activeChannels.size());
             for (auto& [idx, slot] : _this->activeChannels) {
                 bool rec = slot->fileOpen;
                 if (rec) recCount++;
-                marks.push_back({ slot->freqHz, rec });
+                bool play = (playingKey != 0 && _this->freqKey(slot->freqHz) == playingKey);
+                if (play) playingKeyAccountedFor = true;
+                marks.push_back({ slot->freqHz, rec, play });
             }
         }
 
         ImDrawList* dl = args.window->DrawList;
         const float radius = 5.0f;
-        // Place markers ~12 px above the bottom of the FFT area so they don't
-        // clash with frequency-manager bookmark labels at the top.
+        // Place circle markers near the bottom of the FFT area.
         float y = args.max.y - 12.0f;
+        // Green playback diamond sits above the circle marker.
+        const float diamondR = 7.0f;
+        const float diamondYOffset = radius + diamondR + 4.0f;  // gap between circle top and diamond bottom
+
+        auto drawPlayDiamond = [&](float cx, float cy) {
+            ImVec2 top   (cx,           cy - diamondR);
+            ImVec2 right (cx + diamondR, cy);
+            ImVec2 bot   (cx,           cy + diamondR);
+            ImVec2 left  (cx - diamondR, cy);
+            dl->AddQuadFilled(top, right, bot, left, IM_COL32(40, 210, 80, 255));
+            dl->AddQuad(top, right, bot, left, IM_COL32(255, 255, 255, 255), 1.5f);
+        };
 
         for (auto& m : marks) {
             if (m.freq < args.lowFreq || m.freq > args.highFreq) continue;
@@ -1468,23 +1488,20 @@ private:
                 // Orange ring (no fill) — channel exists but isn't recording right now
                 dl->AddCircle(c, radius, IM_COL32(255, 165, 0, 255), 16, 2.0f);
             }
+
+            // Green diamond stacked above the circle when this channel is playing back
+            if (m.playing) {
+                drawPlayDiamond((float)x, y - diamondYOffset);
+            }
         }
 
-        // Blue diamond at the currently-playing frequency (audio source indicator).
-        // Drawn after the other markers so it sits on top if a recording slot
-        // happens to be at the same freq. Disappears the moment playback ends.
-        int64_t playingKey = _this->currentlyPlayingFreqKey.load();
-        if (playingKey != 0) {
+        // Standalone green diamond for playback at a freq with no active channel
+        // (e.g. channel was torn down before playback finished).
+        if (playingKey != 0 && !playingKeyAccountedFor) {
             double playFreq = (double)playingKey * 1000.0;
             if (playFreq >= args.lowFreq && playFreq <= args.highFreq) {
                 double x = args.min.x + (playFreq - args.lowFreq) * args.freqToPixelRatio;
-                const float r = 7.0f;
-                ImVec2 top   ((float)x, y - r);
-                ImVec2 right ((float)x + r, y);
-                ImVec2 bot   ((float)x, y + r);
-                ImVec2 left  ((float)x - r, y);
-                dl->AddQuadFilled(top, right, bot, left, IM_COL32(40, 140, 255, 255));
-                dl->AddQuad(top, right, bot, left, IM_COL32(255, 255, 255, 255), 1.5f);
+                drawPlayDiamond((float)x, y);
             }
         }
 
@@ -2131,7 +2148,7 @@ private:
                 ImGui::BeginChild(CONCAT("##_cb_nowplaying_", _this->name),
                                   ImVec2(menuWidth, 50), true);
                 if (playingKey != 0 && !playingName.empty()) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Playing: %s", playingName.c_str());
+                    ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.35f, 1.0f), "Playing: %s", playingName.c_str());
                     if (!playingDesc.empty()) {
                         ImGui::TextWrapped("%s", playingDesc.c_str());
                     } else {
@@ -2160,7 +2177,7 @@ private:
                     ImGui::SameLine();
                     bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
                     if (playing) {
-                        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "[PLAY]");
+                        ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.35f, 1.0f), "[PLAY]");
                     }
                     else if (slot->fileOpen) {
                         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[REC]");
