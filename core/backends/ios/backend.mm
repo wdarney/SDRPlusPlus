@@ -50,14 +50,16 @@
     NSString*                              _latestText;
     BOOL                                   _isFinal;
     BOOL                                   _cancelled;
+    float                                  _prevSample; // pre-emphasis filter state
 }
 
 - (instancetype)initWithSampleRate:(double)sr {
     self = [super init];
     if (!self) return nil;
-    _latestText = @"";
-    _isFinal    = NO;
-    _cancelled  = NO;
+    _latestText  = @"";
+    _isFinal     = NO;
+    _cancelled   = NO;
+    _prevSample  = 0.0f;
     _recognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"en-US"]];
     if (!_recognizer || !_recognizer.isAvailable) return nil;
 
@@ -95,7 +97,19 @@
                                                           frameCapacity:(AVAudioFrameCount)count];
     if (!buf) return;
     buf.frameLength = (AVAudioFrameCount)count;
-    memcpy(buf.floatChannelData[0], samples, (size_t)count * sizeof(float));
+
+    // Pre-emphasis: y[n] = x[n] - α·x[n-1]
+    // Compensates for the spectral tilt of narrow-band radio audio by boosting
+    // high-frequency consonant energy that the ASR model relies on most.
+    // α=0.97 is the standard value used in telephone/radio speech processing.
+    float* dst  = buf.floatChannelData[0];
+    float  prev = _prevSample;
+    for (int i = 0; i < count; i++) {
+        dst[i] = samples[i] - 0.97f * prev;
+        prev   = samples[i];
+    }
+    _prevSample = prev;
+
     [_request appendAudioPCMBuffer:buf];
 }
 
