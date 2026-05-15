@@ -62,7 +62,10 @@
     if (!_recognizer || !_recognizer.isAvailable) return nil;
 
     _request = [[SFSpeechAudioBufferRecognitionRequest alloc] init];
-    _request.requiresOnDeviceRecognition = YES;
+    // Cloud recognition is significantly more accurate for continuous speech —
+    // on-device model is tuned for short Siri commands, not radio dictation.
+    // Falls back to on-device automatically if no network is available.
+    _request.requiresOnDeviceRecognition = NO;
     _request.shouldReportPartialResults  = YES;
     if (@available(iOS 16, *)) { _request.addsPunctuation = YES; }
 
