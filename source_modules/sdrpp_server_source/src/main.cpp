@@ -10,6 +10,8 @@
 #include <gui/widgets/stepped_slider.h>
 #include <utils/optionlist.h>
 #include <gui/dialogs/dialog_box.h>
+#include <vector>
+#include <string>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -51,6 +53,14 @@ public:
         std::string hostStr = config.conf["hostname"];
         strcpy(hostname, hostStr.c_str());
         port = config.conf["port"];
+        if (config.conf.contains("history")) {
+            for (auto& entry : config.conf["history"]) {
+                ServerEntry e;
+                e.host = entry["host"].get<std::string>();
+                e.port = entry["port"].get<int>();
+                serverHistory.push_back(e);
+            }
+        }
         config.release();
 
         sigpath::sourceManager.registerSource("SDR++ Server", &handler);
@@ -76,6 +86,33 @@ public:
     }
 
 private:
+    struct ServerEntry {
+        std::string host;
+        int port;
+    };
+
+    void addToHistory(const char* host, int port) {
+        // Remove duplicate if present
+        for (auto it = serverHistory.begin(); it != serverHistory.end(); ++it) {
+            if (it->host == host && it->port == port) {
+                serverHistory.erase(it);
+                break;
+            }
+        }
+        serverHistory.insert(serverHistory.begin(), {host, port});
+        if (serverHistory.size() > 20) { serverHistory.resize(20); }
+
+        config.acquire();
+        config.conf["history"] = json::array();
+        for (auto& e : serverHistory) {
+            json entry;
+            entry["host"] = e.host;
+            entry["port"] = e.port;
+            config.conf["history"].push_back(entry);
+        }
+        config.release(true);
+    }
+
     std::string getBandwdithScaled(double bw) {
         char buf[1024];
         if (bw >= 1000000.0) {
@@ -154,10 +191,18 @@ private:
         });
 
         if (connected) { style::beginDisabled(); }
+        float histBtnWidth = ImGui::CalcTextSize("v").x + ImGui::GetStyle().FramePadding.x * 2.0f + 4.0f;
+        float portWidth = 80.0f;
+        float hostWidth = menuWidth - histBtnWidth - portWidth - ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        ImGui::SetNextItemWidth(hostWidth);
         if (ImGui::InputText(CONCAT("##sdrpp_srv_srv_host_", _this->name), _this->hostname, 1023)) {
             config.acquire();
             config.conf["hostname"] = _this->hostname;
             config.release(true);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(CONCAT("v##sdrpp_srv_hist_btn_", _this->name), ImVec2(histBtnWidth, 0))) {
+            ImGui::OpenPopup(CONCAT("##sdrpp_srv_hist_popup_", _this->name));
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
@@ -167,6 +212,28 @@ private:
             config.release(true);
         }
         if (connected) { style::endDisabled(); }
+
+        if (ImGui::BeginPopup(CONCAT("##sdrpp_srv_hist_popup_", _this->name))) {
+            if (_this->serverHistory.empty()) {
+                ImGui::TextUnformatted("No history yet");
+            }
+            else {
+                for (auto& e : _this->serverHistory) {
+                    char label[2048];
+                    snprintf(label, sizeof(label), "%s:%d", e.host.c_str(), e.port);
+                    if (ImGui::Selectable(label)) {
+                        strncpy(_this->hostname, e.host.c_str(), 1023);
+                        _this->hostname[1023] = '\0';
+                        _this->port = e.port;
+                        config.acquire();
+                        config.conf["hostname"] = _this->hostname;
+                        config.conf["port"] = _this->port;
+                        config.release(true);
+                    }
+                }
+            }
+            ImGui::EndPopup();
+        }
 
         if (_this->running) { style::beginDisabled(); }
         if (!connected && ImGui::Button("Connect##sdrpp_srv_source", ImVec2(menuWidth, 0))) {
@@ -235,6 +302,7 @@ private:
         try {
             if (client) { client.reset(); }
             client = server::connect(hostname, port, &stream);
+            addToHistory(hostname, port);
             deviceInit();
         }
         catch (const std::exception& e) {
@@ -277,6 +345,7 @@ private:
     char hostname[1024];
     int port = 50000;
     std::string devConfName = "";
+    std::vector<ServerEntry> serverHistory;
 
     dsp::stream<dsp::complex_t> stream;
     SourceManager::SourceHandler handler;
