@@ -96,7 +96,7 @@ struct ChannelSlot {
     bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
 
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
-    int fadeOutRemaining = 9600; // counts down from 200ms-worth of samples; reset to max while signal present
+    int fadeOutRemaining = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
 
 #ifdef __APPLE__
     void*       transcribeHandle       = nullptr;
@@ -504,7 +504,7 @@ public:
         slot.recFadeRemaining     = 4800;   // 100ms fade-in at 48kHz — suppresses PTT click and filter ring
         slot.snrSum               = 0.0f;
         slot.snrCount             = 0;
-        slot.fadeOutRemaining     = 9600; // 200ms at 48kHz — signal is present at file open
+        slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
         return true;
     }
 
@@ -703,7 +703,7 @@ private:
             {
                 std::lock_guard<std::mutex> lk(manualDetectedMtx);
                 manualDetected    = newDetected;
-                rawManualDetected = std::move(newRawDetected);
+                rawManualDetected = newRawDetected;   // copy — keep newRawDetected usable below
                 manualSnrDb       = std::move(newManualSnr);
             }
             {
@@ -728,6 +728,14 @@ private:
                 std::sort(sorted.begin(), sorted.end());
                 displaySnap.dBmin = sorted[(int)(FFT_SIZE * 0.05f)] - 5.0f;
                 displaySnap.dBmax = sorted[(int)(FFT_SIZE * 0.95f)] + 15.0f;
+            }
+            // Immediately propagate raw detection to active slots — same FFT frame,
+            // no management-thread hop. newRawDetected is indexed by manual-freq list index,
+            // which matches the activeChannels key in manual/bookmark-scan mode.
+            {
+                std::lock_guard<std::mutex> clck(channelsMtx);
+                for (auto& [idx, slot] : activeChannels)
+                    slot->rawSignalPresent.store(newRawDetected.count(idx) > 0);
             }
             mgmtCv.notify_one();
             return;
@@ -797,6 +805,14 @@ private:
                 if (leftBlocked || rightBlocked) { continue; }
                 detected.insert(s);
             }
+
+            // Immediately propagate raw (un-voted) detection to active slots.
+            // We're already holding channelsMtx and have slotMeans in hand, so
+            // rawSignalPresent updates in the SAME FFT frame that detects the drop —
+            // zero management-thread hop, zero extra latency beyond the FFT period.
+            for (auto& [idx, slot] : activeChannels)
+                slot->rawSignalPresent.store(
+                    idx < numSlots && slotMeans[idx] > globalNoiseFloor * snrLinear);
         }
 
         {
@@ -1323,11 +1339,11 @@ private:
         // is atomic and fadeOutRemaining is DSP-thread-only.
         float tailFade = 1.0f;
         if (slot->rawSignalPresent.load()) {
-            slot->fadeOutRemaining = 9600;   // hold at max while signal is present
+            slot->fadeOutRemaining = 2400;   // hold at max while signal is present
         } else {
             if (slot->fadeOutRemaining > 0) {
                 // progress: 1.0 (just started fading) → 0.0 (fully faded)
-                float progress = (float)slot->fadeOutRemaining / 9600.0f;
+                float progress = (float)slot->fadeOutRemaining / 2400.0f;
                 tailFade = 0.5f * (1.0f + cosf(M_PI * (1.0f - progress)));  // 1.0 → 0.0
                 slot->fadeOutRemaining = std::max(0, slot->fadeOutRemaining - count);
             } else {
