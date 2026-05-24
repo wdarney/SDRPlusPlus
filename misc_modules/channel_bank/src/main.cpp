@@ -91,8 +91,12 @@ struct ChannelSlot {
 
     // Lifecycle tracking
     std::chrono::steady_clock::time_point      lastDetected;  // last time FFT saw signal here
-    std::atomic<bool>                          signalPresent  { false };
-    bool                                       prevSignalPresent = false; // rising-edge detect for watch alert
+    std::atomic<bool>                          signalPresent    { false };
+    std::atomic<bool>                          rawSignalPresent { false }; // above SNR threshold RIGHT NOW (no vote smoothing, no hold)
+    bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
+
+    // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
+    int fadeOutRemaining = 9600; // counts down from 200ms-worth of samples; reset to max while signal present
 
 #ifdef __APPLE__
     void*       transcribeHandle       = nullptr;
@@ -500,6 +504,7 @@ public:
         slot.recFadeRemaining     = 4800;   // 100ms fade-in at 48kHz — suppresses PTT click and filter ring
         slot.snrSum               = 0.0f;
         slot.snrCount             = 0;
+        slot.fadeOutRemaining     = 9600; // 200ms at 48kHz — signal is present at file open
         return true;
     }
 
@@ -674,6 +679,7 @@ private:
         if (manualMode) {
             std::vector<double> localFreqs = getActiveManualFreqs();
             std::set<int>       newDetected;
+            std::set<int>       newRawDetected;
             std::map<int,float> newManualSnr;
             for (int i = 0; i < (int)localFreqs.size(); i++) {
                 double freqOffset = localFreqs[i] - lastKnownCenter;
@@ -686,6 +692,7 @@ private:
                 for (int b = lo; b <= hi; b++) sum += power[b];
                 float mean = sum / (float)(hi - lo + 1);
                 bool above = (mean > globalNoiseFloor * snrLinear);
+                if (above) newRawDetected.insert(i);  // raw, un-voted
                 // Store per-freq SNR for M4A metadata
                 if (globalNoiseFloor > 0.0f)
                     newManualSnr[i] = 10.0f * log10f(mean / globalNoiseFloor);
@@ -695,8 +702,9 @@ private:
             }
             {
                 std::lock_guard<std::mutex> lk(manualDetectedMtx);
-                manualDetected = newDetected;
-                manualSnrDb    = std::move(newManualSnr);
+                manualDetected    = newDetected;
+                rawManualDetected = std::move(newRawDetected);
+                manualSnrDb       = std::move(newManualSnr);
             }
             {
                 std::lock_guard<std::mutex> dlck(displayMtx);
@@ -801,6 +809,13 @@ private:
                 slotSnrDb[s] = (globalNoiseFloor > 0.0f)
                     ? 10.0f * log10f(slotMeans[s] / globalNoiseFloor)
                     : 0.0f;
+            // Raw (un-voted) detection — used by the audio handler for instant fade-out.
+            // Does not go through the vote accumulator so it goes false immediately when
+            // signal drops below the SNR threshold, rather than decaying over ~400ms.
+            rawDetectedSlots.clear();
+            for (int s = 0; s < numSlots; s++)
+                if (slotMeans[s] > globalNoiseFloor * snrLinear)
+                    rawDetectedSlots.insert(s);
         }
 
         // Update display snapshot (UI reads under displayMtx)
@@ -921,11 +936,13 @@ private:
             if (manualMode) { manageManualChannels(); continue; }
 
             std::set<int>         current;
+            std::set<int>         localRawDetected;
             std::map<int, double> localPeakOffsets;
             std::vector<float>    localSnrDb;
             {
                 std::lock_guard<std::mutex> lck(detectedMtx);
                 current          = detectedSlots;
+                localRawDetected = rawDetectedSlots;
                 localPeakOffsets = slotPeakOffsets;
                 localSnrDb       = slotSnrDb;
             }
@@ -948,14 +965,16 @@ private:
                     if (isBlocked(slotFreq)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
-                    slot->lastDetected  = now;
-                    slot->signalPresent = true;
+                    slot->lastDetected      = now;
+                    slot->signalPresent     = true;
+                    slot->rawSignalPresent  = true;
                     initSlot(*slot, idx, numSlots, peakOffHz);
                     activeChannels[idx] = slot;
                 }
                 else {
                     it->second->lastDetected  = now;
                     it->second->signalPresent = true;
+                    it->second->rawSignalPresent.store(localRawDetected.count(idx) > 0);
                     // Accumulate SNR while the slot is actively recording
                     if (it->second->fileOpen && idx < (int)localSnrDb.size()) {
                         it->second->snrSum   += localSnrDb[idx];
@@ -985,6 +1004,7 @@ private:
                     float holdElapsed = std::chrono::duration<float>(now - slot->lastDetected).count();
                     slot->signalPresent = detected || (holdElapsed * 1000.0f < (float)signalHoldMs);
                 }
+                slot->rawSignalPresent.store(localRawDetected.count(it->first) > 0);
                 if (!detected) {
                     float elapsed = std::chrono::duration<float>(
                         now - slot->lastDetected).count();
@@ -1289,28 +1309,29 @@ private:
         // halves the file size with no audible difference.
         const int totalFade = 4800;
 
-        // Fade-out: raised-cosine from 1→0 starting the moment the FFT stops seeing
-        // the signal, spanning the full Signal Hold + TX Tail window.
+        // Fade-out: raised-cosine from 1→0 driven by rawSignalPresent.
         //
-        // The old approach keyed off inSilence (set only after Signal Hold expires),
-        // meaning the AGC noise ramp during the hold period was written at full gain.
-        // Instead we key off lastDetected (the real last-seen timestamp), so the fade
-        // begins immediately when the signal drops and finishes exactly when the file
-        // closes — regardless of how hold and tail are set.
+        // rawSignalPresent bypasses the vote-smoothing accumulator so it goes false
+        // the instant the FFT bin drops below the SNR threshold — no ~400ms vote-decay
+        // delay, no 250ms poll-latency grace period needed.
         //
-        // lastDetected is written by the management thread every ~250ms; we subtract
-        // 250ms as a grace period so we don't fade while the signal is actively present
-        // (the management thread may be up to one poll interval behind).
+        // fadeOutRemaining counts down 200ms worth of samples (9600 @ 48kHz) after
+        // rawSignalPresent goes false.  While the signal is present the counter is
+        // held at its maximum so the fade always starts from 1.0.
+        //
+        // This runs entirely on the DSP thread (no mutex needed) — rawSignalPresent
+        // is atomic and fadeOutRemaining is DSP-thread-only.
         float tailFade = 1.0f;
-        {
-            auto now = std::chrono::steady_clock::now();
-            float elapsedMs = std::chrono::duration<float, std::milli>(
-                now - slot->lastDetected).count();
-            elapsedMs = std::max(0.0f, elapsedMs - 250.0f); // grace for poll latency
-            float totalMs = (float)(_this->signalHoldMs + _this->tailMs);
-            if (totalMs > 0.0f && elapsedMs > 0.0f) {
-                float frac = std::clamp(elapsedMs / totalMs, 0.0f, 1.0f);
-                tailFade = 0.5f * (1.0f + cosf(M_PI * frac));  // 1.0 → 0.0
+        if (slot->rawSignalPresent.load()) {
+            slot->fadeOutRemaining = 9600;   // hold at max while signal is present
+        } else {
+            if (slot->fadeOutRemaining > 0) {
+                // progress: 1.0 (just started fading) → 0.0 (fully faded)
+                float progress = (float)slot->fadeOutRemaining / 9600.0f;
+                tailFade = 0.5f * (1.0f + cosf(M_PI * (1.0f - progress)));  // 1.0 → 0.0
+                slot->fadeOutRemaining = std::max(0, slot->fadeOutRemaining - count);
+            } else {
+                tailFade = 0.0f;  // fully faded — write silence until file closes
             }
         }
 
@@ -2701,11 +2722,13 @@ private:
         auto& stop = bookmarkScanStops[bookmarkScanStopIdx];
 
         std::set<int>       localDetected;
+        std::set<int>       localRawDetected;
         std::map<int,float> localSnrDb;
         {
             std::lock_guard<std::mutex> lk(manualDetectedMtx);
-            localDetected = manualDetected;
-            localSnrDb    = manualSnrDb;
+            localDetected    = manualDetected;
+            localRawDetected = rawManualDetected;
+            localSnrDb       = manualSnrDb;
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -2737,6 +2760,7 @@ private:
                 float holdElapsed = std::chrono::duration<float>(now - it->second->lastDetected).count();
                 it->second->signalPresent = present || (holdElapsed * 1000.0f < (float)signalHoldMs);
             }
+            it->second->rawSignalPresent.store(localRawDetected.count(idx) > 0);
             // Accumulate SNR while signal present and recording
             if (present && it->second->fileOpen) {
                 auto sit = localSnrDb.find(idx);
@@ -2755,8 +2779,9 @@ private:
             double offset = stop.freqsHz[i] - lastKnownCenter;
             flog::info("[ChannelBank] BkScan: spawning slot {0} at {1:.3f}MHz", i, stop.freqsHz[i] / 1e6);
             auto* slot = new ChannelSlot();
-            slot->lastDetected  = now;
-            slot->signalPresent = localDetected.count(i) > 0;
+            slot->lastDetected     = now;
+            slot->signalPresent    = localDetected.count(i) > 0;
+            slot->rawSignalPresent = localRawDetected.count(i) > 0;
             initSlot(*slot, i, 1, 0.0, offset);
             activeChannels[i] = slot;
         }
@@ -2892,11 +2917,13 @@ private:
 
     void manageManualChannels() {
         std::set<int>       localDetected;
+        std::set<int>       localRawDetected;
         std::map<int,float> localSnrDb;
         {
             std::lock_guard<std::mutex> lk(manualDetectedMtx);
-            localDetected = manualDetected;
-            localSnrDb    = manualSnrDb;
+            localDetected    = manualDetected;
+            localRawDetected = rawManualDetected;
+            localSnrDb       = manualSnrDb;
         }
         std::vector<double> localFreqs = getActiveManualFreqs();
 
@@ -2930,6 +2957,7 @@ private:
                 float holdElapsed = std::chrono::duration<float>(now - it->second->lastDetected).count();
                 it->second->signalPresent = present || (holdElapsed * 1000.0f < (float)signalHoldMs);
             }
+            it->second->rawSignalPresent.store(localRawDetected.count(idx) > 0);
             // Accumulate SNR while signal present and recording
             if (present && it->second->fileOpen) {
                 auto sit = localSnrDb.find(idx);
@@ -2956,8 +2984,9 @@ private:
             double offset = localFreqs[i] - lastKnownCenter;
             flog::info("[ChannelBank] Manual: spawning slot {0} at {1:.3f}MHz", i, localFreqs[i] / 1e6);
             auto* slot = new ChannelSlot();
-            slot->lastDetected  = now;
-            slot->signalPresent = localDetected.count(i) > 0;
+            slot->lastDetected     = now;
+            slot->signalPresent    = localDetected.count(i) > 0;
+            slot->rawSignalPresent = localRawDetected.count(i) > 0;
             initSlot(*slot, i, 1, 0.0, offset);
             activeChannels[i] = slot;
         }
@@ -3026,8 +3055,9 @@ private:
     std::chrono::steady_clock::time_point lastFmConfigRefresh{};
     char manualFreqInputBuf[64] = {};
     std::map<int, int> manualVotes;       // list-index → vote count (DSP thread only)
-    std::set<int>       manualDetected;   // written by DSP, read by mgmt thread
-    std::map<int,float> manualSnrDb;      // per-freq SNR dB; manual/bookmark scan mode
+    std::set<int>       manualDetected;      // written by DSP, read by mgmt thread
+    std::set<int>       rawManualDetected;   // un-voted; instant fade-out (under manualDetectedMtx)
+    std::map<int,float> manualSnrDb;         // per-freq SNR dB; manual/bookmark scan mode
     std::mutex          manualDetectedMtx;
     std::set<int64_t> watchedFreqs;       // watched freq keys; protected by manualFreqMtx
     std::atomic<int64_t> watchAlert{0};   // non-zero = freqKey of watched freq that just fired
@@ -3076,6 +3106,7 @@ private:
     std::set<int>           detectedSlots;
     std::map<int, double>   slotPeakOffsets;  // Hz from SDR center of peak energy bin per slot
     std::vector<float>      slotSnrDb;        // per-slot SNR dB (signal / noise floor); auto mode
+    std::set<int>           rawDetectedSlots; // un-voted; instant fade-out (under detectedMtx)
 
     // Active demod/record channels (managed by mgmt thread)
     std::mutex                      channelsMtx;
