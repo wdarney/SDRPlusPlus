@@ -1,12 +1,14 @@
 #ifdef _WIN32
-#define NOMINMAX          // prevent windows.h from defining min/max macros
-#define _USE_MATH_DEFINES // enable M_PI in <cmath> on MSVC
+#define NOMINMAX
+#define _USE_MATH_DEFINES
 #endif
 #include <imgui.h>
 #include <module.h>
+#include <frequency_manager_interface.h>
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
+#include <dsp/channel/frequency_xlator.h>
 #include <dsp/multirate/power_decimator.h>
 #include <dsp/demod/am.h>
 #include <dsp/demod/fm.h>
@@ -22,6 +24,7 @@
 #include <core.h>
 #include <utils/wav.h>
 #include <fftw3.h>
+#include <rnnoise.h>
 #include <chrono>
 #include <ctime>
 #include <cmath>
@@ -61,7 +64,7 @@ struct ChannelSlot {
 
     // DSP chain
     dsp::stream<dsp::complex_t>*               iqIn           = nullptr;
-    dsp::channel::FrequencyXlator*             preXlator      = nullptr;
+    dsp::channel::FrequencyXlator*                  preXlator    = nullptr;
     dsp::multirate::PowerDecimator<dsp::complex_t>* preDecimator = nullptr;
     dsp::channel::RxVFO*                       vfo            = nullptr;
     dsp::demod::AM<dsp::stereo_t>*             amDemod        = nullptr;
@@ -91,6 +94,11 @@ struct ChannelSlot {
     // Lifecycle tracking
     std::chrono::steady_clock::time_point      lastDetected;  // last time FFT saw signal here
     std::atomic<bool>                          signalPresent  { false };
+
+    // RNNoise state (per-slot noise reduction)
+    DenoiseState*  nrState    = nullptr;
+    float          nrInBuf[480] = {};     // RNNoise processes 480 samples (10ms at 48kHz)
+    int            nrInPos    = 0;
 };
 
 class ChannelBankModule : public ModuleManager::Instance {
@@ -127,6 +135,12 @@ public:
             tailMs = config.conf[name]["tailMs"];
         if (config.conf[name].contains("maxChannels"))
             maxChannels = config.conf[name]["maxChannels"];
+        if (config.conf[name].contains("bwUsage"))
+            bwUsage = config.conf[name]["bwUsage"];
+        if (config.conf[name].contains("noiseReduction"))
+            noiseReduction = config.conf[name]["noiseReduction"];
+        if (config.conf[name].contains("nrMix"))
+            nrMix = config.conf[name]["nrMix"];
         if (config.conf[name].contains("recPath"))
             folderSelect.setPath(config.conf[name]["recPath"]);
         if (config.conf[name].contains("freqLog")) {
@@ -134,9 +148,10 @@ public:
                 double hz  = j.value("freq", 0.0);
                 FreqEntry e;
                 e.freqHz  = hz;
-                e.count    = j.value("count", 0);
-                e.blocked  = j.value("blocked", false);
-                e.lastSeen = j.value("lastSeen", (int64_t)0);
+                e.count       = j.value("count", 0);
+                e.blocked     = j.value("blocked", false);
+                e.lastSeen    = j.value("lastSeen", (int64_t)0);
+                e.description = j.value("description", std::string());
                 freqLog[freqKey(hz)] = e;
             }
         }
@@ -145,6 +160,17 @@ public:
         if (config.conf[name].contains("manualFrequencies"))
             for (auto& j : config.conf[name]["manualFrequencies"])
                 manualFrequencies.push_back(j.get<double>());
+        if (config.conf[name].contains("boundBookmarkLists")) {
+            for (auto& j : config.conf[name]["boundBookmarkLists"])
+                boundBookmarkLists.insert(j.get<std::string>());
+        }
+        else if (config.conf[name].contains("boundBookmarkList")) {
+            // Migrate legacy single-list config
+            std::string s = config.conf[name]["boundBookmarkList"].get<std::string>();
+            if (!s.empty()) boundBookmarkLists.insert(s);
+        }
+        if (config.conf[name].contains("recordingEnabled"))
+            recordingEnabled = config.conf[name]["recordingEnabled"];
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -157,6 +183,12 @@ public:
         config.release();
 
         channelSpacing = SPACINGS[std::clamp(spacingId, 0, 5)];
+
+        // Load FM bookmarks so displayName() can show names
+        loadFMConfig();
+
+        // Populate cached freqs from all bound lists
+        rebuildBoundFreqs();
 
         // Allocate FFTW buffers
         fftIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
@@ -181,15 +213,23 @@ public:
     ~ChannelBankModule() {
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
+        gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
+        restoreWaterfallVisibility();  // always restore on unload, safe no-op if not saved
         if (running) { stop(); }
         fftwf_destroy_plan(fftPlan);
         fftwf_free(fftIn);
         fftwf_free(fftOut);
     }
 
-    void postInit() {}
+    void postInit() {
+        // Hook the main waterfall's FFT-redraw event so we can draw markers
+        // at each currently-active channel's frequency.
+        fftRedrawHandler.handler = fftRedrawHandlerFunc;
+        fftRedrawHandler.ctx     = this;
+        gui::waterfall.onFFTRedraw.bindHandler(&fftRedrawHandler);
+    }
     void enable()  { enabled = true; }
-    void disable() { enabled = false; }
+    void disable() { enabled = false; restoreWaterfallVisibility(); }
     bool isEnabled() { return enabled; }
 
     void start() {
@@ -199,6 +239,8 @@ public:
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
         fftBufPos = 0;
+        avgPower.clear();           // reset spectrum averaging on start
+        globalNoiseFloor = 0.0f;
 
         if (scanMode) {
             computeScanStops();
@@ -240,6 +282,9 @@ public:
         std::lock_guard<std::mutex> lck(runMtx);
         if (!running) { return; }
         running = false;
+
+        // Restore FM waterfall visibility before tearing down
+        if (manualMode) restoreWaterfallVisibility();
 
         // Stop playback thread — stopWriter() unblocks any pending swap() call
         playbackRunning = false;
@@ -384,6 +429,16 @@ private:
         return std::regex_replace(input, std::regex("//"), "/");
     }
 
+    static unsigned int computePreDecimRatio(double sr) {
+        constexpr double MIN_INTERMEDIATE_SR = 4.0 * 48000.0;
+        unsigned int maxRatio = dsp::multirate::PowerDecimator<dsp::complex_t>::getMaxRatio();
+        unsigned int ratio = 1;
+        while (ratio * 2 <= maxRatio && (sr / (ratio * 2)) >= MIN_INTERMEDIATE_SR) {
+            ratio *= 2;
+        }
+        return ratio;
+    }
+
     // ── Spectrum analysis ────────────────────────────────────────────────────
 
     static void spectrumHandler(dsp::complex_t* data, int count, void* ctx) {
@@ -399,6 +454,25 @@ private:
     }
 
     void analyzeSpectrum() {
+        // Refresh center frequency every frame — free (single double load) and ensures
+        // PPM changes or other mid-session corrections are picked up without a full retune.
+        lastKnownCenter = gui::waterfall.getCenterFrequency();
+
+        // Check for deferred retune — safely reset DSP-owned state on the DSP thread
+        if (retuneFlag.load()) {
+            lastKnownSr     = pendingRetuneSr;
+            lastKnownCenter = pendingRetuneCenter;
+            fftBufPos        = 0;
+            avgPower.clear();
+            globalNoiseFloor  = 0.0f;
+            displayNoiseFloor = 0.0f;
+            floorHistory.clear();
+            slotVotes.clear();
+            manualVotes.clear();
+            retuneFlag.store(false);
+            return;  // skip this frame — buffers are stale from old tuning
+        }
+
         // Apply Hann window and copy to FFTW input
         for (int i = 0; i < FFT_SIZE; i++) {
             float w = hannWindow[i];
@@ -410,23 +484,38 @@ private:
 
         // Compute linear power per bin (FFT-shifted, normalised)
         float scale = 1.0f / (float)(FFT_SIZE * FFT_SIZE);
-        std::vector<float> power(FFT_SIZE);
+
+        // Exponential moving average across FFT frames.
+        // alpha ~0.15 gives an effective averaging window of ~7 frames (~24ms at
+        // 2.4MHz SR), which reduces noise variance by ~7x while still reacting
+        // quickly to real signals.
+        constexpr float alpha = 0.15f;
+        bool firstFrame = avgPower.empty();
+        if (firstFrame) avgPower.resize(FFT_SIZE);
         for (int i = 0; i < FFT_SIZE; i++) {
             int k = (i + FFT_SIZE / 2) % FFT_SIZE;
             float re = fftOut[k][0], im = fftOut[k][1];
-            power[i] = (re * re + im * im) * scale;
+            float inst = (re * re + im * im) * scale;
+            avgPower[i] = firstFrame ? inst : (alpha * inst + (1.0f - alpha) * avgPower[i]);
         }
+        // Use the averaged spectrum for all detection
+        std::vector<float>& power = avgPower;
 
         double binHz  = lastKnownSr / FFT_SIZE;
-        // numSlots covers the FULL bandwidth — maxChannels only limits how many
-        // DSP chains get spawned, not how much spectrum we scan.
+        // numSlots covers the FULL bandwidth so we can detect signals anywhere.
+        // bwUsage only controls which slots contribute to the noise floor estimate
+        // (avoids filter rolloff edges inflating it).
         int numSlots  = (int)std::floor(lastKnownSr / channelSpacing);
-        int halfBins  = std::max(1, (int)std::round((channelSpacing * 0.4) / binHz));
+        // Detection window: fixed ~8 kHz bandwidth (matching AM signal width)
+        // regardless of channel spacing, so wider spacings don't dilute the SNR.
+        // Capped to not exceed the slot width.
+        constexpr double DETECT_BW_HZ = 8000.0;
+        int halfBins  = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
 
         // snrLinear computed once per frame
         float snrLinear = powf(10.0f, snrThreshold / 10.0f);
 
-        // Compute per-slot means
+        // Compute per-slot means (using detection window, not full slot width)
         std::vector<float> slotMeans(numSlots);
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
@@ -452,38 +541,57 @@ private:
             newPeakOffsets[s] = ((centroidBin - FFT_SIZE / 2) / FFT_SIZE) * lastKnownSr;
         }
 
-        // Global noise floor — 20th percentile of all slot means.
-        // This is immune to bad initialisation: even if signals are on-air when
-        // the module starts, the quietest 20% of channels are virtually always
-        // noise-only, giving a reliable floor without any warm-up time.
-        // A slow EMA smooths frame-to-frame jitter (fast down, very slow up).
+        // Global noise floor — 20th percentile of CENTER slot means (bwUsage
+        // fraction).  Edge slots are excluded so filter rolloff doesn't inflate
+        // the floor estimate, but those slots can still detect signals.
+        // The spectrum EMA already smooths bin-level noise, so the rawFloor from
+        // the 20th percentile is stable.  We use a simple symmetric EMA here
+        // (fast enough to track real noise changes, slow enough to ignore brief
+        // signal bursts that leak into the 20th percentile).
         {
-            std::vector<float> sorted = slotMeans;
-            std::sort(sorted.begin(), sorted.end());
-            float rawFloor = sorted[std::max(0, (int)(numSlots * 0.20f) - 1)];
+            int edgeSkip = (int)std::round(numSlots * (1.0f - bwUsage) / 2.0f);
+            std::vector<float> centerMeans;
+            for (int s = edgeSkip; s < numSlots - edgeSkip; s++)
+                centerMeans.push_back(slotMeans[s]);
+            if (centerMeans.empty()) centerMeans = {slotMeans[numSlots / 2]};
+            std::sort(centerMeans.begin(), centerMeans.end());
+            float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * 0.20f) - 1)];
             rawFloor = std::max(rawFloor, 1e-30f);
+
+            // Median-over-N-frames: rejects transient noise pulses (RFI) entirely
+            // unless they last for more than half the buffer. EMA smoothers
+            // partially track every pulse, raising the threshold momentarily and
+            // making detection vulnerable to brief whole-band noise events.
+            // ~30 frames is ~100ms at 2.4MHz SR (FFT_SIZE=8192, ~290 Hz frame
+            // rate); short enough to track real band-condition changes within
+            // half a second, long enough that 50/60/100/120 Hz mains-related
+            // RFI pulses are completely ignored.
+            constexpr size_t FLOOR_HISTORY_LEN = 30;
+            floorHistory.push_back(rawFloor);
+            if (floorHistory.size() > FLOOR_HISTORY_LEN) floorHistory.pop_front();
+
             if (globalNoiseFloor <= 0.0f) {
-                globalNoiseFloor = rawFloor;
+                globalNoiseFloor  = rawFloor;
                 displayNoiseFloor = rawFloor;
-            } else if (rawFloor < globalNoiseFloor) {
-                globalNoiseFloor  = 0.97f * globalNoiseFloor  + 0.03f * rawFloor; // ~1s attack
             } else {
-                globalNoiseFloor  = 0.9995f * globalNoiseFloor + 0.0005f * rawFloor; // very slow rise
+                std::vector<float> sorted(floorHistory.begin(), floorHistory.end());
+                std::nth_element(sorted.begin(),
+                                 sorted.begin() + sorted.size() / 2,
+                                 sorted.end());
+                globalNoiseFloor = sorted[sorted.size() / 2];
             }
-            // Separate slow EMA just for the display line — keeps it visually stable
             displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
         }
 
         // Manual mode: check configured frequencies instead of grid voting
         if (manualMode) {
-            std::vector<double> localFreqs;
-            { std::lock_guard<std::mutex> lk(manualFreqMtx); localFreqs = manualFrequencies; }
+            std::vector<double> localFreqs = getActiveManualFreqs();
             std::set<int> newDetected;
             for (int i = 0; i < (int)localFreqs.size(); i++) {
                 double freqOffset = localFreqs[i] - lastKnownCenter;
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
                 int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
-                int halfBins2 = std::max(1, (int)std::round((channelSpacing * 0.4) / binHz));
+                int halfBins2 = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
                 int lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
                 int hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
                 float sum = 0.0f;
@@ -533,15 +641,62 @@ private:
             else                { votes = std::max(votes - 1, 0); }
         }
 
-        // Pass 2: non-maximum suppression — when adjacent slots both qualify,
-        // only keep the one with higher power (prevents one signal spawning two chains).
+        // Pass 2: non-maximum suppression. We need to prevent two adjacent slots
+        // from being detected for the same physical signal — common at wide
+        // bandwidths (e.g. 10 MHz, ~1.2 kHz bin width) where an AM carrier
+        // straddling two 12.5 kHz slots has its peak energy drift across the
+        // boundary as it modulates.
+        //
+        // Approach: greedy strongest-first selection, respecting both already-
+        // active channels and slots accepted earlier *within this same frame*.
+        // The frame-local accept tracking is critical because activeChannels is
+        // updated by the mgmt thread asynchronously — so checking it alone
+        // doesn't prevent two newly-qualifying adjacent slots from both winning
+        // the same frame.
         std::set<int> detected;
-        for (int s = 0; s < numSlots; s++) {
-            if (slotVotes[s] < SPAWN_VOTES) { continue; }
-            bool leftStronger  = (s > 0            && slotVotes[s-1] >= SPAWN_VOTES && slotMeans[s-1] > slotMeans[s]);
-            bool rightStronger = (s < numSlots - 1 && slotVotes[s+1] >= SPAWN_VOTES && slotMeans[s+1] > slotMeans[s]);
-            if (leftStronger || rightStronger) { continue; }
-            detected.insert(s);
+        {
+            std::lock_guard<std::mutex> clck(channelsMtx);
+
+            // Always include already-active slots, exempt from NMS, with a much
+            // looser vote threshold than spawning (SPAWN_VOTES). Once a slot is
+            // active we trust it: as long as ANY votes remain, keep it in
+            // `detected` so it (a) keeps its channel alive and (b) blocks
+            // adjacent newcomers via the greedy NMS pass below.
+            //
+            // Why this matters: a signal sitting on a slot boundary can have its
+            // peak energy drift between adjacent slots over time. Without this
+            // looser threshold, slot N's votes briefly dip below SPAWN_VOTES,
+            // its channel "loses lock" to the silence countdown, slot N+1
+            // spawns a fresh channel, and we end up with two overlapping
+            // recordings of the same transmission. Vote decay is symmetric
+            // (one per frame), so a real signal-gone case still tears the
+            // channel down within a few frames once the signal genuinely
+            // disappears.
+            std::vector<int> candidates;
+            for (int s = 0; s < numSlots; s++) {
+                bool active = (activeChannels.find(s) != activeChannels.end());
+                if (active) {
+                    if (slotVotes[s] > 0) detected.insert(s);
+                    // votes==0 → let the channel die naturally; don't insert
+                } else {
+                    if (slotVotes[s] < SPAWN_VOTES) { continue; }
+                    candidates.push_back(s);
+                }
+            }
+
+            // Sort remaining candidates by power desc — strongest signals win
+            // the right to spawn first.
+            std::sort(candidates.begin(), candidates.end(),
+                      [&](int a, int b) { return slotMeans[a] > slotMeans[b]; });
+
+            // Greedy accept: skip if any neighbor is already active OR already
+            // accepted into `detected` this frame.
+            for (int s : candidates) {
+                bool leftBlocked  = (s > 0            && detected.count(s - 1) > 0);
+                bool rightBlocked = (s < numSlots - 1 && detected.count(s + 1) > 0);
+                if (leftBlocked || rightBlocked) { continue; }
+                detected.insert(s);
+            }
         }
 
         {
@@ -596,17 +751,19 @@ private:
             std::lock_guard<std::mutex> clck(channelsMtx);
 
             // Create or refresh channels for detected slots
+            debugDetectedCount.store((int)current.size());
+            int blkSkip = 0, capSkip = 0;
             for (int idx : current) {
                 auto it = activeChannels.find(idx);
                 if (it == activeChannels.end()) {
                     // New signal — spawn channel (if under cap and not blocked)
-                    if ((int)activeChannels.size() >= maxChannels) { continue; }
+                    if ((int)activeChannels.size() >= maxChannels) { capSkip++; continue; }
                     int    numSlots   = (int)std::floor(lastKnownSr / channelSpacing);
                     double slotOffset = ((double)idx - (double)(numSlots - 1) / 2.0) * channelSpacing;
                     auto   pit        = localPeakOffsets.find(idx);
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
-                    if (isBlocked(slotFreq)) { continue; }
+                    if (isBlocked(slotFreq)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
                     slot->lastDetected  = now;
@@ -619,6 +776,8 @@ private:
                     it->second->signalPresent = true;
                 }
             }
+            debugBlockedSkips.store(blkSkip);
+            debugCapSkips.store(capSkip);
 
             // Mark channels no longer detected; destroy once file is closed
             for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
@@ -644,7 +803,7 @@ private:
                         std::lock_guard<std::mutex> plk(playbackMtx);
                         int64_t fk = freqKey(slot->freqHz);
                         for (auto& entry : playbackQueue)
-                            if (freqKey(entry.second) == fk) { isQueued = true; break; }
+                            if (freqKey(entry.freqHz) == fk) { isQueued = true; break; }
                     }
                     if (elapsed > cooldownSec && !slot->fileOpen && !isPlaying && !isQueued) {
                         flog::info("[ChannelBank] Destroying slot {0}", it->first);
@@ -680,19 +839,6 @@ private:
                 }
             }
         }
-    }
-
-    // Compute the largest power-of-2 pre-decimation ratio such that the intermediate
-    // sample rate (sr/ratio) stays at or above 192 kHz (= 4 × 48 kHz audio).
-    // This avoids extreme polyphase ratios in the per-channel RxVFO resampler.
-    static unsigned int computePreDecimRatio(double sr) {
-        constexpr double MIN_INTERMEDIATE_SR = 4.0 * 48000.0; // 192 kHz
-        unsigned int maxRatio = dsp::multirate::PowerDecimator<dsp::complex_t>::getMaxRatio();
-        unsigned int ratio = 1;
-        while (ratio * 2 <= maxRatio && (sr / (ratio * 2)) >= MIN_INTERMEDIATE_SR) {
-            ratio *= 2;
-        }
-        return ratio;
     }
 
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
@@ -736,15 +882,9 @@ private:
         slot.iqIn = new dsp::stream<dsp::complex_t>();
         sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
 
-        // Staged decimation: use a power-of-2 pre-decimator to bring the input
-        // sample rate down to an intermediate rate (>=192 kHz) before the VFO.
-        // This avoids the extreme polyphase ratios (e.g. 8 MHz -> 48 kHz = 500:3)
-        // that cause audio compression/distortion in the RationalResampler.
         unsigned int preDecimRatio = computePreDecimRatio(lastKnownSr);
         if (preDecimRatio > 1) {
             double preDecimSr = lastKnownSr / preDecimRatio;
-            // Translate the target channel to DC first, then decimate, then
-            // hand a zero-offset narrow-band stream to the VFO.
             slot.preXlator    = new dsp::channel::FrequencyXlator(slot.iqIn, -vfoOff, lastKnownSr);
             slot.preDecimator = new dsp::multirate::PowerDecimator<dsp::complex_t>(&slot.preXlator->out, preDecimRatio);
             slot.vfo = new dsp::channel::RxVFO(&slot.preDecimator->out, preDecimSr, audioSr, bw, 0.0);
@@ -752,27 +892,23 @@ private:
             slot.vfo = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         }
 
-        // Audio LP cutoff = half the channel width (matches VFO filter), capped at 8kHz.
-        // Aviation AM voice needs ~3-4kHz; wider channels can carry more.
-        const double audioBw = std::min(bw / 2.0, 8000.0);
+        // AM demod bandwidth = full channel width (same as VFO), matching SDR++ radio module.
+        // SSB/FM use narrower audio bandwidth.
+        const double audioBw = bw / 2.0;
         if (demodMode == DEMOD_AM) {
             slot.amDemod = new dsp::demod::AM<dsp::stereo_t>();
-            // AGC time constants: ~1s attack, ~2s decay.
-            // A fast attack (e.g. 0.001 = 21ms) tracks the audio envelope and
-            // causes audible dynamic compression. Carrier-mode AGC must be slow
-            // so it only normalises long-term carrier level, not modulation.
-            const double agcAttack = 1.0 / (audioSr * 1.0);   // ~1 second
-            const double agcDecay  = 1.0 / (audioSr * 2.0);   // ~2 seconds
             slot.amDemod->init(&slot.vfo->out,
                 dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER,
-                audioBw, agcAttack, agcDecay, 100.0 / audioSr, audioSr);
+                bw, 1.0 / (audioSr * 1.0), 1.0 / (audioSr * 2.0), 100.0 / audioSr, audioSr);
         }
         else if (demodMode == DEMOD_USB || demodMode == DEMOD_LSB) {
             auto ssbMode = (demodMode == DEMOD_USB)
                 ? dsp::demod::SSB<dsp::stereo_t>::Mode::USB
                 : dsp::demod::SSB<dsp::stereo_t>::Mode::LSB;
             slot.ssbDemod = new dsp::demod::SSB<dsp::stereo_t>();
-            slot.ssbDemod->init(&slot.vfo->out, ssbMode, ssbBw, audioSr, 1.0/(audioSr*1.0), 1.0/(audioSr*2.0));
+            slot.ssbDemod->init(&slot.vfo->out, ssbMode, ssbBw, audioSr,
+                1.0 / (audioSr * 1.0),   // ~1 second attack
+                1.0 / (audioSr * 2.0));   // ~2 second decay
         }
         else {
             double demodBw = (demodMode == DEMOD_WFM) ? 150000.0 : audioBw;
@@ -798,8 +934,14 @@ private:
         slot.writer.setSampleType(wav::SAMP_TYPE_INT16);
         slot.writer.setSamplerate((uint64_t)audioSr);
 
-        if (slot.preXlator)    { slot.preXlator->start();    }
-        if (slot.preDecimator) { slot.preDecimator->start(); }
+        // RNNoise noise reduction (per-slot)
+        if (noiseReduction) {
+            slot.nrState = rnnoise_create(nullptr);
+            slot.nrInPos = 0;
+        }
+
+        if (slot.preXlator)    slot.preXlator->start();
+        if (slot.preDecimator) slot.preDecimator->start();
         slot.vfo->start();
         if (slot.amDemod)  slot.amDemod->start();
         if (slot.fmDemod)  slot.fmDemod->start();
@@ -820,7 +962,6 @@ private:
         slot.vfo->stop();
         if (slot.preDecimator) { slot.preDecimator->stop(); delete slot.preDecimator; slot.preDecimator = nullptr; }
         if (slot.preXlator)    { slot.preXlator->stop();    delete slot.preXlator;    slot.preXlator    = nullptr; }
-
         sigpath::iqFrontEnd.unbindIQStream(slot.iqIn);
 
         if (slot.fileOpen) {
@@ -847,6 +988,7 @@ private:
         delete slot.vfo;
         delete slot.recFeedStream;
         delete slot.iqIn;
+        if (slot.nrState) { rnnoise_destroy(slot.nrState); slot.nrState = nullptr; }
     }
 
     // ── Audio handler (split-on-silence recording) ───────────────────────────
@@ -903,7 +1045,8 @@ private:
                         _this->saveFreqLog();
                         if (!slot->currentFilePath.empty()) {
                             std::lock_guard<std::mutex> lk(_this->playbackMtx);
-                            _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz});
+                            // deleteAfter=true when recording is disabled — play it back but don't keep the file
+                            _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, !_this->recordingEnabled});
                             _this->playbackCv.notify_one();
                         }
                     }
@@ -935,8 +1078,40 @@ private:
             }
             mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * gain, -1.0f, 1.0f);
         }
-        slot->writer.write(mono, count);
-        slot->audioSamplesWritten += count;
+
+        // RNNoise processing — accumulate into 480-sample frames, process,
+        // and write each completed frame to WAV individually.
+        // RNNoise expects/returns samples in int16 range (-32768..32767).
+        if (slot->nrState) {
+            int pos = 0;
+            while (pos < count) {
+                int room = 480 - slot->nrInPos;
+                int take = std::min(room, count - pos);
+                for (int i = 0; i < take; i++)
+                    slot->nrInBuf[slot->nrInPos + i] = mono[pos + i] * 32768.0f;
+                slot->nrInPos += take;
+                pos += take;
+
+                if (slot->nrInPos >= 480) {
+                    float outBuf[480];
+                    rnnoise_process_frame(slot->nrState, outBuf, slot->nrInBuf);
+                    // Blend original (dry) and denoised (wet) based on nrMix
+                    float mix = _this->nrMix;
+                    float nrMono[480];
+                    for (int i = 0; i < 480; i++) {
+                        float dry = slot->nrInBuf[i] / 32768.0f;
+                        float wet = outBuf[i] / 32768.0f;
+                        nrMono[i] = std::clamp(dry * (1.0f - mix) + wet * mix, -1.0f, 1.0f);
+                    }
+                    slot->writer.write(nrMono, 480);
+                    slot->audioSamplesWritten += 480;
+                    slot->nrInPos = 0;
+                }
+            }
+        } else {
+            slot->writer.write(mono, count);
+            slot->audioSamplesWritten += count;
+        }
     }
 
     // ── Playback monitor ─────────────────────────────────────────────────────
@@ -948,12 +1123,14 @@ private:
 
         while (playbackRunning) {
             std::string path;
-            double      playFreq = 0.0;
+            double      playFreq    = 0.0;
+            bool        deleteAfter = false;
             {
                 std::lock_guard<std::mutex> lk(playbackMtx);
                 if (!playbackQueue.empty()) {
-                    path     = playbackQueue.front().first;
-                    playFreq = playbackQueue.front().second;
+                    path        = playbackQueue.front().path;
+                    playFreq    = playbackQueue.front().freqHz;
+                    deleteAfter = playbackQueue.front().deleteAfter;
                     playbackQueue.pop_front();
                 }
             }
@@ -962,6 +1139,7 @@ private:
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
+                if (deleteAfter) { std::remove(path.c_str()); }
             } else {
                 // Write silence to keep monitorStream continuously flowing.
                 // swap() naturally throttles to the consumer's 48 kHz read rate.
@@ -1046,6 +1224,81 @@ private:
         }
     }
 
+    // ── Main-waterfall overlay ───────────────────────────────────────────────
+    // Draws a marker on the SDR++ main waterfall for each active channel:
+    //   • red filled dot  = currently recording (file open, signal present)
+    //   • orange ring     = active but in cooldown / silence countdown
+    // Plus a counter in the top-right of the FFT area showing
+    // "Recording: N / Active: M".
+
+    static void fftRedrawHandlerFunc(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
+        ChannelBankModule* _this = (ChannelBankModule*)ctx;
+        if (!_this->enabled || !_this->running) { return; }
+
+        // Snapshot active-channel state under lock; minimise work inside the lock.
+        struct Mark { double freq; bool recording; };
+        std::vector<Mark> marks;
+        int recCount = 0;
+        {
+            std::lock_guard<std::mutex> clck(_this->channelsMtx);
+            marks.reserve(_this->activeChannels.size());
+            for (auto& [idx, slot] : _this->activeChannels) {
+                bool rec = slot->fileOpen;
+                if (rec) recCount++;
+                marks.push_back({ slot->freqHz, rec });
+            }
+        }
+
+        ImDrawList* dl = args.window->DrawList;
+        const float radius = 5.0f;
+        // Place markers ~12 px above the bottom of the FFT area so they don't
+        // clash with frequency-manager bookmark labels at the top.
+        float y = args.max.y - 12.0f;
+
+        for (auto& m : marks) {
+            if (m.freq < args.lowFreq || m.freq > args.highFreq) continue;
+            double x = args.min.x + (m.freq - args.lowFreq) * args.freqToPixelRatio;
+            ImVec2 c((float)x, y);
+
+            if (m.recording) {
+                // Red filled dot with white outline for visibility against waterfall
+                dl->AddCircleFilled(c, radius, IM_COL32(255, 60, 60, 255), 16);
+                dl->AddCircle(c, radius + 1.0f, IM_COL32(255, 255, 255, 255), 16, 1.5f);
+            } else {
+                // Orange ring (no fill) — channel exists but isn't recording right now
+                dl->AddCircle(c, radius, IM_COL32(255, 165, 0, 255), 16, 2.0f);
+            }
+        }
+
+        // Blue diamond at the currently-playing frequency (audio source indicator).
+        // Drawn after the other markers so it sits on top if a recording slot
+        // happens to be at the same freq. Disappears the moment playback ends.
+        int64_t playingKey = _this->currentlyPlayingFreqKey.load();
+        if (playingKey != 0) {
+            double playFreq = (double)playingKey * 1000.0;
+            if (playFreq >= args.lowFreq && playFreq <= args.highFreq) {
+                double x = args.min.x + (playFreq - args.lowFreq) * args.freqToPixelRatio;
+                const float r = 7.0f;
+                ImVec2 top   ((float)x, y - r);
+                ImVec2 right ((float)x + r, y);
+                ImVec2 bot   ((float)x, y + r);
+                ImVec2 left  ((float)x - r, y);
+                dl->AddQuadFilled(top, right, bot, left, IM_COL32(40, 140, 255, 255));
+                dl->AddQuad(top, right, bot, left, IM_COL32(255, 255, 255, 255), 1.5f);
+            }
+        }
+
+        // Counter badge in top-right of the FFT area.
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Rec %d / Act %d", recCount, (int)marks.size());
+        ImVec2 textSize = ImGui::CalcTextSize(buf);
+        ImVec2 padMin(args.max.x - textSize.x - 12.0f, args.min.y + 4.0f);
+        ImVec2 padMax(args.max.x - 4.0f,               args.min.y + textSize.y + 8.0f);
+        dl->AddRectFilled(padMin, padMax, IM_COL32(0, 0, 0, 160), 3.0f);
+        dl->AddText(ImVec2(padMin.x + 4.0f, padMin.y + 2.0f),
+                    IM_COL32(255, 255, 255, 255), buf);
+    }
+
     // ── Retune handler ───────────────────────────────────────────────────────
 
     static void retuneHandlerFunc(double /*freq*/, void* ctx) {
@@ -1056,7 +1309,8 @@ private:
         double newCenter = gui::waterfall.getCenterFrequency();
         if (newSr == _this->lastKnownSr && newCenter == _this->lastKnownCenter) { return; }
 
-        // Teardown all active channels and reset — new spectrum, new grid
+        // Teardown all active channels — safe because destroySlot stops the
+        // DSP sinks before freeing, so no audio callback will fire on freed data.
         {
             std::lock_guard<std::mutex> lck(_this->channelsMtx);
             for (auto& [idx, slot] : _this->activeChannels) {
@@ -1069,18 +1323,18 @@ private:
             std::lock_guard<std::mutex> lck(_this->detectedMtx);
             _this->detectedSlots.clear();
         }
-
-        _this->lastKnownSr       = newSr;
-        _this->lastKnownCenter   = newCenter;
-        _this->fftBufPos         = 0;
-        _this->globalNoiseFloor  = 0.0f;
-        _this->displayNoiseFloor = 0.0f;
-        _this->slotVotes.clear();
-        _this->manualVotes.clear();
         {
             std::lock_guard<std::mutex> lk(_this->manualDetectedMtx);
             _this->manualDetected.clear();
         }
+
+        // Store new params but DON'T touch DSP-thread-owned state (slotVotes,
+        // avgPower, fftBufPos, etc.) — set a flag so the DSP thread resets
+        // them safely at the start of its next frame.
+        _this->pendingRetuneSr     = newSr;
+        _this->pendingRetuneCenter = newCenter;
+        _this->retuneFlag.store(true);
+
         // Wake mgmt thread to re-spawn manual channels at new center immediately
         _this->mgmtCv.notify_one();
     }
@@ -1134,6 +1388,55 @@ private:
             config.release(true);
         }
 
+        ImGui::LeftLabel("BW Usage");
+        ImGui::FillWidth();
+        {
+            int bwPct = (int)std::round(_this->bwUsage * 100.0f);
+            if (ImGui::SliderInt(CONCAT("##_cb_bwusage_", _this->name),
+                                 &bwPct, 50, 100, "%d%%")) {
+                bwPct = std::clamp(bwPct, 50, 100);
+                _this->bwUsage = bwPct / 100.0f;
+                config.acquire();
+                config.conf[_this->name]["bwUsage"] = _this->bwUsage;
+                config.release(true);
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Fraction of SDR bandwidth to use.\n"
+                              "Lower = avoids filter rolloff at edges.\n"
+                              "RTL-SDR: 0.9, SDRPlay/Airspy: 0.7-0.8");
+
+        if (ImGui::Checkbox(CONCAT("Noise Reduction##_cb_nr_", _this->name), &_this->noiseReduction)) {
+            config.acquire();
+            config.conf[_this->name]["noiseReduction"] = _this->noiseReduction;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("RNNoise neural network noise suppression.\n"
+                              "Removes static/hiss from recordings while\n"
+                              "preserving voice clarity. Takes effect on\n"
+                              "new channels (restart to apply to all).");
+
+        if (_this->noiseReduction) {
+            ImGui::LeftLabel("NR Strength");
+            ImGui::FillWidth();
+            {
+                int nrPct = (int)std::round(_this->nrMix * 100.0f);
+                if (ImGui::SliderInt(CONCAT("##_cb_nrmix_", _this->name),
+                                     &nrPct, 0, 100, "%d%%")) {
+                    nrPct = std::clamp(nrPct, 0, 100);
+                    _this->nrMix = nrPct / 100.0f;
+                    config.acquire();
+                    config.conf[_this->name]["nrMix"] = _this->nrMix;
+                    config.release(true);
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("0%% = original audio (no NR)\n"
+                                  "100%% = full noise reduction\n"
+                                  "50-70%% = good balance for weak signals");
+        }
+
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
@@ -1143,16 +1446,20 @@ private:
         bool isManual = _this->manualMode;
         bool isScan   = _this->scanMode;
         if (ImGui::RadioButton(CONCAT("Auto##_cb_auto_", _this->name), isAuto)) {
+            if (_this->manualMode) _this->restoreWaterfallVisibility();
             _this->manualMode = false; _this->scanMode = false;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Manual##_cb_manual_", _this->name), isManual)) {
             _this->manualMode = true; _this->scanMode = false;
+            if (!_this->boundBookmarkLists.empty())
+                _this->applyWaterfallVisibility();
             _this->saveManualConfig(); _this->saveScanConfig();
         }
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Scan##_cb_scan_", _this->name), isScan)) {
+            if (_this->manualMode) _this->restoreWaterfallVisibility();
             _this->manualMode = false; _this->scanMode = true;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
@@ -1161,7 +1468,76 @@ private:
 
         // Manual frequency list — editable while running
         if (_this->manualMode) {
+            // Refresh bookmark JSON once per second so newly-added entries
+            // in the Frequency Manager appear here automatically.
+            auto now = std::chrono::steady_clock::now();
+            if (now - _this->lastFmConfigRefresh > std::chrono::seconds(1)) {
+                _this->loadFMConfig();
+                _this->lastFmConfigRefresh = now;
+                std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                _this->rebuildBoundFreqs();
+            }
+
             ImGui::Spacing();
+
+            // Bookmark source dropdown — multi-select: tick any number of FM
+            // lists; their frequencies are scanned alongside manual entries.
+            // Ticking a list also hides all other FM bookmark groups on the
+            // main waterfall so only the selected lists are visible.
+            ImGui::LeftLabel("Bookmark lists");
+            ImGui::FillWidth();
+            {
+                char preview[160];
+                int  nSelected = (int)_this->boundBookmarkLists.size();
+                int  nFreqs    = (int)_this->boundFreqs.size();
+                if (nSelected == 0)
+                    snprintf(preview, sizeof(preview), "(none)");
+                else if (nSelected == 1)
+                    snprintf(preview, sizeof(preview), "%s  (%d)",
+                             _this->boundBookmarkLists.begin()->c_str(), nFreqs);
+                else
+                    snprintf(preview, sizeof(preview), "%d lists  (%d freqs)",
+                             nSelected, nFreqs);
+
+                if (ImGui::BeginCombo(CONCAT("##_cb_bmsrc_", _this->name), preview)) {
+                    if (_this->fmLists.empty()) {
+                        ImGui::TextDisabled("No FM lists found");
+                    }
+                    else {
+                        bool anyChange = false;
+                        for (auto& [listName, freqs] : _this->fmLists) {
+                            bool checked = (_this->boundBookmarkLists.count(listName) > 0);
+                            char lbl[256];
+                            snprintf(lbl, sizeof(lbl), "%s  (%d)",
+                                     listName.c_str(), (int)freqs.size());
+                            // DontClosePopups: keep the dropdown open for multi-select
+                            if (ImGui::Selectable(lbl, checked,
+                                                  ImGuiSelectableFlags_DontClosePopups)) {
+                                std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                                if (checked)
+                                    _this->boundBookmarkLists.erase(listName);
+                                else
+                                    _this->boundBookmarkLists.insert(listName);
+                                _this->rebuildBoundFreqs();
+                                anyChange = true;
+                            }
+                        }
+                        if (anyChange) {
+                            // Apply or restore waterfall visibility
+                            if (_this->boundBookmarkLists.empty())
+                                _this->restoreWaterfallVisibility();
+                            else
+                                _this->applyWaterfallVisibility();
+                            _this->saveManualConfig();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+            ImGui::Spacing();
+
+            // Custom additions (manual entries on top of the bookmark list)
+            ImGui::Text("Custom frequencies (MHz):");
             ImGui::SetNextItemWidth(menuWidth - ImGui::CalcTextSize("Add").x - ImGui::GetStyle().ItemSpacing.x * 2 - 8);
             ImGui::InputText(CONCAT("##_cb_freqin_", _this->name), _this->manualFreqInputBuf, sizeof(_this->manualFreqInputBuf));
             ImGui::SameLine();
@@ -1191,36 +1567,6 @@ private:
                 { std::lock_guard<std::mutex> lk(_this->manualFreqMtx); _this->manualFrequencies.erase(_this->manualFrequencies.begin() + toRemove); }
                 _this->saveManualConfig();
             }
-
-            if (ImGui::Button(CONCAT("Import from Frequency Manager##_cb_importfm_", _this->name), ImVec2(menuWidth, 0))) {
-                _this->loadFMConfig();
-                _this->fmImportOpen = true;
-            }
-        }
-
-        if (_this->fmImportOpen) {
-            ImGui::OpenPopup(CONCAT("FM Import##_cb_fmpopup_", _this->name));
-            _this->fmImportOpen = false;
-        }
-        if (ImGui::BeginPopupModal(CONCAT("FM Import##_cb_fmpopup_", _this->name), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("Select a list to import:");
-            ImGui::Spacing();
-            if (_this->fmLists.empty()) {
-                ImGui::TextDisabled("No lists found in frequency_manager_config.json");
-            } else {
-                for (auto& [listName, freqs] : _this->fmLists) {
-                    char lbl[256];
-                    snprintf(lbl, sizeof(lbl), "%s  (%d entries)", listName.c_str(), (int)freqs.size());
-                    if (ImGui::Button(lbl)) {
-                        { std::lock_guard<std::mutex> lk(_this->manualFreqMtx); for (double f : freqs) _this->manualFrequencies.push_back(f); }
-                        _this->saveManualConfig();
-                        ImGui::CloseCurrentPopup();
-                    }
-                }
-            }
-            ImGui::Spacing();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
         }
 
         // ── Scan range list (shown when scan mode selected) ───────────────────
@@ -1252,7 +1598,7 @@ private:
             // Range list
             ImGui::BeginChild(CONCAT("##_cb_sclist_", _this->name), ImVec2(menuWidth, 100), true);
             int toRemoveScan = -1;
-            double stepMHz = (_this->lastKnownSr > 0.0 ? _this->lastKnownSr * 0.9 : 2400000.0) / 1e6;
+            double stepMHz = (_this->lastKnownSr > 0.0 ? _this->lastKnownSr * _this->bwUsage : 2400000.0) / 1e6;
             for (int i = 0; i < (int)_this->scanRanges.size(); i++) {
                 auto& r = _this->scanRanges[i];
                 double spanMHz = (r.stopHz - r.startHz) / 1e6;
@@ -1388,6 +1734,14 @@ private:
             config.release(true);
         }
 
+        // Global recording enable/disable toggle
+        if (ImGui::Checkbox(CONCAT("Enable Recording##_cb_recen_", _this->name),
+                            &_this->recordingEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["recordingEnabled"] = _this->recordingEnabled;
+            config.release(true);
+        }
+
         // Record gain (live)
         ImGui::LeftLabel("Rec Gain");
         ImGui::FillWidth();
@@ -1427,6 +1781,7 @@ private:
             }
         }
 
+
         // Start / Stop
         if (!_this->running) {
             if (!_this->folderSelect.pathIsValid()) { style::beginDisabled(); }
@@ -1456,6 +1811,53 @@ private:
             ImGui::Text("Active: %d  Recording: %d", total, recording);
             ImGui::Text("Monitor queue: %d pending", queued);
 
+            // Diagnostic: show noise floor + threshold in dB
+            {
+                float nf = _this->globalNoiseFloor;
+                float th = nf * powf(10.0f, _this->snrThreshold / 10.0f);
+                float nfDb = (nf > 0.0f) ? 10.0f * log10f(nf) : -999.0f;
+                float thDb = (th > 0.0f) ? 10.0f * log10f(th) : -999.0f;
+                int det = _this->debugDetectedCount.load();
+                int blk = _this->debugBlockedSkips.load();
+                int cap = _this->debugCapSkips.load();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+                ImGui::Text("Floor: %.1f dB  Thresh: %.1f dB", nfDb, thDb);
+                ImGui::Text("Det: %d  BlkSkip: %d  CapSkip: %d", det, blk, cap);
+                ImGui::PopStyleColor();
+            }
+
+            // Now-playing description panel (above the active-channel list).
+            // Shows the description of the currently monitored frequency.
+            {
+                int64_t playingKey = _this->currentlyPlayingFreqKey.load();
+                std::string playingName, playingDesc;
+                if (playingKey != 0) {
+                    std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                    auto it = _this->freqLog.find(playingKey);
+                    if (it != _this->freqLog.end()) {
+                        playingName = _this->displayName(it->second.freqHz);
+                        playingDesc = it->second.description;
+                    }
+                }
+                ImGui::BeginChild(CONCAT("##_cb_nowplaying_", _this->name),
+                                  ImVec2(menuWidth, 50), true);
+                if (playingKey != 0 && !playingName.empty()) {
+                    ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Playing: %s", playingName.c_str());
+                    if (!playingDesc.empty()) {
+                        ImGui::TextWrapped("%s", playingDesc.c_str());
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                        ImGui::TextWrapped("(no description — click D in history to add one)");
+                        ImGui::PopStyleColor();
+                    }
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                    ImGui::Text("(nothing playing)");
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
+            }
+
             // Active channel list
             ImGui::Separator();
             bool needSaveFreqLog = false;
@@ -1464,9 +1866,8 @@ private:
             {
                 std::lock_guard<std::mutex> lck(_this->channelsMtx);
                 for (auto& [idx, slot] : _this->activeChannels) {
-                    char label[64];
-                    snprintf(label, sizeof(label), "%.3f MHz", slot->freqHz / 1e6);
-                    ImGui::Text("%s", label);
+                    std::string label = _this->displayName(slot->freqHz);
+                    ImGui::Text("%s", label.c_str());
                     ImGui::SameLine();
                     bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
                     if (playing) {
@@ -1506,6 +1907,10 @@ private:
         bool clearAll  = ImGui::SmallButton("Clear All##_cb_clrlog");
         ImGui::SameLine();
         bool clearKeep = ImGui::SmallButton("Clear (keep blocked)##_cb_clrlogkeep");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reload Bookmarks##_cb_reloadbm")) {
+            _this->loadFMConfig();
+        }
 
         bool needSave = false;
 
@@ -1540,28 +1945,67 @@ private:
                 if (ImGui::CollapsingHeader(hdr)) {
                     for (auto& [k, ep] : entries) {
                         FreqEntry& e = *ep;
-                        char label[64];
-                        snprintf(label, sizeof(label), "  %.4f MHz", e.freqHz / 1e6);
+                        std::string dn = _this->displayName(e.freqHz);
+                        std::string label = "  " + dn;
 
                         if (e.blocked)
                             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
 
                         std::string rel = relTime(e.lastSeen);
-                        ImGui::Text("%-18s %5d  %-10s", label, e.count, rel.c_str());
+                        ImGui::Text("%-22s %5d  %-10s", label.c_str(), e.count, rel.c_str());
 
                         if (e.blocked)
                             ImGui::PopStyleColor();
 
-                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 40);
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
+                        char editBtn[32];
+                        snprintf(editBtn, sizeof(editBtn), "D##edt_%lld", (long long)k);
+                        if (ImGui::SmallButton(editBtn)) {
+                            _this->descEditKey   = k;
+                            strncpy(_this->descEditBuf, e.description.c_str(), sizeof(_this->descEditBuf) - 1);
+                            _this->descEditBuf[sizeof(_this->descEditBuf) - 1] = '\0';
+                            _this->descEditRequest = true;
+                        }
+                        ImGui::SameLine();
                         char chk[32];
                         snprintf(chk, sizeof(chk), "##blk_%lld", (long long)k);
                         if (ImGui::Checkbox(chk, &e.blocked))
                             needSave = true;
+
+                        // Show description line under the entry if set
+                        if (!e.description.empty()) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.65f, 1.0f));
+                            ImGui::TextWrapped("      %s", e.description.c_str());
+                            ImGui::PopStyleColor();
+                        }
                     }
                 }
             }
         }
         ImGui::EndChild();
+
+        // Description edit popup (opened at parent scope so it actually renders)
+        if (_this->descEditRequest) {
+            ImGui::OpenPopup("##cb_desc_edit_popup");
+            _this->descEditRequest = false;
+        }
+        if (ImGui::BeginPopup("##cb_desc_edit_popup")) {
+            ImGui::Text("Edit description");
+            ImGui::SetNextItemWidth(320.0f);
+            ImGui::InputText("##cb_desc_edit_txt", _this->descEditBuf, sizeof(_this->descEditBuf));
+            if (ImGui::Button("Save##cb_desc_save")) {
+                std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                auto it = _this->freqLog.find(_this->descEditKey);
+                if (it != _this->freqLog.end()) {
+                    it->second.description = _this->descEditBuf;
+                    needSave = true;
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel##cb_desc_cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
 
         // Save outside the lock to avoid deadlock
         if (needSave) _this->saveFreqLog();
@@ -1572,7 +2016,7 @@ private:
     void computeScanStops() {
         scanStops.clear();
         if (lastKnownSr <= 0.0) return;
-        double step = lastKnownSr * 0.9;
+        double step = lastKnownSr * bwUsage;
         for (auto& r : scanRanges) {
             if (r.stopHz <= r.startHz) continue;
             int n = std::max(1, (int)std::ceil((r.stopHz - r.startHz) / step));
@@ -1602,15 +2046,80 @@ private:
         auto& arr = config.conf[name]["manualFrequencies"];
         arr = nlohmann::json::array();
         for (double f : manualFrequencies) arr.push_back(f);
+        auto& arr2 = config.conf[name]["boundBookmarkLists"];
+        arr2 = nlohmann::json::array();
+        for (auto& s : boundBookmarkLists) arr2.push_back(s);
         config.release(true);
+    }
+
+    // Rebuild boundFreqs as the deduplicated union of all boundBookmarkLists.
+    // Caller must hold manualFreqMtx (or call from constructor before threads start).
+    void rebuildBoundFreqs() {
+        boundFreqs.clear();
+        for (auto& listName : boundBookmarkLists) {
+            auto it = fmLists.find(listName);
+            if (it == fmLists.end()) continue;
+            for (double f : it->second) {
+                bool dup = false;
+                for (double bf : boundFreqs)
+                    if (std::abs(bf - f) < 100.0) { dup = true; break; }
+                if (!dup) boundFreqs.push_back(f);
+            }
+        }
+    }
+
+    // Hide all FM waterfall bookmark groups except the selected ones.
+    // Saves original visibility states the first time it's called.
+    // Safe no-op if FM is not loaded (fm_iface calls return false).
+    void applyWaterfallVisibility() {
+        if (!waterfallStateSaved) {
+            savedShowOnWaterfall.clear();
+            for (auto& n : fm_iface::getListNames())
+                savedShowOnWaterfall[n] = fm_iface::isListShownOnWaterfall(n);
+            waterfallStateSaved = true;
+        }
+        for (auto& n : fm_iface::getListNames())
+            fm_iface::setListShownOnWaterfall(n, boundBookmarkLists.count(n) > 0);
+    }
+
+    // Restore FM waterfall visibility to the states saved by applyWaterfallVisibility().
+    void restoreWaterfallVisibility() {
+        if (!waterfallStateSaved) return;
+        for (auto& [n, v] : savedShowOnWaterfall)
+            fm_iface::setListShownOnWaterfall(n, v);
+        savedShowOnWaterfall.clear();
+        waterfallStateSaved = false;
+    }
+
+    // Build the manual-mode frequency list as the union of user-entered
+    // frequencies and the bound bookmark lists (deduped within ±100 Hz).
+    // BOTH the DSP thread (analyzeSpectrum) and the mgmt thread
+    // (manageManualChannels) must use this same view, otherwise the indices
+    // in `manualDetected` don't map to anything and channels never spawn.
+    std::vector<double> getActiveManualFreqs() {
+        std::lock_guard<std::mutex> lk(manualFreqMtx);
+        std::vector<double> out = manualFrequencies;
+        for (double bf : boundFreqs) {
+            bool dup = false;
+            for (double mf : out) {
+                if (std::abs(mf - bf) < 100.0) { dup = true; break; }
+            }
+            if (!dup) out.push_back(bf);
+        }
+        return out;
     }
 
     void loadFMConfig() {
         fmLists.clear();
+        std::map<int64_t, std::string> newNames;
         std::string path = root + "/frequency_manager_config.json";
         try {
             std::ifstream f(path);
-            if (!f.is_open()) return;
+            if (!f.is_open()) {
+                std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
+                bookmarkNames.clear();
+                return;
+            }
             nlohmann::json j;
             f >> j;
             if (!j.contains("lists")) return;
@@ -1618,9 +2127,19 @@ private:
                 std::vector<double> freqs;
                 if (listData.contains("bookmarks"))
                     for (auto& [bmName, bm] : listData["bookmarks"].items())
-                        if (bm.contains("frequency"))
-                            freqs.push_back(bm["frequency"].get<double>());
+                        if (bm.contains("frequency")) {
+                            double hz = bm["frequency"].get<double>();
+                            freqs.push_back(hz);
+                            int64_t k = (int64_t)std::round(hz / 1000.0);
+                            // First one wins if duplicates across lists
+                            if (newNames.find(k) == newNames.end())
+                                newNames[k] = bmName;
+                        }
                 if (!freqs.empty()) fmLists[listName] = freqs;
+            }
+            {
+                std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
+                bookmarkNames = std::move(newNames);
             }
         } catch (...) {}
     }
@@ -1631,11 +2150,7 @@ private:
             std::lock_guard<std::mutex> lk(manualDetectedMtx);
             localDetected = manualDetected;
         }
-        std::vector<double> localFreqs;
-        {
-            std::lock_guard<std::mutex> lk(manualFreqMtx);
-            localFreqs = manualFrequencies;
-        }
+        std::vector<double> localFreqs = getActiveManualFreqs();
 
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> clck(channelsMtx);
@@ -1696,11 +2211,15 @@ private:
     int          ssbBfoHz      = 0;         // BFO trim for USB/LSB; positive = pitch up
     float        snrThreshold  = 4.0f;      // dB above noise floor
     float        cooldownSec   = 5.0f;      // seconds before destroying a quiet channel
+    bool         recordingEnabled  = true;   // global recording on/off toggle
     float        recGain       = 0.25f;     // linear gain applied before WAV write (~-12dB)
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
     int          maxChannels   = 16;
     double       channelSpacing = 25000.0;
+    float        bwUsage       = 0.8f;      // fraction of SDR bandwidth to use (avoids filter rolloff edges)
+    bool         noiseReduction = false;    // RNNoise neural noise suppression on recordings
+    float        nrMix          = 0.7f;    // 0=dry (original), 1=full NR
 
     // Scan mode
     struct ScanRange { double startHz, stopHz; };
@@ -1719,15 +2238,27 @@ private:
     // Manual mode
     bool manualMode = false;
     std::mutex manualFreqMtx;
-    std::vector<double> manualFrequencies;
+    std::vector<double>   manualFrequencies;    // user-entered frequencies (custom additions)
+    std::set<std::string> boundBookmarkLists;   // names of bound FM bookmark lists
+    std::vector<double>   boundFreqs;           // union of boundBookmarkLists (refreshed periodically)
+    // Waterfall visibility save/restore (Option A)
+    std::map<std::string, bool> savedShowOnWaterfall; // saved FM visibility states before Manual mode
+    bool                        waterfallStateSaved = false;
+    std::chrono::steady_clock::time_point lastFmConfigRefresh{};
     char manualFreqInputBuf[64] = {};
     std::map<int, int> manualVotes;       // list-index → vote count (DSP thread only)
     std::set<int> manualDetected;         // written by DSP, read by mgmt thread
     std::mutex manualDetectedMtx;
 
-    // FM import UI state (UI thread only)
-    bool fmImportOpen = false;
+    // Description editor (UI thread only)
+    int64_t descEditKey = 0;
+    char    descEditBuf[256] = {};
+    bool    descEditRequest = false;
+
+    // FM list cache (populated by loadFMConfig, UI thread only)
     std::map<std::string, std::vector<double>> fmLists;
+    std::mutex bookmarkNamesMtx;
+    std::map<int64_t, std::string> bookmarkNames;   // freqKey -> "Tower KLAX"
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
@@ -1738,9 +2269,19 @@ private:
     std::vector<float>                      hannWindow;
     std::vector<dsp::complex_t>             fftAccum;
     int                                     fftBufPos      = 0;
-    float                                   globalNoiseFloor  = 0.0f; // 20th-pct noise floor (linear)
-    float                                   displayNoiseFloor = 0.0f; // smoothed copy for display only
+    std::atomic<int>                        debugDetectedCount { 0 };
+    std::atomic<int>                        debugBlockedSkips  { 0 };
+    std::atomic<int>                        debugCapSkips      { 0 };
+    std::vector<float>                      avgPower;           // EMA-smoothed power spectrum
+    float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
+    float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
+    std::deque<float>                       floorHistory;             // ring buffer of recent rawFloor values for median filter
     std::map<int, int>                      slotVotes;
+
+    // Deferred retune — set by waterfall thread, consumed by DSP thread
+    std::atomic<bool>                       retuneFlag { false };
+    double                                  pendingRetuneSr     = 0.0;
+    double                                  pendingRetuneCenter = 0.0;
 
     // Detected signals (written by DSP thread, read by mgmt thread)
     std::mutex              detectedMtx;
@@ -1759,16 +2300,44 @@ private:
 
     // Frequency history + blocklist
     struct FreqEntry {
-        double   freqHz   = 0.0;
-        int      count    = 0;
-        bool     blocked  = false;
-        int64_t  lastSeen = 0;     // unix timestamp of most recent recording
+        double       freqHz      = 0.0;
+        int          count       = 0;
+        bool         blocked     = false;
+        int64_t      lastSeen    = 0;     // unix timestamp of most recent recording
+        std::string  description;         // user-editable; lives in channel_bank_config.json
     };
     // keyed by round(freqHz / 1000) — kHz-level uniqueness
     std::map<int64_t, FreqEntry> freqLog;
     std::mutex                   freqLogMtx;
 
     int64_t freqKey(double hz) { return (int64_t)std::round(hz / 1000.0); }
+
+    // Returns bookmark name if one exists within ±tolerance kHz, else "%.3f MHz"
+    std::string displayName(double hz) {
+        // Tolerance = half the channel spacing (in kHz), so grid-aligned detections
+        // always match the nearest real-channel bookmark regardless of SDR center freq.
+        const int64_t tolerance = std::max((int64_t)5, (int64_t)std::round(channelSpacing / 1000.0 / 2.0));
+        int64_t target = freqKey(hz);
+        {
+            std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
+            // Exact hit first
+            auto it = bookmarkNames.find(target);
+            if (it != bookmarkNames.end()) return it->second;
+            // Nearby scan: find closest within tolerance
+            auto lo = bookmarkNames.lower_bound(target - tolerance);
+            auto hi = bookmarkNames.upper_bound(target + tolerance);
+            int64_t bestDist = tolerance + 1;
+            std::string bestName;
+            for (auto jt = lo; jt != hi; ++jt) {
+                int64_t d = std::abs(jt->first - target);
+                if (d < bestDist) { bestDist = d; bestName = jt->second; }
+            }
+            if (!bestName.empty()) return bestName;
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.3f MHz", hz / 1e6);
+        return std::string(buf);
+    }
 
     static std::string relTime(int64_t ts) {
         if (ts == 0) return "never";
@@ -1800,7 +2369,13 @@ private:
         arr = nlohmann::json::array();
         std::lock_guard<std::mutex> lk(freqLogMtx);
         for (auto& [k, e] : freqLog) {
-            arr.push_back({ {"freq", e.freqHz}, {"count", e.count}, {"blocked", e.blocked}, {"lastSeen", e.lastSeen} });
+            arr.push_back({
+                {"freq", e.freqHz},
+                {"count", e.count},
+                {"blocked", e.blocked},
+                {"lastSeen", e.lastSeen},
+                {"description", e.description},
+            });
         }
         config.release(true);
     }
@@ -1822,7 +2397,8 @@ private:
     DisplaySnapshot  displaySnap;
 
     // Playback queue + monitor output
-    std::deque<std::pair<std::string,double>> playbackQueue;
+    struct PlaybackEntry { std::string path; double freqHz; bool deleteAfter; };
+    std::deque<PlaybackEntry> playbackQueue;
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
@@ -1837,6 +2413,9 @@ private:
     double lastKnownCenter = 0.0;
 
     EventHandler<double> retuneHandler;
+
+    // Main waterfall draw hook — adds per-channel markers to gui::waterfall
+    EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
 };
 
 MOD_EXPORT void _INIT_() {
