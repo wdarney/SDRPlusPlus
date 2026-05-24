@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.13)
 project(channel_bank)
 
 file(GLOB SRC "src/*.cpp")
+if (APPLE AND NOT ANDROID)
+    list(APPEND SRC src/transcription.mm src/encoding.mm)
+    set_source_files_properties(src/transcription.mm src/encoding.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+endif()
 
 # RNNoise (Mozilla) — neural network noise suppression
 set(RNNOISE_SRC
@@ -63,6 +69,14 @@ endif()
 # executable exposes @loader_path/../Frameworks via LC_RPATH, which all
 # plugins inherit at load time. Uses a cmake -P script to avoid shell escaping.
 if (APPLE AND NOT ANDROID)
+    target_link_libraries(channel_bank PRIVATE
+        "-framework Speech"
+        "-framework AudioToolbox"
+        "-framework AVFoundation"
+        "-framework Foundation"
+        "-framework AppKit"
+        "-lobjc"
+    )
     add_custom_command(TARGET channel_bank POST_BUILD
         COMMAND ${CMAKE_COMMAND}
             -DDYLIB=$<TARGET_FILE:channel_bank>

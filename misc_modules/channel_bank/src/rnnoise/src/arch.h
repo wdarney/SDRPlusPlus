@@ -34,9 +34,6 @@
 #ifndef ARCH_H
 #define ARCH_H
 
-#include "opus_types.h"
-#include "common.h"
-
 /* VLA compatibility shim: MSVC does not support C99 variable-length arrays.
    Use _alloca() (stack allocation, same semantics) on MSVC instead. */
 #ifdef _MSC_VER
@@ -45,6 +42,9 @@
 #else
 #  define RNNOISE_VLA(type, name, size) type name[size]
 #endif
+
+#include "opus_types.h"
+#include "common.h"
 
 # if !defined(__GNUC_PREREQ)
 #  if defined(__GNUC__)&&defined(__GNUC_MINOR__)
