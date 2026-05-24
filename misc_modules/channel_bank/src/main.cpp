@@ -120,8 +120,9 @@ public:
         8333.0, 12500.0, 25000.0, 50000.0, 100000.0, 200000.0
     };
     static constexpr int FFT_SIZE    = 8192;
-    static constexpr int SPAWN_VOTES = 3;    // FFT frames above threshold before spawning
-    static constexpr int MAX_VOTES   = 8;    // vote cap (controls how fast channel drops out)
+    static constexpr int    SPAWN_VOTES      = 3;    // FFT frames above threshold before spawning
+    static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
+    static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
 
     ChannelBankModule(std::string name) : folderSelect("%ROOT%/recordings") {
         this->name = name;
@@ -261,6 +262,7 @@ public:
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
         fftBufPos = 0;
+        specSamplesUntilFFT = 0;    // trigger first spectrum analysis immediately
         avgPower.clear();           // reset spectrum averaging on start
         globalNoiseFloor = 0.0f;
 
@@ -512,13 +514,30 @@ private:
     static void spectrumHandler(dsp::complex_t* data, int count, void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
 
-        for (int i = 0; i < count; i++) {
-            _this->fftAccum[_this->fftBufPos] = data[i];
-            if (++_this->fftBufPos >= FFT_SIZE) {
-                _this->fftBufPos = 0;
-                _this->analyzeSpectrum();
-            }
+        // Rate-limit spectrum analysis to SPEC_ANALYSIS_HZ regardless of sample rate.
+        // At 64 MHz SR the naive approach (FFT every 8192 samples) runs ~7,800 FFTs/sec,
+        // saturates a CPU core, and creates backpressure on the DSP Splitter chain that
+        // starves the waterfall's own FFT thread — causing visual choppiness.
+        // Returning early here still lets the Handler sink flush the buffer immediately,
+        // so the Splitter never blocks.
+        _this->specSamplesUntilFFT -= count;
+        if (_this->specSamplesUntilFFT > 0) return;
+
+        double sr = _this->lastKnownSr;
+        _this->specSamplesUntilFFT = (sr > 0.0)
+            ? (int64_t)(sr / SPEC_ANALYSIS_HZ)
+            : (int64_t)(FFT_SIZE);
+
+        // Fill fftAccum from this block; zero-pad if the block is smaller than FFT_SIZE
+        // (only possible at very low sample rates — typical HF/SDR blocks are much larger).
+        int fill = std::min(count, FFT_SIZE);
+        std::copy(data, data + fill, _this->fftAccum.data());
+        if (fill < FFT_SIZE) {
+            std::fill(_this->fftAccum.begin() + fill, _this->fftAccum.end(),
+                      dsp::complex_t{0.0f, 0.0f});
         }
+        _this->fftBufPos = 0;
+        _this->analyzeSpectrum();
     }
 
     void analyzeSpectrum() {
@@ -3025,6 +3044,7 @@ private:
     std::vector<float>                      hannWindow;
     std::vector<dsp::complex_t>             fftAccum;
     int                                     fftBufPos      = 0;
+    int64_t                                 specSamplesUntilFFT = 0;  // countdown; analysis fires when ≤ 0
     std::atomic<int>                        debugDetectedCount { 0 };
     std::atomic<int>                        debugBlockedSkips  { 0 };
     std::atomic<int>                        debugCapSkips      { 0 };
