@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#define NOMINMAX          // prevent windows.h from defining min/max macros
+#define _USE_MATH_DEFINES // enable M_PI in <cmath> on MSVC
+#endif
 #include <imgui.h>
 #include <module.h>
 #include <dsp/stream.h>
