@@ -4,6 +4,8 @@
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
+#include <dsp/channel/frequency_xlator.h>
+#include <dsp/multirate/power_decimator.h>
 #include <dsp/demod/am.h>
 #include <dsp/demod/fm.h>
 #include <dsp/demod/ssb.h>
@@ -284,9 +286,16 @@ public:
             }
         }
 
-        // Bind spectrum monitor stream
+        // Create one shared IQ binding — all consumers fan out from this splitter
+        // so the main signal-path thread only copies one buffer.
+        sharedIqIn = new dsp::stream<dsp::complex_t>();
+        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
+        iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
+        iqSplitter->start();
+
+        // Bind spectrum monitor stream to our splitter (not directly to the frontend)
         specStream = new dsp::stream<dsp::complex_t>();
-        sigpath::iqFrontEnd.bindIQStream(specStream);
+        iqSplitter->bindStream(specStream);
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
 
@@ -341,7 +350,7 @@ public:
         if (mgmtThread.joinable()) { mgmtThread.join(); }
 
         specSink->stop();
-        sigpath::iqFrontEnd.unbindIQStream(specStream);
+        iqSplitter->unbindStream(specStream);
         delete specSink;  specSink  = nullptr;
         delete specStream; specStream = nullptr;
 
@@ -363,6 +372,12 @@ public:
         if (encodeThread.joinable()) { encodeThread.join(); }
         { std::lock_guard<std::mutex> lk(encodeQueueMtx);   encodeQueue.clear(); }
         { std::lock_guard<std::mutex> lk(pendingEncodesMtx); pendingEncodes.clear(); }
+
+        // Tear down shared IQ splitter — all slot streams have been unbound by destroySlot above.
+        iqSplitter->stop();
+        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
+        delete iqSplitter; iqSplitter = nullptr;
+        delete sharedIqIn; sharedIqIn = nullptr;
     }
 
     // Normalize a closed INT16 mono WAV to -3 dBFS in-place.
@@ -1037,8 +1052,8 @@ private:
                 : offset;
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
+        iqSplitter->bindStream(slot.iqIn);
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
-        sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
 
         // AM demod bandwidth = full channel width (same as VFO), matching SDR++ radio module.
         // SSB/FM use narrower audio bandwidth.
@@ -1105,7 +1120,7 @@ private:
         if (slot.ssbDemod) slot.ssbDemod->stop();
         slot.vfo->stop();
 
-        sigpath::iqFrontEnd.unbindIQStream(slot.iqIn);
+        iqSplitter->unbindStream(slot.iqIn);
 
         if (slot.fileOpen) {
             slot.writer.close();
@@ -2995,6 +3010,11 @@ private:
     std::map<std::string, std::vector<double>> fmLists;
     std::mutex bookmarkNamesMtx;
     std::map<int64_t, std::string> bookmarkNames;   // freqKey -> "Tower KLAX"
+
+    // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
+    // keeping the main signal-path thread's memcpy cost at O(1) regardless of slot count.
+    dsp::stream<dsp::complex_t>*            sharedIqIn  = nullptr;
+    dsp::routing::Splitter<dsp::complex_t>* iqSplitter  = nullptr;
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
