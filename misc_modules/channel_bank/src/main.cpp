@@ -1289,17 +1289,29 @@ private:
         // halves the file size with no audible difference.
         const int totalFade = 4800;
 
-        // Tail fade-out: raised-cosine from 1→0 over the tail period.
-        // This kills the AGC noise ramp-up that happens when the signal drops —
-        // the demodulator chases noise and gets louder, so we taper it to silence.
-        // Compute once per callback (chunk is short, ~1024 samples — smooth enough).
+        // Fade-out: raised-cosine from 1→0 starting the moment the FFT stops seeing
+        // the signal, spanning the full Signal Hold + TX Tail window.
+        //
+        // The old approach keyed off inSilence (set only after Signal Hold expires),
+        // meaning the AGC noise ramp during the hold period was written at full gain.
+        // Instead we key off lastDetected (the real last-seen timestamp), so the fade
+        // begins immediately when the signal drops and finishes exactly when the file
+        // closes — regardless of how hold and tail are set.
+        //
+        // lastDetected is written by the management thread every ~250ms; we subtract
+        // 250ms as a grace period so we don't fade while the signal is actively present
+        // (the management thread may be up to one poll interval behind).
         float tailFade = 1.0f;
-        if (slot->inSilence && _this->tailMs > 0) {
-            auto silenceElapsed = std::chrono::steady_clock::now() - slot->silenceStart;
-            float frac = std::clamp(
-                std::chrono::duration<float>(silenceElapsed).count() / (_this->tailMs * 0.001f),
-                0.0f, 1.0f);
-            tailFade = 0.5f * (1.0f + cosf(M_PI * frac));  // 1.0 → 0.0
+        {
+            auto now = std::chrono::steady_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(
+                now - slot->lastDetected).count();
+            elapsedMs = std::max(0.0f, elapsedMs - 250.0f); // grace for poll latency
+            float totalMs = (float)(_this->signalHoldMs + _this->tailMs);
+            if (totalMs > 0.0f && elapsedMs > 0.0f) {
+                float frac = std::clamp(elapsedMs / totalMs, 0.0f, 1.0f);
+                tailFade = 0.5f * (1.0f + cosf(M_PI * frac));  // 1.0 → 0.0
+            }
         }
 
         float* mono = (float*)data;  // safe: mono[i] written before data[i] is needed
