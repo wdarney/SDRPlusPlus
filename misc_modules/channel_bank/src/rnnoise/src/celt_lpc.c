@@ -101,7 +101,7 @@ int rnn_autocorr(
    int fastN=n-lag;
    int shift;
    const opus_val16 *xptr;
-   opus_val16 xx[n];
+   RNNOISE_VLA(opus_val16, xx, n);
    celt_assert(n>0);
    celt_assert(overlap>=0);
    if (overlap == 0)
