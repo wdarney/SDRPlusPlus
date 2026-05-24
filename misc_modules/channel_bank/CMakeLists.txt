@@ -26,7 +26,7 @@ target_include_directories(channel_bank PRIVATE
 if (MSVC)
     set_source_files_properties(${RNNOISE_SRC} PROPERTIES
         LANGUAGE C
-        COMPILE_FLAGS "/w"
+        COMPILE_FLAGS "/w /D_USE_MATH_DEFINES"
         SKIP_PRECOMPILE_HEADERS ON
     )
 else()
