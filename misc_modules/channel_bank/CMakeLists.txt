@@ -23,11 +23,19 @@ target_include_directories(channel_bank PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../frequency_manager/src
 )
 # Force C compilation and suppress warnings for third-party RNNoise sources
-set_source_files_properties(${RNNOISE_SRC} PROPERTIES
-    LANGUAGE C
-    COMPILE_FLAGS $<IF:$<CXX_COMPILER_ID:MSVC>,"/w","-w -std=c11">
-    SKIP_PRECOMPILE_HEADERS ON
-)
+if (MSVC)
+    set_source_files_properties(${RNNOISE_SRC} PROPERTIES
+        LANGUAGE C
+        COMPILE_FLAGS "/w"
+        SKIP_PRECOMPILE_HEADERS ON
+    )
+else()
+    set_source_files_properties(${RNNOISE_SRC} PROPERTIES
+        LANGUAGE C
+        COMPILE_FLAGS "-w -std=c11"
+        SKIP_PRECOMPILE_HEADERS ON
+    )
+endif()
 
 # FFTW3F — pulled from android-sdr-kit on Android, system pkg-config elsewhere.
 # Pattern matches core/CMakeLists.txt and the source_modules/* convention.
