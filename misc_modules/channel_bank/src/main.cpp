@@ -1,6 +1,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #define _USE_MATH_DEFINES
+#include <windows.h>
 #endif
 #include <imgui.h>
 #include <module.h>
@@ -1415,31 +1416,71 @@ private:
                 else
                     flog::info("[ChannelBank] Encoded: {0}", result);
 #else
-                // Non-Apple: encode WAV → M4A via FFmpeg subprocess.
-                // ffmpegPath can be a bare name ("ffmpeg") to rely on PATH, or a full path.
+                // Non-Apple: encode WAV → M4A via FFmpeg.
+                // Uses CreateProcess on Windows (no console flash, network paths work,
+                // no cmd.exe shell-quoting issues with metadata values).
                 std::string m4aPath = task.wavPath.substr(0, task.wavPath.rfind('.')) + ".m4a";
-                // Build the command — wrap exe and each path in quotes to handle spaces.
-                // Outer double-quote pair required by cmd.exe when exe path is quoted.
-                std::string cmd = "\"\"" + ffmpegPath + "\"";
-                cmd += " -y -i \"" + task.wavPath + "\"";
-                cmd += " -c:a aac -b:a 32k";
+
+                // Build the command line. Metadata key=value pairs are passed as a
+                // single quoted argument so spaces in the value are handled correctly
+                // by the Windows C-runtime argument parser ffmpeg uses.
+                // Format: "ffmpeg.exe" -y -i "in.wav" -c:a aac -b:a 32k
+                //         [-metadata "comment=SNR: X.X dB avg"] "out.m4a"
+                std::string cmdLine = "\"" + ffmpegPath + "\"";
+                cmdLine += " -y -i \"" + task.wavPath + "\"";
+                cmdLine += " -c:a aac -b:a 32k";
                 if (task.avgSnrDb != 0.0f) {
                     char buf[32];
                     snprintf(buf, sizeof(buf), "%.1f", task.avgSnrDb);
-                    cmd += std::string(" -metadata comment=\"SNR: ") + buf + " dB avg\"";
+                    cmdLine += std::string(" -metadata \"comment=SNR: ") + buf + " dB avg\"";
                 }
                 if (!task.transcript.empty()) {
-                    cmd += " -metadata lyrics=\"" + task.transcript + "\"";
+                    cmdLine += " -metadata \"lyrics=" + task.transcript + "\"";
                 }
-                cmd += " \"" + m4aPath + "\"\"";
-                cmd += " >NUL 2>&1";  // suppress FFmpeg console output
-                int ret = std::system(cmd.c_str());
+                cmdLine += " \"" + m4aPath + "\"";
+
+#ifdef _WIN32
+                {
+                    // Use CreateProcess with CREATE_NO_WINDOW so no console flashes.
+                    STARTUPINFOA si{};
+                    si.cb         = sizeof(si);
+                    si.dwFlags    = STARTF_USESHOWWINDOW;
+                    si.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi{};
+                    std::vector<char> cmdBuf(cmdLine.begin(), cmdLine.end());
+                    cmdBuf.push_back('\0');
+                    BOOL ok = CreateProcessA(nullptr, cmdBuf.data(),
+                                             nullptr, nullptr, FALSE,
+                                             CREATE_NO_WINDOW,
+                                             nullptr, nullptr, &si, &pi);
+                    if (!ok) {
+                        flog::error("[ChannelBank] CreateProcess failed (err {0}): {1}",
+                                    (int)GetLastError(), task.wavPath);
+                    } else {
+                        WaitForSingleObject(pi.hProcess, INFINITE);
+                        DWORD exitCode = 1;
+                        GetExitCodeProcess(pi.hProcess, &exitCode);
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        if (exitCode != 0) {
+                            flog::error("[ChannelBank] FFmpeg exited {0}: {1}", (int)exitCode, task.wavPath);
+                        } else {
+                            std::remove(task.wavPath.c_str());
+                            flog::info("[ChannelBank] Encoded: {0}", m4aPath);
+                        }
+                    }
+                }
+#else
+                // Linux/other: fall back to popen (no console issue there)
+                cmdLine += " >/dev/null 2>&1";
+                int ret = std::system(cmdLine.c_str());
                 if (ret != 0) {
                     flog::error("[ChannelBank] FFmpeg encoding failed (exit {0}): {1}", ret, task.wavPath);
                 } else {
                     std::remove(task.wavPath.c_str());
                     flog::info("[ChannelBank] Encoded: {0}", m4aPath);
                 }
+#endif
 #endif
             }
         }
