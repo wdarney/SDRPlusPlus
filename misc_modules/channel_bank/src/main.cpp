@@ -200,6 +200,8 @@ public:
             transcriptionEnabled = config.conf[name]["transcriptionEnabled"];
         if (config.conf[name].contains("m4aEnabled"))
             m4aEnabled = config.conf[name]["m4aEnabled"];
+        if (config.conf[name].contains("ffmpegPath"))
+            ffmpegPath = config.conf[name]["ffmpegPath"].get<std::string>();
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -1277,19 +1279,24 @@ private:
                             slot->liveTranscript.clear();
                             slot->transcribeHandle = transcription::transcribeFile(slot->currentFilePath.c_str());
                         }
-                        // Register for M4A encoding after playback+transcription both complete.
-                        // transcriptionDone=true when transcription is off or failed to start,
-                        // so encoding fires immediately after playback in those cases.
+#endif
+                        // Register for M4A encoding after playback completes (all platforms).
+                        // On Apple, transcriptionDone reflects whether speech recognition
+                        // is running; on other platforms it is always true so encoding
+                        // fires immediately after playback without waiting.
                         if (_this->m4aEnabled && _this->recordingEnabled && !slot->currentFilePath.empty()) {
                             float avgSnrDb = (slot->snrCount > 0)
                                 ? slot->snrSum / (float)slot->snrCount : 0.0f;
                             std::lock_guard<std::mutex> elk(_this->pendingEncodesMtx);
                             EncodeState& es = _this->pendingEncodes[slot->currentFilePath];
                             es.playbackDone      = false;
+#ifdef __APPLE__
                             es.transcriptionDone = (!_this->transcriptionEnabled || !slot->transcribeHandle);
+#else
+                            es.transcriptionDone = true;
+#endif
                             es.avgSnrDb          = avgSnrDb;
                         }
-#endif
                         // Log the frequency and queue for playback
                         _this->logRecording(slot->freqHz);
                         _this->saveFreqLog();
@@ -1407,6 +1414,32 @@ private:
                     flog::error("[ChannelBank] M4A encoding failed: {0}", task.wavPath);
                 else
                     flog::info("[ChannelBank] Encoded: {0}", result);
+#else
+                // Non-Apple: encode WAV → M4A via FFmpeg subprocess.
+                // ffmpegPath can be a bare name ("ffmpeg") to rely on PATH, or a full path.
+                std::string m4aPath = task.wavPath.substr(0, task.wavPath.rfind('.')) + ".m4a";
+                // Build the command — wrap exe and each path in quotes to handle spaces.
+                // Outer double-quote pair required by cmd.exe when exe path is quoted.
+                std::string cmd = "\"\"" + ffmpegPath + "\"";
+                cmd += " -y -i \"" + task.wavPath + "\"";
+                cmd += " -c:a aac -b:a 32k";
+                if (task.avgSnrDb != 0.0f) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%.1f", task.avgSnrDb);
+                    cmd += std::string(" -metadata comment=\"SNR: ") + buf + " dB avg\"";
+                }
+                if (!task.transcript.empty()) {
+                    cmd += " -metadata lyrics=\"" + task.transcript + "\"";
+                }
+                cmd += " \"" + m4aPath + "\"\"";
+                cmd += " >NUL 2>&1";  // suppress FFmpeg console output
+                int ret = std::system(cmd.c_str());
+                if (ret != 0) {
+                    flog::error("[ChannelBank] FFmpeg encoding failed (exit {0}): {1}", ret, task.wavPath);
+                } else {
+                    std::remove(task.wavPath.c_str());
+                    flog::info("[ChannelBank] Encoded: {0}", m4aPath);
+                }
 #endif
             }
         }
@@ -1438,9 +1471,10 @@ private:
                 if (deleteAfter) {
                     std::remove(path.c_str());
                 }
-#ifdef __APPLE__
                 else if (m4aEnabled) {
-                    // Playback done — check if transcription is also complete
+                    // Playback done — check if transcription is also complete.
+                    // On non-Apple transcriptionDone is always true, so encoding
+                    // fires here immediately after playback.
                     bool        canEncode = false;
                     std::string encodeTranscript;
                     float       encodeSnrDb = 0.0f;
@@ -1459,7 +1493,6 @@ private:
                     }
                     if (canEncode) triggerEncode(path, encodeTranscript, encodeSnrDb);
                 }
-#endif
             } else {
                 // Write silence to keep monitorStream continuously flowing.
                 // swap() naturally throttles to the consumer's 48 kHz read rate.
@@ -2347,6 +2380,38 @@ private:
                 _this->transcriptionEnabled ? " + transcription" : "");
             ImGui::PopStyleColor();
         }
+#else
+        // Non-Apple: M4A encoding via FFmpeg
+        if (ImGui::Checkbox(CONCAT("Encode to M4A (FFmpeg)##_cb_m4a_", _this->name),
+                            &_this->m4aEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["m4aEnabled"] = _this->m4aEnabled;
+            config.release(true);
+        }
+        if (_this->m4aEnabled) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.8f, 0.5f, 1.0f));
+            ImGui::TextUnformatted("32 kbps AAC");
+            ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+            ImGui::TextWrapped("WAV converted after first playback. WAV deleted on success.");
+            ImGui::PopStyleColor();
+
+            // FFmpeg path input
+            ImGui::LeftLabel("FFmpeg path");
+            ImGui::FillWidth();
+            char ffmpegBuf[512];
+            snprintf(ffmpegBuf, sizeof(ffmpegBuf), "%s", _this->ffmpegPath.c_str());
+            if (ImGui::InputText(CONCAT("##_cb_ffmpeg_", _this->name), ffmpegBuf, sizeof(ffmpegBuf))) {
+                _this->ffmpegPath = ffmpegBuf;
+                config.acquire();
+                config.conf[_this->name]["ffmpegPath"] = _this->ffmpegPath;
+                config.release(true);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+            ImGui::TextUnformatted("Leave as \"ffmpeg\" if it's on your PATH.");
+            ImGui::PopStyleColor();
+        }
 #endif
 
         // Record gain (live)
@@ -2998,6 +3063,7 @@ private:
     bool         recordingEnabled      = true;   // global recording on/off toggle
     bool         transcriptionEnabled  = false;  // Apple Speech transcription
     bool         m4aEnabled            = false;  // encode to M4A after playback+transcription
+    std::string  ffmpegPath            = "ffmpeg"; // path/name of ffmpeg executable (non-Apple)
     float        recGain       = 0.25f;     // linear gain applied before WAV write (~-12dB)
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
