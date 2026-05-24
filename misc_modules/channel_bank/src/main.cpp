@@ -268,6 +268,7 @@ public:
         fftBufPos = 0;
         specSamplesUntilFFT = 0;    // trigger first spectrum analysis immediately
         avgPower.clear();           // reset spectrum averaging on start
+        fastAvgPower.clear();
         globalNoiseFloor = 0.0f;
 
         if (scanMode) {
@@ -556,6 +557,7 @@ private:
             lastKnownCenter = pendingRetuneCenter;
             fftBufPos        = 0;
             avgPower.clear();
+            fastAvgPower.clear();
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
             floorHistory.clear();
@@ -577,20 +579,32 @@ private:
         // Compute linear power per bin (FFT-shifted, normalised)
         float scale = 1.0f / (float)(FFT_SIZE * FFT_SIZE);
 
-        // Exponential moving average across FFT frames.
-        // alpha ~0.15 gives an effective averaging window of ~7 frames (~24ms at
-        // 2.4MHz SR), which reduces noise variance by ~7x while still reacting
-        // quickly to real signals.
-        constexpr float alpha = 0.15f;
+        // Two EMAs:
+        //   avgPower     (alpha=0.15) — slow, low-variance: used for voting/spawning/NMS
+        //   fastAvgPower (alpha=0.5)  — fast: used ONLY for rawSignalPresent / fade trigger
+        //
+        // Why two? alpha=0.15 decays to 1/e in ~7 frames ≈ 350ms.  After a carrier drops,
+        // the slow EMA stays above the 4 dB SNR threshold for 150–450 ms depending on signal
+        // strength — so rawSignalPresent would stay true the whole time, keeping the fade
+        // counter reset and producing a long static tail.
+        // alpha=0.5 decays to half in ONE frame (50 ms) and falls below the threshold in
+        // 2–3 frames (100–150 ms) even for a 10 dB SNR signal, while still averaging enough
+        // to suppress noise false-positives (false-trigger rate < 0.001/sec for 3+ bin windows).
+        constexpr float alpha     = 0.15f;
+        constexpr float fastAlpha = 0.50f;
         bool firstFrame = avgPower.empty();
-        if (firstFrame) avgPower.resize(FFT_SIZE);
+        if (firstFrame) {
+            avgPower.resize(FFT_SIZE);
+            fastAvgPower.resize(FFT_SIZE);
+        }
         for (int i = 0; i < FFT_SIZE; i++) {
             int k = (i + FFT_SIZE / 2) % FFT_SIZE;
             float re = fftOut[k][0], im = fftOut[k][1];
             float inst = (re * re + im * im) * scale;
-            avgPower[i] = firstFrame ? inst : (alpha * inst + (1.0f - alpha) * avgPower[i]);
+            avgPower[i]     = firstFrame ? inst : (alpha     * inst + (1.0f - alpha)     * avgPower[i]);
+            fastAvgPower[i] = firstFrame ? inst : (fastAlpha * inst + (1.0f - fastAlpha) * fastAvgPower[i]);
         }
-        // Use the averaged spectrum for all detection
+        // Slow EMA for all detection/voting; fast EMA for raw fade trigger
         std::vector<float>& power = avgPower;
 
         double binHz  = lastKnownSr / FFT_SIZE;
@@ -607,21 +621,26 @@ private:
         // snrLinear computed once per frame
         float snrLinear = powf(10.0f, snrThreshold / 10.0f);
 
-        // Compute per-slot means (using detection window, not full slot width)
+        // Compute per-slot means (using detection window, not full slot width).
+        // Two variants: slotMeans (slow EMA) for voting; fastSlotMeans (fast EMA) for fade trigger.
         std::vector<float> slotMeans(numSlots);
+        std::vector<float> fastSlotMeans(numSlots);
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
             double slotOffset = ((double)s - (double)(numSlots - 1) / 2.0) * channelSpacing;
             int centerBin = (int)std::round((slotOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
             int lo = std::clamp(centerBin - halfBins, 0, FFT_SIZE - 1);
             int hi = std::clamp(centerBin + halfBins, 0, FFT_SIZE - 1);
-            float sum = 0.0f;
+            float sum = 0.0f, fastSum = 0.0f;
             int   peakBin = lo;
             for (int b = lo; b <= hi; b++) {
-                sum += power[b];
+                sum     += power[b];
+                fastSum += fastAvgPower[b];
                 if (power[b] > power[peakBin]) peakBin = b;
             }
-            slotMeans[s] = sum / (float)(hi - lo + 1);
+            int nBins = hi - lo + 1;
+            slotMeans[s]     = sum     / (float)nBins;
+            fastSlotMeans[s] = fastSum / (float)nBins;
             // Spectral centroid: energy-weighted average bin frequency.
             // For SSB voice, this lands near the middle of the voice passband
             // (~1000–1500 Hz above/below carrier) rather than at the loudest
@@ -688,10 +707,16 @@ private:
                 int halfBins2 = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
                 int lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
                 int hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
-                float sum = 0.0f;
-                for (int b = lo; b <= hi; b++) sum += power[b];
-                float mean = sum / (float)(hi - lo + 1);
-                bool above = (mean > globalNoiseFloor * snrLinear);
+                float sum = 0.0f, fastSum = 0.0f;
+                for (int b = lo; b <= hi; b++) {
+                    sum     += power[b];
+                    fastSum += fastAvgPower[b];
+                }
+                int nBins2 = hi - lo + 1;
+                float mean     = sum     / (float)nBins2;
+                float fastMean = fastSum / (float)nBins2;
+                // Raw detection uses fast EMA so fade starts within 100–150 ms of drop
+                bool above = (fastMean > globalNoiseFloor * snrLinear);
                 if (above) newRawDetected.insert(i);  // raw, un-voted
                 // Store per-freq SNR for M4A metadata
                 if (globalNoiseFloor > 0.0f)
@@ -807,12 +832,11 @@ private:
             }
 
             // Immediately propagate raw (un-voted) detection to active slots.
-            // We're already holding channelsMtx and have slotMeans in hand, so
-            // rawSignalPresent updates in the SAME FFT frame that detects the drop —
-            // zero management-thread hop, zero extra latency beyond the FFT period.
+            // Uses fastSlotMeans (fast EMA) so the fade starts within 100–150 ms of
+            // carrier drop rather than 150–450 ms from the slow EMA.
             for (auto& [idx, slot] : activeChannels)
                 slot->rawSignalPresent.store(
-                    idx < numSlots && slotMeans[idx] > globalNoiseFloor * snrLinear);
+                    idx < numSlots && fastSlotMeans[idx] > globalNoiseFloor * snrLinear);
         }
 
         {
@@ -825,12 +849,12 @@ private:
                 slotSnrDb[s] = (globalNoiseFloor > 0.0f)
                     ? 10.0f * log10f(slotMeans[s] / globalNoiseFloor)
                     : 0.0f;
-            // Raw (un-voted) detection — used by the audio handler for instant fade-out.
-            // Does not go through the vote accumulator so it goes false immediately when
-            // signal drops below the SNR threshold, rather than decaying over ~400ms.
+            // Raw (un-voted) detection for instant fade-out — uses fastSlotMeans (fast EMA,
+            // alpha=0.5) so the flag goes false within 100–150 ms of carrier drop instead of
+            // the 150–450 ms it would take the slow EMA (alpha=0.15) to decay below threshold.
             rawDetectedSlots.clear();
             for (int s = 0; s < numSlots; s++)
-                if (slotMeans[s] > globalNoiseFloor * snrLinear)
+                if (fastSlotMeans[s] > globalNoiseFloor * snrLinear)
                     rawDetectedSlots.insert(s);
         }
 
@@ -3106,7 +3130,8 @@ private:
     std::atomic<int>                        debugDetectedCount { 0 };
     std::atomic<int>                        debugBlockedSkips  { 0 };
     std::atomic<int>                        debugCapSkips      { 0 };
-    std::vector<float>                      avgPower;           // EMA-smoothed power spectrum
+    std::vector<float>                      avgPower;           // slow EMA power spectrum (alpha=0.15) — voting
+    std::vector<float>                      fastAvgPower;       // fast EMA power spectrum (alpha=0.5) — fade trigger
     float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
     float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
     std::deque<float>                       floorHistory;             // ring buffer of recent rawFloor values for median filter
