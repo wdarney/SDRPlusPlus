@@ -292,9 +292,16 @@ public:
             }
         }
 
-        // Bind spectrum monitor stream
+        // Create one shared IQ binding — all consumers fan out from this splitter
+        // so the main signal-path thread only copies one 64 MHz buffer.
+        sharedIqIn = new dsp::stream<dsp::complex_t>();
+        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
+        iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
+        iqSplitter->start();
+
+        // Bind spectrum monitor stream to our splitter (not directly to the frontend)
         specStream = new dsp::stream<dsp::complex_t>();
-        sigpath::iqFrontEnd.bindIQStream(specStream);
+        iqSplitter->bindStream(specStream);
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
 
@@ -349,7 +356,7 @@ public:
         if (mgmtThread.joinable()) { mgmtThread.join(); }
 
         specSink->stop();
-        sigpath::iqFrontEnd.unbindIQStream(specStream);
+        iqSplitter->unbindStream(specStream);
         delete specSink;  specSink  = nullptr;
         delete specStream; specStream = nullptr;
 
@@ -364,6 +371,12 @@ public:
             }
             activeChannels.clear();
         }
+
+        // Tear down shared IQ splitter — all slot streams have been unbound by destroySlot above.
+        iqSplitter->stop();
+        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
+        delete iqSplitter; iqSplitter = nullptr;
+        delete sharedIqIn; sharedIqIn = nullptr;
 
         // Now drain + stop the encode thread (picks up anything destroySlot queued above).
         encodeThreadRunning = false;
@@ -1055,7 +1068,7 @@ private:
                 : offset;
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
-        sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
+        iqSplitter->bindStream(slot.iqIn);
 
         unsigned int preDecimRatio = computePreDecimRatio(lastKnownSr);
         if (preDecimRatio > 1) {
@@ -1136,7 +1149,7 @@ private:
         if (slot.preDecimator) { slot.preDecimator->stop(); delete slot.preDecimator; slot.preDecimator = nullptr; }
         if (slot.preXlator)    { slot.preXlator->stop();    delete slot.preXlator;    slot.preXlator    = nullptr; }
 
-        sigpath::iqFrontEnd.unbindIQStream(slot.iqIn);
+        iqSplitter->unbindStream(slot.iqIn);
 
         if (slot.fileOpen) {
             slot.writer.close();
@@ -3026,6 +3039,11 @@ private:
     std::map<std::string, std::vector<double>> fmLists;
     std::mutex bookmarkNamesMtx;
     std::map<int64_t, std::string> bookmarkNames;   // freqKey -> "Tower KLAX"
+
+    // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
+    // so the main signal-path thread only writes one 64 MHz buffer instead of N.
+    dsp::stream<dsp::complex_t>*            sharedIqIn     = nullptr;
+    dsp::routing::Splitter<dsp::complex_t>* iqSplitter     = nullptr;
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
