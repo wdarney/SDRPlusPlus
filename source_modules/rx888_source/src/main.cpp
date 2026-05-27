@@ -494,10 +494,8 @@ private:
             float gmax = (float)_this->gainRanges[i].maximum();
             if (gmin == gmax) continue;  // nothing to control
 
-            // RF gain on R820T2 is an attenuator: 0 dB = max sensitivity, negative = attenuation
-            std::string glabel = (_this->gainList[i] == "RF")
-                ? "RF Gain (0=max)"
-                : _this->gainList[i] + " Gain";
+            // RF gain: 0 = minimum gain, higher values = more gain/sensitivity
+            std::string glabel = _this->gainList[i] + " Gain";
             SmGui::LeftLabel(glabel.c_str());
             SmGui::FillWidth();
             float step = (float)_this->gainRanges[i].step();
