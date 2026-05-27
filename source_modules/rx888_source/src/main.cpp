@@ -455,7 +455,7 @@ private:
             SmGui::LeftLabel("ADC Clock");
             SmGui::FillWidth();
             float adcMHz = (float)(_this->adcFreq / 1e6);
-            if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz, 50.0f, 140.0f, SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
+            if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz, 16.0f, 140.0f, SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
                 _this->adcFreq = adcMHz * 1e6;
                 _this->saveConfig();
             }
