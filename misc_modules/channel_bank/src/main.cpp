@@ -153,6 +153,8 @@ public:
             ssbBfoHz = config.conf[name]["ssbBfoHz"];
         if (config.conf[name].contains("snrThreshold"))
             snrThreshold = config.conf[name]["snrThreshold"];
+        if (config.conf[name].contains("holdHysteresisDb"))
+            holdHysteresisDb = config.conf[name]["holdHysteresisDb"];
         if (config.conf[name].contains("cooldownSec"))
             cooldownSec = config.conf[name]["cooldownSec"];
         if (config.conf[name].contains("recGain"))
@@ -550,7 +552,83 @@ public:
             }
         }
 
-        int outCount = (int)samples.size() - outStart;
+        // Dynamic onset / offset trim.
+        // After the scalar normalisation and block RMS compressor have run (both
+        // in-place), scan the result in 50 ms windows to find where audio actually
+        // starts and where it last contains content.  This removes:
+        //   • leading noise: pre-voice carrier hiss that precedes the first word
+        //   • trailing silence: digital zeros written by the fade-out path
+        //
+        // Uses the 15th-percentile window-RMS as the post-compression noise floor
+        // (same estimator as the block compressor, but computed on the final samples
+        // so it's invariant to the gain curve applied above).
+        //
+        // Only applied when the processable region is ≥ 1 s (48000 samples) — short
+        // clips don't have enough windows for a stable percentile.
+        int outEnd = (int)samples.size();
+        {
+            const int   SCAN_WIN    = 2400;   // 50 ms @ 48 kHz
+            const float ONSET_MULT  = 3.0f;   // onset:  first window > 3× noise floor
+            const float OFFSET_MULT = 2.0f;   // offset: last  window > 2× noise floor
+            const int   MIN_CONTENT = 48000;  // require ≥ 1 s of post-trim content
+
+            int avail = (int)samples.size() - outStart;
+            if (avail >= MIN_CONTENT) {
+                // Build per-window RMS vector for noise-floor percentile
+                std::vector<float> wRms;
+                wRms.reserve(avail / SCAN_WIN + 1);
+                for (int i = outStart; i + SCAN_WIN <= (int)samples.size(); i += SCAN_WIN) {
+                    float s2 = 0.0f;
+                    for (int j = i; j < i + SCAN_WIN; j++) {
+                        float f = samples[j] / 32767.0f;
+                        s2 += f * f;
+                    }
+                    wRms.push_back(sqrtf(s2 / (float)SCAN_WIN));
+                }
+
+                if (!wRms.empty()) {
+                    std::vector<float> sortedW = wRms;
+                    std::sort(sortedW.begin(), sortedW.end());
+                    float scanNoise = sortedW[std::max(0, (int)(sortedW.size() * 0.15f) - 1)];
+
+                    if (scanNoise > 1e-6f) {
+                        float onsetThr  = scanNoise * ONSET_MULT;
+                        float offsetThr = scanNoise * OFFSET_MULT;
+
+                        // Onset: advance outStart to first window above onset threshold.
+                        // Back up one window so we include the actual attack transient.
+                        for (int i = outStart; i + SCAN_WIN <= (int)samples.size(); i += SCAN_WIN) {
+                            float s2 = 0.0f;
+                            for (int j = i; j < i + SCAN_WIN; j++) {
+                                float f = samples[j] / 32767.0f;
+                                s2 += f * f;
+                            }
+                            if (sqrtf(s2 / (float)SCAN_WIN) >= onsetThr) {
+                                outStart = std::max(outStart, i - SCAN_WIN);
+                                break;
+                            }
+                        }
+
+                        // Offset: retract outEnd to just past last window above offset threshold.
+                        // Add two windows of tail so the final word isn't clipped.
+                        for (int i = (int)samples.size() - SCAN_WIN;
+                             i > outStart + SCAN_WIN; i -= SCAN_WIN) {
+                            float s2 = 0.0f;
+                            for (int j = i; j < i + SCAN_WIN; j++) {
+                                float f = samples[j] / 32767.0f;
+                                s2 += f * f;
+                            }
+                            if (sqrtf(s2 / (float)SCAN_WIN) >= offsetThr) {
+                                outEnd = std::min((int)samples.size(), i + 2 * SCAN_WIN);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        int outCount = outEnd - outStart;
         if (outCount <= 0) return;
 
         // 500ms silence on each side — prevents Apple Speech error 1110 ("no speech")
@@ -773,8 +851,21 @@ private:
         constexpr double DETECT_BW_HZ = 8000.0;
         int halfBins  = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
 
-        // snrLinear computed once per frame
-        float snrLinear = powf(10.0f, snrThreshold / 10.0f);
+        // snrLinear: threshold required to SPAWN a new channel.
+        // holdSnrLinear: lower threshold used while a recording file is open — lets the
+        //   channel ride through HF QSB dips without losing votes or rawSignalPresent.
+        //   Derived from snrThreshold - holdHysteresisDb.
+        float snrLinear     = powf(10.0f, snrThreshold / 10.0f);
+        float holdSnrLinear = snrLinear * powf(10.0f, -holdHysteresisDb / 10.0f);
+
+        // Pre-compute which active-channel indices currently have an open recording
+        // file — used in both manual and auto modes below to select the right threshold.
+        std::set<int> openSlotIndices;
+        {
+            std::lock_guard<std::mutex> clck(channelsMtx);
+            for (auto& [idx, slot] : activeChannels)
+                if (slot->fileOpen) openSlotIndices.insert(idx);
+        }
 
         // Compute per-slot means (using detection window, not full slot width).
         // Two variants: slotMeans (slow EMA) for voting; instSlotMeans (instantaneous) for fade trigger.
@@ -946,8 +1037,12 @@ private:
                 //   aboveRaw:  instantaneous (instMean) — fast, drives rawSignalPresent / fade only
                 // Using instMean for voting caused strong-signal modulation spikes to
                 // accumulate votes on adjacent channels, triggering false detections.
-                bool aboveVote = (mean     > globalNoiseFloor * snrLinear);
-                bool aboveRaw  = (instMean > globalNoiseFloor * snrLinear);
+                //
+                // Hysteresis: once a file is open on this index, use holdSnrLinear
+                // (= snrThreshold - holdHysteresisDb) so brief fades don't drain votes.
+                float effSnr   = openSlotIndices.count(i) ? holdSnrLinear : snrLinear;
+                bool aboveVote = (mean     > globalNoiseFloor * effSnr);
+                bool aboveRaw  = (instMean > globalNoiseFloor * effSnr);
 
                 // Guard-band suppression for USB/LSB.
                 //
@@ -1113,9 +1208,14 @@ private:
         // Frozen during wideband noise events (lightning, etc.) so broadband
         // impulses can't accumulate the votes needed to spawn new channels.
         // Existing votes don't decay either — real active signals are protected.
+        //
+        // Hysteresis: slots with an open recording file use holdSnrLinear
+        // (snrThreshold - holdHysteresisDb) so brief fades don't drain votes
+        // and prematurely end recordings of weak/QSB signals.
         if (!widebandEvent) {
             for (int s = 0; s < numSlots; s++) {
-                bool aboveThreshold = (slotMeans[s] > globalNoiseFloor * snrLinear);
+                float effSnr        = openSlotIndices.count(s) ? holdSnrLinear : snrLinear;
+                bool aboveThreshold = (slotMeans[s] > globalNoiseFloor * effSnr);
                 int& votes = slotVotes[s];
                 if (aboveThreshold) { votes = std::min(votes + 1, MAX_VOTES); }
                 else                { votes = std::max(votes - 1, 0); }
@@ -1191,7 +1291,8 @@ private:
             // their miss counter reset by broadband noise.
             if (!widebandEvent) {
                 for (auto& [idx, slot] : activeChannels) {
-                    bool above = (idx < numSlots && instSlotMeans[idx] > globalNoiseFloor * snrLinear);
+                    float effSnrRaw = slot->fileOpen ? holdSnrLinear : snrLinear;
+                    bool above = (idx < numSlots && instSlotMeans[idx] > globalNoiseFloor * effSnrRaw);
                     if (above) {
                         rawSlotMisses[idx] = 0;
                         slot->rawSignalPresent.store(true);
@@ -2962,6 +3063,27 @@ private:
             config.conf[_this->name]["snrThreshold"] = _this->snrThreshold;
             config.release(true);
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Minimum SNR above noise floor required to START\n"
+                              "a new recording. Raising this reduces false triggers\n"
+                              "from noise; lowering it catches weaker signals.");
+
+        // Hold hysteresis — lower threshold while a recording is already open
+        ImGui::LeftLabel("Hold Hysteresis");
+        ImGui::FillWidth();
+        if (ImGui::SliderFloat(CONCAT("##_cb_hyst_", _this->name),
+                               &_this->holdHysteresisDb, 0.0f, 8.0f, "%.1f dB")) {
+            config.acquire();
+            config.conf[_this->name]["holdHysteresisDb"] = _this->holdHysteresisDb;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("dB below SNR Threshold that keeps an open\n"
+                              "recording alive. Signal can fade this far below\n"
+                              "the threshold without losing votes or triggering\n"
+                              "the dropout timer.\n"
+                              "4 dB covers typical HF QSB fading.\n"
+                              "0 = disabled (symmetric open/hold threshold).");
 
         // Cooldown (live)
         ImGui::LeftLabel("Cooldown");
@@ -3836,7 +3958,8 @@ private:
     int          spacingId     = 2;         // default → 25kHz
     int          demodMode     = DEMOD_AM;
     int          ssbBfoHz      = 0;         // BFO trim for USB/LSB; positive = pitch up
-    float        snrThreshold  = 4.0f;      // dB above noise floor
+    float        snrThreshold  = 4.0f;      // dB above noise floor — required to START a recording
+    float        holdHysteresisDb = 4.0f;  // dB below snrThreshold that keeps an open recording alive
     float        cooldownSec   = 5.0f;      // seconds before destroying a quiet channel
     float        leftTrimFrac   = 0.0f;  // fraction of bandwidth to exclude from left edge
     float        rightTrimFrac  = 0.0f;  // fraction of bandwidth to exclude from right edge
