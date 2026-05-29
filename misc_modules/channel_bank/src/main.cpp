@@ -513,6 +513,26 @@ public:
                     }
                 }
 
+                // Forward-lookahead smoothing: cap each block's gain to at most
+                // FWD_RATIO × the following block's gain.
+                //
+                // Without this, a quiet pre-voice carrier window (T=250-500 ms)
+                // has low RMS and receives a large boost.  The compressor then
+                // applies that boosted gain right as the operator keys up (PTT
+                // click / carrier onset noise), which the user hears as a brief
+                // loud static burst before the gain drops to the voice level.
+                // Limiting the gain increase relative to the *next* block ensures
+                // the onset never gets amplified beyond what the following content
+                // warrants — the transition is at most ~3.5 dB (factor 1.5) per
+                // 500 ms window, so ≈ 7 dB/s maximum gain decay rate.
+                {
+                    const float FWD_RATIO = 1.5f;
+                    for (int b = 0; b < numBlocks - 1; b++) {
+                        if (blockGain[b] > blockGain[b + 1] * FWD_RATIO)
+                            blockGain[b] = blockGain[b + 1] * FWD_RATIO;
+                    }
+                }
+
                 // Apply with linear interpolation between block boundaries
                 // to avoid audible gain steps at every 500 ms boundary.
                 for (int b = 0; b < numBlocks; b++) {
