@@ -93,10 +93,22 @@ struct ChannelSlot {
     std::chrono::steady_clock::time_point      lastDetected;  // last time FFT saw signal here
     std::atomic<bool>                          signalPresent    { false };
     std::atomic<bool>                          rawSignalPresent { false }; // above SNR threshold RIGHT NOW (no vote smoothing, no hold)
+    std::atomic<int>                           rawConsecutiveHits { 0 };  // consecutive FFT frames rawSignalPresent was true; gated file-open requires ≥2
     bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
 
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
-    int fadeOutRemaining = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
+    int fadeOutRemaining  = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
+    int audioHoldRemaining = 0;   // short independent audio-hold (200ms) before fade starts;
+                                  // decoupled from signalHoldMs so AM AGC ramp doesn't bleed into recording
+
+    // Pre-roll circular buffer — always running once warmup is done (DSP thread only).
+    // When a file opens we flush the last PREROLL_SAMPLES of audio first so we
+    // capture the start of the transmission that occurred before detection fired.
+    static constexpr int PREROLL_SAMPLES = 19200;  // 400ms @ 48kHz
+    std::vector<float> preRollBuf  = std::vector<float>(PREROLL_SAMPLES, 0.0f);
+    std::vector<float> preRollTmp  = std::vector<float>(PREROLL_SAMPLES, 0.0f);  // scratch for flush
+    int  preRollHead  = 0;   // next write position (wraps mod PREROLL_SAMPLES)
+    int  preRollCount = 0;   // valid samples currently in buffer (0..PREROLL_SAMPLES)
 
 #ifdef __APPLE__
     void*       transcribeHandle       = nullptr;
@@ -192,6 +204,10 @@ public:
                 watchedFreqs.insert(j.get<int64_t>());
         if (config.conf[name].contains("signalHoldMs"))
             signalHoldMs = config.conf[name]["signalHoldMs"];
+        if (config.conf[name].contains("leftTrimFrac"))
+            leftTrimFrac  = config.conf[name]["leftTrimFrac"];
+        if (config.conf[name].contains("rightTrimFrac"))
+            rightTrimFrac = config.conf[name]["rightTrimFrac"];
         if (config.conf[name].contains("recordingEnabled"))
             recordingEnabled = config.conf[name]["recordingEnabled"];
         if (config.conf[name].contains("transcriptionEnabled"))
@@ -222,10 +238,19 @@ public:
         fftOut = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
         fftPlan = fftwf_plan_dft_1d(FFT_SIZE, fftIn, fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
 
-        // Precompute Hann window
+        // Precompute 4-term Blackman-Harris window.
+        // Sidelobes: -92 dB vs Hann's -31.5 dB.  For a 40 dB strong signal,
+        // Hann sidelobes sit at 8.5 dB above noise (above any detection threshold);
+        // Blackman-Harris sidelobes sit at -52 dB — completely invisible.
+        // This prevents strong SELCAL / HFDL carriers from leaking into adjacent
+        // bookmark detection windows and showing wide spikes in the mini-spectrum.
         hannWindow.resize(FFT_SIZE);
         for (int i = 0; i < FFT_SIZE; i++) {
-            hannWindow[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (FFT_SIZE - 1)));
+            float phi = 2.0f * M_PI * i / (float)(FFT_SIZE - 1);
+            hannWindow[i] = 0.35875f
+                          - 0.48829f * cosf(phi)
+                          + 0.14128f * cosf(2.0f * phi)
+                          - 0.01168f * cosf(3.0f * phi);
         }
         fftAccum.resize(FFT_SIZE);
         fftBufPos = 0;
@@ -268,8 +293,11 @@ public:
         fftBufPos = 0;
         specSamplesUntilFFT = 0;    // trigger first spectrum analysis immediately
         avgPower.clear();           // reset spectrum averaging on start
-        fastAvgPower.clear();
+        instPower.clear();
+        rawSlotMisses.clear();
+        rawManualMisses.clear();
         globalNoiseFloor = 0.0f;
+        { std::lock_guard<std::mutex> lck(channelsMtx); recentChannels.clear(); }
 
         if (scanMode) {
             computeScanStops();
@@ -406,19 +434,100 @@ public:
         const int trimLen  = 12000;  // 250ms @ 48kHz
         int       outStart = std::min(trimLen, (int)samples.size());
 
-        // Find peak from the post-trim audio to set the normalization scale.
-        int32_t peak = 0;
+        // Normalization: use the 99th-percentile absolute value as the reference
+        // instead of the absolute peak.  A single static crash or PTT click sets
+        // the absolute peak and anchors the scale at a low value, making the rest
+        // of the recording sound quiet.  The 99th-percentile ignores the top 1% of
+        // samples, so brief spikes don't drag down the overall level.
+        //
+        // Target: -6 dBFS at the 99th percentile.  That leaves 6 dB of headroom
+        // for the top 1% of samples before they clip, which is appropriate for
+        // speech recordings where occasional noise bursts exceed normal speech level.
+        int postLen = (int)samples.size() - outStart;
+        if (postLen <= 0) return;
+        std::vector<int32_t> absVals;
+        absVals.reserve(postLen);
         for (int i = outStart; i < (int)samples.size(); i++)
-            peak = std::max(peak, (int32_t)std::abs((int32_t)samples[i]));
-        if (peak < 100) return;  // silent or too short — skip
+            absVals.push_back(std::abs((int32_t)samples[i]));
+        std::sort(absVals.begin(), absVals.end());
+        int p99idx = std::max(0, (int)(absVals.size() * 0.99f) - 1);
+        int32_t ref99 = absVals[p99idx];
+        if (ref99 < 50) return;  // silent or too short — skip
 
-        float scale = 23170.0f / (float)peak;  // target -3 dBFS
-        if (scale > 8.0f) scale = 8.0f;
+        // -6 dBFS = 32767 * 10^(-6/20) ≈ 16423
+        const float target6dBFS = 16423.0f;
+        float scale = target6dBFS / (float)ref99;
+        // Allow up to 20x gain for very weak signals; cap hard to avoid
+        // turning pure noise into a wall of sound.
+        if (scale > 20.0f) scale = 20.0f;
 
         // Apply scale to all samples.
         for (auto& smp : samples) {
             int32_t v = std::clamp((int32_t)std::round((float)smp * scale), -32768, 32767);
             smp = (int16_t)v;
+        }
+
+        // Block-based dynamic range compression.
+        // On HF a ground station can be 30-40 dB louder than an aircraft reply
+        // within the same recording, so a single scale factor leaves the quiet
+        // parts inaudible.  We divide the content into 500 ms blocks, estimate
+        // the noise floor from the quietest blocks, and apply a smoothed gain
+        // envelope that brings each active block toward a consistent RMS target.
+        // A noise gate prevents amplifying silence between transmissions.
+        {
+            const int   BLOCK_SAMPS = 24000;    // 500 ms @ 48 kHz
+            const float TARGET_RMS  = 0.12f;    // ≈ -18 dBFS — comfortable speech
+            const float MAX_GAIN    = 4.0f;     // cap boost at +12 dB
+            const float MIN_GAIN    = 0.33f;    // cap cut  at -10 dB
+            const float GATE_RATIO  = 3.0f;     // skip blocks below 3× noise floor
+
+            int totalOut = (int)samples.size() - outStart;
+            if (totalOut > 0) {
+                int numBlocks = (int)std::ceil((float)totalOut / BLOCK_SAMPS);
+
+                // Per-block RMS from the post-trim content
+                std::vector<float> blockRms(numBlocks, 0.0f);
+                for (int b = 0; b < numBlocks; b++) {
+                    int s0 = outStart + b * BLOCK_SAMPS;
+                    int s1 = std::min(s0 + BLOCK_SAMPS, (int)samples.size());
+                    float sum2 = 0.0f;
+                    for (int i = s0; i < s1; i++) {
+                        float f = samples[i] / 32767.0f;
+                        sum2 += f * f;
+                    }
+                    blockRms[b] = sqrtf(sum2 / (float)(s1 - s0));
+                }
+
+                // Noise floor: 15th-percentile block RMS
+                std::vector<float> sortedRms = blockRms;
+                std::sort(sortedRms.begin(), sortedRms.end());
+                float noiseRms   = sortedRms[std::max(0, (int)(sortedRms.size() * 0.15f) - 1)];
+                float gateThresh = noiseRms * GATE_RATIO;
+
+                // Target gain per block; gated (quiet/silence) blocks hold at 1.0
+                std::vector<float> blockGain(numBlocks, 1.0f);
+                for (int b = 0; b < numBlocks; b++) {
+                    if (blockRms[b] > gateThresh && blockRms[b] > 1e-6f) {
+                        float g = TARGET_RMS / blockRms[b];
+                        blockGain[b] = std::clamp(g, MIN_GAIN, MAX_GAIN);
+                    }
+                }
+
+                // Apply with linear interpolation between block boundaries
+                // to avoid audible gain steps at every 500 ms boundary.
+                for (int b = 0; b < numBlocks; b++) {
+                    int s0 = outStart + b * BLOCK_SAMPS;
+                    int s1 = std::min(s0 + BLOCK_SAMPS, (int)samples.size());
+                    float g0 = blockGain[b];
+                    float g1 = (b + 1 < numBlocks) ? blockGain[b + 1] : g0;
+                    for (int i = s0; i < s1; i++) {
+                        float t = (float)(i - s0) / (float)(s1 - s0);
+                        float g = g0 + (g1 - g0) * t;
+                        int32_t v = std::clamp((int32_t)std::round(samples[i] * g), -32768, 32767);
+                        samples[i] = (int16_t)v;
+                    }
+                }
+            }
         }
 
         int outCount = (int)samples.size() - outStart;
@@ -501,11 +610,14 @@ public:
         slot.fileOpen             = true;
         slot.fileOpenTime         = std::chrono::steady_clock::now();
         slot.audioSamplesWritten  = 0;
-        slot.fileTrimSamples      = 9600; // skip first 200ms from WAV file
-        slot.recFadeRemaining     = 4800;   // 100ms fade-in at 48kHz — suppresses PTT click and filter ring
+        slot.fileTrimSamples      = 0;    // pre-roll provides seamless audio, no post-open discard needed
+        slot.recFadeRemaining     = 0;    // pre-roll audio is continuous, no fade-in click to suppress
         slot.snrSum               = 0.0f;
         slot.snrCount             = 0;
         slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
+        // Immediately register in history so the user can block this frequency
+        // from the panel even if the recording is later discarded as too short.
+        if (slot.module) slot.module->touchFreqLog(slot.freqHz);
         return true;
     }
 
@@ -557,7 +669,9 @@ private:
             lastKnownCenter = pendingRetuneCenter;
             fftBufPos        = 0;
             avgPower.clear();
-            fastAvgPower.clear();
+            instPower.clear();
+            rawSlotMisses.clear();
+            rawManualMisses.clear();
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
             floorHistory.clear();
@@ -567,11 +681,34 @@ private:
             return;  // skip this frame — buffers are stale from old tuning
         }
 
-        // Apply Hann window and copy to FFTW input
+        // Determine how many real samples are in fftAccum this frame.
+        // At low sample rates (< FFT_SIZE * SPEC_ANALYSIS_HZ ≈ 164 kHz) the DSP block
+        // is shorter than FFT_SIZE, so the remainder was zero-padded in the DSP callback.
+        // Applying the full FFT_SIZE BH window to this truncated data leaves it at ~0.14
+        // at the cut point — far from zero — which reintroduces sidelobes almost as bad
+        // as Hann.  The fix: build a BH window sized to the actual fill, zero-padded to
+        // FFT_SIZE, and cache it so we only recompute on sample-rate changes.
+        int fill = (lastKnownSr > 0.0)
+            ? std::min((int)(lastKnownSr / SPEC_ANALYSIS_HZ), FFT_SIZE)
+            : FFT_SIZE;
+        if (fill != fftWindowFill) {
+            fftWindow.resize(FFT_SIZE, 0.0f);
+            int n = fill > 1 ? fill : 1;
+            for (int i = 0; i < fill; i++) {
+                float phi = 2.0f * M_PI * i / (float)(n - 1);
+                fftWindow[i] = 0.35875f
+                             - 0.48829f * cosf(phi)
+                             + 0.14128f * cosf(2.0f * phi)
+                             - 0.01168f * cosf(3.0f * phi);
+            }
+            for (int i = fill; i < FFT_SIZE; i++) fftWindow[i] = 0.0f;
+            fftWindowFill = fill;
+        }
+
+        // Apply window and copy to FFTW input
         for (int i = 0; i < FFT_SIZE; i++) {
-            float w = hannWindow[i];
-            fftIn[i][0] = fftAccum[i].re * w;
-            fftIn[i][1] = fftAccum[i].im * w;
+            fftIn[i][0] = fftAccum[i].re * fftWindow[i];
+            fftIn[i][1] = fftAccum[i].im * fftWindow[i];
         }
 
         fftwf_execute(fftPlan);
@@ -579,32 +716,30 @@ private:
         // Compute linear power per bin (FFT-shifted, normalised)
         float scale = 1.0f / (float)(FFT_SIZE * FFT_SIZE);
 
-        // Two EMAs:
-        //   avgPower     (alpha=0.15) — slow, low-variance: used for voting/spawning/NMS
-        //   fastAvgPower (alpha=0.5)  — fast: used ONLY for rawSignalPresent / fade trigger
+        // Two power arrays:
+        //   avgPower  (alpha=0.15) — slow EMA: voting/spawning/NMS/noise floor
+        //   instPower              — instantaneous (no EMA): rawSignalPresent / fade trigger only
         //
-        // Why two? alpha=0.15 decays to 1/e in ~7 frames ≈ 350ms.  After a carrier drops,
-        // the slow EMA stays above the 4 dB SNR threshold for 150–450 ms depending on signal
-        // strength — so rawSignalPresent would stay true the whole time, keeping the fade
-        // counter reset and producing a long static tail.
-        // alpha=0.5 decays to half in ONE frame (50 ms) and falls below the threshold in
-        // 2–3 frames (100–150 ms) even for a 10 dB SNR signal, while still averaging enough
-        // to suppress noise false-positives (false-trigger rate < 0.001/sec for 3+ bin windows).
-        constexpr float alpha     = 0.15f;
-        constexpr float fastAlpha = 0.50f;
+        // Why not use an EMA for rawSignalPresent?  A charged EMA (even alpha=0.50) takes
+        // 5–7 frames (250–350 ms) to decay below the SNR threshold after a strong carrier
+        // drops — because signal power during a long transmission fully charges the accumulator.
+        // Instantaneous power drops to noise level in ONE frame (50 ms), so with a
+        // 2-consecutive-miss guard the fade starts within ≤100 ms regardless of how long
+        // or strong the transmission was.
+        constexpr float alpha = 0.15f;
         bool firstFrame = avgPower.empty();
         if (firstFrame) {
             avgPower.resize(FFT_SIZE);
-            fastAvgPower.resize(FFT_SIZE);
+            instPower.resize(FFT_SIZE);
         }
         for (int i = 0; i < FFT_SIZE; i++) {
             int k = (i + FFT_SIZE / 2) % FFT_SIZE;
             float re = fftOut[k][0], im = fftOut[k][1];
             float inst = (re * re + im * im) * scale;
-            avgPower[i]     = firstFrame ? inst : (alpha     * inst + (1.0f - alpha)     * avgPower[i]);
-            fastAvgPower[i] = firstFrame ? inst : (fastAlpha * inst + (1.0f - fastAlpha) * fastAvgPower[i]);
+            avgPower[i]  = firstFrame ? inst : (alpha * inst + (1.0f - alpha) * avgPower[i]);
+            instPower[i] = inst;  // no smoothing — raw per-frame power for fade trigger
         }
-        // Slow EMA for all detection/voting; fast EMA for raw fade trigger
+        // Slow EMA for all detection/voting; instantaneous for raw fade trigger
         std::vector<float>& power = avgPower;
 
         double binHz  = lastKnownSr / FFT_SIZE;
@@ -622,25 +757,25 @@ private:
         float snrLinear = powf(10.0f, snrThreshold / 10.0f);
 
         // Compute per-slot means (using detection window, not full slot width).
-        // Two variants: slotMeans (slow EMA) for voting; fastSlotMeans (fast EMA) for fade trigger.
+        // Two variants: slotMeans (slow EMA) for voting; instSlotMeans (instantaneous) for fade trigger.
         std::vector<float> slotMeans(numSlots);
-        std::vector<float> fastSlotMeans(numSlots);
+        std::vector<float> instSlotMeans(numSlots);
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
             double slotOffset = ((double)s - (double)(numSlots - 1) / 2.0) * channelSpacing;
             int centerBin = (int)std::round((slotOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
             int lo = std::clamp(centerBin - halfBins, 0, FFT_SIZE - 1);
             int hi = std::clamp(centerBin + halfBins, 0, FFT_SIZE - 1);
-            float sum = 0.0f, fastSum = 0.0f;
+            float sum = 0.0f, instSum = 0.0f;
             int   peakBin = lo;
             for (int b = lo; b <= hi; b++) {
                 sum     += power[b];
-                fastSum += fastAvgPower[b];
+                instSum += instPower[b];
                 if (power[b] > power[peakBin]) peakBin = b;
             }
             int nBins = hi - lo + 1;
             slotMeans[s]     = sum     / (float)nBins;
-            fastSlotMeans[s] = fastSum / (float)nBins;
+            instSlotMeans[s] = instSum / (float)nBins;
             // Spectral centroid: energy-weighted average bin frequency.
             // For SSB voice, this lands near the middle of the voice passband
             // (~1000–1500 Hz above/below carrier) rather than at the loudest
@@ -660,9 +795,11 @@ private:
         // (fast enough to track real noise changes, slow enough to ignore brief
         // signal bursts that leak into the 20th percentile).
         {
-            int edgeSkip = (int)std::round(numSlots * (1.0f - bwUsage) / 2.0f);
+            int baseEdgeSkip = (int)std::round(numSlots * (1.0f - bwUsage) / 2.0f);
+            int leftSkip  = std::max(baseEdgeSkip, (int)std::round(numSlots * leftTrimFrac));
+            int rightSkip = std::max(baseEdgeSkip, (int)std::round(numSlots * rightTrimFrac));
             std::vector<float> centerMeans;
-            for (int s = edgeSkip; s < numSlots - edgeSkip; s++)
+            for (int s = leftSkip; s < numSlots - rightSkip; s++)
                 centerMeans.push_back(slotMeans[s]);
             if (centerMeans.empty()) centerMeans = {slotMeans[numSlots / 2]};
             std::sort(centerMeans.begin(), centerMeans.end());
@@ -694,6 +831,34 @@ private:
             displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
         }
 
+        // Wideband noise event detection — lightning, power-line QRM, solar events, etc.
+        //
+        // Real signals raise 1–3 adjacent slots. Broadband impulses raise ALL of them.
+        // If >40% of center slots simultaneously exceed the SNR threshold (measured on
+        // instantaneous power so the flag rises in one FFT frame, ~50 ms), we freeze all
+        // slot votes for that frame: no channels spawn, no channels lose votes.
+        // Active channels that were genuinely signalling remain unaffected — their
+        // rawSignalPresent state is left unchanged until normal processing resumes.
+        //
+        // Threshold rationale:
+        //   Real signals: a busy HF band (e.g. 80m SSB, 500 kHz) at 8 MHz SR
+        //     occupies 500/8000 = 6% of slots — even wall-to-wall.
+        //     At 2 MHz SR focused on 80m, worst-case occupancy is ~25%.
+        //   Lightning: raises 80–100% of all slots simultaneously.
+        //   40% gives a comfortable margin in all realistic cases and protects
+        //   narrower-bandwidth HF setups where a packed 40m/80m band could
+        //   approach the old 20% line.
+        {
+            int wbBaseEdge  = (int)std::round(numSlots * (1.0f - bwUsage) / 2.0f);
+            int wbLeftEdge  = std::max(wbBaseEdge, (int)std::round(numSlots * leftTrimFrac));
+            int wbRightEdge = std::max(wbBaseEdge, (int)std::round(numSlots * rightTrimFrac));
+            int wbCenter    = std::max(1, numSlots - wbLeftEdge - wbRightEdge);
+            int wbAbove     = 0;
+            for (int s = wbLeftEdge; s < numSlots - wbRightEdge; s++)
+                if (instSlotMeans[s] > globalNoiseFloor * snrLinear) wbAbove++;
+            widebandEvent = (wbAbove > wbCenter * 2 / 5);  // >40%
+        }
+
         // Manual mode: check configured frequencies instead of grid voting
         if (manualMode) {
             std::vector<double> localFreqs = getActiveManualFreqs();
@@ -705,25 +870,173 @@ private:
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
                 int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
                 int halfBins2 = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
-                int lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
-                int hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
-                float sum = 0.0f, fastSum = 0.0f;
+                int lo, hi;
+                // Two guard bands per SSB mode (-1 = unused):
+                //   guard1: outer guard, same side as the voice passband
+                //           (above carrier for USB, below for LSB) — catches interferers
+                //           whose lower/upper sideband overlaps the detection window
+                //   guard2: inner guard, opposite side of the carrier from the voice
+                //           (below carrier for USB, above for LSB) — catches interferers
+                //           whose upper/lower sideband leaks across the carrier
+                // USB voice has zero energy below the carrier; LSB has zero above.
+                // Any elevation there means an adjacent signal is leaking through.
+                int guard1Lo = -1, guard1Hi = -1;
+                int guard2Lo = -1, guard2Hi = -1;
+                if (demodMode == DEMOD_USB) {
+                    // USB energy lives in 300-2800 Hz above the carrier only.
+                    // Using halfBins2*2 (≈6.6 kHz for 8.33 kHz channel spacing)
+                    // is far too wide and catches adjacent HFDL signals 6 kHz up.
+                    // Clamp the window to the actual SSB passband width (2800 Hz).
+                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
+                    lo = centerBin;
+                    hi = std::clamp(centerBin + ssbBins, 0, FFT_SIZE - 1);
+                    // guard1: above the voice passband (catches HFDL above the bookmark)
+                    guard1Lo = hi + 1;
+                    guard1Hi = std::clamp(hi + ssbBins, 0, FFT_SIZE - 1);
+                    // guard2: below the carrier (catches HFDL below the bookmark)
+                    // USB voice never has energy here, so any elevation is interference.
+                    guard2Lo = std::clamp(centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    guard2Hi = std::max(0, centerBin - 1);
+                } else if (demodMode == DEMOD_LSB) {
+                    // Mirror: LSB energy lives in 300-2800 Hz below the carrier.
+                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
+                    lo = std::clamp(centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    hi = centerBin;
+                    // guard1: below the voice passband (catches HFDL below the bookmark)
+                    guard1Lo = std::clamp(lo - ssbBins, 0, FFT_SIZE - 1);
+                    guard1Hi = lo - 1;
+                    // guard2: above the carrier (catches HFDL above the bookmark)
+                    guard2Lo = hi + 1;
+                    guard2Hi = std::clamp(hi + ssbBins, 0, FFT_SIZE - 1);
+                } else {
+                    // AM / NFM / WFM: symmetric window around carrier
+                    lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
+                    hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
+                }
+                float sum = 0.0f, instSum = 0.0f;
                 for (int b = lo; b <= hi; b++) {
                     sum     += power[b];
-                    fastSum += fastAvgPower[b];
+                    instSum += instPower[b];
                 }
                 int nBins2 = hi - lo + 1;
                 float mean     = sum     / (float)nBins2;
-                float fastMean = fastSum / (float)nBins2;
-                // Raw detection uses fast EMA so fade starts within 100–150 ms of drop
-                bool above = (fastMean > globalNoiseFloor * snrLinear);
-                if (above) newRawDetected.insert(i);  // raw, un-voted
+                float instMean = instSum / (float)nBins2;
+                // Two separate thresholds — same split as auto mode:
+                //   aboveVote: slow EMA (mean) — stable, low-noise, drives vote accumulation
+                //   aboveRaw:  instantaneous (instMean) — fast, drives rawSignalPresent / fade only
+                // Using instMean for voting caused strong-signal modulation spikes to
+                // accumulate votes on adjacent channels, triggering false detections.
+                bool aboveVote = (mean     > globalNoiseFloor * snrLinear);
+                bool aboveRaw  = (instMean > globalNoiseFloor * snrLinear);
+
+                // Guard-band suppression for USB/LSB.
+                //
+                // Two complementary guards cover both directions:
+                //   guard1 (outer): same side as the voice passband.
+                //                  Elevated when HFDL/interferer is above USB
+                //                  (or below LSB) and its sideband bleeds in.
+                //   guard2 (inner): opposite side of the carrier from the voice.
+                //                  USB voice has ZERO energy below the carrier;
+                //                  LSB voice has ZERO above.  Any elevation there
+                //                  means a signal below (USB) or above (LSB) the
+                //                  bookmark is leaking across the carrier.
+                //
+                // If EITHER guard is significantly elevated AND the detection window
+                // is not much stronger than that guard, the signal is rejected as
+                // likely interference rather than genuine voice.
+                //
+                // The "guard elevated" pre-check prevents penalising weak voice
+                // transmissions in a quiet environment — guard check only activates
+                // when there is actually something to suppress.
+                auto checkGuard = [&](int gLo, int gHi) {
+                    if (gLo < 0 || gHi < gLo) return;
+                    float gSum = 0.0f, gInstSum = 0.0f;
+                    for (int b = gLo; b <= gHi; b++) {
+                        gSum     += power[b];
+                        gInstSum += instPower[b];
+                    }
+                    int   nGuard    = gHi - gLo + 1;
+                    float gMean     = gSum     / (float)nGuard;
+                    float gInstMean = gInstSum / (float)nGuard;
+                    // Activation gate: slow EMA (stable, ignores single-frame noise spikes).
+                    if (gMean > globalNoiseFloor * (snrLinear * 0.5f)) {
+                        // Ratio uses instantaneous power for both numerator and denominator.
+                        // This eliminates EMA charge-up lag at transmission start:
+                        //   • New voice tx: instMean jumps immediately → ratio is high → passes.
+                        //   • Persistent HFDL with no voice: instMean ≈ gInstMean → ratio ≈ 1 → suppressed.
+                        // Using the EMA 'mean' here caused 1-3 extra frames of false suppression
+                        // at the start of each transmission (~50-150 ms of missing audio).
+                        float ratio = (gInstMean > 1e-30f) ? (instMean / gInstMean) : 100.0f;
+                        if (ratio < 1.5f) {
+                            aboveVote = false;
+                            aboveRaw  = false;
+                        }
+                    }
+                };
+                checkGuard(guard1Lo, guard1Hi);
+                checkGuard(guard2Lo, guard2Hi);
+
+                // Ambient leakage suppression for AM / NFM / WFM.
+                // USB/LSB are already protected by the two-guard system above.
+                //
+                // Problem: on HF, a strong signal (e.g. HFDL at 8.925 MHz) whose
+                // spectral edge falls inside the ±4 kHz detection window of a nearby
+                // bookmark (e.g. 8.918 or 8.933 MHz, each ~7 kHz away) causes a false
+                // detection.  The main lobe of the interferer sits in the adjacent
+                // frequency window outside the detection bins.
+                //
+                // Fix: compute the instantaneous mean power in the two adjacent windows
+                // (each 12 kHz wide, just outside the detection window).  If either
+                // exceeds the detection-window power by more than 2.5× (≈ +4 dB), the
+                // detection is classified as spillover from a dominant adjacent carrier,
+                // not a genuine signal, and both flags are suppressed.
+                //
+                // When a real signal IS present at the bookmark frequency alongside the
+                // adjacent carrier, the detection-window power rises above just the
+                // spillover component, pulling the ratio back below 2.5 and letting the
+                // real signal through.
+                if ((aboveRaw || aboveVote) && demodMode != DEMOD_USB && demodMode != DEMOD_LSB) {
+                    const double AMBIENT_BW_HZ = 12000.0;
+                    int ambW = std::max(1, (int)std::round(AMBIENT_BW_HZ / binHz));
+                    int leftLo  = std::clamp(lo - ambW, 0, FFT_SIZE - 1);
+                    int leftHi  = std::clamp(lo - 1,   0, FFT_SIZE - 1);
+                    int rightLo = std::clamp(hi + 1,    0, FFT_SIZE - 1);
+                    int rightHi = std::clamp(hi + ambW, 0, FFT_SIZE - 1);
+
+                    // Instantaneous ambient mean (for aboveRaw gate)
+                    auto instAmbMean = [&](int aLo, int aHi) -> float {
+                        if (aLo > aHi) return 0.0f;
+                        float s = 0.0f;
+                        for (int b = aLo; b <= aHi; b++) s += instPower[b];
+                        return s / (float)(aHi - aLo + 1);
+                    };
+                    // EMA ambient mean (for aboveVote gate — matches slow-EMA mean)
+                    auto emaAmbMean = [&](int aLo, int aHi) -> float {
+                        if (aLo > aHi) return 0.0f;
+                        float s = 0.0f;
+                        for (int b = aLo; b <= aHi; b++) s += power[b];
+                        return s / (float)(aHi - aLo + 1);
+                    };
+
+                    float instMaxAmb = std::max(instAmbMean(leftLo, leftHi),
+                                                instAmbMean(rightLo, rightHi));
+                    float emaMaxAmb  = std::max(emaAmbMean(leftLo, leftHi),
+                                                emaAmbMean(rightLo, rightHi));
+
+                    if (instMean > 1e-30f && instMaxAmb > instMean * 2.5f) aboveRaw  = false;
+                    if (mean     > 1e-30f && emaMaxAmb  > mean     * 2.5f) aboveVote = false;
+                }
+
+                if (aboveRaw && !widebandEvent) newRawDetected.insert(i);  // raw, un-voted
                 // Store per-freq SNR for M4A metadata
                 if (globalNoiseFloor > 0.0f)
                     newManualSnr[i] = 10.0f * log10f(mean / globalNoiseFloor);
-                int& v = manualVotes[i];
-                v = above ? std::min(v + 1, MAX_VOTES) : std::max(v - 1, 0);
-                if (v >= SPAWN_VOTES) newDetected.insert(i);
+                // Votes frozen during wideband events (lightning protection)
+                if (!widebandEvent) {
+                    int& v = manualVotes[i];
+                    v = aboveVote ? std::min(v + 1, MAX_VOTES) : std::max(v - 1, 0);
+                    if (v >= SPAWN_VOTES) newDetected.insert(i);
+                }
             }
             {
                 std::lock_guard<std::mutex> lk(manualDetectedMtx);
@@ -755,23 +1068,38 @@ private:
                 displaySnap.dBmax = sorted[(int)(FFT_SIZE * 0.95f)] + 15.0f;
             }
             // Immediately propagate raw detection to active slots — same FFT frame,
-            // no management-thread hop. newRawDetected is indexed by manual-freq list index,
-            // which matches the activeChannels key in manual/bookmark-scan mode.
-            {
+            // no management-thread hop. Uses 2-consecutive-miss guard, same as auto mode.
+            // Skipped during wideband events so lightning doesn't interfere with state.
+            if (!widebandEvent) {
                 std::lock_guard<std::mutex> clck(channelsMtx);
-                for (auto& [idx, slot] : activeChannels)
-                    slot->rawSignalPresent.store(newRawDetected.count(idx) > 0);
+                for (auto& [idx, slot] : activeChannels) {
+                    bool above = (newRawDetected.count(idx) > 0);
+                    if (above) {
+                        rawManualMisses[idx] = 0;
+                        slot->rawSignalPresent.store(true);
+                        int hits = slot->rawConsecutiveHits.load() + 1;
+                        slot->rawConsecutiveHits.store(hits > 4 ? 4 : hits); // cap to avoid int creep
+                    } else if (++rawManualMisses[idx] >= 2) {
+                        slot->rawSignalPresent.store(false);
+                        slot->rawConsecutiveHits.store(0);
+                    }
+                }
             }
             mgmtCv.notify_one();
             return;
         }
 
-        // Vote on each slot against the global floor
-        for (int s = 0; s < numSlots; s++) {
-            bool aboveThreshold = (slotMeans[s] > globalNoiseFloor * snrLinear);
-            int& votes = slotVotes[s];
-            if (aboveThreshold) { votes = std::min(votes + 1, MAX_VOTES); }
-            else                { votes = std::max(votes - 1, 0); }
+        // Vote on each slot against the global floor.
+        // Frozen during wideband noise events (lightning, etc.) so broadband
+        // impulses can't accumulate the votes needed to spawn new channels.
+        // Existing votes don't decay either — real active signals are protected.
+        if (!widebandEvent) {
+            for (int s = 0; s < numSlots; s++) {
+                bool aboveThreshold = (slotMeans[s] > globalNoiseFloor * snrLinear);
+                int& votes = slotVotes[s];
+                if (aboveThreshold) { votes = std::min(votes + 1, MAX_VOTES); }
+                else                { votes = std::max(votes - 1, 0); }
+            }
         }
 
         // Pass 2: non-maximum suppression. We need to prevent two adjacent slots
@@ -832,11 +1160,31 @@ private:
             }
 
             // Immediately propagate raw (un-voted) detection to active slots.
-            // Uses fastSlotMeans (fast EMA) so the fade starts within 100–150 ms of
-            // carrier drop rather than 150–450 ms from the slow EMA.
-            for (auto& [idx, slot] : activeChannels)
-                slot->rawSignalPresent.store(
-                    idx < numSlots && fastSlotMeans[idx] > globalNoiseFloor * snrLinear);
+            // Uses instantaneous power with a 2-consecutive-miss guard:
+            //   • above threshold → reset miss counter, hold rawSignalPresent true
+            //   • 1st miss        → hold (single-frame noise dip protection)
+            //   • 2nd+ miss       → set rawSignalPresent false → cosine fade begins
+            // Worst-case tail: 2 frames (100 ms) + 50 ms fade = ~150 ms.
+            //
+            // During wideband events (lightning, etc.) the update is skipped entirely:
+            // active real signals keep their current state; quiet channels don't get
+            // their miss counter reset by broadband noise.
+            if (!widebandEvent) {
+                for (auto& [idx, slot] : activeChannels) {
+                    bool above = (idx < numSlots && instSlotMeans[idx] > globalNoiseFloor * snrLinear);
+                    if (above) {
+                        rawSlotMisses[idx] = 0;
+                        slot->rawSignalPresent.store(true);
+                        int hits = slot->rawConsecutiveHits.load() + 1;
+                        slot->rawConsecutiveHits.store(hits > 4 ? 4 : hits);
+                    } else if (++rawSlotMisses[idx] >= 2) {
+                        slot->rawSignalPresent.store(false);
+                        slot->rawConsecutiveHits.store(0);
+                    }
+                    // 1st miss: leave rawSignalPresent unchanged — protects against
+                    // a single noisy frame setting off the fade prematurely.
+                }
+            }
         }
 
         {
@@ -849,13 +1197,15 @@ private:
                 slotSnrDb[s] = (globalNoiseFloor > 0.0f)
                     ? 10.0f * log10f(slotMeans[s] / globalNoiseFloor)
                     : 0.0f;
-            // Raw (un-voted) detection for instant fade-out — uses fastSlotMeans (fast EMA,
-            // alpha=0.5) so the flag goes false within 100–150 ms of carrier drop instead of
-            // the 150–450 ms it would take the slow EMA (alpha=0.15) to decay below threshold.
-            rawDetectedSlots.clear();
-            for (int s = 0; s < numSlots; s++)
-                if (fastSlotMeans[s] > globalNoiseFloor * snrLinear)
-                    rawDetectedSlots.insert(s);
+            // Raw (un-voted) detection — uses instSlotMeans (instantaneous, no EMA).
+            // Not updated during wideband events to prevent management-thread reads
+            // from seeing lightning-inflated slot sets.
+            if (!widebandEvent) {
+                rawDetectedSlots.clear();
+                for (int s = 0; s < numSlots; s++)
+                    if (instSlotMeans[s] > globalNoiseFloor * snrLinear)
+                        rawDetectedSlots.insert(s);
+            }
         }
 
         // Update display snapshot (UI reads under displayMtx)
@@ -1002,6 +1352,7 @@ private:
                     auto   pit        = localPeakOffsets.find(idx);
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
+                    if (!isInActiveSpan(slotFreq)) continue;
                     if (isBlocked(slotFreq)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
@@ -1014,7 +1365,8 @@ private:
                 else {
                     it->second->lastDetected  = now;
                     it->second->signalPresent = true;
-                    it->second->rawSignalPresent.store(localRawDetected.count(idx) > 0);
+                    // rawSignalPresent is maintained exclusively by the DSP thread
+                    // (analyzeSpectrum NMS pass) with 2-consecutive-miss logic.
                     // Accumulate SNR while the slot is actively recording
                     if (it->second->fileOpen && idx < (int)localSnrDb.size()) {
                         it->second->snrSum   += localSnrDb[idx];
@@ -1038,13 +1390,31 @@ private:
                     continue;
                 }
 
-                bool detected = current.count(it->first) > 0;
-                if (detected) slot->lastDetected = now;
+                // Tear down channels outside the active span trim
+                if (!isInActiveSpan(slot->freqHz)) {
+                    flog::info("[ChannelBank] Destroying out-of-span slot {0}", it->first);
+                    destroySlot(*slot);
+                    delete slot;
+                    it = activeChannels.erase(it);
+                    continue;
+                }
+
+                bool detected   = current.count(it->first) > 0;
+                bool rawPresent = slot->rawSignalPresent.load();
+                // Update lastDetected from rawSignalPresent too (see manual/bkscan comment).
+                if (detected || rawPresent) slot->lastDetected = now;
                 {
                     float holdElapsed = std::chrono::duration<float>(now - slot->lastDetected).count();
-                    slot->signalPresent = detected || (holdElapsed * 1000.0f < (float)signalHoldMs);
+                    // Boost hold for long active recordings — once a transmission has been going
+                    // for >2s we know it's real, so protect against momentary SNR dropouts by
+                    // using at least 2 s of hold regardless of signalHoldMs setting.
+                    float recDurSec = slot->fileOpen
+                        ? std::chrono::duration<float>(now - slot->fileOpenTime).count() : 0.0f;
+                    int effectiveHoldMs = (recDurSec > 2.0f)
+                        ? std::max(signalHoldMs, 2000) : signalHoldMs;
+                    slot->signalPresent = detected || rawPresent || (holdElapsed * 1000.0f < (float)effectiveHoldMs);
                 }
-                slot->rawSignalPresent.store(localRawDetected.count(it->first) > 0);
+                // rawSignalPresent maintained exclusively by the DSP thread (NMS pass).
                 if (!detected) {
                     float elapsed = std::chrono::duration<float>(
                         now - slot->lastDetected).count();
@@ -1122,13 +1492,23 @@ private:
         // (getTranslation() returns +bw/2 for USB, -bw/2 for LSB).  The VFO must be
         // placed at carrier ∓ ssbBw/2 so after the xlator the carrier lands at DC.
         const double ssbBw  = 2800.0;  // standard SSB voice bandwidth
+        // VFO placement:
+        //   Manual mode: caller supplies the exact offset (already correct for SSB sideband shift).
+        //   Auto grid, SSB: spectral centroid with BFO trim — real carrier isn't at grid center.
+        //   Auto grid, AM/NFM/WFM: also use spectral centroid.
+        //     Original code used the grid-aligned slot center, assuming signals are on-grid.
+        //     In practice the grid spacing rarely matches the actual channel plan (e.g. 12.5 kHz
+        //     grid for 8.33 kHz-spaced aviation channels).  The carrier can be 5-7 kHz off the
+        //     slot center, which places the AM demodulator 5-7 kHz from the carrier — terrible
+        //     audio.  The spectral centroid (peakOffsetHz) tracks the actual carrier position
+        //     regardless of grid alignment, so we use it for all auto-mode demod types.
         const double vfoOff = isManual
             ? (demodMode == DEMOD_USB ? offset + ssbBw / 2.0
              : demodMode == DEMOD_LSB ? offset - ssbBw / 2.0
              : offset)
             : (demodMode == DEMOD_USB || demodMode == DEMOD_LSB)
                 ? peakOffsetHz - (double)ssbBfoHz
-                : offset;
+                : peakOffsetHz;  // centroid: centers VFO on actual carrier, not grid slot
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
         iqSplitter->bindStream(slot.iqIn);
@@ -1191,6 +1571,9 @@ private:
     }
 
     void destroySlot(ChannelSlot& slot) {
+        // Register in the sticky-recent list (caller always holds channelsMtx).
+        recentChannels.push_back({slot.freqHz, std::chrono::steady_clock::now()});
+
         slot.recSink->stop();
         slot.meter->stop();
         slot.splitter->stop();
@@ -1205,9 +1588,11 @@ private:
             slot.writer.close();
             slot.fileOpen = false;
             if (slot.module) {
-                int64_t tailSamples   = (int64_t)slot.module->tailMs * 48000 / 1000;
-                int64_t signalSamples = slot.audioSamplesWritten - tailSamples;
-                int64_t signalMs      = signalSamples * 1000 / 48000;
+                // Same time-based signal duration as the normal close path — immune to
+                // signalHoldMs inflating the sample count (see comment there for details).
+                int64_t signalMs = std::max(int64_t(0),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        slot.lastDetected - slot.fileOpenTime).count());
                 if (signalMs < (int64_t)slot.module->minTransmissionMs) {
                     std::remove(slot.currentFilePath.c_str());
                 } else {
@@ -1269,12 +1654,69 @@ private:
             return;
         }
 
-        // Use FFT-based detection (signalPresent) rather than audio amplitude.
+        // Pre-roll: mix stereo→mono and push into the circular buffer.
+        // This runs continuously so we always have the last PREROLL_SAMPLES
+        // of audio ready to prepend when a file opens.  Runs before the
+        // file-open check so the samples that arrived just before detection
+        // fired are captured — that's where the call sign lives.
+        for (int i = 0; i < count; i++) {
+            slot->preRollBuf[slot->preRollHead] = (data[i].l + data[i].r) * 0.5f;
+            slot->preRollHead = (slot->preRollHead + 1) % ChannelSlot::PREROLL_SAMPLES;
+            if (slot->preRollCount < ChannelSlot::PREROLL_SAMPLES) slot->preRollCount++;
+        }
+
+        // Use FFT-based detection rather than audio amplitude.
         // AM/FM demodulators always output noise, so amplitude-based silence
         // detection is unreliable — the FFT already knows if a signal is there.
-        if (slot->signalPresent.load()) {
+        //
+        // Two flags drive this:
+        //   rawSignalPresent – updated in the DSP thread every FFT frame (50 ms).
+        //                      Goes TRUE on the very first frame above the SNR
+        //                      threshold; goes FALSE only after 2 consecutive misses.
+        //                      Fast but has no vote smoothing.
+        //   signalPresent    – updated by the management thread every 250 ms.
+        //                      Requires SPAWN_VOTES consecutive detections and
+        //                      holds TRUE for signalHoldMs after the last detection.
+        //                      Slow but stable; provides dropout hysteresis.
+        //
+        // Using signalPresent alone for file-open caused up to ~400 ms of missed
+        // audio per transmission (150 ms vote accumulation + up to 250 ms mgmt-thread
+        // polling lag). The call sign is spoken in the first ~500 ms, so this
+        // consistently clipped it.
+        //
+        // rawSignalPresent gives fast detection (first frame above SNR = 50 ms), but
+        // a single-frame spike from lightning or a nearby HFDL burst is enough to set
+        // it and open a file on adjacent bookmarks.  Requiring ≥ 2 consecutive raw
+        // frames (rawConsecutiveHits ≥ 2, i.e. 100 ms of continuous detection) keeps
+        // the file-open latency at ~100 ms while filtering out single-frame spikes.
+        // The pre-roll buffer recovers this 100ms (and the former 200ms fileTrimSamples
+        // discard) by prepending buffered audio when the file opens, so the net latency
+        // heard in the recording is ~0ms even though detection takes 100ms to fire.
+        // signalPresent still controls the hold/silence-countdown (unchanged).
+        bool rawOpen     = (slot->rawSignalPresent.load() && slot->rawConsecutiveHits.load() >= 2);
+        bool activeSignal = slot->signalPresent.load() || rawOpen;
+        if (activeSignal) {
             slot->inSilence = false;
-            if (!slot->fileOpen) { _this->openNewFile(*slot); }
+            if (!slot->fileOpen) {
+                _this->openNewFile(*slot);
+                // Flush pre-roll: write the last PREROLL_SAMPLES of audio that
+                // arrived before detection fired.  This recovers the ~100-300ms
+                // of transmission that happened before the file opened.
+                // Gain is applied; the buffer already contains mixed mono.
+                if (slot->preRollCount > 0) {
+                    int avail = slot->preRollCount;
+                    int startIdx = (slot->preRollHead - avail + ChannelSlot::PREROLL_SAMPLES)
+                                   % ChannelSlot::PREROLL_SAMPLES;
+                    for (int i = 0; i < avail; i++) {
+                        int idx = (startIdx + i) % ChannelSlot::PREROLL_SAMPLES;
+                        slot->preRollTmp[i] = std::clamp(
+                            slot->preRollBuf[idx] * _this->recGain, -1.0f, 1.0f);
+                    }
+                    slot->writer.write(slot->preRollTmp.data(), avail);
+                    slot->audioSamplesWritten += avail;
+                    slot->preRollCount = 0;   // consumed; don't re-write on next call
+                }
+            }
         }
         else {
             // Signal gone — start 1-second grace before closing file
@@ -1285,11 +1727,15 @@ private:
             if (slot->fileOpen) {
                 auto silenceElapsed = std::chrono::steady_clock::now() - slot->silenceStart;
                 if (silenceElapsed >= std::chrono::milliseconds(_this->tailMs)) {
-                    // Signal duration = total samples written minus tail samples.
-                    // This is exact — no vote-accumulation or poll-delay error.
-                    int64_t tailSamples = (int64_t)_this->tailMs * 48000 / 1000;
-                    int64_t signalSamples = slot->audioSamplesWritten - tailSamples;
-                    int64_t signalMs = signalSamples * 1000 / 48000;
+                    // Signal duration = time from file-open to the last genuine FFT detection.
+                    // Using (audioSamplesWritten - tailSamples) was wrong: the signalHoldMs
+                    // grace period kept signalPresent=true and the audio handler writing,
+                    // so even a 50ms noise burst appeared as (holdMs) worth of "signal time"
+                    // and passed the min-TX check.  lastDetected is only updated when the FFT
+                    // actually sees power above the SNR threshold, so it's hold-period-immune.
+                    int64_t signalMs = std::max(int64_t(0),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            slot->lastDetected - slot->fileOpenTime).count());
                     slot->writer.close();
                     slot->fileOpen = false;
                     if (signalMs < (int64_t)_this->minTransmissionMs) {
@@ -1349,21 +1795,42 @@ private:
         // halves the file size with no audible difference.
         const int totalFade = 4800;
 
-        // Fade-out: raised-cosine from 1→0 driven by rawSignalPresent.
+        // Fade-out: raised-cosine from 1→0 driven by signal absence.
         //
-        // rawSignalPresent bypasses the vote-smoothing accumulator so it goes false
-        // the instant the FFT bin drops below the SNR threshold — no ~400ms vote-decay
-        // delay, no 250ms poll-latency grace period needed.
+        // The fade only begins when BOTH the instantaneous power (rawSignalPresent,
+        // 2-frame miss counter) AND the vote accumulator (signalPresent) agree the
+        // signal is gone.  Using rawSignalPresent alone caused mid-transmission
+        // squelch: USB inter-word pauses (50-300ms) are long enough for the 2-miss
+        // counter to fire and begin a 50ms fade, producing audible dropouts.
         //
-        // fadeOutRemaining counts down 200ms worth of samples (9600 @ 48kHz) after
-        // rawSignalPresent goes false.  While the signal is present the counter is
-        // held at its maximum so the fade always starts from 1.0.
+        // signalPresent (vote-based) holds true through brief pauses — MAX_VOTES=8
+        // takes 6 frames (300ms) to drain below SPAWN_VOTES — so it acts as a hold
+        // that keeps the audio at full gain while speech is momentarily quiet.
+        // The fade only starts once the slot is genuinely idle (votes exhausted AND
+        // instantaneous power below threshold).
         //
-        // This runs entirely on the DSP thread (no mutex needed) — rawSignalPresent
-        // is atomic and fadeOutRemaining is DSP-thread-only.
+        // This runs entirely on the DSP thread (no mutex needed) — both flags are
+        // atomic and fadeOutRemaining is DSP-thread-only.
         float tailFade = 1.0f;
-        if (slot->rawSignalPresent.load()) {
-            slot->fadeOutRemaining = 2400;   // hold at max while signal is present
+        // Audio fade is driven by rawSignalPresent plus a short independent hold
+        // (200 ms, ~9600 samples).  This hold is separate from signalHoldMs so that
+        // AM mode doesn't write AGC ramp-up noise for the entire hold period before
+        // the fade kicks in.  200 ms is long enough to bridge SSB inter-word pauses
+        // without creating audible dropouts.
+        //
+        // The file stays open for the full signalHoldMs+tailMs period (driven by
+        // signalPresent + the silenceElapsed counter above), but any audio written
+        // after the fade completes is digital silence (tailFade = 0.0f).
+        const int AUDIO_HOLD_SAMPLES = 9600;  // 200 ms @ 48 kHz
+        bool rawAlive = slot->rawSignalPresent.load();
+        if (rawAlive) {
+            slot->audioHoldRemaining = AUDIO_HOLD_SAMPLES;
+        } else if (slot->audioHoldRemaining > 0) {
+            slot->audioHoldRemaining = std::max(0, slot->audioHoldRemaining - count);
+        }
+        bool signalAlive = rawAlive || (slot->audioHoldRemaining > 0);
+        if (signalAlive) {
+            slot->fadeOutRemaining = 2400;   // hold at max while signal (or hold) is present
         } else {
             if (slot->fadeOutRemaining > 0) {
                 // progress: 1.0 (just started fading) → 0.0 (fully faded)
@@ -1590,10 +2057,12 @@ private:
 
     // ── Main-waterfall overlay ───────────────────────────────────────────────
     // Draws a marker on the SDR++ main waterfall for each active channel:
-    //   • red filled dot  = currently recording (file open, signal present)
-    //   • orange ring     = active but in cooldown / silence countdown
-    // Plus a counter in the top-right of the FFT area showing
-    // "Recording: N / Active: M".
+    //   • red filled dot    = signal on air RIGHT NOW (rawSignalPresent); turns
+    //                         off within ~100ms of signal end
+    //   • orange filled dot = file open but signal gone (hold/tail recording);
+    //                         disappears when tailMs elapses and the file closes
+    //   • orange ring       = monitoring channel, idle
+    // "Recording: N" in the overlay counts channels with a live signal.
 
     static void fftRedrawHandlerFunc(ImGui::WaterFall::FFTRedrawArgs args, void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
@@ -1601,7 +2070,7 @@ private:
 
         // Snapshot active-channel state under lock; minimise work inside the lock.
         int64_t playingKey = _this->currentlyPlayingFreqKey.load();
-        struct Mark { double freq; bool recording; bool playing; };
+        struct Mark { double freq; bool liveSignal; bool recording; bool playing; };
         std::vector<Mark> marks;
         int  recCount              = 0;
         bool playingKeyAccountedFor = false;
@@ -1609,11 +2078,12 @@ private:
             std::lock_guard<std::mutex> clck(_this->channelsMtx);
             marks.reserve(_this->activeChannels.size());
             for (auto& [idx, slot] : _this->activeChannels) {
+                bool live = slot->rawSignalPresent.load();
                 bool rec  = slot->fileOpen;
-                if (rec) recCount++;
+                if (live) recCount++;
                 bool play = (playingKey != 0 && _this->freqKey(slot->freqHz) == playingKey);
                 if (play) playingKeyAccountedFor = true;
-                marks.push_back({ slot->freqHz, rec, play });
+                marks.push_back({ slot->freqHz, live, rec, play });
             }
         }
 
@@ -1638,12 +2108,19 @@ private:
             double x = args.min.x + (m.freq - args.lowFreq) * args.freqToPixelRatio;
             ImVec2 c((float)x, y);
 
-            if (m.recording) {
-                // Red filled dot — actively recording
+            if (m.liveSignal) {
+                // Bright red filled dot — signal on air RIGHT NOW (rawSignalPresent).
+                // Turns off within ~100ms of signal end.
                 dl->AddCircleFilled(c, radius, IM_COL32(255, 60, 60, 255), 16);
                 dl->AddCircle(c, radius + 1.0f, IM_COL32(255, 255, 255, 255), 16, 1.5f);
+            } else if (m.recording) {
+                // Orange filled dot — file still open (signal hold / tail recording).
+                // Signal is gone but we're still writing the post-signal audio.
+                // Goes away when tailMs elapses and the file closes.
+                dl->AddCircleFilled(c, radius, IM_COL32(255, 140, 30, 255), 16);
+                dl->AddCircle(c, radius + 1.0f, IM_COL32(255, 255, 255, 255), 16, 1.5f);
             } else {
-                // Orange ring — active channel, not recording
+                // Orange ring — monitoring channel, idle (no active signal or recording)
                 dl->AddCircle(c, radius, IM_COL32(255, 165, 0, 255), 16, 2.0f);
             }
 
@@ -1709,6 +2186,116 @@ private:
                 dl->AddText(ImVec2(lblX, lblY), IM_COL32(255, 200, 50, 255), threshBuf);
             }
         }
+
+        // Active span trim bars
+        {
+            float wfWidth  = (float)(args.max.x - args.min.x);
+            float wfHeight = (float)(args.max.y - args.min.y);
+
+            // Convert trim fractions to screen X positions
+            float leftBarX  = (float)args.min.x + wfWidth * _this->leftTrimFrac;
+            float rightBarX = (float)args.max.x - wfWidth * _this->rightTrimFrac;
+
+            // Grey overlay on excluded zones
+            if (_this->leftTrimFrac > 0.001f)
+                dl->AddRectFilled(ImVec2((float)args.min.x, (float)args.min.y),
+                                  ImVec2(leftBarX, (float)args.max.y),
+                                  IM_COL32(0, 0, 0, 90));
+            if (_this->rightTrimFrac > 0.001f)
+                dl->AddRectFilled(ImVec2(rightBarX, (float)args.min.y),
+                                  ImVec2((float)args.max.x, (float)args.max.y),
+                                  IM_COL32(0, 0, 0, 90));
+
+            // Bar lines — amber colored
+            ImU32 barCol = IM_COL32(255, 180, 0, 220);
+            if (_this->leftTrimFrac > 0.001f)
+                dl->AddLine(ImVec2(leftBarX, (float)args.min.y),
+                            ImVec2(leftBarX, (float)args.max.y), barCol, 2.0f);
+            if (_this->rightTrimFrac > 0.001f)
+                dl->AddLine(ImVec2(rightBarX, (float)args.min.y),
+                            ImVec2(rightBarX, (float)args.max.y), barCol, 2.0f);
+
+            // Drag handles (small triangles at bottom of bars)
+            if (_this->leftTrimFrac > 0.001f) {
+                float tx = leftBarX, ty = (float)args.max.y - 6.0f;
+                dl->AddTriangleFilled(ImVec2(tx, ty), ImVec2(tx-6, ty+6), ImVec2(tx+6, ty+6), barCol);
+            }
+            if (_this->rightTrimFrac > 0.001f) {
+                float tx = rightBarX, ty = (float)args.max.y - 6.0f;
+                dl->AddTriangleFilled(ImVec2(tx, ty), ImVec2(tx-6, ty+6), ImVec2(tx+6, ty+6), barCol);
+            }
+
+            // Mouse interaction — drag bars
+            ImVec2 mp = ImGui::GetMousePos();
+            bool inWF = mp.x >= args.min.x && mp.x <= args.max.x &&
+                        mp.y >= args.min.y && mp.y <= args.max.y;
+            bool lmbDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+
+            // Release
+            if (!lmbDown) {
+                if (_this->draggingLeft || _this->draggingRight) {
+                    // Save config on release
+                    config.acquire();
+                    config.conf[_this->name]["leftTrimFrac"]  = _this->leftTrimFrac;
+                    config.conf[_this->name]["rightTrimFrac"] = _this->rightTrimFrac;
+                    config.release(true);
+                }
+                _this->draggingLeft  = false;
+                _this->draggingRight = false;
+            }
+
+            // Update drag
+            if (_this->draggingLeft && lmbDown) {
+                float newFrac = (mp.x - (float)args.min.x) / wfWidth;
+                _this->leftTrimFrac = std::clamp(newFrac, 0.0f, 0.48f);
+            }
+            if (_this->draggingRight && lmbDown) {
+                float newFrac = ((float)args.max.x - mp.x) / wfWidth;
+                _this->rightTrimFrac = std::clamp(newFrac, 0.0f, 0.48f);
+            }
+
+            // Start drag — only if not already dragging, mouse is in waterfall, and near a bar
+            if (!_this->draggingLeft && !_this->draggingRight &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left) && inWF) {
+                const float hitDist = 10.0f;
+                float dLeft  = std::abs(mp.x - leftBarX);
+                float dRight = std::abs(mp.x - rightBarX);
+                if (dLeft <= hitDist && dLeft < dRight)
+                    _this->draggingLeft = true;
+                else if (dRight <= hitDist)
+                    _this->draggingRight = true;
+            }
+        }
+
+        // Hover-frequency crosshair — cyan vertical line + label when the user
+        // mouses over any row in the active-channel list, recent-channel list,
+        // or frequency-history panel.  hoveredFreqHz is reset to 0.0 each frame
+        // at the start of menuHandler so it never lingers.
+        {
+            double hf = _this->hoveredFreqHz;
+            if (hf != 0.0 && hf >= args.lowFreq && hf <= args.highFreq) {
+                float hx = (float)(args.min.x +
+                            (hf - args.lowFreq) * args.freqToPixelRatio);
+                dl->AddLine(ImVec2(hx, (float)args.min.y),
+                            ImVec2(hx, (float)args.max.y),
+                            IM_COL32(0, 220, 255, 180), 1.5f);
+
+                // Small frequency label near the top of the line
+                char hfBuf[32];
+                snprintf(hfBuf, sizeof(hfBuf), "%.4f MHz", hf / 1e6);
+                ImVec2 lblSz = ImGui::CalcTextSize(hfBuf);
+                float  lblX  = hx + 4.0f;
+                // Flip label to the left if it would overflow the right edge
+                if (lblX + lblSz.x > (float)args.max.x - 4.0f)
+                    lblX = hx - lblSz.x - 4.0f;
+                float lblY = (float)args.min.y + 4.0f;
+                dl->AddRectFilled(ImVec2(lblX - 2.0f, lblY - 1.0f),
+                                  ImVec2(lblX + lblSz.x + 2.0f, lblY + lblSz.y + 1.0f),
+                                  IM_COL32(0, 0, 0, 160), 2.0f);
+                dl->AddText(ImVec2(lblX, lblY),
+                            IM_COL32(0, 220, 255, 230), hfBuf);
+            }
+        }
     }
 
     // ── Retune handler ───────────────────────────────────────────────────────
@@ -1756,6 +2343,10 @@ private:
     static void menuHandler(void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
+
+        // Reset each frame; set below whenever a channel/history row is hovered.
+        // Read by fftRedrawHandlerFunc to draw the cyan crosshair.
+        _this->hoveredFreqHz = 0.0;
 
         if (_this->running) { style::beginDisabled(); }
 
@@ -1847,6 +2438,33 @@ private:
                 ImGui::SetTooltip("0%% = original audio (no NR)\n"
                                   "100%% = full noise reduction\n"
                                   "50-70%% = good balance for weak signals");
+        }
+
+        // Active span trim
+        {
+            ImGui::Text("Active Span Trim");
+            ImGui::SameLine();
+            ImGui::TextDisabled("(drag bars on waterfall)");
+            float leftPct  = _this->leftTrimFrac  * 100.0f;
+            float rightPct = _this->rightTrimFrac * 100.0f;
+            ImGui::SetNextItemWidth(menuWidth * 0.45f);
+            if (ImGui::SliderFloat(CONCAT("L##_cb_triml_", _this->name), &leftPct, 0.0f, 48.0f, "%.0f%%")) {
+                _this->leftTrimFrac = leftPct / 100.0f;
+                config.acquire();
+                config.conf[_this->name]["leftTrimFrac"] = _this->leftTrimFrac;
+                config.release(true);
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(menuWidth * 0.45f);
+            if (ImGui::SliderFloat(CONCAT("R##_cb_trimr_", _this->name), &rightPct, 0.0f, 48.0f, "%.0f%%")) {
+                _this->rightTrimFrac = rightPct / 100.0f;
+                config.acquire();
+                config.conf[_this->name]["rightTrimFrac"] = _this->rightTrimFrac;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Exclude this fraction of the bandwidth\n"
+                                  "from left/right edge (Airspy filter rolloff).");
         }
 
         ImGui::Spacing();
@@ -2570,6 +3188,7 @@ private:
                 for (auto& [idx, slot] : _this->activeChannels) {
                     std::string label = _this->displayName(slot->freqHz);
                     ImGui::Text("%s", label.c_str());
+                    if (ImGui::IsItemHovered()) _this->hoveredFreqHz = slot->freqHz;
                     ImGui::SameLine();
                     bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
                     if (playing) {
@@ -2598,6 +3217,63 @@ private:
                 }
             }
             ImGui::EndChild();
+
+            // ── Recent channels (sticky 30s after teardown) ───────────────────
+            // These linger so the user can confirm a frequency was just noise and
+            // hit Block before the row vanishes.  Alpha fades from 1→0 over 30s.
+            {
+                auto now = std::chrono::steady_clock::now();
+
+                // Snapshot + prune under channelsMtx
+                std::vector<std::pair<double, float>> recent;  // {freqHz, alpha}
+                {
+                    std::lock_guard<std::mutex> lck(_this->channelsMtx);
+                    for (auto it = _this->recentChannels.begin();
+                         it != _this->recentChannels.end(); ) {
+                        long ageMs = std::chrono::duration_cast<
+                            std::chrono::milliseconds>(now - it->destroyedAt).count();
+                        if (ageMs >= 30000) {
+                            it = _this->recentChannels.erase(it);
+                        } else {
+                            float alpha = std::max(0.0f, 1.0f - (float)ageMs / 30000.0f);
+                            recent.push_back({it->freqHz, alpha});
+                            ++it;
+                        }
+                    }
+                }
+
+                // Render without lock; collect any block-toggle action
+                double toBlockFreq = 0.0;
+                bool   toBlockVal  = false;
+                for (auto& [hz, alpha] : recent) {
+                    std::string dn = _this->displayName(hz);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.35f, alpha));
+                    ImGui::Text("  [recent] %s", dn.c_str());
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) _this->hoveredFreqHz = hz;
+                    ImGui::SameLine();
+                    bool blocked = _this->isBlocked(hz);
+                    char blkId[64];
+                    snprintf(blkId, sizeof(blkId), "Blk##_cb_rblk_%lld",
+                             (long long)_this->freqKey(hz));
+                    if (ImGui::Checkbox(blkId, &blocked)) {
+                        toBlockFreq = hz;
+                        toBlockVal  = blocked;
+                    }
+                }
+
+                // Apply block toggle outside both locks (freqLogMtx → saveFreqLog)
+                if (toBlockFreq != 0.0) {
+                    {
+                        std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                        auto& entry = _this->freqLog[_this->freqKey(toBlockFreq)];
+                        if (entry.freqHz == 0.0) entry.freqHz = toBlockFreq;
+                        entry.blocked = toBlockVal;
+                    }
+                    _this->saveFreqLog();
+                }
+            }
+
             if (needSaveFreqLog) _this->saveFreqLog();
         }
 
@@ -2613,6 +3289,16 @@ private:
         if (ImGui::SmallButton("Reload Bookmarks##_cb_reloadbm")) {
             _this->loadFMConfig();
         }
+
+        // Filter row: text search + blocked-only toggle
+        ImGui::Checkbox("Blocked only##_cb_histblk", &_this->freqHistBlockedOnly);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX() - 26);
+        ImGui::InputText("##_cb_histflt", _this->freqHistFilter, sizeof(_this->freqHistFilter));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Filter by name or frequency (MHz)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##_cb_clrflt"))
+            _this->freqHistFilter[0] = '\0';
 
         bool needSave = false;
 
@@ -2630,57 +3316,82 @@ private:
                 needSave = true;
             }
 
-            // Group entries by 50 MHz band
-            std::map<int64_t, std::vector<std::pair<int64_t, FreqEntry*>>> bands;
-            for (auto& [k, e] : _this->freqLog)
-                bands[(int64_t)std::floor(e.freqHz / 50e6)].push_back({k, &e});
+            // Collect entries, apply filters, sort: named first (alpha by name),
+            // then unnamed sorted by frequency ascending.
+            // Named = display name starts with a letter (bookmark name).
+            // Unnamed = display name is "X.XXX MHz" format (starts with a digit).
+            std::string filterStr = _this->freqHistFilter;
+            std::transform(filterStr.begin(), filterStr.end(), filterStr.begin(), ::tolower);
 
-            for (auto& [bandIdx, entries] : bands) {
-                // Sort entries within band by count desc
-                std::sort(entries.begin(), entries.end(),
-                    [](auto& a, auto& b){ return a.second->count > b.second->count; });
+            std::vector<std::pair<int64_t, FreqEntry*>> allEntries;
+            allEntries.reserve(_this->freqLog.size());
+            for (auto& [k, e] : _this->freqLog) {
+                // Blocked-only filter
+                if (_this->freqHistBlockedOnly && !e.blocked) continue;
+                // Text filter: match against display name or frequency string
+                if (!filterStr.empty()) {
+                    std::string dn = _this->displayName(e.freqHz);
+                    char freqBuf[32];
+                    snprintf(freqBuf, sizeof(freqBuf), "%.4f", e.freqHz / 1e6);
+                    std::string dnL = dn, fqL = freqBuf;
+                    std::transform(dnL.begin(), dnL.end(), dnL.begin(), ::tolower);
+                    std::transform(fqL.begin(), fqL.end(), fqL.begin(), ::tolower);
+                    if (dnL.find(filterStr) == std::string::npos &&
+                        fqL.find(filterStr) == std::string::npos) continue;
+                }
+                allEntries.push_back({k, &e});
+            }
 
-                char hdr[64];
-                snprintf(hdr, sizeof(hdr), "%lld-%lld MHz (%d)##band_%lld",
-                         (long long)(bandIdx * 50), (long long)(bandIdx * 50 + 50),
-                         (int)entries.size(), (long long)bandIdx);
-                if (ImGui::CollapsingHeader(hdr)) {
-                    for (auto& [k, ep] : entries) {
-                        FreqEntry& e = *ep;
-                        std::string dn = _this->displayName(e.freqHz);
-                        std::string label = "  " + dn;
+            // Sort: named bookmarks (letter-leading) first, alphabetically;
+            //        unnamed (digit-leading) last, by frequency ascending.
+            std::sort(allEntries.begin(), allEntries.end(), [&](auto& aa, auto& bb) {
+                std::string na = _this->displayName(aa.second->freqHz);
+                std::string nb = _this->displayName(bb.second->freqHz);
+                bool aIsNamed = !na.empty() && std::isalpha((unsigned char)na[0]);
+                bool bIsNamed = !nb.empty() && std::isalpha((unsigned char)nb[0]);
+                if (aIsNamed != bIsNamed) return aIsNamed > bIsNamed; // named first
+                std::string naL = na, nbL = nb;
+                std::transform(naL.begin(), naL.end(), naL.begin(), ::tolower);
+                std::transform(nbL.begin(), nbL.end(), nbL.begin(), ::tolower);
+                if (naL != nbL) return naL < nbL;
+                return aa.second->freqHz < bb.second->freqHz;
+            });
 
-                        if (e.blocked)
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+            // Render flat list
+            for (auto& [k, ep] : allEntries) {
+                FreqEntry& e = *ep;
+                std::string dn = _this->displayName(e.freqHz);
 
-                        std::string rel = relTime(e.lastSeen);
-                        ImGui::Text("%-22s %5d  %-10s", label.c_str(), e.count, rel.c_str());
+                if (e.blocked)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
 
-                        if (e.blocked)
-                            ImGui::PopStyleColor();
+                std::string rel = relTime(e.lastSeen);
+                ImGui::Text("%-22s %5d  %-10s", dn.c_str(), e.count, rel.c_str());
+                if (ImGui::IsItemHovered()) _this->hoveredFreqHz = e.freqHz;
 
-                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
-                        char editBtn[32];
-                        snprintf(editBtn, sizeof(editBtn), "D##edt_%lld", (long long)k);
-                        if (ImGui::SmallButton(editBtn)) {
-                            _this->descEditKey   = k;
-                            strncpy(_this->descEditBuf, e.description.c_str(), sizeof(_this->descEditBuf) - 1);
-                            _this->descEditBuf[sizeof(_this->descEditBuf) - 1] = '\0';
-                            _this->descEditRequest = true;
-                        }
-                        ImGui::SameLine();
-                        char chk[32];
-                        snprintf(chk, sizeof(chk), "##blk_%lld", (long long)k);
-                        if (ImGui::Checkbox(chk, &e.blocked))
-                            needSave = true;
+                if (e.blocked)
+                    ImGui::PopStyleColor();
 
-                        // Show description line under the entry if set
-                        if (!e.description.empty()) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.65f, 1.0f));
-                            ImGui::TextWrapped("      %s", e.description.c_str());
-                            ImGui::PopStyleColor();
-                        }
-                    }
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
+                char editBtn[32];
+                snprintf(editBtn, sizeof(editBtn), "D##edt_%lld", (long long)k);
+                if (ImGui::SmallButton(editBtn)) {
+                    _this->descEditKey   = k;
+                    strncpy(_this->descEditBuf, e.description.c_str(), sizeof(_this->descEditBuf) - 1);
+                    _this->descEditBuf[sizeof(_this->descEditBuf) - 1] = '\0';
+                    _this->descEditRequest = true;
+                }
+                ImGui::SameLine();
+                char chk[32];
+                snprintf(chk, sizeof(chk), "##blk_%lld", (long long)k);
+                if (ImGui::Checkbox(chk, &e.blocked))
+                    needSave = true;
+
+                // Show description line under the entry if set
+                if (!e.description.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.65f, 1.0f));
+                    ImGui::TextWrapped("      %s", e.description.c_str());
+                    ImGui::PopStyleColor();
                 }
             }
         }
@@ -2779,7 +3490,7 @@ private:
         std::set<int> desired;
         for (int i = 0; i < (int)stop.freqsHz.size(); i++) {
             double offset = stop.freqsHz[i] - lastKnownCenter;
-            if (std::abs(offset) < lastKnownSr / 2.0)
+            if (std::abs(offset) < lastKnownSr / 2.0 && isInActiveSpan(stop.freqsHz[i]))
                 desired.insert(i);
         }
 
@@ -2794,13 +3505,42 @@ private:
                 it = activeChannels.erase(it);
                 continue;
             }
-            bool present = localDetected.count(idx) > 0;
-            if (present) it->second->lastDetected = now;
+            // Immediately tear down blocked channels (mirrors auto-mode behaviour)
+            if (isBlocked(it->second->freqHz)) {
+                flog::info("[ChannelBank] BkScan: removing blocked slot {0}", idx);
+                destroySlot(*it->second);
+                delete it->second;
+                it = activeChannels.erase(it);
+                continue;
+            }
+            // Tear down channels outside the active span trim
+            if (!isInActiveSpan(it->second->freqHz)) {
+                flog::info("[ChannelBank] BkScan: removing out-of-span slot {0}", idx);
+                destroySlot(*it->second);
+                delete it->second;
+                it = activeChannels.erase(it);
+                continue;
+            }
+            bool present    = localDetected.count(idx) > 0;
+            bool rawPresent = it->second->rawSignalPresent.load();
+            // Update lastDetected from rawSignalPresent as well as voted detection.
+            // The management thread runs every 250ms, so using voted detection alone
+            // means lastDetected can be up to 250ms stale when a signal starts to
+            // dip — the hold timer effectively begins 250ms early, causing the file
+            // to close prematurely and then immediately reopen on signal recovery.
+            // rawSignalPresent is updated in the DSP thread every FFT frame (50ms),
+            // so pinning lastDetected to it keeps the hold countdown accurate to
+            // within ~100ms of actual signal loss.
+            if (present || rawPresent) it->second->lastDetected = now;
             {
                 float holdElapsed = std::chrono::duration<float>(now - it->second->lastDetected).count();
-                it->second->signalPresent = present || (holdElapsed * 1000.0f < (float)signalHoldMs);
+                float recDurSec = it->second->fileOpen
+                    ? std::chrono::duration<float>(now - it->second->fileOpenTime).count() : 0.0f;
+                int effectiveHoldMs = (recDurSec > 2.0f)
+                    ? std::max(signalHoldMs, 2000) : signalHoldMs;
+                it->second->signalPresent = present || rawPresent || (holdElapsed * 1000.0f < (float)effectiveHoldMs);
             }
-            it->second->rawSignalPresent.store(localRawDetected.count(idx) > 0);
+            // rawSignalPresent maintained exclusively by the DSP thread (analyzeSpectrum).
             // Accumulate SNR while signal present and recording
             if (present && it->second->fileOpen) {
                 auto sit = localSnrDb.find(idx);
@@ -2816,6 +3556,7 @@ private:
         for (int i : desired) {
             if (activeChannels.find(i) != activeChannels.end()) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
+            if (isBlocked(stop.freqsHz[i])) continue;
             double offset = stop.freqsHz[i] - lastKnownCenter;
             flog::info("[ChannelBank] BkScan: spawning slot {0} at {1:.3f}MHz", i, stop.freqsHz[i] / 1e6);
             auto* slot = new ChannelSlot();
@@ -2970,11 +3711,11 @@ private:
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> clck(channelsMtx);
 
-        // Build desired set (indices currently within SDR bandwidth)
+        // Build desired set (indices currently within SDR bandwidth and active span)
         std::set<int> desired;
         for (int i = 0; i < (int)localFreqs.size(); i++) {
             double offset = localFreqs[i] - lastKnownCenter;
-            if (std::abs(offset) < lastKnownSr / 2.0)
+            if (std::abs(offset) < lastKnownSr / 2.0 && isInActiveSpan(localFreqs[i]))
                 desired.insert(i);
         }
 
@@ -2991,13 +3732,44 @@ private:
                 it = activeChannels.erase(it);
                 continue;
             }
-            bool present = localDetected.count(idx) > 0;
-            if (present) it->second->lastDetected = now;
+            // Immediately tear down blocked channels (mirrors auto-mode behaviour).
+            // Without this, blocking a freq left the slot alive forever in manual mode,
+            // so unblocking had no effect (nothing to respawn since slot never left).
+            if (isBlocked(it->second->freqHz)) {
+                flog::info("[ChannelBank] Manual: removing blocked slot {0}", idx);
+                destroySlot(*it->second);
+                delete it->second;
+                it = activeChannels.erase(it);
+                continue;
+            }
+            // Tear down channels outside the active span trim
+            if (!isInActiveSpan(it->second->freqHz)) {
+                flog::info("[ChannelBank] Manual: removing out-of-span slot {0}", idx);
+                destroySlot(*it->second);
+                delete it->second;
+                it = activeChannels.erase(it);
+                continue;
+            }
+            bool present    = localDetected.count(idx) > 0;
+            bool rawPresent = it->second->rawSignalPresent.load();
+            // Update lastDetected from rawSignalPresent as well as voted detection.
+            // The management thread runs every 250ms, so using voted detection alone
+            // means lastDetected can be up to 250ms stale when a signal starts to
+            // dip — the hold timer effectively begins 250ms early, causing the file
+            // to close prematurely and then immediately reopen on signal recovery.
+            // rawSignalPresent is updated in the DSP thread every FFT frame (50ms),
+            // so pinning lastDetected to it keeps the hold countdown accurate to
+            // within ~100ms of actual signal loss.
+            if (present || rawPresent) it->second->lastDetected = now;
             {
                 float holdElapsed = std::chrono::duration<float>(now - it->second->lastDetected).count();
-                it->second->signalPresent = present || (holdElapsed * 1000.0f < (float)signalHoldMs);
+                float recDurSec = it->second->fileOpen
+                    ? std::chrono::duration<float>(now - it->second->fileOpenTime).count() : 0.0f;
+                int effectiveHoldMs = (recDurSec > 2.0f)
+                    ? std::max(signalHoldMs, 2000) : signalHoldMs;
+                it->second->signalPresent = present || rawPresent || (holdElapsed * 1000.0f < (float)effectiveHoldMs);
             }
-            it->second->rawSignalPresent.store(localRawDetected.count(idx) > 0);
+            // rawSignalPresent maintained exclusively by the DSP thread (analyzeSpectrum).
             // Accumulate SNR while signal present and recording
             if (present && it->second->fileOpen) {
                 auto sit = localSnrDb.find(idx);
@@ -3046,6 +3818,10 @@ private:
     int          ssbBfoHz      = 0;         // BFO trim for USB/LSB; positive = pitch up
     float        snrThreshold  = 4.0f;      // dB above noise floor
     float        cooldownSec   = 5.0f;      // seconds before destroying a quiet channel
+    float        leftTrimFrac   = 0.0f;  // fraction of bandwidth to exclude from left edge
+    float        rightTrimFrac  = 0.0f;  // fraction of bandwidth to exclude from right edge
+    bool         draggingLeft   = false;
+    bool         draggingRight  = false;
     int          signalHoldMs          = 500;    // hold signalPresent true N ms after last detection (dropout hysteresis)
     bool         recordingEnabled      = true;   // global recording on/off toggle
     bool         transcriptionEnabled  = false;  // Apple Speech transcription
@@ -3107,6 +3883,10 @@ private:
     char    descEditBuf[256] = {};
     bool    descEditRequest = false;
 
+    // Frequency history filter state (UI thread only)
+    bool freqHistBlockedOnly = false;
+    char freqHistFilter[64]  = {};
+
     // FM list cache (populated by loadFMConfig, UI thread only)
     std::map<std::string, std::vector<double>> fmLists;
     std::mutex bookmarkNamesMtx;
@@ -3124,6 +3904,14 @@ private:
     fftwf_complex*                          fftOut         = nullptr;
     fftwf_plan                              fftPlan;
     std::vector<float>                      hannWindow;
+    // At very low sample rates (< FFT_SIZE * SPEC_ANALYSIS_HZ ≈ 164 kHz) the
+    // DSP block has fewer than FFT_SIZE samples, so fftAccum is zero-padded.
+    // Applying the full-size BH window to truncated data leaves it non-zero at
+    // the cut point, causing sidelobes nearly as bad as Hann.  We cache a BH
+    // window sized to the actual fill length (zero-padded to FFT_SIZE) and
+    // recompute only when the sample rate changes.
+    std::vector<float>                      fftWindow;     // active window (length FFT_SIZE, correct for current SR)
+    int                                     fftWindowFill  = 0; // fill length fftWindow was built for
     std::vector<dsp::complex_t>             fftAccum;
     int                                     fftBufPos      = 0;
     int64_t                                 specSamplesUntilFFT = 0;  // countdown; analysis fires when ≤ 0
@@ -3131,7 +3919,10 @@ private:
     std::atomic<int>                        debugBlockedSkips  { 0 };
     std::atomic<int>                        debugCapSkips      { 0 };
     std::vector<float>                      avgPower;           // slow EMA power spectrum (alpha=0.15) — voting
-    std::vector<float>                      fastAvgPower;       // fast EMA power spectrum (alpha=0.5) — fade trigger
+    std::vector<float>                      instPower;          // instantaneous per-frame power (no EMA) — fade trigger
+    std::map<int, int>                      rawSlotMisses;      // DSP-thread-only: consecutive below-threshold frames (auto mode)
+    std::map<int, int>                      rawManualMisses;    // DSP-thread-only: consecutive below-threshold frames (manual mode)
+    bool                                    widebandEvent = false; // DSP-thread-only: >40% of slots above threshold this frame
     float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
     float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
     std::deque<float>                       floorHistory;             // ring buffer of recent rawFloor values for median filter
@@ -3152,6 +3943,19 @@ private:
     // Active demod/record channels (managed by mgmt thread)
     std::mutex                      channelsMtx;
     std::map<int, ChannelSlot*>     activeChannels;
+
+    // Recently-destroyed channels — kept alive in the UI for 30 s so the user
+    // can correlate to the waterfall and block after the channel is gone.
+    // Protected by channelsMtx (destroySlot always called under that lock).
+    struct RecentChannel {
+        double freqHz;
+        std::chrono::steady_clock::time_point destroyedAt;
+    };
+    std::vector<RecentChannel> recentChannels;
+
+    // Frequency being hovered in any list panel — read by fftRedrawHandlerFunc
+    // to draw a crosshair line on the main waterfall.  UI thread only.
+    double hoveredFreqHz = 0.0;
 
     // Management thread
     std::thread             mgmtThread;
@@ -3254,6 +4058,15 @@ private:
         return it != freqLog.end() && it->second.blocked;
     }
 
+    bool isInActiveSpan(double freqHz) const {
+        if (lastKnownSr <= 0.0) return true;
+        double lo = lastKnownCenter - lastKnownSr * 0.5;
+        double hi = lastKnownCenter + lastKnownSr * 0.5;
+        double leftCut  = lo + (hi - lo) * leftTrimFrac;
+        double rightCut = hi - (hi - lo) * rightTrimFrac;
+        return freqHz >= leftCut && freqHz <= rightCut;
+    }
+
     void logRecording(double hz) {
         std::lock_guard<std::mutex> lk(freqLogMtx);
         auto  key  = freqKey(hz);
@@ -3261,6 +4074,17 @@ private:
         e.freqHz   = hz;
         e.count++;
         e.lastSeen = (int64_t)std::time(nullptr);
+    }
+
+    // Called from openNewFile (DSP/audio thread) the moment a recording begins.
+    // Creates the freqLog entry immediately so the user can see and block this
+    // frequency in the history panel even if the recording is later discarded as
+    // too short.  Does NOT increment count (logRecording does that on keep).
+    void touchFreqLog(double hz) {
+        std::lock_guard<std::mutex> lk(freqLogMtx);
+        auto  key  = freqKey(hz);
+        auto& e    = freqLog[key];
+        if (e.freqHz == 0.0) e.freqHz = hz;  // only initialise new entries
     }
 
     void saveFreqLog() {
