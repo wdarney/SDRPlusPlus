@@ -1590,13 +1590,24 @@ private:
         slot.gridIdx = gridIdx;
 
         bool isManual = !std::isnan(exactOffsetHz);
-        // Always use grid-aligned offset in auto mode. Signals are on standard channel
-        // frequencies so there is no benefit to peak-bin tuning, and it causes the VFO
-        // to lock onto a sideband rather than the carrier.
+        // Auto mode: use the spectral centroid (peakOffsetHz) as the channel frequency.
+        // The centroid tracks the actual carrier position, which is typically NOT exactly
+        // at the grid slot center — the SDR tuning offset, transmitter frequency error, or
+        // a mismatch between the grid spacing and the actual channel plan (e.g. airband
+        // 8.33 kHz channels relative to an SDR tuned to a non-grid-aligned frequency) all
+        // shift the carrier away from the computed slot center.  Using the grid center for
+        // slot.freqHz causes the waterfall dot and sidebar frequency label to show the wrong
+        // position relative to the visible carrier peak, making it appear the module grabbed
+        // the "wrong" channel.  Using the centroid here keeps dot, label, blocking check,
+        // and VFO all anchored to the actual carrier.
+        //
+        // Clamp to ±channelSpacing/2 of the grid center so a noisy centroid (e.g. during
+        // a very brief burst) cannot drift the channel into an adjacent slot's territory.
         // In manual mode, use the caller-supplied exact offset.
+        const double gridOffset = ((double)gridIdx - (double)(numSlots - 1) / 2.0) * channelSpacing;
         double offset = isManual
             ? exactOffsetHz
-            : ((double)gridIdx - (double)(numSlots - 1) / 2.0) * channelSpacing;
+            : std::clamp(peakOffsetHz, gridOffset - channelSpacing * 0.5, gridOffset + channelSpacing * 0.5);
         slot.freqHz   = lastKnownCenter + offset;
 
         char freqBuf[64];
@@ -1613,16 +1624,10 @@ private:
         // (getTranslation() returns +bw/2 for USB, -bw/2 for LSB).  The VFO must be
         // placed at carrier ∓ ssbBw/2 so after the xlator the carrier lands at DC.
         const double ssbBw  = 2800.0;  // standard SSB voice bandwidth
-        // VFO placement:
+        // VFO placement (consistent with slot.freqHz above — both centroid-based in auto mode):
         //   Manual mode: caller supplies the exact offset (already correct for SSB sideband shift).
-        //   Auto grid, SSB: spectral centroid with BFO trim — real carrier isn't at grid center.
-        //   Auto grid, AM/NFM/WFM: also use spectral centroid.
-        //     Original code used the grid-aligned slot center, assuming signals are on-grid.
-        //     In practice the grid spacing rarely matches the actual channel plan (e.g. 12.5 kHz
-        //     grid for 8.33 kHz-spaced aviation channels).  The carrier can be 5-7 kHz off the
-        //     slot center, which places the AM demodulator 5-7 kHz from the carrier — terrible
-        //     audio.  The spectral centroid (peakOffsetHz) tracks the actual carrier position
-        //     regardless of grid alignment, so we use it for all auto-mode demod types.
+        //   Auto, SSB: centroid with user BFO trim applied.
+        //   Auto, AM/NFM/WFM: centroid directly (symmetric energy → centroid ≈ carrier).
         const double vfoOff = isManual
             ? (demodMode == DEMOD_USB ? offset + ssbBw / 2.0
              : demodMode == DEMOD_LSB ? offset - ssbBw / 2.0
