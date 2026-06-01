@@ -325,6 +325,16 @@ public:
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
         restoreWaterfallVisibility();  // always restore on unload, safe no-op if not saved
         if (running) { stop(); }
+#ifdef __APPLE__
+        // Drain any cached Whisper model contexts BEFORE static destructors run.
+        // ggml-metal's residency-set teardown asserts that all Metal buffers
+        // have been freed (rsets->data count == 0) and waits for its async
+        // keep-alive worker to stop.  whisper_free() does both correctly; the
+        // static-destructor path (which fires from libc's __cxa_finalize_ranges
+        // at process exit) does not, and crashes with SIGABRT in ggml_abort.
+        // Calling shutdown() here gives whisper.cpp a clean teardown window.
+        transcription_whisper::shutdown();
+#endif
         fftwf_destroy_plan(fftPlan);
         fftwf_free(fftIn);
         fftwf_free(fftOut);
