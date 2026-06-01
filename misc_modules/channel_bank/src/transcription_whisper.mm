@@ -213,20 +213,15 @@ void shutdown() {
 
 // ── Session object ──────────────────────────────────────────────────────────
 struct Session {
-    std::atomic<bool>     finalFlag { false };
-    std::atomic<bool>     cancelled { false };
-    std::mutex            textMtx;
-    std::string           text;
-    std::thread           thread;
+    std::atomic<bool>      finalFlag { false };
+    std::atomic<bool>      cancelled { false };
+    std::mutex             textMtx;
+    std::string            text;        // joined transcript (kept for legacy paths)
+    std::vector<Segment>   segments;    // time-aligned segments (Whisper-native)
+    std::thread            thread;
     // ctx is owned by the worker thread — we don't touch it from the main
     // thread.  cancelled is atomic so the worker can check it cheaply.
 };
-
-// Set the latest transcript (thread-safe).
-static void sessionSetText(Session* s, const std::string& t) {
-    std::lock_guard<std::mutex> lk(s->textMtx);
-    s->text = t;
-}
 
 // ── Worker thread: get cached context, run inference, publish text ──────────
 //
@@ -295,8 +290,9 @@ static void runInference(Session* s, std::string wavPath, Model model) {
         //    mutates the context's segment buffer; whisper_full_get_segment_text
         //    reads it.  If a second worker started whisper_full() between our
         //    call and the readback, it would overwrite our results.  Serialize.
-        std::string out;
-        int nseg = 0;
+        std::string          out;
+        std::vector<Segment> segs;
+        int                  nseg = 0;
         {
             std::lock_guard<std::mutex> lk(g_inferMtx);
             if (s->cancelled.load()) { s->finalFlag.store(true); return; }
@@ -309,17 +305,28 @@ static void runInference(Session* s, std::string wavPath, Model model) {
             }
             nseg = whisper_full_n_segments(ctx);
             out.reserve(256);
+            segs.reserve(nseg);
             for (int i = 0; i < nseg; i++) {
                 const char* seg = whisper_full_get_segment_text(ctx, i);
                 if (!seg) continue;
-                // Trim leading whitespace whisper.cpp emits between segments.
+                // whisper.cpp returns timestamps in centiseconds — convert to ms
+                // so the playback thread's position (sample count ÷ 48) is a
+                // direct comparison without any unit math at the use site.
+                int64_t t0cs = whisper_full_get_segment_t0(ctx, i);
+                int64_t t1cs = whisper_full_get_segment_t1(ctx, i);
                 while (*seg == ' ') seg++;
+                if (*seg == '\0') continue;
+                segs.push_back({ (int)(t0cs * 10), (int)(t1cs * 10), std::string(seg) });
                 if (!out.empty()) out += ' ';
                 out += seg;
             }
         }  // release g_inferMtx
 
-        sessionSetText(s, out);
+        {
+            std::lock_guard<std::mutex> lk(s->textMtx);
+            s->text     = out;
+            s->segments = std::move(segs);
+        }
         s->finalFlag.store(true);
 
         if (!s->cancelled.load()) {
@@ -357,6 +364,33 @@ std::string getText(void* handle) {
     Session* s = (Session*)handle;
     std::lock_guard<std::mutex> lk(s->textMtx);
     return s->text;
+}
+
+std::vector<Segment> getSegments(void* handle) {
+    if (!handle) return {};
+    Session* s = (Session*)handle;
+    std::lock_guard<std::mutex> lk(s->textMtx);
+    return s->segments;
+}
+
+// Standard LRC line is "[mm:ss.xx]text".  Centiseconds, two-digit fields.
+// Players that don't understand LRC just see the lines as plain text — graceful
+// degradation, no other format gets corrupted.
+std::string formatLrc(const std::vector<Segment>& segs) {
+    std::string out;
+    out.reserve(segs.size() * 32);
+    char buf[16];
+    for (auto& s : segs) {
+        int ms  = s.t0Ms;
+        int mm  = ms / 60000;
+        int ss  = (ms / 1000) % 60;
+        int cs  = (ms / 10)   % 100;
+        snprintf(buf, sizeof(buf), "[%02d:%02d.%02d]", mm, ss, cs);
+        out += buf;
+        out += s.text;
+        out += '\n';
+    }
+    return out;
 }
 
 bool isFinal(void* handle) {

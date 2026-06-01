@@ -2,6 +2,7 @@
 #ifdef __APPLE__
 #include <string>
 #include <cstdint>
+#include <vector>
 
 // Whisper.cpp transcription backend.  Drop-in alternative to transcription::
 // (Apple Speech) — same handle/poll API so call sites only need to dispatch
@@ -57,6 +58,23 @@ namespace transcription_whisper {
 
     // True once whisper_full() has returned and the segments are joined.
     bool        isFinal(void* handle);
+
+    // ── Time-aligned segments ───────────────────────────────────────────────
+    // Whisper produces per-segment timestamps natively (centiseconds of the
+    // input audio).  Available after isFinal() flips true; empty before.
+    // Times are in milliseconds, relative to the START of the WAV that was
+    // transcribed (i.e. directly comparable to playback elapsed time).
+    struct Segment {
+        int         t0Ms;
+        int         t1Ms;
+        std::string text;
+    };
+    std::vector<Segment> getSegments(void* handle);
+
+    // Format a segment list as standard LRC ("[mm:ss.xx]text" per line).
+    // Embeddable in the M4A ©lyr metadata atom so external players (VLC,
+    // QuickTime, IINA, iTunes) render synced captions automatically.
+    std::string  formatLrc(const std::vector<Segment>& segs);
 
     // Release the handle (also cancels if still in flight).
     void        destroy(void* handle);

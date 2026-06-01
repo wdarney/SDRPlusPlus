@@ -115,6 +115,11 @@ struct ChannelSlot {
     void*       transcribeHandle       = nullptr;
     int         transcribeBackend      = 0;  // mirrors TranscriptionBackend; tracks which lib owns transcribeHandle
     std::string liveTranscript;
+    // Time-aligned segments from the last completed transcription (Whisper only;
+    // empty for Apple Speech).  Drives the synced display during playback and
+    // the LRC ©lyr tag embedded in the M4A.  Lives on the slot until playback
+    // captures it for display.
+    std::vector<transcription_whisper::Segment> liveSegments;
     std::string pendingTranscriptPath;
 #endif
 
@@ -423,6 +428,13 @@ public:
         if (playbackThread.joinable()) { playbackThread.join(); }
         monitorStream.clearWriteStop();
         { std::lock_guard<std::mutex> lk(playbackMtx); playbackQueue.clear(); }
+#ifdef __APPLE__
+        // Drop any orphaned synced-segment entries (would otherwise leak if the
+        // WAV they belonged to got discarded before playback dequeued them).
+        { std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx); pendingPlaybackSegments.clear(); }
+        playbackPosMs.store(-1);
+        { std::lock_guard<std::mutex> tlk(lastTranscriptMtx); playingSegments.clear(); }
+#endif
 
         // Tear down monitor stream
         monitorSinkStream->stop();
@@ -1464,6 +1476,19 @@ private:
             slot->liveTranscript = txGetText(slot->transcribeBackend, slot->transcribeHandle);
             if (!txIsFinal(slot->transcribeBackend, slot->transcribeHandle)) continue;
 
+            // Pull time-aligned segments too (Whisper only — Apple Speech returns []).
+            if (slot->transcribeBackend >= TB_WHISPER_ATC_LARGE) {
+                slot->liveSegments = transcription_whisper::getSegments(slot->transcribeHandle);
+                // Stash by path so playbackThreadFunc can install them when this
+                // WAV's turn comes up in the queue.  pendingTranscriptPath is the
+                // path the WAV was registered under at file-close time — same
+                // string the playback queue uses.
+                if (!slot->liveSegments.empty() && !slot->pendingTranscriptPath.empty()) {
+                    std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
+                    pendingPlaybackSegments[slot->pendingTranscriptPath] = slot->liveSegments;
+                }
+            }
+
             // Update live transcript display
             if (!slot->liveTranscript.empty()) {
                 std::lock_guard<std::mutex> tlk(lastTranscriptMtx);
@@ -1479,12 +1504,19 @@ private:
                 bool canEncode = false;
                 std::string encodePath, encodeTranscript;
                 float       encodeSnrDb = 0.0f;
+                // Prefer LRC (synced captions) when segments exist — external players
+                // like VLC/QuickTime/IINA render them as time-aligned subtitles when
+                // embedded in ©lyr.  Apple Speech has no segments → falls back to
+                // the joined transcript text just like before.
+                std::string transcriptForM4A = !slot->liveSegments.empty()
+                    ? transcription_whisper::formatLrc(slot->liveSegments)
+                    : slot->liveTranscript;
                 {
                     std::lock_guard<std::mutex> elk(pendingEncodesMtx);
                     auto it = pendingEncodes.find(slot->pendingTranscriptPath);
                     if (it != pendingEncodes.end()) {
                         it->second.transcriptionDone = true;
-                        it->second.transcript        = slot->liveTranscript;
+                        it->second.transcript        = transcriptForM4A;
                         if (it->second.playbackDone) {
                             canEncode        = true;
                             encodePath       = it->first;
@@ -2243,9 +2275,36 @@ private:
             }
 
             if (!path.empty()) {
+#ifdef __APPLE__
+                // Install synced-playback state for THIS file before playback
+                // starts, so the UI thread can highlight whichever segment the
+                // playback cursor is in.  If no segments were stashed (Apple
+                // Speech, transcription off, or transcription not yet finished
+                // by the time playback reaches the front of the queue), the
+                // overlay just doesn't render — graceful degradation.
+                {
+                    std::vector<transcription_whisper::Segment> segs;
+                    {
+                        std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
+                        auto it = pendingPlaybackSegments.find(path);
+                        if (it != pendingPlaybackSegments.end()) {
+                            segs = std::move(it->second);
+                            pendingPlaybackSegments.erase(it);
+                        }
+                    }
+                    std::lock_guard<std::mutex> tlk(lastTranscriptMtx);
+                    playingSegments = std::move(segs);
+                }
+                playbackPosMs.store(0);
+#endif
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
+#ifdef __APPLE__
+                playbackPosMs.store(-1);
+                // Leave playingSegments intact for a moment so the user can read
+                // the final transcript — it's cleared on the next playback start.
+#endif
                 if (deleteAfter) {
                     std::remove(path.c_str());
                 }
@@ -2352,6 +2411,13 @@ private:
             if (!monitorStream.swap(samples)) { break; }
             remaining    -= bytesRead;
             samplesRead  += samples;
+#ifdef __APPLE__
+            // Publish the playback cursor for the synced-transcript overlay.
+            // The WAV is 48 kHz so ms = samples * 1000 / 48000.  Atomic store —
+            // UI thread reads without locking.  Updated once per CHUNK (~21ms
+            // @ 48 kHz), plenty fast enough for UI sync.
+            playbackPosMs.store(int((int64_t)samplesRead * 1000 / 48000));
+#endif
         }
     }
 
@@ -3578,12 +3644,18 @@ private:
                 }
 #ifdef __APPLE__
                 std::string txText, txName;
+                std::vector<transcription_whisper::Segment> txSegs;
+                int txPosMs = _this->playbackPosMs.load();
                 if (_this->transcriptionOn()) {
                     std::lock_guard<std::mutex> tlk(_this->lastTranscriptMtx);
                     txText = _this->lastTranscriptText;
                     txName = _this->lastTranscriptName;
+                    txSegs = _this->playingSegments;
                 }
-                float panelH = (!txText.empty()) ? 110.0f : 50.0f;
+                // Pick panel height: synced display is taller (line per segment).
+                float panelH = 50.0f;
+                if (!txSegs.empty())     panelH = std::min(220.0f, 60.0f + 22.0f * (float)txSegs.size());
+                else if (!txText.empty()) panelH = 110.0f;
 #else
                 float panelH = 50.0f;
 #endif
@@ -3604,7 +3676,34 @@ private:
                     ImGui::PopStyleColor();
                 }
 #ifdef __APPLE__
-                if (!txText.empty()) {
+                if (!txSegs.empty()) {
+                    // Synced segment display: stack each segment with [mm:ss],
+                    // bright color on the active one (cursor lies in [t0,t1)),
+                    // dim everything else.  Past segments stay readable;
+                    // future ones get the same dim color so the user sees
+                    // what's coming.  Once playback ends (txPosMs == -1)
+                    // everything dims uniformly — still readable, no highlight.
+                    ImGui::Separator();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.6f, 1.0f, 1.0f));
+                    if (!txName.empty()) ImGui::Text("[%s]", txName.c_str());
+                    ImGui::PopStyleColor();
+                    for (auto& seg : txSegs) {
+                        bool active = (txPosMs >= 0 && txPosMs >= seg.t0Ms && txPosMs < seg.t1Ms);
+                        ImVec4 col = active
+                            ? ImVec4(1.00f, 0.95f, 0.45f, 1.0f)   // active = warm yellow
+                            : ImVec4(0.55f, 0.55f, 0.62f, 1.0f);  // dim
+                        ImGui::PushStyleColor(ImGuiCol_Text, col);
+                        // [mm:ss]
+                        int mm = seg.t0Ms / 60000;
+                        int ss = (seg.t0Ms / 1000) % 60;
+                        ImGui::Text("[%02d:%02d]", mm, ss);
+                        ImGui::SameLine();
+                        ImGui::TextWrapped("%s", seg.text.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                } else if (!txText.empty()) {
+                    // No segments (Apple Speech or transcription pre-Whisper) —
+                    // fall back to the original flat display.
                     ImGui::Separator();
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.6f, 1.0f, 1.0f));
                     if (!txName.empty())
@@ -4656,12 +4755,34 @@ private:
     std::atomic<bool>                  encodeThreadRunning { false };
 
     // Playback queue + monitor output
-    struct PlaybackEntry { std::string path; double freqHz; bool deleteAfter; };
+    // PlaybackEntry now carries the segments alongside the WAV path so the
+    // playback thread can install them as `playingSegments` for the synced
+    // display.  Empty segments = no sync overlay (Apple Speech / transcription off).
+    struct PlaybackEntry {
+        std::string path;
+        double      freqHz;
+        bool        deleteAfter;
+#ifdef __APPLE__
+        std::vector<transcription_whisper::Segment> segments;
+#endif
+    };
     std::deque<PlaybackEntry> playbackQueue;
 #ifdef __APPLE__
     std::mutex  lastTranscriptMtx;
     std::string lastTranscriptText;  // most recently completed transcript
     std::string lastTranscriptName;  // displayName of the transcribed freq
+    // Synced-playback state: the segments captured at playback start, plus an
+    // atomic playback position (ms from the start of the WAV).  The UI thread
+    // reads playbackPosMs without locking and walks playingSegments to find
+    // which segment to highlight.  lastTranscriptMtx guards playingSegments.
+    std::vector<transcription_whisper::Segment> playingSegments;
+    std::atomic<int> playbackPosMs { -1 };  // -1 = not playing
+    // Segments waiting for their WAV to start playback.  Populated by the
+    // transcription poll loop (under pendingPlaybackSegmentsMtx) and consumed
+    // by playbackThreadFunc before each WAV plays.  Path-keyed because
+    // playbacks queue independently of when transcriptions finish.
+    std::mutex pendingPlaybackSegmentsMtx;
+    std::map<std::string, std::vector<transcription_whisper::Segment>> pendingPlaybackSegments;
 #endif
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
     std::mutex                      playbackMtx;
