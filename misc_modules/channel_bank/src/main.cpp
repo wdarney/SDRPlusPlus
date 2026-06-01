@@ -122,6 +122,30 @@ struct ChannelSlot {
     float snrSum   = 0.0f;  // sum of SNR dB samples taken while recording + signal present
     int   snrCount = 0;     // number of samples in snrSum
 
+    // Static-vs-voice gate — spectral-flatness tally. Written by analyzeSpectrum
+    // (DSP spectrum thread, under channelsMtx) on every above-threshold frame while
+    // the file is open; read by audioHandler at file-close time. Atomic so the
+    // close-time read is clean across threads. A recording whose channel spectrum
+    // is predominantly *flat* (broadband static, no carrier) instead of *peaky*
+    // (carrier + voice sidebands) is discarded before it queues or logs.
+    std::atomic<int> gateFramesAbove { 0 };  // frames above threshold while recording (auto only — static/drift gate)
+    std::atomic<int> gateFramesVoice { 0 };  // ...of those, frames with a carrier (low flatness)
+
+    // On-air time tally — frames the carrier was actually present (above the hold threshold)
+    // while recording, counted in BOTH auto and manual modes. Min TX is checked against this
+    // cumulative on-air time rather than the open→last-seen span, so intermittent data bursts
+    // (ACARS, etc.) that get bridged into one long span are still discarded for having little
+    // real airtime. At SPEC_ANALYSIS_HZ (20 Hz) each frame is 50 ms.
+    std::atomic<int> onAirFrames { 0 };
+
+    // Drift gate — running stats of the carrier centroid (relative to slot center, Hz)
+    // over the above-threshold frames of this recording. A healthy transmitter holds a
+    // fixed carrier (small stddev); a faulty/drifting emitter sweeps in frequency (large
+    // stddev → diagonal streaks in the waterfall). Plain doubles, written by analyzeSpectrum
+    // under channelsMtx, read once at close (benign one-frame race, like snrSum).
+    double driftSum   = 0.0;  // Σ centroidHz
+    double driftSumSq = 0.0;  // Σ centroidHz²
+
     // RNNoise state (per-slot noise reduction)
     DenoiseState*  nrState    = nullptr;
     float          nrInBuf[480] = {};     // RNNoise processes 480 samples (10ms at 48kHz)
@@ -155,6 +179,18 @@ public:
             snrThreshold = config.conf[name]["snrThreshold"];
         if (config.conf[name].contains("holdHysteresisDb"))
             holdHysteresisDb = config.conf[name]["holdHysteresisDb"];
+        if (config.conf[name].contains("maxRecordingSec"))
+            maxRecordingSec = config.conf[name]["maxRecordingSec"];
+        if (config.conf[name].contains("staticGateEnabled"))
+            staticGateEnabled = config.conf[name]["staticGateEnabled"];
+        if (config.conf[name].contains("staticGateFlatness"))
+            staticGateFlatness = config.conf[name]["staticGateFlatness"];
+        if (config.conf[name].contains("staticGateVoiceFrac"))
+            staticGateVoiceFrac = config.conf[name]["staticGateVoiceFrac"];
+        if (config.conf[name].contains("driftGateEnabled"))
+            driftGateEnabled = config.conf[name]["driftGateEnabled"];
+        if (config.conf[name].contains("driftMaxStdHz"))
+            driftMaxStdHz = config.conf[name]["driftMaxStdHz"];
         if (config.conf[name].contains("cooldownSec"))
             cooldownSec = config.conf[name]["cooldownSec"];
         if (config.conf[name].contains("recGain"))
@@ -182,6 +218,11 @@ public:
                 e.blocked     = j.value("blocked", false);
                 e.lastSeen    = j.value("lastSeen", (int64_t)0);
                 e.description = j.value("description", std::string());
+                // One-time cleanup of legacy touchFreqLog() junk: drop entries that never
+                // produced a kept recording (count==0), aren't blocked, and have no
+                // description. These are leftover open-time entries from interference;
+                // real history (count>0), blocks, and named entries are preserved.
+                if (e.count == 0 && !e.blocked && e.description.empty()) continue;
                 freqLog[freqKey(hz)] = e;
             }
         }
@@ -568,7 +609,7 @@ public:
         int outEnd = (int)samples.size();
         {
             const int   SCAN_WIN    = 2400;   // 50 ms @ 48 kHz
-            const float ONSET_MULT  = 3.0f;   // onset:  first window > 3× noise floor
+            const float ONSET_MULT  = 2.0f;   // onset:  first window > 2× noise floor (gentle — keeps quiet word onsets)
             const float OFFSET_MULT = 2.0f;   // offset: last  window > 2× noise floor
             const int   MIN_CONTENT = 48000;  // require ≥ 1 s of post-trim content
 
@@ -595,8 +636,15 @@ public:
                         float onsetThr  = scanNoise * ONSET_MULT;
                         float offsetThr = scanNoise * OFFSET_MULT;
 
-                        // Onset: advance outStart to first window above onset threshold.
-                        // Back up one window so we include the actual attack transient.
+                        // Onset: advance outStart to the first window above the onset
+                        // threshold, but (a) back up 4 windows (200 ms) so a quiet first-word
+                        // attack is preserved, and (b) cap the advance at 6 windows (300 ms)
+                        // past the fixed trim so a mis-fire can never eat into speech. With the
+                        // 200 ms lead-in this usually doesn't advance at all when the signal
+                        // begins right after the fixed trim — it only bites on real dead air.
+                        const int onsetBase    = outStart;
+                        const int ONSET_LEADIN = 4 * SCAN_WIN;   // 200 ms attack lead-in
+                        const int ONSET_CAP    = 6 * SCAN_WIN;   // ≤ 300 ms total onset trim
                         for (int i = outStart; i + SCAN_WIN <= (int)samples.size(); i += SCAN_WIN) {
                             float s2 = 0.0f;
                             for (int j = i; j < i + SCAN_WIN; j++) {
@@ -604,7 +652,8 @@ public:
                                 s2 += f * f;
                             }
                             if (sqrtf(s2 / (float)SCAN_WIN) >= onsetThr) {
-                                outStart = std::max(outStart, i - SCAN_WIN);
+                                int cand = std::min(i - ONSET_LEADIN, onsetBase + ONSET_CAP);
+                                outStart = std::max(onsetBase, cand);
                                 break;
                             }
                         }
@@ -712,10 +761,19 @@ public:
         slot.recFadeRemaining     = 0;    // pre-roll audio is continuous, no fade-in click to suppress
         slot.snrSum               = 0.0f;
         slot.snrCount             = 0;
+        slot.gateFramesAbove.store(0);   // fresh static-gate tally per recording
+        slot.gateFramesVoice.store(0);
+        slot.onAirFrames.store(0);       // fresh on-air (min-TX) tally per recording
+        slot.driftSum             = 0.0; // fresh drift-gate stats per recording
+        slot.driftSumSq           = 0.0;
         slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
-        // Immediately register in history so the user can block this frequency
-        // from the panel even if the recording is later discarded as too short.
-        if (slot.module) slot.module->touchFreqLog(slot.freqHz);
+        // NOTE: deliberately do NOT register the frequency in permanent history here.
+        // Doing so created an entry for every file-open — including the flood of opens
+        // from broadband/drifting interference whose recordings are then discarded by the
+        // static/drift gates — so the history filled with count-0 junk that per-frequency
+        // blocking couldn't keep up with. The frequency is still blockable while recording
+        // (active list) and for 30 s after teardown (recent list); a permanent history
+        // entry is created only when a recording is actually KEPT (logRecording()).
         return true;
     }
 
@@ -871,22 +929,34 @@ private:
         // Two variants: slotMeans (slow EMA) for voting; instSlotMeans (instantaneous) for fade trigger.
         std::vector<float> slotMeans(numSlots);
         std::vector<float> instSlotMeans(numSlots);
+        std::vector<float> slotFlatness(numSlots, 1.0f);  // spectral flatness per slot: ~1 flat/noise, ~0 peaky/carrier
+        std::vector<float> slotCentroidHz(numSlots, 0.0f);// carrier centroid relative to slot center (Hz) — for drift gate
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
             double slotOffset = ((double)s - (double)(numSlots - 1) / 2.0) * channelSpacing;
             int centerBin = (int)std::round((slotOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
             int lo = std::clamp(centerBin - halfBins, 0, FFT_SIZE - 1);
             int hi = std::clamp(centerBin + halfBins, 0, FFT_SIZE - 1);
-            float sum = 0.0f, instSum = 0.0f;
+            float  sum = 0.0f, instSum = 0.0f;
+            double logSum = 0.0;  // Σ ln(power) for geometric mean → spectral flatness
             int   peakBin = lo;
             for (int b = lo; b <= hi; b++) {
                 sum     += power[b];
                 instSum += instPower[b];
+                logSum  += logf(std::max(power[b], 1e-20f));
                 if (power[b] > power[peakBin]) peakBin = b;
             }
             int nBins = hi - lo + 1;
             slotMeans[s]     = sum     / (float)nBins;
             instSlotMeans[s] = instSum / (float)nBins;
+            // Spectral flatness measure (Wiener entropy): geometric mean / arithmetic mean
+            // of the channel's power bins. → 1.0 for a flat (broadband static) spectrum,
+            // → 0 when one bin (the carrier) dominates. This is what separates a real
+            // AM/voice signal (carrier + sidebands = peaky) from interference (flat),
+            // regardless of when the bursts occur.
+            double arithMean = (double)slotMeans[s];
+            double geoMean   = exp(logSum / (double)nBins);
+            slotFlatness[s]  = (arithMean > 1e-30) ? (float)(geoMean / arithMean) : 1.0f;
             // Spectral centroid: energy-weighted average bin frequency.
             // For SSB voice, this lands near the middle of the voice passband
             // (~1000–1500 Hz above/below carrier) rather than at the loudest
@@ -896,6 +966,10 @@ private:
                 weightedSum += (double)b * (double)power[b];
             double centroidBin = (sum > 0.0f) ? (weightedSum / (double)sum) : (double)centerBin;
             newPeakOffsets[s] = ((centroidBin - FFT_SIZE / 2) / FFT_SIZE) * lastKnownSr;
+            // Centroid relative to this slot's center — small (±detection window), so the
+            // drift-gate variance math stays well-conditioned. Subtracting a constant
+            // doesn't change the stddev we ultimately test.
+            slotCentroidHz[s] = (float)(newPeakOffsets[s] - slotOffset);
         }
 
         // Global noise floor — 20th percentile of CENTER slot means (bwUsage
@@ -1198,6 +1272,8 @@ private:
                         slot->rawSignalPresent.store(false);
                         slot->rawConsecutiveHits.store(0);
                     }
+                    // On-air tally for the Min TX check (manual mode). Mirrors the auto path.
+                    if (above && slot->fileOpen) slot->onAirFrames.fetch_add(1);
                 }
             }
             mgmtCv.notify_one();
@@ -1304,6 +1380,22 @@ private:
                     }
                     // 1st miss: leave rawSignalPresent unchanged — protects against
                     // a single noisy frame setting off the fade prematurely.
+
+                    // Static gate tally: on every above-threshold frame while recording,
+                    // count whether this channel's spectrum has a carrier (peaky, low
+                    // flatness = voice-like) or is flat (broadband static). The fraction
+                    // over the whole recording decides keep-vs-discard at file close.
+                    if (above && slot->fileOpen && idx < numSlots) {
+                        slot->gateFramesAbove.fetch_add(1);
+                        slot->onAirFrames.fetch_add(1);
+                        if (slotFlatness[idx] < staticGateFlatness)
+                            slot->gateFramesVoice.fetch_add(1);
+                        // Drift gate: accumulate carrier-centroid stats. A stable carrier
+                        // barely moves; a drifting/faulty emitter spreads these out.
+                        double c = (double)slotCentroidHz[idx];
+                        slot->driftSum   += c;
+                        slot->driftSumSq += c * c;
+                    }
                 }
             }
         }
@@ -1719,7 +1811,26 @@ private:
                 int64_t signalMs = std::max(int64_t(0),
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         slot.lastDetected - slot.fileOpenTime).count());
-                if (signalMs < (int64_t)slot.module->minTransmissionMs) {
+                // Min TX on cumulative on-air time (see normal close path) — discards
+                // bursty data (ACARS) even when bridged into a long span.
+                int64_t onAirMs = (int64_t)(slot.onAirFrames.load() * (1000.0 / SPEC_ANALYSIS_HZ));
+                // Same static gate as the normal close path — don't keep a flat-spectrum
+                // (carrier-less) recording just because it was torn down mid-flight.
+                int   gAbove    = slot.gateFramesAbove.load();
+                int   gVoice    = slot.gateFramesVoice.load();
+                float voiceFrac = (gAbove > 0) ? (float)gVoice / (float)gAbove : 1.0f;
+                bool  staticReject = slot.module->staticGateEnabled
+                                     && gAbove >= slot.module->staticGateMinFrames
+                                     && voiceFrac < slot.module->staticGateVoiceFrac;
+                // Same drift gate as the normal close path — a torn-down recording of a
+                // drifting/faulty carrier shouldn't be kept either.
+                double dMean    = (gAbove > 0) ? slot.driftSum / (double)gAbove : 0.0;
+                double dVar     = (gAbove > 0) ? std::max(0.0, slot.driftSumSq / (double)gAbove - dMean * dMean) : 0.0;
+                float  driftStd = (float)sqrt(dVar);
+                bool   driftReject = slot.module->driftGateEnabled
+                                     && gAbove >= slot.module->staticGateMinFrames
+                                     && driftStd > slot.module->driftMaxStdHz;
+                if (staticReject || driftReject || onAirMs < (int64_t)slot.module->minTransmissionMs) {
                     std::remove(slot.currentFilePath.c_str());
                 } else {
                     // Recording meets the minimum duration — process it even though
@@ -1821,7 +1932,21 @@ private:
         // signalPresent still controls the hold/silence-countdown (unchanged).
         bool rawOpen     = (slot->rawSignalPresent.load() && slot->rawConsecutiveHits.load() >= 2);
         bool activeSignal = slot->signalPresent.load() || rawOpen;
-        if (activeSignal) {
+
+        // Hard duration cap: a recording open longer than maxRecordingSec is force-closed
+        // regardless of whether the signal is still "present". Persistent come-and-go
+        // interference keeps activeSignal latched forever (each burst re-arms it), so this
+        // is the only thing that breaks the loop. The closed segment is then judged by the
+        // static gate below — static segments are discarded, a genuinely long transmission
+        // is kept and simply continues into a fresh file on the next frame.
+        bool forceClose = false;
+        if (slot->fileOpen && _this->maxRecordingSec > 0.0f) {
+            float openSec = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - slot->fileOpenTime).count();
+            forceClose = (openSec >= _this->maxRecordingSec);
+        }
+
+        if (activeSignal && !forceClose) {
             slot->inSilence = false;
             if (!slot->fileOpen) {
                 _this->openNewFile(*slot);
@@ -1852,7 +1977,7 @@ private:
             }
             if (slot->fileOpen) {
                 auto silenceElapsed = std::chrono::steady_clock::now() - slot->silenceStart;
-                if (silenceElapsed >= std::chrono::milliseconds(_this->tailMs)) {
+                if (silenceElapsed >= std::chrono::milliseconds(_this->tailMs) || forceClose) {
                     // Signal duration = time from file-open to the last genuine FFT detection.
                     // Using (audioSamplesWritten - tailSamples) was wrong: the signalHoldMs
                     // grace period kept signalPresent=true and the audio handler writing,
@@ -1862,13 +1987,50 @@ private:
                     int64_t signalMs = std::max(int64_t(0),
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             slot->lastDetected - slot->fileOpenTime).count());
+                    // Min TX is judged on cumulative ON-AIR time (frames the carrier was
+                    // actually present), not the open→last-seen span. Intermittent data
+                    // bursts (ACARS) get bridged into a long span by the signal-hold, but
+                    // their real airtime stays small — so this discards them while keeping
+                    // continuous voice. 50 ms per frame @ SPEC_ANALYSIS_HZ.
+                    int64_t onAirMs = (int64_t)(slot->onAirFrames.load() * (1000.0 / SPEC_ANALYSIS_HZ));
                     slot->writer.close();
                     slot->fileOpen = false;
-                    if (signalMs < (int64_t)_this->minTransmissionMs) {
-                        flog::info("[ChannelBank] Discarding short recording ({0}ms < {1}ms threshold)", signalMs, _this->minTransmissionMs);
+
+                    // Static gate: did this recording's channel show a carrier (voice)
+                    // or was it predominantly flat-spectrum (broadband interference)?
+                    int   gAbove    = slot->gateFramesAbove.load();
+                    int   gVoice    = slot->gateFramesVoice.load();
+                    float voiceFrac = (gAbove > 0) ? (float)gVoice / (float)gAbove : 1.0f;
+                    bool  staticReject = _this->staticGateEnabled
+                                         && gAbove >= _this->staticGateMinFrames
+                                         && voiceFrac < _this->staticGateVoiceFrac;
+
+                    // Drift gate: stddev of the carrier centroid over the recording.
+                    // Stable carrier → small; drifting/faulty emitter → large.
+                    double dMean    = (gAbove > 0) ? slot->driftSum / (double)gAbove : 0.0;
+                    double dVar     = (gAbove > 0) ? std::max(0.0, slot->driftSumSq / (double)gAbove - dMean * dMean) : 0.0;
+                    float  driftStd = (float)sqrt(dVar);
+                    bool   driftReject = _this->driftGateEnabled
+                                         && gAbove >= _this->staticGateMinFrames
+                                         && driftStd > _this->driftMaxStdHz;
+
+                    if (staticReject) {
+                        flog::info("[ChannelBank] Discarding static recording (carrier in {0}/{1} frames = {2:.0f}%% < {3:.0f}%%) slot {4}{5}",
+                                   gVoice, gAbove, voiceFrac * 100.0f,
+                                   _this->staticGateVoiceFrac * 100.0f, slot->gridIdx,
+                                   forceClose ? " [dur-cap]" : "");
+                        std::remove(slot->currentFilePath.c_str());
+                    } else if (driftReject) {
+                        flog::info("[ChannelBank] Discarding drifting recording (carrier drift {0:.0f}Hz > {1:.0f}Hz over {2} frames) slot {3}{4}",
+                                   driftStd, _this->driftMaxStdHz, gAbove, slot->gridIdx,
+                                   forceClose ? " [dur-cap]" : "");
+                        std::remove(slot->currentFilePath.c_str());
+                    } else if (onAirMs < (int64_t)_this->minTransmissionMs) {
+                        flog::info("[ChannelBank] Discarding short recording (on-air {0}ms < {1}ms threshold; span was {2}ms)", onAirMs, _this->minTransmissionMs, signalMs);
                         std::remove(slot->currentFilePath.c_str());
                     } else {
-                        flog::info("[ChannelBank] Keeping recording ({0}ms >= {1}ms threshold) slot {2}", signalMs, _this->minTransmissionMs, slot->gridIdx);
+                        flog::info("[ChannelBank] Keeping recording (on-air {0}ms / span {1}ms, carrier {2}/{3} = {4:.0f}%%, drift {5:.0f}Hz) slot {6}",
+                                   onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f, driftStd, slot->gridIdx);
                         normalizeWavFile(slot->currentFilePath);
 #ifdef __APPLE__
                         if (_this->transcriptionEnabled) {
@@ -3090,6 +3252,83 @@ private:
                               "4 dB covers typical HF QSB fading.\n"
                               "0 = disabled (symmetric open/hold threshold).");
 
+        // Max recording length — hard duration cap (live)
+        ImGui::LeftLabel("Max Length");
+        ImGui::FillWidth();
+        if (ImGui::SliderFloat(CONCAT("##_cb_maxlen_", _this->name),
+                               &_this->maxRecordingSec, 0.0f, 300.0f, "%.0f s")) {
+            config.acquire();
+            config.conf[_this->name]["maxRecordingSec"] = _this->maxRecordingSec;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Force-close any recording open longer than this.\n"
+                              "Persistent come-and-go interference keeps a channel\n"
+                              "latched open forever; this breaks the loop so the\n"
+                              "static gate can judge and discard each segment.\n"
+                              "A genuinely long transmission simply continues into\n"
+                              "a new file.  0 = no cap.");
+
+        // Static gate — discard carrier-less (broadband interference) recordings
+        if (ImGui::Checkbox(CONCAT("Static Gate##_cb_statgate_", _this->name),
+                            &_this->staticGateEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["staticGateEnabled"] = _this->staticGateEnabled;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Discard a finished recording whose channel spectrum\n"
+                              "was flat (broadband static, no carrier) rather than\n"
+                              "peaky (carrier + voice sidebands).  Judges the whole\n"
+                              "recording's structure, so it catches interference that\n"
+                              "comes and goes.  Discarded files never queue or log.");
+        if (_this->staticGateEnabled) {
+            ImGui::LeftLabel("  Min Voice %");
+            ImGui::FillWidth();
+            float pct = _this->staticGateVoiceFrac * 100.0f;
+            if (ImGui::SliderFloat(CONCAT("##_cb_statfrac_", _this->name),
+                                   &pct, 5.0f, 75.0f, "%.0f %%")) {
+                _this->staticGateVoiceFrac = pct / 100.0f;
+                config.acquire();
+                config.conf[_this->name]["staticGateVoiceFrac"] = _this->staticGateVoiceFrac;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Minimum %% of above-threshold frames that must show\n"
+                                  "a carrier for the recording to be kept.  Higher =\n"
+                                  "stricter (discards more borderline recordings).\n"
+                                  "If real transmissions are being discarded, lower it.");
+        }
+
+        // Drift gate — discard drifting/faulty (frequency-wandering) carriers
+        if (ImGui::Checkbox(CONCAT("Drift Gate##_cb_driftgate_", _this->name),
+                            &_this->driftGateEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["driftGateEnabled"] = _this->driftGateEnabled;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Discard a recording whose carrier wandered in frequency\n"
+                              "(a faulty/drifting transmitter — diagonal streaks in the\n"
+                              "waterfall) instead of holding a fixed carrier.  Catches the\n"
+                              "spur/comb interference the static gate can't, since each\n"
+                              "drifting spur still reads as a carrier.");
+        if (_this->driftGateEnabled) {
+            ImGui::LeftLabel("  Max Drift");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_cb_drift_", _this->name),
+                                   &_this->driftMaxStdHz, 200.0f, 3000.0f, "%.0f Hz")) {
+                config.acquire();
+                config.conf[_this->name]["driftMaxStdHz"] = _this->driftMaxStdHz;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Carrier-frequency stddev (over the recording) above which\n"
+                                  "the signal counts as drifting and is discarded.  A healthy\n"
+                                  "transmitter holds within a few hundred Hz.  Lower = stricter.\n"
+                                  "If real (slightly off-tuned) signals are discarded, raise it.");
+        }
+
         // Cooldown (live)
         ImGui::LeftLabel("Cooldown");
         ImGui::FillWidth();
@@ -3183,6 +3422,13 @@ private:
                 config.conf[_this->name]["minTransmissionMs"] = _this->minTransmissionMs;
                 config.release(true);
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Discard recordings with less than this much actual ON-AIR\n"
+                                  "time (sum of the moments the carrier is truly present),\n"
+                                  "not elapsed wall-clock. Bursty data like ACARS gets bridged\n"
+                                  "into a long recording by the signal-hold, but its real\n"
+                                  "airtime stays small — so this discards it while keeping\n"
+                                  "continuous voice of the same wall-clock length.");
         }
 
         // Tail length — how long to keep recording after signal gone
@@ -3966,6 +4212,25 @@ private:
     float        snrThreshold  = 4.0f;      // dB above noise floor — required to START a recording
     float        holdHysteresisDb = 4.0f;  // dB below snrThreshold that keeps an open recording alive
     float        cooldownSec   = 5.0f;      // seconds before destroying a quiet channel
+    // Hard cap: force-close any recording open longer than this many seconds. Real
+    // voice transmissions are short; a multi-minute "transmission" is interference
+    // holding the channel open. Force-closing lets the static gate (below) judge and
+    // discard each segment, and bounds queue/encode backlog. 0 disables the cap.
+    float        maxRecordingSec   = 90.0f;
+    // Static gate: discard a finished recording whose channel spectrum was
+    // predominantly flat (broadband static / no carrier) rather than peaky (carrier
+    // + voice sidebands). Immune to come-and-go interference because it judges the
+    // whole recording's structure, not its temporal envelope.
+    bool         staticGateEnabled  = true;
+    float        staticGateFlatness = 0.55f; // spectral flatness ≥ this on a frame ⇒ "flat/static" (no carrier)
+    float        staticGateVoiceFrac= 0.30f; // need ≥ this fraction of active frames carrier-present, else discard
+    int          staticGateMinFrames= 30;    // need ≥ this many above-threshold frames before judging (~1.5s)
+    // Drift gate: discard a recording whose carrier wandered in frequency (a faulty /
+    // drifting transmitter — diagonal streaks in the waterfall) rather than holding a
+    // fixed carrier like a healthy emitter. Catches the comb/spur interference that the
+    // static gate can't (each drifting spur is a carrier, so it reads as "voice-like").
+    bool         driftGateEnabled   = true;
+    float        driftMaxStdHz      = 700.0f; // carrier-centroid stddev above this (Hz) ⇒ drifting ⇒ discard
     float        leftTrimFrac   = 0.0f;  // fraction of bandwidth to exclude from left edge
     float        rightTrimFrac  = 0.0f;  // fraction of bandwidth to exclude from right edge
     bool         draggingLeft   = false;
@@ -4224,16 +4489,9 @@ private:
         e.lastSeen = (int64_t)std::time(nullptr);
     }
 
-    // Called from openNewFile (DSP/audio thread) the moment a recording begins.
-    // Creates the freqLog entry immediately so the user can see and block this
-    // frequency in the history panel even if the recording is later discarded as
-    // too short.  Does NOT increment count (logRecording does that on keep).
-    void touchFreqLog(double hz) {
-        std::lock_guard<std::mutex> lk(freqLogMtx);
-        auto  key  = freqKey(hz);
-        auto& e    = freqLog[key];
-        if (e.freqHz == 0.0) e.freqHz = hz;  // only initialise new entries
-    }
+    // (touchFreqLog removed) — permanent history is now populated only by logRecording()
+    // when a recording is KEPT, so discarded interference no longer floods the list.
+    // Frequencies stay blockable live (active list) and for 30 s after teardown (recent list).
 
     void saveFreqLog() {
         config.acquire();
