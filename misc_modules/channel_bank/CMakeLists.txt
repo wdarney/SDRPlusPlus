@@ -3,8 +3,8 @@ project(channel_bank)
 
 file(GLOB SRC "src/*.cpp")
 if (APPLE AND NOT ANDROID)
-    list(APPEND SRC src/transcription.mm src/encoding.mm)
-    set_source_files_properties(src/transcription.mm src/encoding.mm PROPERTIES
+    list(APPEND SRC src/transcription.mm src/encoding.mm src/transcription_whisper.mm)
+    set_source_files_properties(src/transcription.mm src/encoding.mm src/transcription_whisper.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
 endif()
@@ -19,6 +19,37 @@ set(RNNOISE_SRC
     src/rnnoise/src/rnn_data.c
 )
 list(APPEND SRC ${RNNOISE_SRC})
+
+# whisper.cpp — in-process speech-to-text (vendored under external/whisper.cpp).
+# Built only on Apple for now (Metal acceleration); could be extended to Linux
+# (CPU/CUDA/Vulkan) later by relaxing this guard.  Drives the new transcription
+# backend in src/transcription_whisper.mm.
+if (APPLE AND NOT ANDROID)
+    # Force STATIC linking for whisper + ggml so everything collapses into the
+    # channel_bank.dylib at link time and deployment stays one file.  Without this
+    # whisper.cpp builds six separate .dylibs that we'd then have to bundle in the
+    # .app, rpath-rewrite, and re-sign individually.  Set as a non-cache scope
+    # variable so it ONLY affects the add_subdirectory call below — other SDR++
+    # modules / the core build are unaffected.
+    set(BUILD_SHARED_LIBS OFF)
+    # Don't propagate whisper.cpp's options to the SDR++ root project.
+    set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+    set(WHISPER_CURL           OFF CACHE BOOL "" FORCE) # we use NSURLSession for downloads
+    set(WHISPER_SDL2           OFF CACHE BOOL "" FORCE)
+    set(WHISPER_COREML         OFF CACHE BOOL "" FORCE) # could enable later; Metal is plenty on M-series
+    set(GGML_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_EXAMPLES    OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL             ON  CACHE BOOL "" FORCE)
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # bake Metal shaders into the dylib
+    set(GGML_OPENMP            OFF CACHE BOOL "" FORCE)    # Apple Clang ships no libomp
+    set(GGML_ACCELERATE        ON  CACHE BOOL "" FORCE)    # use Apple's Accelerate BLAS
+    # whisper.cpp 3rd-party warnings get noisy; we don't want them gating the build.
+    set(WHISPER_ALL_WARNINGS_3RD_PARTY OFF CACHE BOOL "" FORCE)
+    set(GGML_ALL_WARNINGS_3RD_PARTY    OFF CACHE BOOL "" FORCE)
+    add_subdirectory(external/whisper.cpp EXCLUDE_FROM_ALL)
+endif()
 
 include(${SDRPP_MODULE_CMAKE})
 
@@ -62,7 +93,15 @@ if (APPLE AND NOT ANDROID)
         "-framework AVFoundation"
         "-framework Foundation"
         "-framework AppKit"
+        "-framework Metal"
+        "-framework MetalKit"
         "-lobjc"
+        # whisper.cpp + ggml (Metal-accelerated)
+        whisper
+    )
+    target_include_directories(channel_bank PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp/ggml/include
     )
     add_custom_command(TARGET channel_bank POST_BUILD
         COMMAND ${CMAKE_COMMAND}

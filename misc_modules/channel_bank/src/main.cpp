@@ -38,6 +38,7 @@
 #include <fstream>
 #ifdef __APPLE__
 #include "transcription.h"
+#include "transcription_whisper.h"
 #include "encoding.h"
 #endif
 
@@ -112,6 +113,7 @@ struct ChannelSlot {
 
 #ifdef __APPLE__
     void*       transcribeHandle       = nullptr;
+    int         transcribeBackend      = 0;  // mirrors TranscriptionBackend; tracks which lib owns transcribeHandle
     std::string liveTranscript;
     std::string pendingTranscriptPath;
 #endif
@@ -253,8 +255,15 @@ public:
             rightTrimFrac = config.conf[name]["rightTrimFrac"];
         if (config.conf[name].contains("recordingEnabled"))
             recordingEnabled = config.conf[name]["recordingEnabled"];
-        if (config.conf[name].contains("transcriptionEnabled"))
-            transcriptionEnabled = config.conf[name]["transcriptionEnabled"];
+        // Transcription backend: prefer the new enum key, fall back to the legacy
+        // boolean so existing configs keep working (true → Apple Speech, false → Off).
+        if (config.conf[name].contains("transcriptionBackend")) {
+            transcriptionBackend = config.conf[name]["transcriptionBackend"].get<int>();
+        }
+        else if (config.conf[name].contains("transcriptionEnabled")) {
+            transcriptionBackend = config.conf[name]["transcriptionEnabled"].get<bool>()
+                                   ? TB_APPLE_SPEECH : TB_OFF;
+        }
         if (config.conf[name].contains("m4aEnabled"))
             m4aEnabled = config.conf[name]["m4aEnabled"];
         if (config.conf[name].contains("scanMode"))
@@ -1452,8 +1461,8 @@ private:
         std::lock_guard<std::mutex> clck(channelsMtx);
         for (auto& [idx, slot] : activeChannels) {
             if (!slot->transcribeHandle) continue;
-            slot->liveTranscript = transcription::getText(slot->transcribeHandle);
-            if (!transcription::isFinal(slot->transcribeHandle)) continue;
+            slot->liveTranscript = txGetText(slot->transcribeBackend, slot->transcribeHandle);
+            if (!txIsFinal(slot->transcribeBackend, slot->transcribeHandle)) continue;
 
             // Update live transcript display
             if (!slot->liveTranscript.empty()) {
@@ -1461,7 +1470,7 @@ private:
                 lastTranscriptText = slot->liveTranscript;
                 lastTranscriptName = displayName(slot->freqHz);
             }
-            transcription::destroy(slot->transcribeHandle);
+            txDestroy(slot->transcribeBackend, slot->transcribeHandle);
             slot->transcribeHandle = nullptr;
 
             // Transcription chain is done — check if encoding can now proceed.
@@ -1864,8 +1873,8 @@ private:
         if (slot.nrState) { rnnoise_destroy(slot.nrState); slot.nrState = nullptr; }
 #ifdef __APPLE__
         if (slot.transcribeHandle) {
-            transcription::cancel(slot.transcribeHandle);
-            transcription::destroy(slot.transcribeHandle);
+            txCancel(slot.transcribeBackend, slot.transcribeHandle);
+            txDestroy(slot.transcribeBackend, slot.transcribeHandle);
             slot.transcribeHandle = nullptr;
         }
 #endif
@@ -2033,14 +2042,17 @@ private:
                                    onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f, driftStd, slot->gridIdx);
                         normalizeWavFile(slot->currentFilePath);
 #ifdef __APPLE__
-                        if (_this->transcriptionEnabled) {
+                        if (_this->transcriptionOn()) {
                             if (slot->transcribeHandle) {
-                                transcription::cancel(slot->transcribeHandle);
-                                transcription::destroy(slot->transcribeHandle);
+                                _this->txCancel(slot->transcribeBackend, slot->transcribeHandle);
+                                _this->txDestroy(slot->transcribeBackend, slot->transcribeHandle);
                             }
                             slot->pendingTranscriptPath = slot->currentFilePath;
                             slot->liveTranscript.clear();
-                            slot->transcribeHandle = transcription::transcribeFile(slot->currentFilePath.c_str());
+                            slot->transcribeBackend = _this->transcriptionBackend;
+                            slot->transcribeHandle  = _this->txTranscribeFile(
+                                slot->transcribeBackend,
+                                slot->currentFilePath.c_str());
                         }
                         // Register for M4A encoding after playback+transcription both complete.
                         // transcriptionDone=true when transcription is off or failed to start,
@@ -2051,7 +2063,7 @@ private:
                             std::lock_guard<std::mutex> elk(_this->pendingEncodesMtx);
                             EncodeState& es = _this->pendingEncodes[slot->currentFilePath];
                             es.playbackDone      = false;
-                            es.transcriptionDone = (!_this->transcriptionEnabled || !slot->transcribeHandle);
+                            es.transcriptionDone = (!_this->transcriptionOn() || !slot->transcribeHandle);
                             es.avgSnrDb          = avgSnrDb;
                         }
 #endif
@@ -3348,32 +3360,70 @@ private:
         }
 
 #ifdef __APPLE__
-        // Speech transcription toggle
+        // ── Transcription backend dropdown ──────────────────────────────────
+        // Selecting a Whisper model that isn't installed shows an inline status
+        // message and a Download button (download UI lands in a follow-up step;
+        // for now users can place a .bin in the models dir manually).
         {
-            auto txStatus = transcription::authStatus();
-            if (txStatus == transcription::AuthStatus::NotConfigured) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.2f, 1.0f));
-                ImGui::TextWrapped("Transcription: NSSpeechRecognitionUsageDescription missing from Info.plist");
-                ImGui::PopStyleColor();
-            } else if (txStatus == transcription::AuthStatus::Denied) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
-                ImGui::TextUnformatted("Transcription: access denied");
-                ImGui::PopStyleColor();
-                ImGui::SameLine();
-                if (ImGui::SmallButton(CONCAT("Open Settings##_cb_txset_", _this->name)))
-                    transcription::openSystemSettings();
-            } else if (txStatus == transcription::AuthStatus::NotDetermined) {
-                bool dummy = false;
-                if (ImGui::Checkbox(CONCAT("Transcribe (click to authorize)##_cb_txen_", _this->name), &dummy))
+            ImGui::LeftLabel("Transcribe");
+            ImGui::FillWidth();
+            const char* labels[] = {
+                "Off",
+                "Apple Speech",
+                "Whisper ATC Large (best)",
+                "Whisper ATC Medium",
+                "Whisper Turbo (fast)",
+            };
+            int  cur = _this->transcriptionBackend;
+            if (cur < 0 || cur > TB_WHISPER_TURBO) cur = TB_OFF;
+            if (ImGui::Combo(CONCAT("##_cb_txbe_", _this->name), &cur, labels, 5)) {
+                _this->transcriptionBackend = cur;
+                config.acquire();
+                config.conf[_this->name]["transcriptionBackend"] = cur;
+                config.release(true);
+                // Trigger Apple Speech authorization the first time it's picked
+                if (cur == TB_APPLE_SPEECH &&
+                    transcription::authStatus() == transcription::AuthStatus::NotDetermined) {
                     transcription::requestPermission();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Click to request speech recognition permission from macOS");
-            } else {
-                if (ImGui::Checkbox(CONCAT("Transcribe recordings##_cb_txen_", _this->name),
-                                    &_this->transcriptionEnabled)) {
-                    config.acquire();
-                    config.conf[_this->name]["transcriptionEnabled"] = _this->transcriptionEnabled;
-                    config.release(true);
+                }
+            }
+
+            // Surface backend-specific status / actions on the next line.
+            if (_this->transcriptionBackend == TB_APPLE_SPEECH) {
+                auto txStatus = transcription::authStatus();
+                if (txStatus == transcription::AuthStatus::NotConfigured) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.2f, 1.0f));
+                    ImGui::TextWrapped("Info.plist missing NSSpeechRecognitionUsageDescription");
+                    ImGui::PopStyleColor();
+                } else if (txStatus == transcription::AuthStatus::Denied) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                    ImGui::TextUnformatted("Speech access denied");
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(CONCAT("Open Settings##_cb_txset_", _this->name)))
+                        transcription::openSystemSettings();
+                } else if (txStatus == transcription::AuthStatus::NotDetermined) {
+                    if (ImGui::SmallButton(CONCAT("Authorize##_cb_txauth_", _this->name)))
+                        transcription::requestPermission();
+                }
+            } else if (_this->transcriptionBackend >= TB_WHISPER_ATC_LARGE) {
+                using transcription_whisper::Model;
+                Model whichModel = Model::ATCLarge;
+                if (_this->transcriptionBackend == TB_WHISPER_ATC_MEDIUM) whichModel = Model::ATCMedium;
+                else if (_this->transcriptionBackend == TB_WHISPER_TURBO)   whichModel = Model::Turbo;
+                bool installed = transcription_whisper::isModelInstalled(whichModel);
+                if (installed) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 1.0f, 0.4f, 1.0f));
+                    ImGui::TextWrapped("Model: ready (%.1f MB)",
+                        transcription_whisper::modelSize(whichModel) / (1024.0 * 1024.0));
+                    ImGui::PopStyleColor();
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.7f, 0.3f, 1.0f));
+                    ImGui::TextWrapped(
+                        "Model not installed. Place %s in:\n%s",
+                        transcription_whisper::modelFilename(whichModel).c_str(),
+                        transcription_whisper::modelsDir().c_str());
+                    ImGui::PopStyleColor();
                 }
             }
         }
@@ -3392,7 +3442,7 @@ private:
             ImGui::PopStyleColor();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
             ImGui::TextWrapped("WAV converted after first playback%s. WAV deleted on success.",
-                _this->transcriptionEnabled ? " + transcription" : "");
+                _this->transcriptionOn() ? " + transcription" : "");
             ImGui::PopStyleColor();
         }
 #endif
@@ -3528,7 +3578,7 @@ private:
                 }
 #ifdef __APPLE__
                 std::string txText, txName;
-                if (_this->transcriptionEnabled) {
+                if (_this->transcriptionOn()) {
                     std::lock_guard<std::mutex> tlk(_this->lastTranscriptMtx);
                     txText = _this->lastTranscriptText;
                     txName = _this->lastTranscriptName;
@@ -3561,7 +3611,7 @@ private:
                         ImGui::Text("[%s]", txName.c_str());
                     ImGui::PopStyleColor();
                     ImGui::TextWrapped("%s", txText.c_str());
-                } else if (_this->transcriptionEnabled) {
+                } else if (_this->transcriptionOn()) {
                     ImGui::Separator();
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
                     ImGui::Text("(transcript will appear here)");
@@ -4237,7 +4287,21 @@ private:
     bool         draggingRight  = false;
     int          signalHoldMs          = 500;    // hold signalPresent true N ms after last detection (dropout hysteresis)
     bool         recordingEnabled      = true;   // global recording on/off toggle
-    bool         transcriptionEnabled  = false;  // Apple Speech transcription
+    // Transcription backend selector.  ChannelSlot::transcribeBackend stores the
+    // raw int form of this enum so it can live in the slot struct (which is
+    // declared above ChannelBankModule).  Order is config-stable — DO NOT
+    // renumber without writing migration logic.
+    enum TranscriptionBackend {
+        TB_OFF              = 0,
+        TB_APPLE_SPEECH     = 1,
+        TB_WHISPER_ATC_LARGE  = 2,
+        TB_WHISPER_ATC_MEDIUM = 3,
+        TB_WHISPER_TURBO    = 4,
+    };
+    int          transcriptionBackend  = TB_OFF;
+    // True if any non-Off backend is selected — most call sites just want to
+    // know "is transcription on?", regardless of which backend.
+    bool         transcriptionOn() const { return transcriptionBackend != TB_OFF; }
     bool         m4aEnabled            = false;  // encode to M4A after playback+transcription
     float        recGain       = 0.25f;     // linear gain applied before WAV write (~-12dB)
     int          minTransmissionMs = 300;   // discard recordings shorter than this
@@ -4479,6 +4543,51 @@ private:
         double rightCut = hi - (hi - lo) * rightTrimFrac;
         return freqHz >= leftCut && freqHz <= rightCut;
     }
+
+    // ── Transcription backend dispatch ──────────────────────────────────────
+    // Each slot stamps its handle with `transcribeBackend` at create time so
+    // later poll/cancel/destroy calls route to the same implementation that
+    // produced the handle — the user could switch backends mid-stream without
+    // breaking in-flight transcriptions.
+#ifdef __APPLE__
+    void* txTranscribeFile(int backend, const char* path) {
+        switch (backend) {
+            case TB_APPLE_SPEECH: return transcription::transcribeFile(path);
+            case TB_WHISPER_ATC_LARGE:
+                return transcription_whisper::transcribeFile(path,
+                    transcription_whisper::Model::ATCLarge);
+            case TB_WHISPER_ATC_MEDIUM:
+                return transcription_whisper::transcribeFile(path,
+                    transcription_whisper::Model::ATCMedium);
+            case TB_WHISPER_TURBO:
+                return transcription_whisper::transcribeFile(path,
+                    transcription_whisper::Model::Turbo);
+            default: return nullptr;
+        }
+    }
+    void txCancel(int backend, void* h) {
+        if (!h) return;
+        if (backend == TB_APPLE_SPEECH) transcription::cancel(h);
+        else if (backend >= TB_WHISPER_ATC_LARGE) transcription_whisper::cancel(h);
+    }
+    void txDestroy(int backend, void* h) {
+        if (!h) return;
+        if (backend == TB_APPLE_SPEECH) transcription::destroy(h);
+        else if (backend >= TB_WHISPER_ATC_LARGE) transcription_whisper::destroy(h);
+    }
+    std::string txGetText(int backend, void* h) {
+        if (!h) return {};
+        if (backend == TB_APPLE_SPEECH) return transcription::getText(h);
+        if (backend >= TB_WHISPER_ATC_LARGE) return transcription_whisper::getText(h);
+        return {};
+    }
+    bool txIsFinal(int backend, void* h) {
+        if (!h) return true;
+        if (backend == TB_APPLE_SPEECH) return transcription::isFinal(h);
+        if (backend >= TB_WHISPER_ATC_LARGE) return transcription_whisper::isFinal(h);
+        return true;
+    }
+#endif
 
     void logRecording(double hz) {
         std::lock_guard<std::mutex> lk(freqLogMtx);
