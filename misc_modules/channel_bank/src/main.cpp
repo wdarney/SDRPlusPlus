@@ -213,6 +213,8 @@ public:
             tailMs = config.conf[name]["tailMs"];
         if (config.conf[name].contains("maxChannels"))
             maxChannels = config.conf[name]["maxChannels"];
+        if (config.conf[name].contains("nmsRadiusSlots"))
+            nmsRadiusSlots = config.conf[name]["nmsRadiusSlots"];
         if (config.conf[name].contains("bwUsage"))
             bwUsage = config.conf[name]["bwUsage"];
         if (config.conf[name].contains("noiseReduction"))
@@ -1382,12 +1384,23 @@ private:
             std::sort(candidates.begin(), candidates.end(),
                       [&](int a, int b) { return slotMeans[a] > slotMeans[b]; });
 
-            // Greedy accept: skip if any neighbor is already active OR already
-            // accepted into `detected` this frame.
+            // Greedy accept with configurable NMS radius.  Skip if ANY accepted
+            // slot is within ±nmsRadius — this catches the case where a wide signal
+            // (e.g. AM voice carrier + sidebands ~10–16 kHz total) spills detectable
+            // energy into slots beyond ±1.  With radius=1, slot N+2 wasn't blocked
+            // by N (only N+1 was), and since N+1 was suppressed-not-accepted, N+2
+            // passed and we'd open a spurious recording on the sideband.
+            // Radius 2 covers typical AM voice at 8.33–25 kHz channel spacing.
+            // Sorted-by-power order ensures the carrier center wins first; sidebands
+            // are then suppressed.
+            const int nmsR = std::max(1, nmsRadiusSlots);
             for (int s : candidates) {
-                bool leftBlocked  = (s > 0            && detected.count(s - 1) > 0);
-                bool rightBlocked = (s < numSlots - 1 && detected.count(s + 1) > 0);
-                if (leftBlocked || rightBlocked) { continue; }
+                bool blocked = false;
+                for (int r = 1; r <= nmsR && !blocked; r++) {
+                    if (s - r >= 0          && detected.count(s - r) > 0) blocked = true;
+                    if (s + r < numSlots    && detected.count(s + r) > 0) blocked = true;
+                }
+                if (blocked) continue;
                 detected.insert(s);
             }
 
@@ -3358,6 +3371,24 @@ private:
                               "4 dB covers typical HF QSB fading.\n"
                               "0 = disabled (symmetric open/hold threshold).");
 
+        // NMS radius — how far around a detected center to suppress neighbors
+        ImGui::LeftLabel("NMS Radius");
+        ImGui::FillWidth();
+        if (ImGui::SliderInt(CONCAT("##_cb_nmsr_", _this->name),
+                             &_this->nmsRadiusSlots, 1, 4, "±%d slots")) {
+            config.acquire();
+            config.conf[_this->name]["nmsRadiusSlots"] = _this->nmsRadiusSlots;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("When a signal is detected at slot N, also block\n"
+                              "spawn on the neighboring ±N slots.  Prevents the\n"
+                              "sidebands of a wide AM/FM transmission from being\n"
+                              "treated as separate signals.\n"
+                              "  1 = old behavior (only direct neighbors)\n"
+                              "  2 = default — covers AM voice on 8.33/12.5/25 kHz grids\n"
+                              "  3-4 = wider signals or fine grid spacing");
+
         // Max recording length — hard duration cap (live)
         ImGui::LeftLabel("Max Length");
         ImGui::FillWidth();
@@ -4434,6 +4465,13 @@ private:
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
     int          maxChannels   = 16;
+    // Non-max-suppression radius in slots — when detecting a signal at slot N,
+    // also suppress neighbors up to ±nmsRadiusSlots from joining `detected`.
+    // Default 2: covers AM voice (carrier + ±5–8 kHz sidebands) at 8.33–25 kHz
+    // channel spacing.  Drop to 1 if your real channels are packed tighter than
+    // their signal widths (rare).  Bump higher (3–4) only for very wide signals
+    // like FM broadcast at narrow grid spacing.
+    int          nmsRadiusSlots = 2;
     double       channelSpacing = 25000.0;
     float        bwUsage       = 0.8f;      // fraction of SDR bandwidth to use (avoids filter rolloff edges)
     bool         noiseReduction = false;    // RNNoise neural noise suppression on recordings
