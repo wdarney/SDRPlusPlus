@@ -58,7 +58,12 @@ class ChannelBankModule;
 
 struct ChannelSlot {
     int    gridIdx = 0;
-    double freqHz  = 0.0;
+    double freqHz  = 0.0;   // centroid-aligned (auto mode) — for VFO placement + display
+    // Grid-aligned channel freq (lastKnownCenter + gridOffset).  Stable across the
+    // centroid jitter, so it's the right key for blocking + freqLog history: one
+    // grid slot ⇒ one history entry, blocks persist across re-spawns of the same
+    // channel.  Same as freqHz in manual mode (no centroid).
+    double gridFreqHz = 0.0;
     std::string streamName;
 
     ChannelBankModule* module = nullptr;
@@ -1645,8 +1650,13 @@ private:
             for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
                 auto* slot = it->second;
 
-                // Immediately tear down blocked channels
-                if (isBlocked(slot->freqHz)) {
+                // Immediately tear down blocked channels.  Key on gridFreqHz so this
+                // matches the block-check at spawn (which used slotFreq = grid) — using
+                // slot->freqHz here would be the centroid key, which doesn't match what
+                // the UI's Block toggle wrote, and the slot would never get destroyed
+                // (or it would, depending on which side of the kHz boundary the centroid
+                // jittered to).  gridFreqHz makes the whole loop coherent.
+                if (isBlocked(slot->gridFreqHz)) {
                     flog::info("[ChannelBank] Destroying blocked slot {0}", it->first);
                     destroySlot(*slot);
                     delete slot;
@@ -1751,7 +1761,11 @@ private:
         double offset = isManual
             ? exactOffsetHz
             : std::clamp(peakOffsetHz, gridOffset - channelSpacing * 0.5, gridOffset + channelSpacing * 0.5);
-        slot.freqHz   = lastKnownCenter + offset;
+        slot.freqHz     = lastKnownCenter + offset;
+        // gridFreqHz is the deterministic, jitter-free identity for this channel:
+        // grid-aligned in auto, identical to freqHz in manual.  Used for the
+        // freqLog key + blocking checks so one grid slot ⇒ one history row.
+        slot.gridFreqHz = isManual ? slot.freqHz : (lastKnownCenter + gridOffset);
 
         char freqBuf[64];
         snprintf(freqBuf, sizeof(freqBuf), "%.3fMHz", slot.freqHz / 1e6);
@@ -1841,7 +1855,9 @@ private:
 
     void destroySlot(ChannelSlot& slot) {
         // Register in the sticky-recent list (caller always holds channelsMtx).
-        recentChannels.push_back({slot.freqHz, std::chrono::steady_clock::now()});
+        // Push the GRID freq, not the centroid — so the recent-list block button
+        // writes the same freqLog key the spawn/destroy checks use.
+        recentChannels.push_back({slot.gridFreqHz, std::chrono::steady_clock::now()});
 
         slot.recSink->stop();
         slot.meter->stop();
@@ -2110,7 +2126,9 @@ private:
                         }
 #endif
                         // Log the frequency and queue for playback
-                        _this->logRecording(slot->freqHz);
+                        // Log under the GRID freq — one history row per channel, no
+                        // per-recording centroid-jitter duplicates.
+                        _this->logRecording(slot->gridFreqHz);
                         _this->saveFreqLog();
                         if (!slot->currentFilePath.empty()) {
                             std::lock_guard<std::mutex> lk(_this->playbackMtx);
@@ -3756,13 +3774,13 @@ private:
                         ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "[ ? ]");
                     }
                     ImGui::SameLine();
-                    bool blocked = _this->isBlocked(slot->freqHz);
+                    bool blocked = _this->isBlocked(slot->gridFreqHz);
                     char blkId[48];
                     snprintf(blkId, sizeof(blkId), "Blk##_cb_ablk_%d", idx);
                     if (ImGui::Checkbox(blkId, &blocked)) {
                         std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                        auto& entry = _this->freqLog[_this->freqKey(slot->freqHz)];
-                        if (entry.freqHz == 0.0) entry.freqHz = slot->freqHz;
+                        auto& entry = _this->freqLog[_this->freqKey(slot->gridFreqHz)];
+                        if (entry.freqHz == 0.0) entry.freqHz = slot->gridFreqHz;
                         entry.blocked = blocked;
                         needSaveFreqLog = true;
                     }
@@ -4058,7 +4076,7 @@ private:
                 continue;
             }
             // Immediately tear down blocked channels (mirrors auto-mode behaviour)
-            if (isBlocked(it->second->freqHz)) {
+            if (isBlocked(it->second->gridFreqHz)) {
                 flog::info("[ChannelBank] BkScan: removing blocked slot {0}", idx);
                 destroySlot(*it->second);
                 delete it->second;
@@ -4287,7 +4305,7 @@ private:
             // Immediately tear down blocked channels (mirrors auto-mode behaviour).
             // Without this, blocking a freq left the slot alive forever in manual mode,
             // so unblocking had no effect (nothing to respawn since slot never left).
-            if (isBlocked(it->second->freqHz)) {
+            if (isBlocked(it->second->gridFreqHz)) {
                 flog::info("[ChannelBank] Manual: removing blocked slot {0}", idx);
                 destroySlot(*it->second);
                 delete it->second;
