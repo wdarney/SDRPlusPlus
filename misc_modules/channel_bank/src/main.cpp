@@ -215,6 +215,12 @@ public:
             maxChannels = config.conf[name]["maxChannels"];
         if (config.conf[name].contains("nmsRadiusSlots"))
             nmsRadiusSlots = config.conf[name]["nmsRadiusSlots"];
+        if (config.conf[name].contains("playbackAutoFlushEnabled"))
+            playbackAutoFlushEnabled = config.conf[name]["playbackAutoFlushEnabled"];
+        if (config.conf[name].contains("playbackAutoFlushThreshold"))
+            playbackAutoFlushThreshold = config.conf[name]["playbackAutoFlushThreshold"];
+        if (config.conf[name].contains("playbackAutoFlushKeepLatest"))
+            playbackAutoFlushKeepLatest = config.conf[name]["playbackAutoFlushKeepLatest"];
         if (config.conf[name].contains("bwUsage"))
             bwUsage = config.conf[name]["bwUsage"];
         if (config.conf[name].contains("noiseReduction"))
@@ -2144,10 +2150,21 @@ private:
                         _this->logRecording(slot->gridFreqHz);
                         _this->saveFreqLog();
                         if (!slot->currentFilePath.empty()) {
-                            std::lock_guard<std::mutex> lk(_this->playbackMtx);
-                            // deleteAfter=true when recording is disabled — play it back but don't keep the file
-                            _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, !_this->recordingEnabled});
-                            _this->playbackCv.notify_one();
+                            size_t qSize = 0;
+                            {
+                                std::lock_guard<std::mutex> lk(_this->playbackMtx);
+                                // deleteAfter=true when recording is disabled — play it back but don't keep the file
+                                _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, !_this->recordingEnabled});
+                                qSize = _this->playbackQueue.size();
+                                _this->playbackCv.notify_one();
+                            }
+                            // Auto-flush: if the queue is running away (live preview
+                            // gets hours behind otherwise), drain the oldest entries
+                            // straight to M4A so the latest few stay listenable.
+                            if (_this->playbackAutoFlushEnabled &&
+                                (int)qSize > _this->playbackAutoFlushThreshold) {
+                                _this->flushPlaybackQueue(_this->playbackAutoFlushKeepLatest);
+                            }
                         }
                     }
                 }
@@ -2268,6 +2285,68 @@ private:
         std::lock_guard<std::mutex> lk(encodeQueueMtx);
         encodeQueue.push_back({wavPath, transcript, avgSnrDb});
         encodeQueueCv.notify_one();
+    }
+
+    // Drain the oldest entries from the playback queue WITHOUT playing them.
+    // Each drained entry has its M4A pipeline kicked off (or its WAV deleted if
+    // recordingEnabled was off at record-time).  Used by the manual "Flush" UI
+    // button and the auto-flush threshold.
+    //
+    // keepLatest: how many entries to LEAVE in the queue (most recent kept).
+    //   keepLatest=0  ⇒ flush everything
+    //   keepLatest=N  ⇒ keep the last N for live preview, flush the rest
+    void flushPlaybackQueue(int keepLatest = 0) {
+        std::vector<PlaybackEntry> toFlush;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            int drain = (int)playbackQueue.size() - keepLatest;
+            for (int i = 0; i < drain && !playbackQueue.empty(); i++) {
+                toFlush.push_back(std::move(playbackQueue.front()));
+                playbackQueue.pop_front();
+            }
+        }
+        for (auto& entry : toFlush) {
+            if (entry.deleteAfter) {
+                // recordingEnabled was false at record-time — discard the WAV
+                // (matches the deleteAfter contract: the user never wanted to keep it).
+                std::remove(entry.path.c_str());
+#ifdef __APPLE__
+                std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+                pendingEncodes.erase(entry.path);
+#endif
+            } else {
+#ifdef __APPLE__
+                // Mark playbackDone in pendingEncodes; if transcription is also
+                // done, fire the M4A encode now.  Otherwise leave the entry
+                // alone — pollTranscriptions will fire the encode once Whisper
+                // finishes, with the transcript baked in.
+                if (m4aEnabled && recordingEnabled) {
+                    bool        canEncode = false;
+                    std::string encodeTranscript;
+                    float       encodeSnrDb = 0.0f;
+                    {
+                        std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+                        auto it = pendingEncodes.find(entry.path);
+                        if (it != pendingEncodes.end()) {
+                            it->second.playbackDone = true;
+                            if (it->second.transcriptionDone) {
+                                canEncode        = true;
+                                encodeTranscript = it->second.transcript;
+                                encodeSnrDb      = it->second.avgSnrDb;
+                                pendingEncodes.erase(it);
+                            }
+                        }
+                    }
+                    if (canEncode) triggerEncode(entry.path, encodeTranscript, encodeSnrDb);
+                }
+                // If m4a is disabled the WAV stays as-is on disk — same outcome
+                // as if playback had run to completion with m4aEnabled=false.
+#endif
+            }
+        }
+        if (!toFlush.empty()) {
+            flog::info("[ChannelBank] Flushed {0} queued recording(s) to M4A", (int)toFlush.size());
+        }
     }
 
     void encodeThreadFunc() {
@@ -3484,6 +3563,42 @@ private:
             config.release(true);
         }
 
+        // Auto-flush playback queue when it gets too long
+        if (ImGui::Checkbox(CONCAT("Auto-flush queue##_cb_autoflush_", _this->name),
+                            &_this->playbackAutoFlushEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["playbackAutoFlushEnabled"] = _this->playbackAutoFlushEnabled;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("When the playback queue exceeds the threshold below,\n"
+                              "drain the OLDEST entries straight to M4A (no playback)\n"
+                              "so the live preview stays current.  Skipped recordings\n"
+                              "are still encoded with full transcripts + backdated\n"
+                              "timestamps — you just don't listen to them in real time.");
+        if (_this->playbackAutoFlushEnabled) {
+            ImGui::LeftLabel("  Flush at");
+            ImGui::FillWidth();
+            if (ImGui::SliderInt(CONCAT("##_cb_aflush_th_", _this->name),
+                                 &_this->playbackAutoFlushThreshold, 5, 200, "%d in queue")) {
+                config.acquire();
+                config.conf[_this->name]["playbackAutoFlushThreshold"] = _this->playbackAutoFlushThreshold;
+                config.release(true);
+            }
+            ImGui::LeftLabel("  Keep latest");
+            ImGui::FillWidth();
+            if (ImGui::SliderInt(CONCAT("##_cb_aflush_keep_", _this->name),
+                                 &_this->playbackAutoFlushKeepLatest, 0, 30, "%d to play")) {
+                config.acquire();
+                config.conf[_this->name]["playbackAutoFlushKeepLatest"] = _this->playbackAutoFlushKeepLatest;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("After a flush, how many of the NEWEST recordings\n"
+                                  "to leave in the queue for live preview.\n"
+                                  "0 = drain completely; 5 = keep the last 5 to listen to.");
+        }
+
 #ifdef __APPLE__
         // ── Transcription backend dropdown ──────────────────────────────────
         // Selecting a Whisper model that isn't installed shows an inline status
@@ -3672,6 +3787,19 @@ private:
             }
             ImGui::Text("Active: %d  Recording: %d", total, recording);
             ImGui::Text("Monitor queue: %d pending", queued);
+            // Inline "Flush" button — only useful when the queue actually has items
+            if (queued > 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton(CONCAT("Flush##_cb_flushq_", _this->name))) {
+                    _this->flushPlaybackQueue(0);   // drain everything
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Skip playback for ALL queued recordings.\n"
+                                      "Each is sent straight to M4A encoding instead.\n"
+                                      "WAVs are encoded with full transcripts when\n"
+                                      "transcription is done; otherwise the encode\n"
+                                      "fires once Whisper catches up.");
+            }
 
             // Diagnostic: show noise floor + threshold in dB
             {
@@ -4465,6 +4593,15 @@ private:
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
     int          maxChannels   = 16;
+    // Playback-queue auto-flush.  When playback can't keep up with recording
+    // (common at busy times — many channels, many short transmissions, real-
+    // time-only playback), the queue snowballs and the live preview falls
+    // hours behind.  Auto-flush drains the OLDEST entries from the queue
+    // straight to M4A (no playback) when the queue size exceeds the threshold,
+    // keeping the latest few for live preview.
+    bool         playbackAutoFlushEnabled    = true;
+    int          playbackAutoFlushThreshold  = 30;  // queue size above which auto-flush kicks in
+    int          playbackAutoFlushKeepLatest = 5;   // how many to keep playable after a flush
     // Non-max-suppression radius in slots — when detecting a signal at slot N,
     // also suppress neighbors up to ±nmsRadiusSlots from joining `detected`.
     // Default 2: covers AM voice (carrier + ±5–8 kHz sidebands) at 8.33–25 kHz
