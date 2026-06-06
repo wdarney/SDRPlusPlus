@@ -5,8 +5,7 @@
 
 set -e
 
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKTREE="$REPO_DIR/.claude/worktrees/laughing-carson"
+WORKTREE="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$WORKTREE/build"
 APP="/Applications/SDR++MODULETESTING.app"
 EXTIO_DIR="$HOME/src/ExtIO_sddc"
