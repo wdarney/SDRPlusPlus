@@ -33,7 +33,14 @@ if [ "$SDDC_SRC" -nt "$SDDC_OUT" ] || [ ! -f "$SDDC_OUT" ]; then
         -DCMAKE_BUILD_TYPE=Release -Wno-dev 2>&1 | grep -v "^--"
     cmake --build "$EXTIO_BUILD" --target SDDCSupport -j$JOBS
     cp "$SDDC_OUT" "$APP/Contents/SoapySDR/modules0.8/libSDDCSupport.so"
-    echo "  SoapySDDC deployed"
+    # Rewrite absolute MacPorts paths → @loader_path so the app is portable
+    # (works on Macs without MacPorts; all three libs are bundled in Frameworks/)
+    install_name_tool \
+        -change /opt/local/lib/libSoapySDR.0.8.dylib "@loader_path/../../Frameworks/libSoapySDR.0.8.dylib" \
+        -change /opt/local/lib/libfftw3f.3.dylib      "@loader_path/../../Frameworks/libfftw3f.3.dylib" \
+        -change /opt/local/lib/libusb-1.0.0.dylib     "@loader_path/../../Frameworks/libusb-1.0.0.dylib" \
+        "$APP/Contents/SoapySDR/modules0.8/libSDDCSupport.so"
+    echo "  SoapySDDC deployed (paths rewritten for portability)"
 else
     echo "=== SoapySDDC up to date, skipping rebuild ==="
 fi
