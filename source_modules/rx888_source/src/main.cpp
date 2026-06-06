@@ -13,6 +13,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __APPLE__
+#include <dlfcn.h>
+#endif
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -40,6 +43,7 @@ public:
         handler.tuneHandler = tune;
         handler.stream = &stream;
 
+        loadSoapySDDC();
         refresh();
 
         config.acquire();
@@ -61,6 +65,32 @@ public:
     bool isEnabled() { return enabled; }
 
 private:
+    // Explicitly load the SoapySDDC module bundled alongside this plugin.
+    // Resolves the path relative to this dylib's own location so it works
+    // regardless of where the app bundle lives or how it was launched.
+    // Falls back silently if the module is already loaded or not found.
+    static void loadSoapySDDC() {
+#ifdef __APPLE__
+        Dl_info info;
+        if (!dladdr((void*)&loadSoapySDDC, &info) || !info.dli_fname) return;
+
+        // rx888_source.dylib is at Contents/Plugins/rx888_source.dylib
+        // SoapySDDC is at  Contents/SoapySDR/modules0.8/libSDDCSupport.so
+        std::string self = info.dli_fname;
+        auto pluginsPos = self.rfind("/Plugins/");
+        if (pluginsPos == std::string::npos) return;
+
+        std::string sddc = self.substr(0, pluginsPos) +
+                           "/SoapySDR/modules0.8/libSDDCSupport.so";
+
+        std::string err = SoapySDR::loadModule(sddc);
+        if (!err.empty())
+            flog::warn("RX888: SoapySDDC load: {}", err);
+        else
+            flog::info("RX888: Loaded SoapySDDC from {}", sddc);
+#endif
+    }
+
     // Returns a human-readable label for a device entry
     static std::string deviceLabel(const SoapySDR::Kwargs& args) {
         if (args.count("label") && !args.at("label").empty())
