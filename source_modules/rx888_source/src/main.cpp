@@ -91,12 +91,30 @@ private:
 #endif
     }
 
+    // Strip non-printable and non-ASCII bytes from a device name.
+    // The FX3 USB chip can return garbage in its descriptor strings when
+    // firmware is stale (after close/reopen without power-cycle).
+    // Feeding those bytes to nlohmann::json causes dump_escaped() to throw
+    // on invalid UTF-8, crashing the auto-save worker.
+    static std::string sanitizeLabel(const std::string& raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (unsigned char c : raw) {
+            if (c >= 0x20 && c < 0x7F)  // printable ASCII only
+                out += (char)c;
+        }
+        // Trim trailing whitespace
+        while (!out.empty() && out.back() == ' ')
+            out.pop_back();
+        return out.empty() ? "RX888" : out;
+    }
+
     // Returns a human-readable label for a device entry
     static std::string deviceLabel(const SoapySDR::Kwargs& args) {
         if (args.count("label") && !args.at("label").empty())
-            return args.at("label");
+            return sanitizeLabel(args.at("label"));
         if (args.count("hardware") && !args.at("hardware").empty())
-            return args.at("hardware");
+            return sanitizeLabel(args.at("hardware"));
         return "RX888";
     }
 
