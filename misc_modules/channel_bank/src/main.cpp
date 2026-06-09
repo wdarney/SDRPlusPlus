@@ -981,14 +981,21 @@ private:
             int centerBin = (int)std::round((slotOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
             int lo = std::clamp(centerBin - halfBins, 0, FFT_SIZE - 1);
             int hi = std::clamp(centerBin + halfBins, 0, FFT_SIZE - 1);
+            // Single pass over bins: accumulate mean, instantaneous mean, log-sum
+            // (for spectral flatness), peak bin, AND energy-weighted centroid sum.
+            // Previously the centroid was a separate second loop — merging saves
+            // numSlots × (2×halfBins) redundant memory reads per frame.
             float  sum = 0.0f, instSum = 0.0f;
-            double logSum = 0.0;  // Σ ln(power) for geometric mean → spectral flatness
+            double logSum = 0.0;       // Σ ln(power) for geometric mean → spectral flatness
+            double weightedSum = 0.0;  // Σ (bin × power) for spectral centroid
             int   peakBin = lo;
             for (int b = lo; b <= hi; b++) {
-                sum     += power[b];
+                float p = power[b];
+                sum     += p;
                 instSum += instPower[b];
-                logSum  += logf(std::max(power[b], 1e-20f));
-                if (power[b] > power[peakBin]) peakBin = b;
+                logSum  += logf(std::max(p, 1e-20f));
+                weightedSum += (double)b * (double)p;
+                if (p > power[peakBin]) peakBin = b;
             }
             int nBins = hi - lo + 1;
             slotMeans[s]     = sum     / (float)nBins;
@@ -1005,9 +1012,6 @@ private:
             // For SSB voice, this lands near the middle of the voice passband
             // (~1000–1500 Hz above/below carrier) rather than at the loudest
             // fundamental (~300–500 Hz), giving much better carrier tracking.
-            double weightedSum = 0.0;
-            for (int b = lo; b <= hi; b++)
-                weightedSum += (double)b * (double)power[b];
             double centroidBin = (sum > 0.0f) ? (weightedSum / (double)sum) : (double)centerBin;
             newPeakOffsets[s] = ((centroidBin - FFT_SIZE / 2) / FFT_SIZE) * lastKnownSr;
             // Centroid relative to this slot's center — small (±detection window), so the
@@ -1296,9 +1300,12 @@ private:
                     displaySnap.manualActiveFlags.push_back(newDetected.count(i) > 0);
                 }
                 std::vector<float> sorted = displaySnap.power;
-                std::sort(sorted.begin(), sorted.end());
-                displaySnap.dBmin = sorted[(int)(FFT_SIZE * 0.05f)] - 5.0f;
-                displaySnap.dBmax = sorted[(int)(FFT_SIZE * 0.95f)] + 15.0f;
+                int lo5  = (int)(FFT_SIZE * 0.05f);
+                int hi95 = (int)(FFT_SIZE * 0.95f);
+                std::nth_element(sorted.begin(), sorted.begin() + lo5, sorted.end());
+                displaySnap.dBmin = sorted[lo5] - 5.0f;
+                std::nth_element(sorted.begin(), sorted.begin() + hi95, sorted.end());
+                displaySnap.dBmax = sorted[hi95] + 15.0f;
             }
             // Immediately propagate raw detection to active slots — same FFT frame,
             // no management-thread hop. Uses 2-consecutive-miss guard, same as auto mode.
@@ -1490,11 +1497,16 @@ private:
             displaySnap.threshDb  = 10.0f * log10f(displayNoiseFloor * snrLinear + 1e-30f);
             displaySnap.detected  = detected;
             displaySnap.numSlots  = numSlots;
-            // Auto-range: 5th/95th percentile for a clean y-axis
+            // Auto-range: 5th/95th percentile for a clean y-axis.
+            // nth_element is O(n) vs std::sort's O(n log n) — saves ~50% of
+            // this block's CPU on 8192-element arrays at 20 Hz.
             std::vector<float> sorted = displaySnap.power;
-            std::sort(sorted.begin(), sorted.end());
-            displaySnap.dBmin = sorted[(int)(FFT_SIZE * 0.05f)] - 5.0f;
-            displaySnap.dBmax = sorted[(int)(FFT_SIZE * 0.95f)] + 15.0f;
+            int lo5  = (int)(FFT_SIZE * 0.05f);
+            int hi95 = (int)(FFT_SIZE * 0.95f);
+            std::nth_element(sorted.begin(), sorted.begin() + lo5, sorted.end());
+            displaySnap.dBmin = sorted[lo5] - 5.0f;
+            std::nth_element(sorted.begin(), sorted.begin() + hi95, sorted.end());
+            displaySnap.dBmax = sorted[hi95] + 15.0f;
         }
 
         mgmtCv.notify_one();
@@ -1625,6 +1637,16 @@ private:
                 localSnrDb       = slotSnrDb;
             }
 
+            // Snapshot queued freq keys ONCE per management cycle instead of
+            // scanning the entire playback queue per non-detected channel — O(Q)
+            // up front vs O(C × Q) inside the teardown loop.
+            std::set<int64_t> queuedFreqKeys;
+            {
+                std::lock_guard<std::mutex> plk(playbackMtx);
+                for (auto& entry : playbackQueue)
+                    queuedFreqKeys.insert(freqKey(entry.freqHz));
+            }
+
             std::lock_guard<std::mutex> clck(channelsMtx);
 
             // Create or refresh channels for detected slots
@@ -1712,13 +1734,7 @@ private:
                     float elapsed = std::chrono::duration<float>(
                         now - slot->lastDetected).count();
                     bool isPlaying = (currentlyPlayingFreqKey.load() == freqKey(slot->freqHz));
-                    bool isQueued  = false;
-                    {
-                        std::lock_guard<std::mutex> plk(playbackMtx);
-                        int64_t fk = freqKey(slot->freqHz);
-                        for (auto& entry : playbackQueue)
-                            if (freqKey(entry.freqHz) == fk) { isQueued = true; break; }
-                    }
+                    bool isQueued  = (queuedFreqKeys.count(freqKey(slot->freqHz)) > 0);
                     if (elapsed > cooldownSec && !slot->fileOpen && !isPlaying && !isQueued) {
                         flog::info("[ChannelBank] Destroying slot {0}", it->first);
                         destroySlot(*slot);
@@ -3839,10 +3855,12 @@ private:
                     txName = _this->lastTranscriptName;
                     txSegs = _this->playingSegments;
                 }
-                // Pick panel height: synced display is taller (line per segment).
-                float panelH = 50.0f;
-                if (!txSegs.empty())     panelH = std::min(220.0f, 60.0f + 22.0f * (float)txSegs.size());
-                else if (!txText.empty()) panelH = 110.0f;
+                // Fixed height — scrolls internally when transcript is long.
+                // Previously this was dynamic (50–220 px depending on content),
+                // which caused every module below channel_bank in the sidebar to
+                // jump position whenever playback started/stopped or a transcript
+                // arrived.
+                float panelH = 130.0f;
 #else
                 float panelH = 50.0f;
 #endif
@@ -3907,101 +3925,106 @@ private:
                 ImGui::EndChild();
             }
 
-            // Active channel list
+            // Active + Recent channels — fixed-height scrollable region so the
+            // panel below (Frequency History, settings, etc.) stays put even as
+            // channels spawn/expire.
             ImGui::Separator();
             bool needSaveFreqLog = false;
             ImGui::BeginChild(CONCAT("##_cb_ch_", _this->name),
                               ImVec2(menuWidth, 150), false);
             {
-                std::lock_guard<std::mutex> lck(_this->channelsMtx);
-                for (auto& [idx, slot] : _this->activeChannels) {
-                    std::string label = _this->displayName(slot->freqHz);
-                    ImGui::Text("%s", label.c_str());
-                    if (ImGui::IsItemHovered()) _this->hoveredFreqHz = slot->freqHz;
-                    ImGui::SameLine();
-                    bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
-                    if (playing) {
-                        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "[PLAY]");
-                    }
-                    else if (slot->fileOpen) {
-                        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[REC]");
-                    }
-                    else if (slot->inSilence) {
-                        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "[---]");
-                    }
-                    else {
-                        ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "[ ? ]");
-                    }
-                    ImGui::SameLine();
-                    bool blocked = _this->isBlocked(slot->gridFreqHz);
-                    char blkId[48];
-                    snprintf(blkId, sizeof(blkId), "Blk##_cb_ablk_%d", idx);
-                    if (ImGui::Checkbox(blkId, &blocked)) {
-                        std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                        auto& entry = _this->freqLog[_this->freqKey(slot->gridFreqHz)];
-                        if (entry.freqHz == 0.0) entry.freqHz = slot->gridFreqHz;
-                        entry.blocked = blocked;
-                        needSaveFreqLog = true;
-                    }
-                }
-            }
-            ImGui::EndChild();
-
-            // ── Recent channels (sticky 30s after teardown) ───────────────────
-            // These linger so the user can confirm a frequency was just noise and
-            // hit Block before the row vanishes.  Alpha fades from 1→0 over 30s.
-            {
-                auto now = std::chrono::steady_clock::now();
-
-                // Snapshot + prune under channelsMtx
-                std::vector<std::pair<double, float>> recent;  // {freqHz, alpha}
+                // ── Active channels ──────────────────────────────────────────
                 {
                     std::lock_guard<std::mutex> lck(_this->channelsMtx);
-                    for (auto it = _this->recentChannels.begin();
-                         it != _this->recentChannels.end(); ) {
-                        long ageMs = std::chrono::duration_cast<
-                            std::chrono::milliseconds>(now - it->destroyedAt).count();
-                        if (ageMs >= 30000) {
-                            it = _this->recentChannels.erase(it);
-                        } else {
-                            float alpha = std::max(0.0f, 1.0f - (float)ageMs / 30000.0f);
-                            recent.push_back({it->freqHz, alpha});
-                            ++it;
+                    for (auto& [idx, slot] : _this->activeChannels) {
+                        std::string label = _this->displayName(slot->freqHz);
+                        ImGui::Text("%s", label.c_str());
+                        if (ImGui::IsItemHovered()) _this->hoveredFreqHz = slot->freqHz;
+                        ImGui::SameLine();
+                        bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
+                        if (playing) {
+                            ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "[PLAY]");
+                        }
+                        else if (slot->fileOpen) {
+                            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[REC]");
+                        }
+                        else if (slot->inSilence) {
+                            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "[---]");
+                        }
+                        else {
+                            ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "[ ? ]");
+                        }
+                        ImGui::SameLine();
+                        bool blocked = _this->isBlocked(slot->gridFreqHz);
+                        char blkId[48];
+                        snprintf(blkId, sizeof(blkId), "Blk##_cb_ablk_%d", idx);
+                        if (ImGui::Checkbox(blkId, &blocked)) {
+                            std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                            auto& entry = _this->freqLog[_this->freqKey(slot->gridFreqHz)];
+                            if (entry.freqHz == 0.0) entry.freqHz = slot->gridFreqHz;
+                            entry.blocked = blocked;
+                            needSaveFreqLog = true;
                         }
                     }
                 }
 
-                // Render without lock; collect any block-toggle action
-                double toBlockFreq = 0.0;
-                bool   toBlockVal  = false;
-                for (auto& [hz, alpha] : recent) {
-                    std::string dn = _this->displayName(hz);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.35f, alpha));
-                    ImGui::Text("  [recent] %s", dn.c_str());
-                    ImGui::PopStyleColor();
-                    if (ImGui::IsItemHovered()) _this->hoveredFreqHz = hz;
-                    ImGui::SameLine();
-                    bool blocked = _this->isBlocked(hz);
-                    char blkId[64];
-                    snprintf(blkId, sizeof(blkId), "Blk##_cb_rblk_%lld",
-                             (long long)_this->freqKey(hz));
-                    if (ImGui::Checkbox(blkId, &blocked)) {
-                        toBlockFreq = hz;
-                        toBlockVal  = blocked;
-                    }
-                }
+                // ── Recent channels (sticky 30s after teardown) ──────────────
+                // These linger so the user can confirm a frequency was just noise
+                // and hit Block before the row vanishes.  Alpha fades 1→0 over 30s.
+                {
+                    auto now = std::chrono::steady_clock::now();
 
-                // Apply block toggle outside both locks (freqLogMtx → saveFreqLog)
-                if (toBlockFreq != 0.0) {
+                    // Snapshot + prune under channelsMtx
+                    std::vector<std::pair<double, float>> recent;  // {freqHz, alpha}
                     {
-                        std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                        auto& entry = _this->freqLog[_this->freqKey(toBlockFreq)];
-                        if (entry.freqHz == 0.0) entry.freqHz = toBlockFreq;
-                        entry.blocked = toBlockVal;
+                        std::lock_guard<std::mutex> lck(_this->channelsMtx);
+                        for (auto it = _this->recentChannels.begin();
+                             it != _this->recentChannels.end(); ) {
+                            long ageMs = std::chrono::duration_cast<
+                                std::chrono::milliseconds>(now - it->destroyedAt).count();
+                            if (ageMs >= 30000) {
+                                it = _this->recentChannels.erase(it);
+                            } else {
+                                float alpha = std::max(0.0f, 1.0f - (float)ageMs / 30000.0f);
+                                recent.push_back({it->freqHz, alpha});
+                                ++it;
+                            }
+                        }
                     }
-                    _this->saveFreqLog();
+
+                    // Render without lock; collect any block-toggle action
+                    double toBlockFreq = 0.0;
+                    bool   toBlockVal  = false;
+                    for (auto& [hz, alpha] : recent) {
+                        std::string dn = _this->displayName(hz);
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.35f, alpha));
+                        ImGui::Text("  [recent] %s", dn.c_str());
+                        ImGui::PopStyleColor();
+                        if (ImGui::IsItemHovered()) _this->hoveredFreqHz = hz;
+                        ImGui::SameLine();
+                        bool blocked = _this->isBlocked(hz);
+                        char blkId[64];
+                        snprintf(blkId, sizeof(blkId), "Blk##_cb_rblk_%lld",
+                                 (long long)_this->freqKey(hz));
+                        if (ImGui::Checkbox(blkId, &blocked)) {
+                            toBlockFreq = hz;
+                            toBlockVal  = blocked;
+                        }
+                    }
+
+                    // Apply block toggle outside both locks (freqLogMtx → saveFreqLog)
+                    if (toBlockFreq != 0.0) {
+                        {
+                            std::lock_guard<std::mutex> lk(_this->freqLogMtx);
+                            auto& entry = _this->freqLog[_this->freqKey(toBlockFreq)];
+                            if (entry.freqHz == 0.0) entry.freqHz = toBlockFreq;
+                            entry.blocked = toBlockVal;
+                        }
+                        _this->saveFreqLog();
+                    }
                 }
             }
+            ImGui::EndChild();
 
             if (needSaveFreqLog) _this->saveFreqLog();
         }
@@ -4052,14 +4075,24 @@ private:
             std::string filterStr = _this->freqHistFilter;
             std::transform(filterStr.begin(), filterStr.end(), filterStr.begin(), ::tolower);
 
-            std::vector<std::pair<int64_t, FreqEntry*>> allEntries;
+            // Pre-compute display names ONCE per entry instead of inside the sort
+            // comparator — the old code called displayName() (which locks
+            // bookmarkNamesMtx) on both entries for every comparison, yielding
+            // O(n log n) mutex lock/unlock pairs for N history entries.
+            struct HistEntry {
+                int64_t    key;
+                FreqEntry* ep;
+                std::string name;    // cached displayName
+                std::string nameLow; // lower-cased for sort
+            };
+            std::vector<HistEntry> allEntries;
             allEntries.reserve(_this->freqLog.size());
             for (auto& [k, e] : _this->freqLog) {
                 // Blocked-only filter
                 if (_this->freqHistBlockedOnly && !e.blocked) continue;
+                std::string dn = _this->displayName(e.freqHz);
                 // Text filter: match against display name or frequency string
                 if (!filterStr.empty()) {
-                    std::string dn = _this->displayName(e.freqHz);
                     char freqBuf[32];
                     snprintf(freqBuf, sizeof(freqBuf), "%.4f", e.freqHz / 1e6);
                     std::string dnL = dn, fqL = freqBuf;
@@ -4068,28 +4101,26 @@ private:
                     if (dnL.find(filterStr) == std::string::npos &&
                         fqL.find(filterStr) == std::string::npos) continue;
                 }
-                allEntries.push_back({k, &e});
+                std::string dnLow = dn;
+                std::transform(dnLow.begin(), dnLow.end(), dnLow.begin(), ::tolower);
+                allEntries.push_back({k, &e, std::move(dn), std::move(dnLow)});
             }
 
             // Sort: named bookmarks (letter-leading) first, alphabetically;
             //        unnamed (digit-leading) last, by frequency ascending.
-            std::sort(allEntries.begin(), allEntries.end(), [&](auto& aa, auto& bb) {
-                std::string na = _this->displayName(aa.second->freqHz);
-                std::string nb = _this->displayName(bb.second->freqHz);
-                bool aIsNamed = !na.empty() && std::isalpha((unsigned char)na[0]);
-                bool bIsNamed = !nb.empty() && std::isalpha((unsigned char)nb[0]);
+            // Comparator uses pre-computed names — no mutex acquisitions.
+            std::sort(allEntries.begin(), allEntries.end(), [](const HistEntry& aa, const HistEntry& bb) {
+                bool aIsNamed = !aa.name.empty() && std::isalpha((unsigned char)aa.name[0]);
+                bool bIsNamed = !bb.name.empty() && std::isalpha((unsigned char)bb.name[0]);
                 if (aIsNamed != bIsNamed) return aIsNamed > bIsNamed; // named first
-                std::string naL = na, nbL = nb;
-                std::transform(naL.begin(), naL.end(), naL.begin(), ::tolower);
-                std::transform(nbL.begin(), nbL.end(), nbL.begin(), ::tolower);
-                if (naL != nbL) return naL < nbL;
-                return aa.second->freqHz < bb.second->freqHz;
+                if (aa.nameLow != bb.nameLow) return aa.nameLow < bb.nameLow;
+                return aa.ep->freqHz < bb.ep->freqHz;
             });
 
-            // Render flat list
-            for (auto& [k, ep] : allEntries) {
-                FreqEntry& e = *ep;
-                std::string dn = _this->displayName(e.freqHz);
+            // Render flat list — reuse pre-computed display names from HistEntry
+            for (auto& he : allEntries) {
+                FreqEntry& e = *he.ep;
+                const std::string& dn = he.name;
 
                 if (e.blocked)
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
@@ -4103,16 +4134,16 @@ private:
 
                 ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
                 char editBtn[32];
-                snprintf(editBtn, sizeof(editBtn), "D##edt_%lld", (long long)k);
+                snprintf(editBtn, sizeof(editBtn), "D##edt_%lld", (long long)he.key);
                 if (ImGui::SmallButton(editBtn)) {
-                    _this->descEditKey   = k;
+                    _this->descEditKey   = he.key;
                     strncpy(_this->descEditBuf, e.description.c_str(), sizeof(_this->descEditBuf) - 1);
                     _this->descEditBuf[sizeof(_this->descEditBuf) - 1] = '\0';
                     _this->descEditRequest = true;
                 }
                 ImGui::SameLine();
                 char chk[32];
-                snprintf(chk, sizeof(chk), "##blk_%lld", (long long)k);
+                snprintf(chk, sizeof(chk), "##blk_%lld", (long long)he.key);
                 if (ImGui::Checkbox(chk, &e.blocked))
                     needSave = true;
 
