@@ -230,20 +230,27 @@ public:
         if (config.conf[name].contains("recPath"))
             folderSelect.setPath(config.conf[name]["recPath"]);
         if (config.conf[name].contains("freqLog")) {
+            double sp = SPACINGS[std::clamp(spacingId, 0, 5)];
             for (auto& j : config.conf[name]["freqLog"]) {
                 double hz  = j.value("freq", 0.0);
                 FreqEntry e;
-                e.freqHz  = hz;
+                // Snap stored freq to grid so blocks survive retuning
+                e.freqHz  = std::round(hz / sp) * sp;
                 e.count       = j.value("count", 0);
                 e.blocked     = j.value("blocked", false);
                 e.lastSeen    = j.value("lastSeen", (int64_t)0);
                 e.description = j.value("description", std::string());
-                // One-time cleanup of legacy touchFreqLog() junk: drop entries that never
-                // produced a kept recording (count==0), aren't blocked, and have no
-                // description. These are leftover open-time entries from interference;
-                // real history (count>0), blocks, and named entries are preserved.
                 if (e.count == 0 && !e.blocked && e.description.empty()) continue;
-                freqLog[freqKey(hz)] = e;
+                int64_t key = freqKey(e.freqHz);
+                auto& existing = freqLog[key];
+                if (existing.freqHz == 0.0) {
+                    existing = e;
+                } else {
+                    existing.count += e.count;
+                    if (e.blocked) existing.blocked = true;
+                    if (e.lastSeen > existing.lastSeen) existing.lastSeen = e.lastSeen;
+                    if (existing.description.empty()) existing.description = e.description;
+                }
             }
         }
         if (config.conf[name].contains("manualMode"))
@@ -1797,10 +1804,11 @@ private:
             ? exactOffsetHz
             : std::clamp(peakOffsetHz, gridOffset - channelSpacing * 0.5, gridOffset + channelSpacing * 0.5);
         slot.freqHz     = lastKnownCenter + offset;
-        // gridFreqHz is the deterministic, jitter-free identity for this channel:
-        // grid-aligned in auto, identical to freqHz in manual.  Used for the
-        // freqLog key + blocking checks so one grid slot ⇒ one history row.
-        slot.gridFreqHz = isManual ? slot.freqHz : (lastKnownCenter + gridOffset);
+        // gridFreqHz: deterministic identity for blocking + freqLog keying.
+        // Snap to nearest multiple of channelSpacing so the key is independent
+        // of the SDR center frequency — retuning won't invalidate blocks.
+        double rawGrid = isManual ? slot.freqHz : (lastKnownCenter + gridOffset);
+        slot.gridFreqHz = std::round(rawGrid / channelSpacing) * channelSpacing;
 
         char freqBuf[64];
         snprintf(freqBuf, sizeof(freqBuf), "%.3fMHz", slot.freqHz / 1e6);

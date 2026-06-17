@@ -327,13 +327,13 @@ static void runInference(Session* s, std::string wavPath, Model model) {
             s->text     = out;
             s->segments = std::move(segs);
         }
-        s->finalFlag.store(true);
 
         if (!s->cancelled.load()) {
             NSLog(@"[CBWhisper] %s → %s (%d segments)",
                   [[[NSString stringWithUTF8String:wavPath.c_str()] lastPathComponent] UTF8String],
                   out.c_str(), nseg);
         }
+        s->finalFlag.store(true);
     }
 }
 
@@ -349,7 +349,6 @@ void* transcribeFile(const char* path, Model m) {
     Session* s = new Session();
     std::string wavPath(path);
     s->thread = std::thread(runInference, s, wavPath, m);
-    s->thread.detach();
     return s;
 }
 
@@ -403,19 +402,7 @@ void destroy(void* handle) {
     if (!handle) return;
     Session* s = (Session*)handle;
     s->cancelled.store(true);
-    // Worker thread is detached — it will finish whisper_free() in its own
-    // time and exit on its own.  We just delete the session shell.  This is
-    // safe because the worker only writes through atomics + the textMtx, and
-    // once cancelled, it doesn't matter that we drop the read side.  In the
-    // worst case the worker briefly holds the mutex on a deleted object —
-    // which is why the worker treats `s` as alive for its whole lifetime
-    // and we ONLY delete here after we know the user has stopped polling.
-    //
-    // For a fully clean design we'd refcount the session; for now we just
-    // wait synchronously if the worker hasn't finished.  Cheap, deterministic.
-    while (!s->finalFlag.load()) {
-        [NSThread sleepForTimeInterval:0.005];
-    }
+    if (s->thread.joinable()) s->thread.join();
     delete s;
 }
 
