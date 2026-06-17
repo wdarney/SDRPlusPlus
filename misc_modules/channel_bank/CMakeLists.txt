@@ -9,16 +9,19 @@ if (APPLE AND NOT ANDROID)
     )
 endif()
 
-# RNNoise (Mozilla) — neural network noise suppression
-set(RNNOISE_SRC
-    src/rnnoise/src/denoise.c
-    src/rnnoise/src/kiss_fft.c
-    src/rnnoise/src/pitch.c
-    src/rnnoise/src/celt_lpc.c
-    src/rnnoise/src/rnn.c
-    src/rnnoise/src/rnn_data.c
-)
-list(APPEND SRC ${RNNOISE_SRC})
+# RNNoise (Mozilla) — neural network noise suppression.
+# Disabled on MSVC: the vendored C sources use VLAs (C99) which MSVC doesn't support.
+if (NOT MSVC)
+    set(RNNOISE_SRC
+        src/rnnoise/src/denoise.c
+        src/rnnoise/src/kiss_fft.c
+        src/rnnoise/src/pitch.c
+        src/rnnoise/src/celt_lpc.c
+        src/rnnoise/src/rnn.c
+        src/rnnoise/src/rnn_data.c
+    )
+    list(APPEND SRC ${RNNOISE_SRC})
+endif()
 
 # whisper.cpp — in-process speech-to-text (vendored under external/whisper.cpp).
 # Built only on Apple for now (Metal acceleration); could be extended to Linux
@@ -53,18 +56,24 @@ endif()
 
 include(${SDRPP_MODULE_CMAKE})
 
-# RNNoise + cross-module FM interface
+# Cross-module FM interface
 target_include_directories(channel_bank PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../frequency_manager/src
 )
-# Force C compilation and suppress warnings for third-party RNNoise sources
-set_source_files_properties(${RNNOISE_SRC} PROPERTIES
-    LANGUAGE C
-    COMPILE_FLAGS "-w -std=c11"
-    SKIP_PRECOMPILE_HEADERS ON
-)
+
+if (NOT MSVC)
+    target_include_directories(channel_bank PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise/src
+    )
+    set_source_files_properties(${RNNOISE_SRC} PROPERTIES
+        LANGUAGE C
+        COMPILE_FLAGS "-w -std=c11"
+        SKIP_PRECOMPILE_HEADERS ON
+    )
+else()
+    target_compile_definitions(channel_bank PRIVATE CB_NO_RNNOISE)
+endif()
 
 # FFTW3F — matches the per-platform pattern in core/CMakeLists.txt.
 if (ANDROID)

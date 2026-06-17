@@ -25,7 +25,9 @@
 #include <core.h>
 #include <utils/wav.h>
 #include <fftw3.h>
+#ifndef CB_NO_RNNOISE
 #include <rnnoise.h>
+#endif
 #include <chrono>
 #include <ctime>
 #include <cmath>
@@ -1886,10 +1888,12 @@ private:
         slot.writer.setSamplerate((uint64_t)audioSr);
 
         // RNNoise noise reduction (per-slot)
+#ifndef CB_NO_RNNOISE
         if (noiseReduction) {
             slot.nrState = rnnoise_create(nullptr);
             slot.nrInPos = 0;
         }
+#endif
 
         slot.vfo->start();
         if (slot.amDemod)  slot.amDemod->start();
@@ -1976,7 +1980,9 @@ private:
         delete slot.vfo;
         delete slot.recFeedStream;
         delete slot.iqIn;
+#ifndef CB_NO_RNNOISE
         if (slot.nrState) { rnnoise_destroy(slot.nrState); slot.nrState = nullptr; }
+#endif
 #ifdef __APPLE__
         if (slot.transcribeHandle) {
             txCancel(slot.transcribeBackend, slot.transcribeHandle);
@@ -2276,6 +2282,7 @@ private:
         // RNNoise processing — accumulate into 480-sample frames, process,
         // and write each completed frame to WAV individually.
         // RNNoise expects/returns samples in int16 range (-32768..32767).
+#ifndef CB_NO_RNNOISE
         if (slot->nrState) {
             int pos = 0;
             while (pos < count) {
@@ -2289,7 +2296,6 @@ private:
                 if (slot->nrInPos >= 480) {
                     float outBuf[480];
                     rnnoise_process_frame(slot->nrState, outBuf, slot->nrInBuf);
-                    // Blend original (dry) and denoised (wet) based on nrMix
                     float mix = _this->nrMix;
                     float nrMono[480];
                     for (int i = 0; i < 480; i++) {
@@ -2302,7 +2308,9 @@ private:
                     slot->nrInPos = 0;
                 }
             }
-        } else {
+        } else
+#endif
+        {
             slot->writer.write(mono, count);
             slot->audioSamplesWritten += count;
         }
