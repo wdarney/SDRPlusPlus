@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#define NOMINMAX
+#define _USE_MATH_DEFINES
+#include <windows.h>
+#endif
 #include <imgui.h>
 #include <module.h>
 #include <frequency_manager_interface.h>
