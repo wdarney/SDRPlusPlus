@@ -165,10 +165,11 @@ struct ChannelSlot {
     double driftSum   = 0.0;  // Σ centroidHz
     double driftSumSq = 0.0;  // Σ centroidHz²
 
-    // RNNoise state (per-slot noise reduction)
+#ifndef CB_NO_RNNOISE
     DenoiseState*  nrState    = nullptr;
-    float          nrInBuf[480] = {};     // RNNoise processes 480 samples (10ms at 48kHz)
+    float          nrInBuf[480] = {};
     int            nrInPos    = 0;
+#endif
 };
 
 class ChannelBankModule : public ModuleManager::Instance {
