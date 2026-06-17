@@ -66,8 +66,7 @@ set_source_files_properties(${RNNOISE_SRC} PROPERTIES
     SKIP_PRECOMPILE_HEADERS ON
 )
 
-# FFTW3F — pulled from android-sdr-kit on Android, system pkg-config elsewhere.
-# Pattern matches core/CMakeLists.txt and the source_modules/* convention.
+# FFTW3F — matches the per-platform pattern in core/CMakeLists.txt.
 if (ANDROID)
     target_include_directories(channel_bank PRIVATE
         /sdr-kit/${ANDROID_ABI}/include
@@ -75,6 +74,9 @@ if (ANDROID)
     target_link_libraries(channel_bank PRIVATE
         /sdr-kit/${ANDROID_ABI}/lib/libfftw3f.so
     )
+elseif (MSVC)
+    find_package(FFTW3f CONFIG REQUIRED)
+    target_link_libraries(channel_bank PRIVATE FFTW3::fftw3f)
 else()
     find_package(PkgConfig)
     pkg_check_modules(FFTW3F REQUIRED fftw3f)
