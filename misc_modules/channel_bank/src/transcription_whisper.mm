@@ -20,6 +20,11 @@
 #include <thread>
 #include <vector>
 
+// Disable ggml-metal residency sets to prevent SIGABRT during static destruction.
+// The residency set heartbeat outlives whisper_free() when __cxa_finalize_ranges
+// tears down ggml-metal's static device vector before our destructor runs.
+static const int g_noResidency = []{ setenv("GGML_METAL_NO_RESIDENCY", "1", 0); return 0; }();
+
 namespace transcription_whisper {
 
 // ── Model registry ──────────────────────────────────────────────────────────
@@ -167,14 +172,15 @@ static const char* kAtcPrompt =
 // per backend the user has selected since startup (typically just one).
 // On 8 GB Macs this is a meaningful budget; on 16 GB+ it's free.
 //
-// Threading model: we serialize ALL whisper_full calls behind a single mutex
+// Threading model: we serialize ALL whisper_full calls behind a timed mutex
 // (g_inferMtx).  whisper.cpp's context state is mutated by whisper_full() and
 // then read by whisper_full_get_segment_text(); a second concurrent inference
-// would clobber the first's results.  ATC traffic isn't truly parallel, so
-// serializing is a non-issue in practice.
+// would clobber the first's results.  Timed so a hung inference doesn't
+// permanently block all future transcriptions.
 static std::mutex                              g_cacheMtx;
 static std::map<Model, whisper_context*>       g_ctxCache;
-static std::mutex                              g_inferMtx;
+static std::timed_mutex                        g_inferMtx;
+static constexpr int                           kInferTimeoutSec = 120;
 
 static whisper_context* getOrLoadCtx(Model m) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
@@ -203,25 +209,43 @@ void shutdown() {
     // under a running whisper_full().  Order matters: g_inferMtx → g_cacheMtx
     // (same as the worker's order — worker takes g_cacheMtx briefly, then
     // g_inferMtx for the inference itself; no overlap).
-    std::lock_guard<std::mutex> ilk(g_inferMtx);
-    std::lock_guard<std::mutex> clk(g_cacheMtx);
-    for (auto& [m, ctx] : g_ctxCache) {
-        if (ctx) whisper_free(ctx);
+    if (g_inferMtx.try_lock_for(std::chrono::seconds(5))) {
+        std::lock_guard<std::timed_mutex> ilk(g_inferMtx, std::adopt_lock);
+        std::lock_guard<std::mutex> clk(g_cacheMtx);
+        for (auto& [m, ctx] : g_ctxCache) {
+            if (ctx) whisper_free(ctx);
+        }
+        g_ctxCache.clear();
+    } else {
+        NSLog(@"[CBWhisper] shutdown: inference mutex held — skipping whisper_free (leak is OK at exit)");
     }
-    g_ctxCache.clear();
 }
 
 // ── Session object ──────────────────────────────────────────────────────────
+static constexpr int kInferWallClockSec = 90;
+
 struct Session {
     std::atomic<bool>      finalFlag { false };
     std::atomic<bool>      cancelled { false };
     std::mutex             textMtx;
-    std::string            text;        // joined transcript (kept for legacy paths)
-    std::vector<Segment>   segments;    // time-aligned segments (Whisper-native)
+    std::string            text;
+    std::vector<Segment>   segments;
     std::thread            thread;
-    // ctx is owned by the worker thread — we don't touch it from the main
-    // thread.  cancelled is atomic so the worker can check it cheaply.
+    std::chrono::steady_clock::time_point inferStart;
 };
+
+// Abort callback — whisper calls this before each ggml computation.
+// Returning true aborts inference cleanly (whisper_full returns non-zero).
+static bool abortCb(void* userData) {
+    Session* s = (Session*)userData;
+    if (s->cancelled.load()) return true;
+    auto elapsed = std::chrono::steady_clock::now() - s->inferStart;
+    if (elapsed > std::chrono::seconds(kInferWallClockSec)) {
+        NSLog(@"[CBWhisper] inference exceeded %ds wall clock — aborting", kInferWallClockSec);
+        return true;
+    }
+    return false;
+}
 
 // ── Worker thread: get cached context, run inference, publish text ──────────
 //
@@ -285,17 +309,27 @@ static void runInference(Session* s, std::string wavPath, Model model) {
         // The GPU does the heavy math; the CPU threads just feed it.  4+ just
         // creates scheduler contention with the audio thread for no speedup.
         wparams.n_threads        = 2;
+        wparams.abort_callback           = abortCb;
+        wparams.abort_callback_user_data = s;
 
         // 4) Run inference + segment readback under a single lock.  whisper_full
         //    mutates the context's segment buffer; whisper_full_get_segment_text
         //    reads it.  If a second worker started whisper_full() between our
-        //    call and the readback, it would overwrite our results.  Serialize.
+        //    call and the readback, it would overwrite our results.  Timed lock
+        //    so a hung inference doesn't permanently block all future transcriptions.
         std::string          out;
         std::vector<Segment> segs;
         int                  nseg = 0;
         {
-            std::lock_guard<std::mutex> lk(g_inferMtx);
+            if (!g_inferMtx.try_lock_for(std::chrono::seconds(kInferTimeoutSec))) {
+                NSLog(@"[CBWhisper] inference mutex held for >%ds — skipping %s",
+                      kInferTimeoutSec, wavPath.c_str());
+                s->finalFlag.store(true);
+                return;
+            }
+            std::lock_guard<std::timed_mutex> lk(g_inferMtx, std::adopt_lock);
             if (s->cancelled.load()) { s->finalFlag.store(true); return; }
+            s->inferStart = std::chrono::steady_clock::now();
             int rc = whisper_full(ctx, wparams, pcm16k.data(), (int)pcm16k.size());
             if (rc != 0) {
                 NSLog(@"[CBWhisper] whisper_full failed rc=%d for %s",
@@ -309,9 +343,6 @@ static void runInference(Session* s, std::string wavPath, Model model) {
             for (int i = 0; i < nseg; i++) {
                 const char* seg = whisper_full_get_segment_text(ctx, i);
                 if (!seg) continue;
-                // whisper.cpp returns timestamps in centiseconds — convert to ms
-                // so the playback thread's position (sample count ÷ 48) is a
-                // direct comparison without any unit math at the use site.
                 int64_t t0cs = whisper_full_get_segment_t0(ctx, i);
                 int64_t t1cs = whisper_full_get_segment_t1(ctx, i);
                 while (*seg == ' ') seg++;
@@ -402,8 +433,18 @@ void destroy(void* handle) {
     if (!handle) return;
     Session* s = (Session*)handle;
     s->cancelled.store(true);
-    if (s->thread.joinable()) s->thread.join();
-    delete s;
+    if (!s->thread.joinable()) { delete s; return; }
+    if (s->finalFlag.load()) {
+        s->thread.join();
+        delete s;
+        return;
+    }
+    // Thread is still running (probably blocked on g_inferMtx or inside
+    // whisper_full).  Detach so the management thread doesn't hang — the
+    // Session is leaked, but that's better than freezing the whole module.
+    NSLog(@"[CBWhisper] destroy: thread not finished — detaching to avoid deadlock");
+    s->thread.detach();
+    // Don't delete s — the detached thread still references it.
 }
 
 } // namespace transcription_whisper

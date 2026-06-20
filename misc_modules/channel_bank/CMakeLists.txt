@@ -24,31 +24,39 @@ if (NOT MSVC)
 endif()
 
 # whisper.cpp — in-process speech-to-text (vendored under external/whisper.cpp).
-# Built only on Apple for now (Metal acceleration); could be extended to Linux
-# (CPU/CUDA/Vulkan) later by relaxing this guard.  Drives the new transcription
-# backend in src/transcription_whisper.mm.
+# macOS: Metal + Accelerate.  Windows: CPU-only (no CUDA/Vulkan — Intel iGPU only).
 if (APPLE AND NOT ANDROID)
-    # Force STATIC linking for whisper + ggml so everything collapses into the
-    # channel_bank.dylib at link time and deployment stays one file.  Without this
-    # whisper.cpp builds six separate .dylibs that we'd then have to bundle in the
-    # .app, rpath-rewrite, and re-sign individually.  Set as a non-cache scope
-    # variable so it ONLY affects the add_subdirectory call below — other SDR++
-    # modules / the core build are unaffected.
     set(BUILD_SHARED_LIBS OFF)
-    # Don't propagate whisper.cpp's options to the SDR++ root project.
     set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
     set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
-    set(WHISPER_CURL           OFF CACHE BOOL "" FORCE) # we use NSURLSession for downloads
+    set(WHISPER_CURL           OFF CACHE BOOL "" FORCE)
     set(WHISPER_SDL2           OFF CACHE BOOL "" FORCE)
-    set(WHISPER_COREML         OFF CACHE BOOL "" FORCE) # could enable later; Metal is plenty on M-series
+    set(WHISPER_COREML         OFF CACHE BOOL "" FORCE)
     set(GGML_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
     set(GGML_BUILD_EXAMPLES    OFF CACHE BOOL "" FORCE)
     set(GGML_METAL             ON  CACHE BOOL "" FORCE)
-    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # bake Metal shaders into the dylib
-    set(GGML_OPENMP            OFF CACHE BOOL "" FORCE)    # Apple Clang ships no libomp
-    set(GGML_ACCELERATE        ON  CACHE BOOL "" FORCE)    # use Apple's Accelerate BLAS
-    # whisper.cpp 3rd-party warnings get noisy; we don't want them gating the build.
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+    set(GGML_OPENMP            OFF CACHE BOOL "" FORCE)
+    set(GGML_ACCELERATE        ON  CACHE BOOL "" FORCE)
+    set(WHISPER_ALL_WARNINGS_3RD_PARTY OFF CACHE BOOL "" FORCE)
+    set(GGML_ALL_WARNINGS_3RD_PARTY    OFF CACHE BOOL "" FORCE)
+    add_subdirectory(external/whisper.cpp EXCLUDE_FROM_ALL)
+elseif (MSVC)
+    set(BUILD_SHARED_LIBS OFF)
+    set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+    set(WHISPER_CURL           OFF CACHE BOOL "" FORCE)
+    set(WHISPER_SDL2           OFF CACHE BOOL "" FORCE)
+    set(WHISPER_COREML         OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_EXAMPLES    OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL             OFF CACHE BOOL "" FORCE)
+    set(GGML_CUDA              OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN            OFF CACHE BOOL "" FORCE)
+    set(GGML_OPENMP            OFF CACHE BOOL "" FORCE)
+    set(GGML_ACCELERATE        OFF CACHE BOOL "" FORCE)
     set(WHISPER_ALL_WARNINGS_3RD_PARTY OFF CACHE BOOL "" FORCE)
     set(GGML_ALL_WARNINGS_3RD_PARTY    OFF CACHE BOOL "" FORCE)
     add_subdirectory(external/whisper.cpp EXCLUDE_FROM_ALL)
@@ -107,7 +115,6 @@ if (APPLE AND NOT ANDROID)
         "-framework Metal"
         "-framework MetalKit"
         "-lobjc"
-        # whisper.cpp + ggml (Metal-accelerated)
         whisper
     )
     target_include_directories(channel_bank PRIVATE
@@ -119,5 +126,14 @@ if (APPLE AND NOT ANDROID)
             -DDYLIB=$<TARGET_FILE:channel_bank>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/fix_rpath.cmake
         COMMENT "Fixing channel_bank library paths for macOS bundle portability"
+    )
+elseif (MSVC)
+    target_link_libraries(channel_bank PRIVATE
+        whisper
+        shell32
+    )
+    target_include_directories(channel_bank PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp/ggml/include
     )
 endif()

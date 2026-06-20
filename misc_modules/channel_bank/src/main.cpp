@@ -45,6 +45,8 @@
 #include <fstream>
 #ifdef __APPLE__
 #include "transcription.h"
+#endif
+#if defined(__APPLE__) || defined(_WIN32)
 #include "transcription_whisper.h"
 #include "encoding.h"
 #endif
@@ -123,7 +125,7 @@ struct ChannelSlot {
     int  preRollHead  = 0;   // next write position (wraps mod PREROLL_SAMPLES)
     int  preRollCount = 0;   // valid samples currently in buffer (0..PREROLL_SAMPLES)
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     void*       transcribeHandle       = nullptr;
     int         transcribeBackend      = 0;  // mirrors TranscriptionBackend; tracks which lib owns transcribeHandle
     std::string liveTranscript;
@@ -315,6 +317,9 @@ public:
         // Load FM bookmarks so displayName() can show names
         loadFMConfig();
 
+        // Migrate to profile system and load active profile
+        migrateToProfiles();
+
         // Populate cached freqs from all bound lists
         rebuildBoundFreqs();
 
@@ -353,7 +358,7 @@ public:
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
         restoreWaterfallVisibility();  // always restore on unload, safe no-op if not saved
         if (running) { stop(); }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
         // Drain any cached Whisper model contexts BEFORE static destructors run.
         // ggml-metal's residency-set teardown asserts that all Metal buffers
         // have been freed (rsets->data count == 0) and waits for its async
@@ -466,7 +471,7 @@ public:
         if (playbackThread.joinable()) { playbackThread.join(); }
         monitorStream.clearWriteStop();
         { std::lock_guard<std::mutex> lk(playbackMtx); playbackQueue.clear(); }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
         // Drop any orphaned synced-segment entries (would otherwise leak if the
         // WAV they belonged to got discarded before playback dequeued them).
         { std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx); pendingPlaybackSegments.clear(); }
@@ -795,10 +800,15 @@ public:
         time_t now = time(0);
         tm* ltm = localtime(&now);
         char buf[320];
-        std::string bmName = bookmarkNameForFilename(slot.freqHz);
-        if (!bmName.empty())
+        auto bmInfo = bookmarkForFilename(slot.freqHz);
+        if (!bmInfo.bmName.empty() && !bmInfo.listName.empty())
+            snprintf(buf, sizeof(buf), "%s_%s_%s_%.4fMHz_%02d-%02d-%02d_%02d-%02d-%04d.wav",
+                bmInfo.listName.c_str(), bmInfo.bmName.c_str(), name.c_str(), slot.freqHz / 1e6,
+                ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
+                ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
+        else if (!bmInfo.bmName.empty())
             snprintf(buf, sizeof(buf), "%s_%s_%.4fMHz_%02d-%02d-%02d_%02d-%02d-%04d.wav",
-                bmName.c_str(), name.c_str(), slot.freqHz / 1e6,
+                bmInfo.bmName.c_str(), name.c_str(), slot.freqHz / 1e6,
                 ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
                 ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
         else
@@ -1529,7 +1539,7 @@ private:
 
     // ── Channel lifecycle ────────────────────────────────────────────────────
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     void pollTranscriptions() {
         std::lock_guard<std::mutex> clck(channelsMtx);
         for (auto& [idx, slot] : activeChannels) {
@@ -1601,7 +1611,7 @@ private:
 
             auto now = std::chrono::steady_clock::now();
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
             pollTranscriptions();
 #endif
 
@@ -1910,7 +1920,20 @@ private:
         // Register in the sticky-recent list (caller always holds channelsMtx).
         // Push the GRID freq, not the centroid — so the recent-list block button
         // writes the same freqLog key the spawn/destroy checks use.
-        recentChannels.push_back({slot.gridFreqHz, std::chrono::steady_clock::now()});
+        // Deduplicate: if this freq is already recent, just refresh its timestamp.
+        {
+            int64_t k = freqKey(slot.gridFreqHz);
+            bool found = false;
+            for (auto& rc : recentChannels) {
+                if (freqKey(rc.freqHz) == k) {
+                    rc.destroyedAt = std::chrono::steady_clock::now();
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                recentChannels.push_back({slot.gridFreqHz, std::chrono::steady_clock::now()});
+        }
 
         slot.recSink->stop();
         slot.meter->stop();
@@ -1984,7 +2007,7 @@ private:
 #ifndef CB_NO_RNNOISE
         if (slot.nrState) { rnnoise_destroy(slot.nrState); slot.nrState = nullptr; }
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
         if (slot.transcribeHandle) {
             txCancel(slot.transcribeBackend, slot.transcribeHandle);
             txDestroy(slot.transcribeBackend, slot.transcribeHandle);
@@ -2154,7 +2177,7 @@ private:
                         flog::info("[ChannelBank] Keeping recording (on-air {0}ms / span {1}ms, carrier {2}/{3} = {4:.0f}%%, drift {5:.0f}Hz) slot {6}",
                                    onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f, driftStd, slot->gridIdx);
                         normalizeWavFile(slot->currentFilePath);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                         if (_this->transcriptionOn()) {
                             if (slot->transcribeHandle) {
                                 _this->txCancel(slot->transcribeBackend, slot->transcribeHandle);
@@ -2348,12 +2371,12 @@ private:
                 // recordingEnabled was false at record-time — discard the WAV
                 // (matches the deleteAfter contract: the user never wanted to keep it).
                 std::remove(entry.path.c_str());
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 std::lock_guard<std::mutex> elk(pendingEncodesMtx);
                 pendingEncodes.erase(entry.path);
 #endif
             } else {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 // Mark playbackDone in pendingEncodes; if transcription is also
                 // done, fire the M4A encode now.  Otherwise leave the entry
                 // alone — pollTranscriptions will fire the encode once Whisper
@@ -2402,7 +2425,7 @@ private:
                 }
             }
             if (!task.wavPath.empty()) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 auto result = encoding::wavToM4A(task.wavPath, task.transcript, task.avgSnrDb);
                 if (result.empty())
                     flog::error("[ChannelBank] M4A encoding failed: {0}", task.wavPath);
@@ -2433,7 +2456,7 @@ private:
             }
 
             if (!path.empty()) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 // Install synced-playback state for THIS file before playback
                 // starts, so the UI thread can highlight whichever segment the
                 // playback cursor is in.  If no segments were stashed (Apple
@@ -2458,7 +2481,7 @@ private:
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 playbackPosMs.store(-1);
                 // Leave playingSegments intact for a moment so the user can read
                 // the final transcript — it's cleared on the next playback start.
@@ -2466,7 +2489,7 @@ private:
                 if (deleteAfter) {
                     std::remove(path.c_str());
                 }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 else if (m4aEnabled) {
                     // Playback done — check if transcription is also complete
                     bool        canEncode = false;
@@ -2569,7 +2592,7 @@ private:
             if (!monitorStream.swap(samples)) { break; }
             remaining    -= bytesRead;
             samplesRead  += samples;
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
             // Publish the playback cursor for the synced-transcript overlay.
             // The WAV is 48 kHz so ms = samples * 1000 / 48000.  Atomic store —
             // UI thread reads without locking.  Updated once per CHUNK (~21ms
@@ -2871,6 +2894,84 @@ private:
         // Reset each frame; set below whenever a channel/history row is hovered.
         // Read by fftRedrawHandlerFunc to draw the cyan crosshair.
         _this->hoveredFreqHz = 0.0;
+
+        // ── Config Profiles ──────────────────────────────────────────────
+        if (_this->running) { style::beginDisabled(); }
+        ImGui::LeftLabel("Profile");
+        float comboW = menuWidth - ImGui::GetCursorPosX() - 75;
+        ImGui::SetNextItemWidth(comboW > 80 ? comboW : 80);
+        if (ImGui::BeginCombo(CONCAT("##_cb_profile_", _this->name),
+                              _this->activeProfileName.c_str())) {
+            for (int i = 0; i < (int)_this->profileNames.size(); i++) {
+                bool sel = (i == _this->profileComboIdx);
+                if (ImGui::Selectable(_this->profileNames[i].c_str(), sel)) {
+                    if (_this->profileNames[i] != _this->activeProfileName) {
+                        _this->saveCurrentProfile();
+                        _this->loadProfile(_this->profileNames[i]);
+                    }
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(CONCAT("Save##_cb_profsave_", _this->name))) {
+            _this->saveCurrentProfile();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(CONCAT("+##_cb_profnew_", _this->name))) {
+            memset(_this->newProfileNameBuf, 0, sizeof(_this->newProfileNameBuf));
+            _this->showNewProfilePopup = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(CONCAT("x##_cb_profdel_", _this->name))) {
+            if (_this->profileNames.size() > 1) {
+                _this->showDeleteConfirm = true;
+            }
+        }
+        if (_this->running) { style::endDisabled(); }
+
+        if (_this->showNewProfilePopup) {
+            ImGui::OpenPopup(CONCAT("New Profile##_cb_newprof_", _this->name));
+            _this->showNewProfilePopup = false;
+        }
+        if (ImGui::BeginPopup(CONCAT("New Profile##_cb_newprof_", _this->name))) {
+            ImGui::Text("Profile name:");
+            ImGui::InputText(CONCAT("##_cb_profname_", _this->name),
+                             _this->newProfileNameBuf, sizeof(_this->newProfileNameBuf));
+            if (ImGui::Button("Create") && _this->newProfileNameBuf[0]) {
+                std::string newName(_this->newProfileNameBuf);
+                _this->saveCurrentProfile();
+                _this->activeProfileName = newName;
+                _this->saveCurrentProfile();
+                _this->refreshProfileNames();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        if (_this->showDeleteConfirm) {
+            ImGui::OpenPopup(CONCAT("Delete Profile?##_cb_delprof_", _this->name));
+            _this->showDeleteConfirm = false;
+        }
+        if (ImGui::BeginPopup(CONCAT("Delete Profile?##_cb_delprof_", _this->name))) {
+            ImGui::Text("Delete \"%s\"?", _this->activeProfileName.c_str());
+            if (ImGui::Button("Delete")) {
+                config.acquire();
+                config.conf[_this->name]["profiles"].erase(_this->activeProfileName);
+                config.release(true);
+                _this->refreshProfileNames();
+                _this->loadProfile(_this->profileNames[0]);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        ImGui::Separator();
 
         if (_this->running) { style::beginDisabled(); }
 
@@ -3637,7 +3738,7 @@ private:
                                   "0 = drain completely; 5 = keep the last 5 to listen to.");
         }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
         // ── Transcription backend dropdown ──────────────────────────────────
         // Selecting a Whisper model that isn't installed shows an inline status
         // message and a Download button (download UI lands in a follow-up step;
@@ -3645,6 +3746,7 @@ private:
         {
             ImGui::LeftLabel("Transcribe");
             ImGui::FillWidth();
+#ifdef __APPLE__
             const char* labels[] = {
                 "Off",
                 "Apple Speech",
@@ -3652,21 +3754,49 @@ private:
                 "Whisper ATC Medium",
                 "Whisper Turbo (fast)",
             };
+            int labelCount = 5;
+#else
+            const char* labels[] = {
+                "Off",
+                "Whisper ATC Large (best)",
+                "Whisper ATC Medium",
+                "Whisper Turbo (fast)",
+            };
+            int labelCount = 4;
+#endif
             int  cur = _this->transcriptionBackend;
             if (cur < 0 || cur > TB_WHISPER_TURBO) cur = TB_OFF;
-            if (ImGui::Combo(CONCAT("##_cb_txbe_", _this->name), &cur, labels, 5)) {
+#ifndef __APPLE__
+            int comboVal = (cur >= TB_WHISPER_ATC_LARGE) ? (cur - TB_WHISPER_ATC_LARGE + 1) : 0;
+#else
+            int comboVal = cur;
+#endif
+            if (ImGui::Combo(CONCAT("##_cb_txbe_", _this->name), &comboVal, labels, labelCount)) {
+#ifndef __APPLE__
+                cur = (comboVal >= 1) ? (comboVal - 1 + TB_WHISPER_ATC_LARGE) : TB_OFF;
+#else
+                cur = comboVal;
+#endif
                 _this->transcriptionBackend = cur;
                 config.acquire();
                 config.conf[_this->name]["transcriptionBackend"] = cur;
                 config.release(true);
-                // Trigger Apple Speech authorization the first time it's picked
+                if (cur == TB_OFF) {
+                    std::lock_guard<std::mutex> tlk(_this->lastTranscriptMtx);
+                    _this->lastTranscriptText.clear();
+                    _this->lastTranscriptName.clear();
+                    _this->playingSegments.clear();
+                }
+#ifdef __APPLE__
                 if (cur == TB_APPLE_SPEECH &&
                     transcription::authStatus() == transcription::AuthStatus::NotDetermined) {
                     transcription::requestPermission();
                 }
+#endif
             }
 
             // Surface backend-specific status / actions on the next line.
+#ifdef __APPLE__
             if (_this->transcriptionBackend == TB_APPLE_SPEECH) {
                 auto txStatus = transcription::authStatus();
                 if (txStatus == transcription::AuthStatus::NotConfigured) {
@@ -3684,7 +3814,9 @@ private:
                     if (ImGui::SmallButton(CONCAT("Authorize##_cb_txauth_", _this->name)))
                         transcription::requestPermission();
                 }
-            } else if (_this->transcriptionBackend >= TB_WHISPER_ATC_LARGE) {
+            } else
+#endif
+            if (_this->transcriptionBackend >= TB_WHISPER_ATC_LARGE) {
                 using transcription_whisper::Model;
                 Model whichModel = Model::ATCLarge;
                 if (_this->transcriptionBackend == TB_WHISPER_ATC_MEDIUM) whichModel = Model::ATCMedium;
@@ -3706,7 +3838,7 @@ private:
             }
         }
 
-        // M4A encoding toggle (macOS only — uses AudioToolbox)
+        // M4A encoding toggle (AudioToolbox on macOS, ffmpeg on Windows)
         if (ImGui::Checkbox(CONCAT("Encode to M4A##_cb_m4a_", _this->name),
                             &_this->m4aEnabled)) {
             config.acquire();
@@ -3867,7 +3999,7 @@ private:
                         playingDesc = it->second.description;
                     }
                 }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 std::string txText, txName;
                 std::vector<transcription_whisper::Segment> txSegs;
                 int txPosMs = _this->playbackPosMs.load();
@@ -3902,7 +4034,7 @@ private:
                     ImGui::Text("(nothing playing)");
                     ImGui::PopStyleColor();
                 }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
                 if (!txSegs.empty()) {
                     // Synced segment display: stack each segment with [mm:ss],
                     // bright color on the active one (cursor lies in [t0,t1)),
@@ -4445,7 +4577,7 @@ private:
 
     void loadFMConfig() {
         fmLists.clear();
-        std::map<int64_t, std::string> newNames;
+        std::map<int64_t, BookmarkEntry> newNames;
         std::string path = root + "/frequency_manager_config.json";
         try {
             std::ifstream f(path);
@@ -4465,9 +4597,8 @@ private:
                             double hz = bm["frequency"].get<double>();
                             freqs.push_back(hz);
                             int64_t k = (int64_t)std::round(hz / 1000.0);
-                            // First one wins if duplicates across lists
                             if (newNames.find(k) == newNames.end())
-                                newNames[k] = bmName;
+                                newNames[k] = {bmName, listName};
                         }
                 if (!freqs.empty()) fmLists[listName] = freqs;
             }
@@ -4722,7 +4853,8 @@ private:
     // FM list cache (populated by loadFMConfig, UI thread only)
     std::map<std::string, std::vector<double>> fmLists;
     std::mutex bookmarkNamesMtx;
-    std::map<int64_t, std::string> bookmarkNames;   // freqKey -> "Tower KLAX"
+    struct BookmarkEntry { std::string name; std::string listName; };
+    std::map<int64_t, BookmarkEntry> bookmarkNames;  // freqKey -> {name, listName}
 
     // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
     // keeping the main signal-path thread's memcpy cost at O(1) regardless of slot count.
@@ -4811,23 +4943,19 @@ private:
 
     // Returns bookmark name if one exists within ±tolerance kHz, else "%.3f MHz"
     std::string displayName(double hz) {
-        // Tolerance = half the channel spacing (in kHz), so grid-aligned detections
-        // always match the nearest real-channel bookmark regardless of SDR center freq.
         const int64_t tolerance = std::max((int64_t)5, (int64_t)std::round(channelSpacing / 1000.0 / 2.0));
         int64_t target = freqKey(hz);
         {
             std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
-            // Exact hit first
             auto it = bookmarkNames.find(target);
-            if (it != bookmarkNames.end()) return it->second;
-            // Nearby scan: find closest within tolerance
+            if (it != bookmarkNames.end()) return it->second.name;
             auto lo = bookmarkNames.lower_bound(target - tolerance);
             auto hi = bookmarkNames.upper_bound(target + tolerance);
             int64_t bestDist = tolerance + 1;
             std::string bestName;
             for (auto jt = lo; jt != hi; ++jt) {
                 int64_t d = std::abs(jt->first - target);
-                if (d < bestDist) { bestDist = d; bestName = jt->second; }
+                if (d < bestDist) { bestDist = d; bestName = jt->second.name; }
             }
             if (!bestName.empty()) return bestName;
         }
@@ -4836,16 +4964,33 @@ private:
         return std::string(buf);
     }
 
-    // Returns a filesystem-safe bookmark name for use in recording filenames,
-    // or an empty string if no bookmark is found within ±channelSpacing/2.
-    std::string bookmarkNameForFilename(double hz) {
+    static std::string sanitizeForFilename(const std::string& s, size_t maxLen = 32) {
+        std::string out;
+        for (char c : s) {
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                c == '"' || c == '<'  || c == '>' || c == '|' ||
+                c == '\n' || c == '\r' || c == '\t')
+                out += '-';
+            else if (c == ' ')
+                out += '-';
+            else
+                out += c;
+        }
+        while (!out.empty() && out.back() == '-') out.pop_back();
+        if (out.size() > maxLen) out = out.substr(0, maxLen);
+        return out;
+    }
+
+    struct BookmarkFilenameInfo { std::string bmName; std::string listName; };
+
+    BookmarkFilenameInfo bookmarkForFilename(double hz) {
         const int64_t tolerance = std::max((int64_t)5, (int64_t)std::round(channelSpacing / 1000.0 / 2.0));
         int64_t target = freqKey(hz);
-        std::string found;
+        BookmarkEntry found;
         {
             std::lock_guard<std::mutex> lk(bookmarkNamesMtx);
             auto it = bookmarkNames.find(target);
-            if (it != bookmarkNames.end()) found = it->second;
+            if (it != bookmarkNames.end()) { found = it->second; }
             else {
                 auto lo = bookmarkNames.lower_bound(target - tolerance);
                 auto hi = bookmarkNames.upper_bound(target + tolerance);
@@ -4856,23 +5001,8 @@ private:
                 }
             }
         }
-        if (found.empty()) return "";
-        // Sanitize: replace characters illegal in filenames with underscores
-        std::string out;
-        for (char c : found) {
-            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
-                c == '"' || c == '<'  || c == '>' || c == '|' ||
-                c == '\n' || c == '\r' || c == '\t')
-                out += '_';
-            else if (c == ' ')
-                out += '_';
-            else
-                out += c;
-        }
-        // Strip trailing underscores and limit length
-        while (!out.empty() && out.back() == '_') out.pop_back();
-        if (out.size() > 32) out = out.substr(0, 32);
-        return out;
+        if (found.name.empty()) return {};
+        return { sanitizeForFilename(found.name), sanitizeForFilename(found.listName) };
     }
 
     static std::string relTime(int64_t ts) {
@@ -4904,10 +5034,12 @@ private:
     // later poll/cancel/destroy calls route to the same implementation that
     // produced the handle — the user could switch backends mid-stream without
     // breaking in-flight transcriptions.
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     void* txTranscribeFile(int backend, const char* path) {
         switch (backend) {
+#ifdef __APPLE__
             case TB_APPLE_SPEECH: return transcription::transcribeFile(path);
+#endif
             case TB_WHISPER_ATC_LARGE:
                 return transcription_whisper::transcribeFile(path,
                     transcription_whisper::Model::ATCLarge);
@@ -4922,23 +5054,33 @@ private:
     }
     void txCancel(int backend, void* h) {
         if (!h) return;
+#ifdef __APPLE__
         if (backend == TB_APPLE_SPEECH) transcription::cancel(h);
-        else if (backend >= TB_WHISPER_ATC_LARGE) transcription_whisper::cancel(h);
+        else
+#endif
+        if (backend >= TB_WHISPER_ATC_LARGE) transcription_whisper::cancel(h);
     }
     void txDestroy(int backend, void* h) {
         if (!h) return;
+#ifdef __APPLE__
         if (backend == TB_APPLE_SPEECH) transcription::destroy(h);
-        else if (backend >= TB_WHISPER_ATC_LARGE) transcription_whisper::destroy(h);
+        else
+#endif
+        if (backend >= TB_WHISPER_ATC_LARGE) transcription_whisper::destroy(h);
     }
     std::string txGetText(int backend, void* h) {
         if (!h) return {};
+#ifdef __APPLE__
         if (backend == TB_APPLE_SPEECH) return transcription::getText(h);
+#endif
         if (backend >= TB_WHISPER_ATC_LARGE) return transcription_whisper::getText(h);
         return {};
     }
     bool txIsFinal(int backend, void* h) {
         if (!h) return true;
+#ifdef __APPLE__
         if (backend == TB_APPLE_SPEECH) return transcription::isFinal(h);
+#endif
         if (backend >= TB_WHISPER_ATC_LARGE) return transcription_whisper::isFinal(h);
         return true;
     }
@@ -5018,12 +5160,12 @@ private:
         std::string path;
         double      freqHz;
         bool        deleteAfter;
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
         std::vector<transcription_whisper::Segment> segments;
 #endif
     };
     std::deque<PlaybackEntry> playbackQueue;
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     std::mutex  lastTranscriptMtx;
     std::string lastTranscriptText;  // most recently completed transcript
     std::string lastTranscriptName;  // displayName of the transcribed freq
@@ -5057,6 +5199,175 @@ private:
 
     // Main waterfall draw hook — adds per-channel markers to gui::waterfall
     EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
+
+    // ── Config profiles ─────────────────────────────────────────────────────
+    std::string              activeProfileName = "Default";
+    std::vector<std::string> profileNames;
+    int                      profileComboIdx   = 0;
+    char                     newProfileNameBuf[64] = {};
+    bool                     showNewProfilePopup   = false;
+    bool                     showDeleteConfirm     = false;
+
+    json snapshotProfile() {
+        json p;
+        p["spacingId"]        = spacingId;
+        p["demodMode"]        = demodMode;
+        p["ssbBfoHz"]         = ssbBfoHz;
+        p["snrThreshold"]     = snrThreshold;
+        p["holdHysteresisDb"] = holdHysteresisDb;
+        p["maxRecordingSec"]  = maxRecordingSec;
+        p["cooldownSec"]      = cooldownSec;
+        p["recGain"]          = recGain;
+        p["minTransmissionMs"]= minTransmissionMs;
+        p["tailMs"]           = tailMs;
+        p["maxChannels"]      = maxChannels;
+        p["bwUsage"]          = bwUsage;
+        p["noiseReduction"]   = noiseReduction;
+        p["nrMix"]            = nrMix;
+        p["nmsRadiusSlots"]   = nmsRadiusSlots;
+        p["recPath"]          = folderSelect.path;
+        p["staticGateEnabled"]  = staticGateEnabled;
+        p["staticGateFlatness"] = staticGateFlatness;
+        p["staticGateVoiceFrac"]= staticGateVoiceFrac;
+        p["driftGateEnabled"]   = driftGateEnabled;
+        p["driftMaxStdHz"]      = driftMaxStdHz;
+        p["leftTrimFrac"]       = leftTrimFrac;
+        p["rightTrimFrac"]      = rightTrimFrac;
+        p["signalHoldMs"]       = signalHoldMs;
+        p["recordingEnabled"]   = recordingEnabled;
+        p["transcriptionBackend"] = transcriptionBackend;
+        p["m4aEnabled"]         = m4aEnabled;
+        p["manualMode"]         = manualMode;
+        p["bookmarkScanMode"]   = bookmarkScanMode;
+        p["scanMode"]           = scanMode;
+        p["scanQuietSec"]       = scanQuietSec;
+        p["scanNoSignalSec"]    = scanNoSignalSec;
+        p["playbackAutoFlushEnabled"]    = playbackAutoFlushEnabled;
+        p["playbackAutoFlushThreshold"]  = playbackAutoFlushThreshold;
+        p["playbackAutoFlushKeepLatest"] = playbackAutoFlushKeepLatest;
+        p["manualFrequencies"]  = json::array();
+        for (auto f : manualFrequencies) p["manualFrequencies"].push_back(f);
+        p["boundBookmarkLists"] = json::array();
+        for (auto& s : boundBookmarkLists) p["boundBookmarkLists"].push_back(s);
+        p["watchedFreqs"]       = json::array();
+        for (auto k : watchedFreqs) p["watchedFreqs"].push_back(k);
+        p["scanRanges"]         = json::array();
+        for (auto& r : scanRanges) p["scanRanges"].push_back({{"start", r.startHz}, {"stop", r.stopHz}});
+        return p;
+    }
+
+    void applyProfile(const json& p) {
+        spacingId         = p.value("spacingId", 2);
+        demodMode         = p.value("demodMode", (int)DEMOD_AM);
+        ssbBfoHz          = p.value("ssbBfoHz", 0);
+        snrThreshold      = p.value("snrThreshold", 4.0f);
+        holdHysteresisDb  = p.value("holdHysteresisDb", 4.0f);
+        maxRecordingSec   = p.value("maxRecordingSec", 90.0f);
+        cooldownSec       = p.value("cooldownSec", 5.0f);
+        recGain           = p.value("recGain", 0.25f);
+        minTransmissionMs = p.value("minTransmissionMs", 300);
+        tailMs            = p.value("tailMs", 500);
+        maxChannels       = p.value("maxChannels", 16);
+        bwUsage           = p.value("bwUsage", 0.8f);
+        noiseReduction    = p.value("noiseReduction", false);
+        nrMix             = p.value("nrMix", 0.7f);
+        nmsRadiusSlots    = p.value("nmsRadiusSlots", 2);
+        if (p.contains("recPath")) folderSelect.setPath(p["recPath"].get<std::string>());
+        staticGateEnabled  = p.value("staticGateEnabled", true);
+        staticGateFlatness = p.value("staticGateFlatness", 0.55f);
+        staticGateVoiceFrac= p.value("staticGateVoiceFrac", 0.30f);
+        driftGateEnabled   = p.value("driftGateEnabled", true);
+        driftMaxStdHz      = p.value("driftMaxStdHz", 700.0f);
+        leftTrimFrac       = p.value("leftTrimFrac", 0.0f);
+        rightTrimFrac      = p.value("rightTrimFrac", 0.0f);
+        signalHoldMs       = p.value("signalHoldMs", 500);
+        recordingEnabled   = p.value("recordingEnabled", true);
+        transcriptionBackend = p.value("transcriptionBackend", (int)TB_OFF);
+        m4aEnabled         = p.value("m4aEnabled", false);
+        manualMode         = p.value("manualMode", false);
+        bookmarkScanMode   = p.value("bookmarkScanMode", false);
+        scanMode           = p.value("scanMode", false);
+        scanQuietSec       = p.value("scanQuietSec", 3.0f);
+        scanNoSignalSec    = p.value("scanNoSignalSec", 1.0f);
+        playbackAutoFlushEnabled    = p.value("playbackAutoFlushEnabled", true);
+        playbackAutoFlushThreshold  = p.value("playbackAutoFlushThreshold", 30);
+        playbackAutoFlushKeepLatest = p.value("playbackAutoFlushKeepLatest", 5);
+
+        manualFrequencies.clear();
+        if (p.contains("manualFrequencies"))
+            for (auto& j : p["manualFrequencies"]) manualFrequencies.push_back(j.get<double>());
+        boundBookmarkLists.clear();
+        if (p.contains("boundBookmarkLists"))
+            for (auto& j : p["boundBookmarkLists"]) boundBookmarkLists.insert(j.get<std::string>());
+        watchedFreqs.clear();
+        if (p.contains("watchedFreqs"))
+            for (auto& j : p["watchedFreqs"]) watchedFreqs.insert(j.get<int64_t>());
+        scanRanges.clear();
+        if (p.contains("scanRanges"))
+            for (auto& j : p["scanRanges"]) scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });
+
+        channelSpacing = SPACINGS[std::clamp(spacingId, 0, 5)];
+        rebuildBoundFreqs();
+    }
+
+    void saveCurrentProfile() {
+        config.acquire();
+        config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
+        config.conf[name]["activeProfile"] = activeProfileName;
+        config.release(true);
+    }
+
+    void loadProfile(const std::string& profileName) {
+        config.acquire();
+        if (config.conf[name].contains("profiles") &&
+            config.conf[name]["profiles"].contains(profileName)) {
+            applyProfile(config.conf[name]["profiles"][profileName]);
+            activeProfileName = profileName;
+            config.conf[name]["activeProfile"] = activeProfileName;
+            // Write loaded settings to top-level keys for backward compat
+            json snap = snapshotProfile();
+            for (auto& [k, v] : snap.items()) {
+                config.conf[name][k] = v;
+            }
+        }
+        config.release(true);
+        refreshProfileNames();
+    }
+
+    void refreshProfileNames() {
+        profileNames.clear();
+        profileComboIdx = 0;
+        config.acquire();
+        if (config.conf[name].contains("profiles")) {
+            for (auto& [k, v] : config.conf[name]["profiles"].items()) {
+                profileNames.push_back(k);
+            }
+        }
+        config.release();
+        std::sort(profileNames.begin(), profileNames.end());
+        for (int i = 0; i < (int)profileNames.size(); i++) {
+            if (profileNames[i] == activeProfileName) { profileComboIdx = i; break; }
+        }
+        if (profileNames.empty()) {
+            profileNames.push_back("Default");
+            activeProfileName = "Default";
+            profileComboIdx = 0;
+        }
+    }
+
+    void migrateToProfiles() {
+        config.acquire();
+        if (!config.conf[name].contains("profiles")) {
+            config.conf[name]["profiles"]["Default"] = snapshotProfile();
+            config.conf[name]["activeProfile"] = "Default";
+            config.release(true);
+        } else {
+            if (config.conf[name].contains("activeProfile"))
+                activeProfileName = config.conf[name]["activeProfile"].get<std::string>();
+            config.release();
+        }
+        refreshProfileNames();
+    }
 };
 
 MOD_EXPORT void _INIT_() {

@@ -1,17 +1,8 @@
 #pragma once
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
 #include <string>
 #include <cstdint>
 #include <vector>
-
-// Whisper.cpp transcription backend.  Drop-in alternative to transcription::
-// (Apple Speech) — same handle/poll API so call sites only need to dispatch
-// by backend choice; downstream code (polling, embedding text in M4A tags,
-// teardown) is identical.
-//
-// Model files live in ~/Library/Application Support/SDR++/channel_bank/models/.
-// transcribeFile() returns nullptr if the requested model file isn't present —
-// the caller (main.cpp) is responsible for the download UX before calling.
 
 namespace transcription_whisper {
 
