@@ -81,7 +81,7 @@ static bool runProcess(const std::string& cmdLine, DWORD timeoutMs = 60000) {
     if (!CreateProcessA(NULL, &cmd[0], NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         flog::error("[CBEncoding] CreateProcess failed (err={0}): {1}",
-                    (int)GetLastError(), cmdLine);
+                    std::to_string(GetLastError()), cmdLine);
         return false;
     }
     DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs);
@@ -91,7 +91,7 @@ static bool runProcess(const std::string& cmdLine, DWORD timeoutMs = 60000) {
     CloseHandle(pi.hThread);
 
     if (wait != WAIT_OBJECT_0) {
-        flog::error("[CBEncoding] ffmpeg timed out after {0}ms", timeoutMs);
+        flog::error("[CBEncoding] ffmpeg timed out after {0}ms", std::to_string(timeoutMs));
         return false;
     }
     return exitCode == 0;
