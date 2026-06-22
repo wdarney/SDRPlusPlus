@@ -2176,7 +2176,6 @@ private:
                     } else {
                         flog::info("[ChannelBank] Keeping recording (on-air {0}ms / span {1}ms, carrier {2}/{3} = {4:.0f}%%, drift {5:.0f}Hz) slot {6}",
                                    onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f, driftStd, slot->gridIdx);
-                        normalizeWavFile(slot->currentFilePath);
 #if defined(__APPLE__) || defined(_WIN32)
                         if (_this->transcriptionOn()) {
                             if (slot->transcribeHandle) {
@@ -2376,6 +2375,7 @@ private:
                 pendingEncodes.erase(entry.path);
 #endif
             } else {
+                normalizeWavFile(entry.path);
 #if defined(__APPLE__) || defined(_WIN32)
                 // Mark playbackDone in pendingEncodes; if transcription is also
                 // done, fire the M4A encode now.  Otherwise leave the entry
@@ -2478,6 +2478,7 @@ private:
                 }
                 playbackPosMs.store(0);
 #endif
+                normalizeWavFile(path);
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
