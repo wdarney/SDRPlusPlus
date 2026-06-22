@@ -1,5 +1,13 @@
 # SDR++ Custom Build
 
+## Scope for this session (claude/laughing-carson)
+
+**ONLY make changes to `source_modules/rx888_source/` in this session.**
+
+Do not read, edit, build, or deploy any other module — not `channel_bank`, not `vdl2_decoder`, not `hfdl_decoder`, not `selcal_decoder`. Those are maintained in other sessions on other branches. If a task would require touching anything outside `source_modules/rx888_source/`, stop and tell the user rather than proceeding.
+
+---
+
 Fork of [AlexandreRouma/SDRPlusPlus](https://github.com/AlexandreRouma/SDRPlusPlus) with custom modules for wideband aviation monitoring, multi-protocol data link decoding, and direct-sampling SDR support via the RX888 MkII.
 
 ## What is SDR++?
