@@ -17,6 +17,49 @@ static std::string g_ffmpegPath;
 void setFfmpegPath(const std::string& path) { g_ffmpegPath = path; }
 std::string getFfmpegPath() { return g_ffmpegPath; }
 
+static std::string winErr(DWORD err = GetLastError()) {
+    return std::to_string((unsigned long)err);
+}
+
+static bool fileExists(const std::string& path) {
+    DWORD attr = GetFileAttributesA(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string joinPath(const std::string& base, const std::string& child) {
+    if (base.empty()) return child;
+    char last = base[base.size() - 1];
+    if (last == '\\' || last == '/') return base + child;
+    return base + "\\" + child;
+}
+
+static std::string firstMatchingDir(const std::string& parent, const std::string& pattern) {
+    WIN32_FIND_DATAA data{};
+    std::string query = joinPath(parent, pattern);
+    HANDLE h = FindFirstFileA(query.c_str(), &data);
+    if (h == INVALID_HANDLE_VALUE) return {};
+
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            strcmp(data.cFileName, ".") != 0 &&
+            strcmp(data.cFileName, "..") != 0) {
+            std::string result = joinPath(parent, data.cFileName);
+            FindClose(h);
+            return result;
+        }
+    } while (FindNextFileA(h, &data));
+
+    FindClose(h);
+    return {};
+}
+
+static std::string envVar(const char* name) {
+    char buf[MAX_PATH];
+    DWORD len = GetEnvironmentVariableA(name, buf, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return {};
+    return std::string(buf, len);
+}
+
 static time_t captureTimeFromWavPath(const std::string& wavPath) {
     std::string base = wavPath;
     size_t slash = base.find_last_of("/\\");
@@ -61,16 +104,37 @@ static void setFileCaptureTime(const std::string& path, time_t t) {
 
 static std::string findFfmpeg() {
     if (!g_ffmpegPath.empty()) {
-        DWORD attr = GetFileAttributesA(g_ffmpegPath.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES) return g_ffmpegPath;
+        if (fileExists(g_ffmpegPath)) return g_ffmpegPath;
     }
     char buf[MAX_PATH];
     DWORD len = SearchPathA(NULL, "ffmpeg.exe", NULL, MAX_PATH, buf, NULL);
     if (len > 0 && len < MAX_PATH) return std::string(buf);
+
+    std::string localAppData = envVar("LOCALAPPDATA");
+    if (!localAppData.empty()) {
+        std::string packages = joinPath(localAppData, "Microsoft\\WinGet\\Packages");
+        std::string gyanPkg = firstMatchingDir(packages, "Gyan.FFmpeg_Microsoft.Winget.Source_*");
+        if (!gyanPkg.empty()) {
+            std::string ffmpegDir = firstMatchingDir(gyanPkg, "ffmpeg-*");
+            if (!ffmpegDir.empty()) {
+                std::string candidate = joinPath(ffmpegDir, "bin\\ffmpeg.exe");
+                if (fileExists(candidate)) return candidate;
+            }
+        }
+    }
+
+    const char* programDirs[] = { "ProgramFiles", "ProgramFiles(x86)" };
+    for (const char* envName : programDirs) {
+        std::string root = envVar(envName);
+        if (root.empty()) continue;
+        std::string candidate = joinPath(root, "ffmpeg\\bin\\ffmpeg.exe");
+        if (fileExists(candidate)) return candidate;
+    }
+
     return {};
 }
 
-static bool runProcess(const std::string& cmdLine, DWORD timeoutMs = 60000) {
+static bool runProcess(const std::string& cmdLine, DWORD timeoutMs = 600000) {
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -87,12 +151,19 @@ static bool runProcess(const std::string& cmdLine, DWORD timeoutMs = 60000) {
     DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs);
     DWORD exitCode = 1;
     if (wait == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
 
     if (wait != WAIT_OBJECT_0) {
         flog::error("[CBEncoding] ffmpeg timed out after {0}ms", std::to_string(timeoutMs));
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
         return false;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        flog::error("[CBEncoding] ffmpeg exited with code {0}", std::to_string(exitCode));
     }
     return exitCode == 0;
 }
@@ -107,6 +178,20 @@ static std::string escapeArg(const std::string& s) {
     return out;
 }
 
+static std::string tempBasePath() {
+    char tempDir[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, tempDir);
+    if (len == 0 || len >= MAX_PATH) return {};
+
+    DWORD pid = GetCurrentProcessId();
+    DWORD tid = GetCurrentThreadId();
+    DWORD tick = GetTickCount();
+    return std::string(tempDir) + "channel_bank_" +
+           std::to_string((unsigned long)pid) + "_" +
+           std::to_string((unsigned long)tid) + "_" +
+           std::to_string((unsigned long)tick);
+}
+
 std::string wavToM4A(const std::string& wavPath, const std::string& transcript, float avgSnrDb) {
     if (wavPath.size() < 4 || wavPath.substr(wavPath.size() - 4) != ".wav") return {};
 
@@ -117,9 +202,26 @@ std::string wavToM4A(const std::string& wavPath, const std::string& transcript, 
     }
 
     std::string m4aPath = wavPath.substr(0, wavPath.size() - 4) + ".m4a";
+    std::string tempBase = tempBasePath();
+    if (tempBase.empty()) {
+        flog::error("[CBEncoding] could not resolve Windows temp directory");
+        return {};
+    }
+    std::string tempWav = tempBase + ".wav";
+    std::string tempM4A = tempBase + ".m4a";
+
+    // Network shares and mapped drives can make ffmpeg's direct read/write
+    // unreliable or very slow. Copy to local temp first, encode locally, then
+    // copy the finished M4A back to the recording folder.
+    if (!CopyFileA(wavPath.c_str(), tempWav.c_str(), FALSE)) {
+        flog::error("[CBEncoding] failed to stage WAV locally (err={0}): {1}",
+                    winErr(), wavPath);
+        DeleteFileA(tempWav.c_str());
+        return {};
+    }
 
     std::string cmd = escapeArg(ffmpeg)
-        + " -y -i " + escapeArg(wavPath)
+        + " -y -hide_banner -loglevel error -i " + escapeArg(tempWav)
         + " -c:a aac -b:a 32k";
 
     bool hasTranscript = !transcript.empty();
@@ -142,13 +244,27 @@ std::string wavToM4A(const std::string& wavPath, const std::string& transcript, 
         cmd += "\"";
     }
 
-    cmd += " " + escapeArg(m4aPath);
+    cmd += " " + escapeArg(tempM4A);
 
     if (!runProcess(cmd)) {
         flog::error("[CBEncoding] ffmpeg encode failed: {0}", wavPath);
+        DeleteFileA(tempWav.c_str());
+        DeleteFileA(tempM4A.c_str());
+        return {};
+    }
+
+    DeleteFileA(m4aPath.c_str());
+    if (!CopyFileA(tempM4A.c_str(), m4aPath.c_str(), FALSE)) {
+        flog::error("[CBEncoding] failed to copy M4A to destination (err={0}): {1}",
+                    winErr(), m4aPath);
+        DeleteFileA(tempWav.c_str());
+        DeleteFileA(tempM4A.c_str());
         DeleteFileA(m4aPath.c_str());
         return {};
     }
+
+    DeleteFileA(tempWav.c_str());
+    DeleteFileA(tempM4A.c_str());
 
     setFileCaptureTime(m4aPath, captureTimeFromWavPath(wavPath));
 

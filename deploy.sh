@@ -12,10 +12,15 @@ set -e
 APP="/Applications/SDR++MODULETESTING.app"
 DYLIB="build/misc_modules/channel_bank/channel_bank.dylib"
 PLUGIN_DEST="$APP/Contents/Plugins/channel_bank.dylib"
+LEGACY_DEST="$APP/Contents/channel_bank.dylib"
 
 cd "$(dirname "$0")"
 
 SDKROOT=$(xcrun --show-sdk-path) cmake --build build --target channel_bank
+
+# Do not keep stale channel_bank copies around. The app should load the module
+# from Contents/Plugins only.
+rm -f "$PLUGIN_DEST" "$LEGACY_DEST"
 cp "$DYLIB" "$PLUGIN_DEST"
 
 # Clear any xattrs Spotlight/quarantine/Time Machine may have left on the

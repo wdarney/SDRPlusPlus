@@ -6,11 +6,13 @@
 #include "transcription_whisper.h"
 #include "whisper.h"
 
+#include <core.h>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -52,25 +54,19 @@ std::string modelLabel(Model m) {
 }
 
 std::string modelsDir() {
-    // ~/Library/Application Support/SDR++/channel_bank/models/
-    NSArray<NSURL*>* urls = [[NSFileManager defaultManager]
-        URLsForDirectory:NSApplicationSupportDirectory
-               inDomains:NSUserDomainMask];
-    if (urls.count == 0) return {};
-    NSURL* base = [[urls.firstObject
-        URLByAppendingPathComponent:@"SDR++" isDirectory:YES]
-        URLByAppendingPathComponent:@"channel_bank" isDirectory:YES];
-    NSURL* dir  = [base URLByAppendingPathComponent:@"models" isDirectory:YES];
-    [[NSFileManager defaultManager]
-        createDirectoryAtURL:dir withIntermediateDirectories:YES
-                  attributes:nil error:nil];
-    return std::string(dir.path.UTF8String);
+    std::string root = (std::string)core::args["root"];
+    if (root.empty()) return {};
+    std::filesystem::path dir = std::filesystem::path(root) / "channel_bank" / "models";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return {};
+    return dir.string();
 }
 
 std::string modelPath(Model m) {
     std::string d = modelsDir();
     if (d.empty()) return {};
-    return d + "/" + modelFilename(m);
+    return (std::filesystem::path(d) / modelFilename(m)).string();
 }
 
 bool isModelInstalled(Model m) {

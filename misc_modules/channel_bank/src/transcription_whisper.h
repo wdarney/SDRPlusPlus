@@ -20,7 +20,7 @@ namespace transcription_whisper {
     // Human-readable model label for UI.
     std::string modelLabel(Model m);
 
-    // The directory under ~/Library/Application Support/ where models live.
+    // The instance-local model directory: <root>/channel_bank/models.
     // Created on first call if it doesn't exist.
     std::string modelsDir();
 

@@ -5,12 +5,14 @@
 #include "transcription_whisper.h"
 #include "whisper.h"
 
+#include <core.h>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -52,33 +54,19 @@ std::string modelLabel(Model m) {
 }
 
 std::string modelsDir() {
-#ifdef _WIN32
-    char appData[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appData) != S_OK) return {};
-    std::string dir = std::string(appData) + "\\SDR++\\channel_bank\\models";
-    CreateDirectoryA((std::string(appData) + "\\SDR++").c_str(), NULL);
-    CreateDirectoryA((std::string(appData) + "\\SDR++\\channel_bank").c_str(), NULL);
-    CreateDirectoryA(dir.c_str(), NULL);
-    return dir;
-#else
-    const char* home = getenv("HOME");
-    if (!home) home = getpwuid(getuid())->pw_dir;
-    std::string dir = std::string(home) + "/.local/share/SDR++/channel_bank/models";
-    mkdir((std::string(home) + "/.local/share/SDR++").c_str(), 0755);
-    mkdir((std::string(home) + "/.local/share/SDR++/channel_bank").c_str(), 0755);
-    mkdir(dir.c_str(), 0755);
-    return dir;
-#endif
+    std::string root = (std::string)core::args["root"];
+    if (root.empty()) return {};
+    std::filesystem::path dir = std::filesystem::path(root) / "channel_bank" / "models";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return {};
+    return dir.string();
 }
 
 std::string modelPath(Model m) {
     std::string d = modelsDir();
     if (d.empty()) return {};
-#ifdef _WIN32
-    return d + "\\" + modelFilename(m);
-#else
-    return d + "/" + modelFilename(m);
-#endif
+    return (std::filesystem::path(d) / modelFilename(m)).string();
 }
 
 bool isModelInstalled(Model m) {

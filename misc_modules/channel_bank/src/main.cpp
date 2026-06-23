@@ -186,7 +186,7 @@ public:
     static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
     static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
 
-    ChannelBankModule(std::string name) : folderSelect("%ROOT%/recordings") {
+    ChannelBankModule(std::string name) : folderSelect("%ROOT%/channel_bank/recordings") {
         this->name = name;
         root = (std::string)core::args["root"];
 
@@ -310,6 +310,8 @@ public:
         if (config.conf[name].contains("scanRanges"))
             for (auto& j : config.conf[name]["scanRanges"])
                 scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });
+        if (config.conf[name].contains("autoStart"))
+            autoStart = config.conf[name]["autoStart"];
         config.release();
 
         channelSpacing = SPACINGS[std::clamp(spacingId, 0, 5)];
@@ -379,6 +381,15 @@ public:
         fftRedrawHandler.handler = fftRedrawHandlerFunc;
         fftRedrawHandler.ctx     = this;
         gui::waterfall.onFFTRedraw.bindHandler(&fftRedrawHandler);
+
+        if (autoStart) {
+            if (folderSelect.pathIsValid()) {
+                start();
+            }
+            else {
+                flog::warn("[ChannelBank] autoStart requested but recording path is invalid: {0}", folderSelect.path);
+            }
+        }
     }
     void enable()  { enabled = true; }
     void disable() { enabled = false; restoreWaterfallVisibility(); }
@@ -785,9 +796,18 @@ public:
         fwrite(zeroPad.data(),           sizeof(int16_t), silencePad, fw);
         fclose(fw);
 
+#ifdef _WIN32
+        if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            flog::error("[ChannelBank] normalizeWavFile: replace failed: {0}",
+                std::to_string((unsigned long)GetLastError()));
+            std::error_code cleanupEc;
+            std::filesystem::remove(tmp, cleanupEc);
+        }
+#else
         std::error_code ec;
         std::filesystem::rename(tmp, path, ec);
         if (ec) flog::error("[ChannelBank] normalizeWavFile: rename failed: {0}", ec.message());
+#endif
     }
 
     bool openNewFile(ChannelSlot& slot) {
@@ -3929,6 +3949,12 @@ private:
             }
         }
 
+        if (ImGui::Checkbox(CONCAT("Start on module load##_cb_autostart_", _this->name),
+                            &_this->autoStart)) {
+            config.acquire();
+            config.conf[_this->name]["autoStart"] = _this->autoStart;
+            config.release(true);
+        }
 
         // Start / Stop
         if (!_this->running) {
@@ -4724,6 +4750,7 @@ private:
     std::string  root;
     bool         enabled       = true;
     bool         running       = false;
+    bool         autoStart     = false;
     std::mutex   runMtx;
 
     FolderSelect folderSelect;
@@ -5373,9 +5400,7 @@ private:
 
 MOD_EXPORT void _INIT_() {
     std::string root = (std::string)core::args["root"];
-    if (!std::filesystem::exists(root + "/recordings")) {
-        std::filesystem::create_directory(root + "/recordings");
-    }
+    std::filesystem::create_directories(root + "/channel_bank/recordings");
     json def = json({});
     config.setPath(root + "/channel_bank_config.json");
     config.load(def);
