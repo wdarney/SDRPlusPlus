@@ -128,6 +128,7 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["fftWindow"] = 2;
     defConfig["frequency"] = 100000000.0;
     defConfig["fullWaterfallUpdate"] = false;
+    defConfig["uiFrameRateLimit"] = 30;
     defConfig["max"] = 0.0;
     defConfig["maximized"] = false;
     defConfig["fullscreen"] = false;

@@ -168,6 +168,9 @@ namespace backend {
         eglSwapBuffers(_EglDisplay, _EglSurface);
     }
 
+    void setFrameRateLimit(int fps) {}
+    int getFrameRateLimit() { return 0; }
+
     // No screen pos to detect
     void getMouseScreenPos(double& x, double& y) { x = 0; y = 0; }
     void setMouseScreenPos(double x, double y) {}

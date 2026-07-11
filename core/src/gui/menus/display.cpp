@@ -8,6 +8,7 @@
 #include <signal_path/signal_path.h>
 #include <gui/style.h>
 #include <utils/optionlist.h>
+#include <backend.h>
 #include <algorithm>
 
 namespace displaymenu {
@@ -19,6 +20,7 @@ namespace displaymenu {
     std::string colorMapAuthor = "";
     int selectedWindow = 0;
     int fftRate = 20;
+    int uiFrameRateLimit = 30;
     int fftSizeId = 0;
     int uiScaleId = 0;
     bool restartRequired = false;
@@ -87,6 +89,8 @@ namespace displaymenu {
 
         fftRate = core::configManager.conf["fftRate"];
         sigpath::iqFrontEnd.setFFTRate(fftRate);
+        uiFrameRateLimit = std::clamp<int>((int)core::configManager.conf["uiFrameRateLimit"], 0, 240);
+        backend::setFrameRateLimit(uiFrameRateLimit);
 
         selectedWindow = std::clamp<int>((int)core::configManager.conf["fftWindow"], 0, (sizeof(fftWindowList) / sizeof(IQFrontEnd::FFTWindow)) - 1);
         sigpath::iqFrontEnd.setFFTWindow(fftWindowList[selectedWindow]);
@@ -209,6 +213,16 @@ namespace displaymenu {
             updateFFTSpeeds();
             core::configManager.acquire();
             core::configManager.conf["fftRate"] = fftRate;
+            core::configManager.release(true);
+        }
+
+        ImGui::LeftLabel("UI Framerate Limit");
+        ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
+        if (ImGui::InputInt("##sdrpp_ui_frame_rate_limit", &uiFrameRateLimit, 1, 10)) {
+            uiFrameRateLimit = std::clamp<int>(uiFrameRateLimit, 0, 240);
+            backend::setFrameRateLimit(uiFrameRateLimit);
+            core::configManager.acquire();
+            core::configManager.conf["uiFrameRateLimit"] = uiFrameRateLimit;
             core::configManager.release(true);
         }
 
