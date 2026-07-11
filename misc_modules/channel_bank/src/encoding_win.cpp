@@ -178,6 +178,28 @@ static std::string escapeArg(const std::string& s) {
     return out;
 }
 
+static void appendMetadataArgs(std::string& cmd, const std::string& transcript, float avgSnrDb) {
+    bool hasTranscript = !transcript.empty();
+    bool hasSnr        = (avgSnrDb != 0.0f);
+    char snrBuf[32]    = {};
+    if (hasSnr) snprintf(snrBuf, sizeof(snrBuf), "SNR: %.1f dB avg", avgSnrDb);
+
+    if (hasTranscript) {
+        std::string escaped;
+        for (char c : transcript) {
+            if (c == '"') escaped += "\\\"";
+            else if (c == '\n') escaped += " ";
+            else escaped += c;
+        }
+        cmd += " -metadata lyrics=\"" + escaped + "\"";
+    }
+    if (hasSnr) {
+        cmd += " -metadata comment=\"";
+        cmd += snrBuf;
+        cmd += "\"";
+    }
+}
+
 static std::string tempBasePath() {
     char tempDir[MAX_PATH];
     DWORD len = GetTempPathA(MAX_PATH, tempDir);
@@ -229,20 +251,7 @@ std::string wavToM4A(const std::string& wavPath, const std::string& transcript, 
     char snrBuf[32]    = {};
     if (hasSnr) snprintf(snrBuf, sizeof(snrBuf), "SNR: %.1f dB avg", avgSnrDb);
 
-    if (hasTranscript) {
-        std::string escaped;
-        for (char c : transcript) {
-            if (c == '"') escaped += "\\\"";
-            else if (c == '\n') escaped += " ";
-            else escaped += c;
-        }
-        cmd += " -metadata lyrics=\"" + escaped + "\"";
-    }
-    if (hasSnr) {
-        cmd += " -metadata comment=\"";
-        cmd += snrBuf;
-        cmd += "\"";
-    }
+    appendMetadataArgs(cmd, transcript, avgSnrDb);
 
     cmd += " " + escapeArg(tempM4A);
 

@@ -63,7 +63,26 @@ SDRPP_MOD_INFO{
 
 ConfigManager config;
 
+#if defined(__APPLE__) || defined(_WIN32)
+#ifdef _WIN32
+static constexpr int kM4ATranscriptionMaxWaitSec = 60;
+#else
+static constexpr int kM4ATranscriptionMaxWaitSec = 180;
+#endif
+static constexpr int kM4AEncodeMaxAttempts = 6;
+static constexpr int kM4AFsRetryAttempts = 5;
+#endif
+
 class ChannelBankModule;
+
+#if defined(__APPLE__) || defined(_WIN32)
+struct TranscriptionJob {
+    std::string path;
+    std::string name;
+    int         backend = 0;
+    void*       handle  = nullptr;
+};
+#endif
 
 struct ChannelSlot {
     int    gridIdx = 0;
@@ -94,6 +113,7 @@ struct ChannelSlot {
     dsp::sink::Handler<dsp::stereo_t>*         recSink        = nullptr;
     wav::Writer                                writer;
     std::string                                currentFilePath;
+    std::string                                currentFinalM4APath;
     bool    fileOpen        = false;
     bool    inSilence       = false;
     std::chrono::steady_clock::time_point      silenceStart;
@@ -109,6 +129,8 @@ struct ChannelSlot {
     std::atomic<bool>                          signalPresent    { false };
     std::atomic<bool>                          rawSignalPresent { false }; // above SNR threshold RIGHT NOW (no vote smoothing, no hold)
     std::atomic<int>                           rawConsecutiveHits { 0 };  // consecutive FFT frames rawSignalPresent was true; gated file-open requires ≥2
+    std::atomic<float>                         sustainSnrDb { -120.0f }; // smoothed SNR for audio sustain only
+    std::atomic<bool>                          sustainSnrValid { false };
     bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
 
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
@@ -167,6 +189,15 @@ struct ChannelSlot {
     double driftSum   = 0.0;  // Σ centroidHz
     double driftSumSq = 0.0;  // Σ centroidHz²
 
+    // Stuck-noise guard — manual passband mode only.  This intentionally does not
+    // try to classify "voice"; it looks for long recordings that stay continuously
+    // active while the passband centroid wanders like local interference.
+    std::atomic<int> noiseGuardFramesTotal  { 0 };
+    std::atomic<int> noiseGuardFramesActive { 0 };
+    double noiseGuardCentroidSum   = 0.0;
+    double noiseGuardCentroidSumSq = 0.0;
+    double noiseGuardWidthSum      = 0.0;
+
 #ifndef CB_NO_RNNOISE
     DenoiseState*  nrState    = nullptr;
     float          nrInBuf[480] = {};
@@ -213,6 +244,14 @@ public:
             driftGateEnabled = config.conf[name]["driftGateEnabled"];
         if (config.conf[name].contains("driftMaxStdHz"))
             driftMaxStdHz = config.conf[name]["driftMaxStdHz"];
+        if (config.conf[name].contains("stuckNoiseGuardEnabled"))
+            stuckNoiseGuardEnabled = config.conf[name]["stuckNoiseGuardEnabled"];
+        if (config.conf[name].contains("stuckNoiseGuardMinSec"))
+            stuckNoiseGuardMinSec = config.conf[name]["stuckNoiseGuardMinSec"];
+        if (config.conf[name].contains("stuckNoiseGuardActiveFrac"))
+            stuckNoiseGuardActiveFrac = config.conf[name]["stuckNoiseGuardActiveFrac"];
+        if (config.conf[name].contains("stuckNoiseGuardDriftHz"))
+            stuckNoiseGuardDriftHz = config.conf[name]["stuckNoiseGuardDriftHz"];
         if (config.conf[name].contains("cooldownSec"))
             cooldownSec = config.conf[name]["cooldownSec"];
         if (config.conf[name].contains("recGain"))
@@ -267,6 +306,8 @@ public:
             manualMode = config.conf[name]["manualMode"];
         if (config.conf[name].contains("bookmarkScanMode"))
             bookmarkScanMode = config.conf[name]["bookmarkScanMode"];
+        if (config.conf[name].contains("manualPassbandLimit"))
+            manualPassbandLimit = config.conf[name]["manualPassbandLimit"];
         if (config.conf[name].contains("manualFrequencies"))
             for (auto& j : config.conf[name]["manualFrequencies"])
                 manualFrequencies.push_back(j.get<double>());
@@ -301,6 +342,8 @@ public:
         }
         if (config.conf[name].contains("m4aEnabled"))
             m4aEnabled = config.conf[name]["m4aEnabled"];
+        if (config.conf[name].contains("normalizeRecordings"))
+            normalizeRecordings = config.conf[name]["normalizeRecordings"];
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
         if (config.conf[name].contains("scanQuietSec"))
@@ -518,6 +561,10 @@ public:
             }
             activeChannels.clear();
         }
+
+#if defined(__APPLE__) || defined(_WIN32)
+        cancelTranscriptionJobs();
+#endif
 
         // Now drain + stop the encode thread (picks up anything destroySlot queued above).
         encodeThreadRunning = false;
@@ -810,6 +857,10 @@ public:
 #endif
     }
 
+    void normalizeRecordingIfEnabled(const std::string& path) {
+        if (normalizeRecordings) normalizeWavFile(path);
+    }
+
     bool openNewFile(ChannelSlot& slot) {
         const double audioSr = 48000.0;
         slot.writer.setFormat(wav::FORMAT_WAV);
@@ -836,9 +887,43 @@ public:
                 name.c_str(), slot.freqHz / 1e6,
                 ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
                 ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
-        std::string path = expandString(folderSelect.path + "/" + buf);
+        std::filesystem::path requestedWav = expandString(folderSelect.path + "/" + buf);
+        std::string path = requestedWav.string();
+        slot.currentFinalM4APath.clear();
+
+#if defined(__APPLE__) || defined(_WIN32)
+        // Intermediate WAVs are scratch files when recording is disabled or
+        // when the final output will be M4A. Keep those off network shares.
+        if (!recordingEnabled || m4aEnabled) {
+            std::error_code ec;
+            std::filesystem::path scratchBase = std::filesystem::path(root) / "channel_bank" / "tmp" / "recordings";
+            std::filesystem::create_directories(scratchBase, ec);
+            if (ec) {
+                ec.clear();
+                scratchBase = std::filesystem::temp_directory_path(ec) / "sdrpp-channel-bank" / "recordings";
+                if (!ec) std::filesystem::create_directories(scratchBase, ec);
+            }
+            if (!ec) {
+                static std::atomic<uint64_t> scratchSeq { 0 };
+                auto id = scratchSeq.fetch_add(1);
+                path = (scratchBase / (std::to_string(id) + "-" + requestedWav.filename().string())).string();
+            } else {
+                flog::warn("[ChannelBank] Could not create local recording scratch directory; using recPath for intermediate WAV");
+            }
+
+            if (recordingEnabled && m4aEnabled) {
+                std::filesystem::path finalM4A = requestedWav;
+                finalM4A.replace_extension(".m4a");
+                slot.currentFinalM4APath = finalM4A.string();
+            }
+        }
+#endif
+
         slot.currentFilePath = path;
         flog::info("[ChannelBank] Opening file: {0}", path);
+        if (!slot.currentFinalM4APath.empty()) {
+            flog::info("[ChannelBank] Final M4A destination: {0}", slot.currentFinalM4APath);
+        }
         if (!slot.writer.open(path)) {
             flog::error("[ChannelBank] Failed to open: {0}", path);
             return false;
@@ -850,11 +935,18 @@ public:
         slot.recFadeRemaining     = 0;    // pre-roll audio is continuous, no fade-in click to suppress
         slot.snrSum               = 0.0f;
         slot.snrCount             = 0;
+        slot.sustainSnrDb.store(-120.0f);
+        slot.sustainSnrValid.store(false);
         slot.gateFramesAbove.store(0);   // fresh static-gate tally per recording
         slot.gateFramesVoice.store(0);
         slot.onAirFrames.store(0);       // fresh on-air (min-TX) tally per recording
         slot.driftSum             = 0.0; // fresh drift-gate stats per recording
         slot.driftSumSq           = 0.0;
+        slot.noiseGuardFramesTotal.store(0);
+        slot.noiseGuardFramesActive.store(0);
+        slot.noiseGuardCentroidSum   = 0.0;
+        slot.noiseGuardCentroidSumSq = 0.0;
+        slot.noiseGuardWidthSum      = 0.0;
         slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
         // NOTE: deliberately do NOT register the frequency in permanent history here.
         // Doing so created an entry for every file-open — including the flood of opens
@@ -867,6 +959,25 @@ public:
     }
 
 private:
+    void updateSustainSnr(ChannelSlot& slot, float instantSnrDb) {
+        if (!std::isfinite(instantSnrDb)) return;
+
+        constexpr float FRAME_SEC   = 1.0f / (float)SPEC_ANALYSIS_HZ;
+        constexpr float ATTACK_SEC  = 0.12f;
+        constexpr float RELEASE_SEC = 0.45f;
+
+        if (!slot.sustainSnrValid.load()) {
+            slot.sustainSnrDb.store(instantSnrDb);
+            slot.sustainSnrValid.store(true);
+            return;
+        }
+
+        float current = slot.sustainSnrDb.load();
+        float tau = (instantSnrDb > current) ? ATTACK_SEC : RELEASE_SEC;
+        float alpha = 1.0f - expf(-FRAME_SEC / tau);
+        slot.sustainSnrDb.store(current + alpha * (instantSnrDb - current));
+    }
+
     std::string expandString(std::string input) {
         input = std::regex_replace(input, std::regex("%ROOT%"), root);
         return std::regex_replace(input, std::regex("//"), "/");
@@ -924,6 +1035,12 @@ private:
             manualVotes.clear();
             retuneFlag.store(false);
             return;  // skip this frame — buffers are stale from old tuning
+        }
+
+        if (detectorFloorResetRequested.exchange(false)) {
+            globalNoiseFloor  = 0.0f;
+            displayNoiseFloor = 0.0f;
+            floorHistory.clear();
         }
 
         // Determine how many real samples are in fftAccum this frame.
@@ -988,6 +1105,20 @@ private:
         std::vector<float>& power = avgPower;
 
         double binHz  = lastKnownSr / FFT_SIZE;
+        std::vector<double> manualPassbandFreqs;
+        if (manualMode && manualPassbandLimit)
+            manualPassbandFreqs = getActiveManualFreqs();
+
+        std::vector<uint8_t> manualPassbandMask;
+        if (!manualPassbandFreqs.empty()) {
+            manualPassbandMask.assign(FFT_SIZE, 0);
+            for (double f : manualPassbandFreqs) {
+                int pbLo = 0, pbHi = -1;
+                if (!manualPassbandBinsForFreq(f, binHz, pbLo, pbHi)) continue;
+                for (int b = pbLo; b <= pbHi; b++) manualPassbandMask[b] = 1;
+            }
+        }
+
         // numSlots covers the FULL bandwidth so we can detect signals anywhere.
         // bwUsage only controls which slots contribute to the noise floor estimate
         // (avoids filter rolloff edges inflating it).
@@ -1077,11 +1208,18 @@ private:
             int leftSkip  = std::max(baseEdgeSkip, (int)std::round(numSlots * leftTrimFrac));
             int rightSkip = std::max(baseEdgeSkip, (int)std::round(numSlots * rightTrimFrac));
             std::vector<float> centerMeans;
-            for (int s = leftSkip; s < numSlots - rightSkip; s++)
-                centerMeans.push_back(slotMeans[s]);
+            if (!manualPassbandMask.empty()) {
+                centerMeans.reserve(FFT_SIZE);
+                for (int b = 0; b < FFT_SIZE; b++)
+                    if (manualPassbandMask[b]) centerMeans.push_back(power[b]);
+            } else {
+                for (int s = leftSkip; s < numSlots - rightSkip; s++)
+                    centerMeans.push_back(slotMeans[s]);
+            }
             if (centerMeans.empty()) centerMeans = {slotMeans[numSlots / 2]};
             std::sort(centerMeans.begin(), centerMeans.end());
-            float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * 0.20f) - 1)];
+            float floorPct = manualPassbandMask.empty() ? 0.20f : 0.25f;
+            float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * floorPct) - 1)];
             rawFloor = std::max(rawFloor, 1e-30f);
 
             // Median-over-N-frames: rejects transient noise pulses (RFI) entirely
@@ -1132,9 +1270,19 @@ private:
             int wbRightEdge = std::max(wbBaseEdge, (int)std::round(numSlots * rightTrimFrac));
             int wbCenter    = std::max(1, numSlots - wbLeftEdge - wbRightEdge);
             int wbAbove     = 0;
-            for (int s = wbLeftEdge; s < numSlots - wbRightEdge; s++)
-                if (instSlotMeans[s] > globalNoiseFloor * snrLinear) wbAbove++;
-            widebandEvent = (wbAbove > wbCenter * 2 / 5);  // >40%
+            if (!manualPassbandMask.empty()) {
+                wbCenter = 0;
+                for (int b = 0; b < FFT_SIZE; b++) {
+                    if (!manualPassbandMask[b]) continue;
+                    wbCenter++;
+                    if (instPower[b] > globalNoiseFloor * snrLinear) wbAbove++;
+                }
+                widebandEvent = (wbCenter > 0 && wbAbove > wbCenter * 4 / 5);  // >80% of allowed passbands
+            } else {
+                for (int s = wbLeftEdge; s < numSlots - wbRightEdge; s++)
+                    if (instSlotMeans[s] > globalNoiseFloor * snrLinear) wbAbove++;
+                widebandEvent = (wbAbove > wbCenter * 2 / 5);  // >40%
+            }
         }
 
         // Manual mode: check configured frequencies instead of grid voting
@@ -1143,6 +1291,9 @@ private:
             std::set<int>       newDetected;
             std::set<int>       newRawDetected;
             std::map<int,float> newManualSnr;
+            std::map<int,float> newManualInstantSnr;
+            std::map<int,float> newManualCentroidHz;
+            std::map<int,float> newManualWidthHz;
             for (int i = 0; i < (int)localFreqs.size(); i++) {
                 double freqOffset = localFreqs[i] - lastKnownCenter;
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
@@ -1199,6 +1350,27 @@ private:
                 int nBins2 = hi - lo + 1;
                 float mean     = sum     / (float)nBins2;
                 float instMean = instSum / (float)nBins2;
+                if (globalNoiseFloor > 0.0f && instMean > 1e-30f)
+                    newManualInstantSnr[i] = 10.0f * log10f(instMean / globalNoiseFloor);
+                double centroidWeighted = 0.0;
+                double centroidPower = 0.0;
+                for (int b = lo; b <= hi; b++) {
+                    double p = (double)power[b];
+                    centroidWeighted += ((double)b - (double)centerBin) * binHz * p;
+                    centroidPower += p;
+                }
+                float centroidHz = (centroidPower > 1e-30) ? (float)(centroidWeighted / centroidPower) : 0.0f;
+                newManualCentroidHz[i] = centroidHz;
+                double widthPower = 0.0;
+                double widthWeighted = 0.0;
+                for (int b = lo; b <= hi; b++) {
+                    double p = (double)power[b];
+                    double hz = ((double)b - (double)centerBin) * binHz;
+                    double d = hz - (double)centroidHz;
+                    widthWeighted += d * d * p;
+                    widthPower += p;
+                }
+                newManualWidthHz[i] = (widthPower > 1e-30) ? (float)std::sqrt(widthWeighted / widthPower) : 0.0f;
                 // Two separate thresholds — same split as auto mode:
                 //   aboveVote: slow EMA (mean) — stable, low-noise, drives vote accumulation
                 //   aboveRaw:  instantaneous (instMean) — fast, drives rawSignalPresent / fade only
@@ -1353,18 +1525,38 @@ private:
                 displaySnap.dBmax = sorted[hi95] + 15.0f;
             }
             // Immediately propagate raw detection to active slots — same FFT frame,
-            // no management-thread hop. Uses 2-consecutive-miss guard, same as auto mode.
-            // Skipped during wideband events so lightning doesn't interfere with state.
+            // no management-thread hop. Before file-open this keeps the old fast
+            // 2-frame miss guard; after file-open it debounces below-threshold dips
+            // for ~400 ms so marginal copyable HF does not flicker raw state between
+            // words or syllables.
             if (!widebandEvent) {
                 std::lock_guard<std::mutex> clck(channelsMtx);
                 for (auto& [idx, slot] : activeChannels) {
+                    const int missLimit = slot->fileOpen ? 4 : 2;
                     bool above = (newRawDetected.count(idx) > 0);
+                    auto ssit = newManualInstantSnr.find(idx);
+                    if (slot->fileOpen && ssit != newManualInstantSnr.end())
+                        updateSustainSnr(*slot, ssit->second);
+                    if (slot->fileOpen && manualPassbandLimit && stuckNoiseGuardEnabled) {
+                        slot->noiseGuardFramesTotal.fetch_add(1);
+                        if (above) {
+                            slot->noiseGuardFramesActive.fetch_add(1);
+                            double c = 0.0;
+                            auto cit = newManualCentroidHz.find(idx);
+                            if (cit != newManualCentroidHz.end()) c = (double)cit->second;
+                            slot->noiseGuardCentroidSum   += c;
+                            slot->noiseGuardCentroidSumSq += c * c;
+                            auto wit = newManualWidthHz.find(idx);
+                            if (wit != newManualWidthHz.end())
+                                slot->noiseGuardWidthSum += (double)wit->second;
+                        }
+                    }
                     if (above) {
                         rawManualMisses[idx] = 0;
                         slot->rawSignalPresent.store(true);
                         int hits = slot->rawConsecutiveHits.load() + 1;
                         slot->rawConsecutiveHits.store(hits > 4 ? 4 : hits); // cap to avoid int creep
-                    } else if (++rawManualMisses[idx] >= 2) {
+                    } else if (++rawManualMisses[idx] >= missLimit) {
                         slot->rawSignalPresent.store(false);
                         slot->rawConsecutiveHits.store(0);
                     }
@@ -1463,30 +1655,34 @@ private:
             }
 
             // Immediately propagate raw (un-voted) detection to active slots.
-            // Uses instantaneous power with a 2-consecutive-miss guard:
+            // Uses instantaneous power with a miss debounce:
             //   • above threshold → reset miss counter, hold rawSignalPresent true
-            //   • 1st miss        → hold (single-frame noise dip protection)
-            //   • 2nd+ miss       → set rawSignalPresent false → cosine fade begins
-            // Worst-case tail: 2 frames (100 ms) + 50 ms fade = ~150 ms.
+            //   • before file-open: 2 misses (fast start/stop behavior)
+            //   • after file-open: 8 misses (~400 ms) to stabilize marginal HF
+            //     through word/syllable dips before the cosine fade begins.
             //
             // During wideband events (lightning, etc.) the update is skipped entirely:
             // active real signals keep their current state; quiet channels don't get
             // their miss counter reset by broadband noise.
             if (!widebandEvent) {
                 for (auto& [idx, slot] : activeChannels) {
+                    const int missLimit = slot->fileOpen ? 4 : 2;
                     float effSnrRaw = slot->fileOpen ? holdSnrLinear : snrLinear;
                     bool above = (idx < numSlots && instSlotMeans[idx] > globalNoiseFloor * effSnrRaw);
+                    if (slot->fileOpen && idx < numSlots && globalNoiseFloor > 0.0f && instSlotMeans[idx] > 1e-30f) {
+                        float instantSnrDb = 10.0f * log10f(instSlotMeans[idx] / globalNoiseFloor);
+                        updateSustainSnr(*slot, instantSnrDb);
+                    }
                     if (above) {
                         rawSlotMisses[idx] = 0;
                         slot->rawSignalPresent.store(true);
                         int hits = slot->rawConsecutiveHits.load() + 1;
                         slot->rawConsecutiveHits.store(hits > 4 ? 4 : hits);
-                    } else if (++rawSlotMisses[idx] >= 2) {
+                    } else if (++rawSlotMisses[idx] >= missLimit) {
                         slot->rawSignalPresent.store(false);
                         slot->rawConsecutiveHits.store(0);
                     }
-                    // 1st miss: leave rawSignalPresent unchanged — protects against
-                    // a single noisy frame setting off the fade prematurely.
+                    // Until missLimit is reached, leave rawSignalPresent unchanged.
 
                     // Static gate tally: on every above-threshold frame while recording,
                     // count whether this channel's spectrum has a carrier (peaky, low
@@ -1561,65 +1757,146 @@ private:
 
 #if defined(__APPLE__) || defined(_WIN32)
     void pollTranscriptions() {
-        std::lock_guard<std::mutex> clck(channelsMtx);
-        for (auto& [idx, slot] : activeChannels) {
-            if (!slot->transcribeHandle) continue;
-            slot->liveTranscript = txGetText(slot->transcribeBackend, slot->transcribeHandle);
-            if (!txIsFinal(slot->transcribeBackend, slot->transcribeHandle)) continue;
+        struct CompletedTranscript {
+            std::string path;
+            std::string name;
+            std::string text;
+            std::vector<transcription_whisper::Segment> segments;
+        };
 
-            // Pull time-aligned segments too (Whisper only — Apple Speech returns []).
-            if (slot->transcribeBackend >= TB_WHISPER_ATC_LARGE) {
-                slot->liveSegments = transcription_whisper::getSegments(slot->transcribeHandle);
-                // Stash by path so playbackThreadFunc can install them when this
-                // WAV's turn comes up in the queue.  pendingTranscriptPath is the
-                // path the WAV was registered under at file-close time — same
-                // string the playback queue uses.
-                if (!slot->liveSegments.empty() && !slot->pendingTranscriptPath.empty()) {
-                    std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
-                    pendingPlaybackSegments[slot->pendingTranscriptPath] = slot->liveSegments;
+        std::vector<CompletedTranscript> completed;
+        {
+            std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+            for (auto it = transcriptionJobs.begin(); it != transcriptionJobs.end();) {
+                TranscriptionJob& job = it->second;
+                if (!job.handle) {
+                    it = transcriptionJobs.erase(it);
+                    continue;
                 }
+
+                std::string text = txGetText(job.backend, job.handle);
+                if (!txIsFinal(job.backend, job.handle)) {
+                    ++it;
+                    continue;
+                }
+
+                CompletedTranscript done;
+                done.path = job.path;
+                done.name = job.name;
+                done.text = text;
+                if (job.backend >= TB_WHISPER_ATC_LARGE) {
+                    done.segments = transcription_whisper::getSegments(job.handle);
+                }
+
+                txDestroy(job.backend, job.handle);
+                it = transcriptionJobs.erase(it);
+                completed.push_back(std::move(done));
+            }
+        }
+
+        for (auto& done : completed) {
+            if (!done.segments.empty()) {
+                std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
+                pendingPlaybackSegments[done.path] = done.segments;
             }
 
-            // Update live transcript display
-            if (!slot->liveTranscript.empty()) {
+            if (!done.text.empty()) {
                 std::lock_guard<std::mutex> tlk(lastTranscriptMtx);
-                lastTranscriptText = slot->liveTranscript;
-                lastTranscriptName = displayName(slot->freqHz);
+                lastTranscriptText = done.text;
+                lastTranscriptName = done.name;
             }
-            txDestroy(slot->transcribeBackend, slot->transcribeHandle);
-            slot->transcribeHandle = nullptr;
 
-            // Transcription chain is done — check if encoding can now proceed.
-            // Store the transcript text so the encode thread can embed it as ©lyr.
             if (m4aEnabled && recordingEnabled) {
                 bool canEncode = false;
-                std::string encodePath, encodeTranscript;
+                std::string encodePath, encodeFinalM4APath, encodeTranscript;
                 float       encodeSnrDb = 0.0f;
-                // Prefer LRC (synced captions) when segments exist — external players
-                // like VLC/QuickTime/IINA render them as time-aligned subtitles when
-                // embedded in ©lyr.  Apple Speech has no segments → falls back to
-                // the joined transcript text just like before.
-                std::string transcriptForM4A = !slot->liveSegments.empty()
-                    ? transcription_whisper::formatLrc(slot->liveSegments)
-                    : slot->liveTranscript;
+                std::string transcriptForM4A = !done.segments.empty()
+                    ? transcription_whisper::formatLrc(done.segments)
+                    : done.text;
                 {
                     std::lock_guard<std::mutex> elk(pendingEncodesMtx);
-                    auto it = pendingEncodes.find(slot->pendingTranscriptPath);
+                    auto it = pendingEncodes.find(done.path);
                     if (it != pendingEncodes.end()) {
                         it->second.transcriptionDone = true;
                         it->second.transcript        = transcriptForM4A;
                         if (it->second.playbackDone) {
                             canEncode        = true;
                             encodePath       = it->first;
+                            encodeFinalM4APath = it->second.finalM4APath;
                             encodeTranscript = it->second.transcript;
                             encodeSnrDb      = it->second.avgSnrDb;
                             pendingEncodes.erase(it);
                         }
                     }
                 }
-                if (canEncode) triggerEncode(encodePath, encodeTranscript, encodeSnrDb);
+                if (canEncode) triggerEncode(encodePath, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
             }
         }
+    }
+
+    void expirePendingEncodeWaits() {
+        if (!m4aEnabled || !recordingEnabled || !transcriptionOn()) return;
+
+        struct ExpiredEncode {
+            std::string wavPath;
+            std::string finalM4APath;
+            float       avgSnrDb = 0.0f;
+        };
+        std::vector<ExpiredEncode> expired;
+        auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(pendingEncodesMtx);
+            for (auto it = pendingEncodes.begin(); it != pendingEncodes.end();) {
+                EncodeState& es = it->second;
+                if (!es.transcriptionDone) {
+                    auto queuedAt = es.queuedAt;
+                    if (queuedAt == std::chrono::steady_clock::time_point{}) {
+                        queuedAt = (es.playbackDoneAt == std::chrono::steady_clock::time_point{})
+                            ? now : es.playbackDoneAt;
+                    }
+                    auto waitSec = std::chrono::duration_cast<std::chrono::seconds>(now - queuedAt).count();
+                    if (waitSec >= kM4ATranscriptionMaxWaitSec) {
+                        if (!es.playbackDone && isCurrentlyPlaying(it->first)) {
+                            ++it;
+                            continue;
+                        }
+                        if (!es.playbackDone) {
+                            removeFromPlaybackQueue(it->first);
+                            clearPendingPlaybackSegments(it->first);
+                        }
+                        flog::warn("[ChannelBank] M4A encode waited {0}s after close for transcript; encoding without lyrics: {1}",
+                                   kM4ATranscriptionMaxWaitSec, it->first);
+                        expired.push_back({it->first, es.finalM4APath, es.avgSnrDb});
+                        it = pendingEncodes.erase(it);
+                        continue;
+                    }
+                }
+                ++it;
+            }
+        }
+
+        for (auto& task : expired) {
+            triggerEncode(task.wavPath, task.finalM4APath, {}, task.avgSnrDb);
+        }
+    }
+
+    bool isCurrentlyPlaying(const std::string& path) {
+        std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
+        return currentPlaybackPath == path;
+    }
+
+    bool removeFromPlaybackQueue(const std::string& path) {
+        std::lock_guard<std::mutex> lk(playbackMtx);
+        auto it = std::find_if(playbackQueue.begin(), playbackQueue.end(),
+            [&](const auto& entry) { return entry.path == path; });
+        if (it == playbackQueue.end()) return false;
+        playbackQueue.erase(it);
+        return true;
+    }
+
+    void clearPendingPlaybackSegments(const std::string& path) {
+        std::lock_guard<std::mutex> lk(pendingPlaybackSegmentsMtx);
+        pendingPlaybackSegments.erase(path);
     }
 #endif
 
@@ -1633,6 +1910,7 @@ private:
 
 #if defined(__APPLE__) || defined(_WIN32)
             pollTranscriptions();
+            expirePendingEncodeWaits();
 #endif
 
             if (bookmarkScanMode) {
@@ -1993,21 +2271,27 @@ private:
                 bool   driftReject = slot.module->driftGateEnabled
                                      && gAbove >= slot.module->staticGateMinFrames
                                      && driftStd > slot.module->driftMaxStdHz;
-                if (staticReject || driftReject || onAirMs < (int64_t)slot.module->minTransmissionMs) {
+                std::string stuckNoiseReason;
+                bool stuckNoiseReject = slot.module->shouldRejectStuckNoise(slot, stuckNoiseReason);
+                if (stuckNoiseReject) {
+                    flog::info("[ChannelBank] Discarding stuck-noise recording ({0}) slot {1}",
+                               stuckNoiseReason, slot.gridIdx);
+                }
+                if (staticReject || driftReject || stuckNoiseReject || onAirMs < (int64_t)slot.module->minTransmissionMs) {
                     std::remove(slot.currentFilePath.c_str());
                 } else {
                     // Recording meets the minimum duration — process it even though
                     // it was cut short by a stop/scan-advance/block rather than by
                     // the normal silence-tail path.
-                    normalizeWavFile(slot.currentFilePath);
+                    slot.module->normalizeRecordingIfEnabled(slot.currentFilePath);
                     if (slot.module->m4aEnabled && slot.module->recordingEnabled
                             && slot.module->encodeThreadRunning.load()) {
                         // Queue for direct encoding (no playback, no transcription).
                         float avgSnrDb = (slot.snrCount > 0)
                             ? slot.snrSum / (float)slot.snrCount : 0.0f;
-                        slot.module->triggerEncode(slot.currentFilePath, {}, avgSnrDb);
+                        slot.module->triggerEncode(slot.currentFilePath, slot.currentFinalM4APath, {}, avgSnrDb);
                     }
-                    // If M4A encoding is off the normalized WAV stays on disk as-is.
+                    // If M4A encoding is off the WAV stays on disk as-is.
                 }
             }
         }
@@ -2178,6 +2462,8 @@ private:
                     bool   driftReject = _this->driftGateEnabled
                                          && gAbove >= _this->staticGateMinFrames
                                          && driftStd > _this->driftMaxStdHz;
+                    std::string stuckNoiseReason;
+                    bool stuckNoiseReject = _this->shouldRejectStuckNoise(*slot, stuckNoiseReason);
 
                     if (staticReject) {
                         flog::info("[ChannelBank] Discarding static recording (carrier in {0}/{1} frames = {2:.0f}%% < {3:.0f}%%) slot {4}{5}",
@@ -2190,6 +2476,11 @@ private:
                                    driftStd, _this->driftMaxStdHz, gAbove, slot->gridIdx,
                                    forceClose ? " [dur-cap]" : "");
                         std::remove(slot->currentFilePath.c_str());
+                    } else if (stuckNoiseReject) {
+                        flog::info("[ChannelBank] Discarding stuck-noise recording ({0}) slot {1}{2}",
+                                   stuckNoiseReason, slot->gridIdx,
+                                   forceClose ? " [dur-cap]" : "");
+                        std::remove(slot->currentFilePath.c_str());
                     } else if (onAirMs < (int64_t)_this->minTransmissionMs) {
                         flog::info("[ChannelBank] Discarding short recording (on-air {0}ms < {1}ms threshold; span was {2}ms)", onAirMs, _this->minTransmissionMs, signalMs);
                         std::remove(slot->currentFilePath.c_str());
@@ -2197,19 +2488,22 @@ private:
                         flog::info("[ChannelBank] Keeping recording (on-air {0}ms / span {1}ms, carrier {2}/{3} = {4:.0f}%%, drift {5:.0f}Hz) slot {6}",
                                    onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f, driftStd, slot->gridIdx);
 #if defined(__APPLE__) || defined(_WIN32)
+                        bool transcriptionStarted = false;
                         if (_this->transcriptionOn()) {
                             if (slot->transcribeHandle) {
                                 _this->txCancel(slot->transcribeBackend, slot->transcribeHandle);
                                 _this->txDestroy(slot->transcribeBackend, slot->transcribeHandle);
+                                slot->transcribeHandle = nullptr;
                             }
                             slot->pendingTranscriptPath = slot->currentFilePath;
                             slot->liveTranscript.clear();
-                            slot->transcribeBackend = _this->transcriptionBackend;
-                            slot->transcribeHandle  = _this->txTranscribeFile(
-                                slot->transcribeBackend,
-                                slot->currentFilePath.c_str());
+                            slot->liveSegments.clear();
+                            transcriptionStarted = _this->startTranscriptionJob(
+                                slot->currentFilePath,
+                                _this->displayName(slot->freqHz));
                         }
-                        // Register for M4A encoding after playback+transcription both complete.
+                        // Register for M4A encoding after playback+transcription,
+                        // bounded by kM4ATranscriptionMaxWaitSec from file close.
                         // transcriptionDone=true when transcription is off or failed to start,
                         // so encoding fires immediately after playback in those cases.
                         if (_this->m4aEnabled && _this->recordingEnabled && !slot->currentFilePath.empty()) {
@@ -2218,8 +2512,10 @@ private:
                             std::lock_guard<std::mutex> elk(_this->pendingEncodesMtx);
                             EncodeState& es = _this->pendingEncodes[slot->currentFilePath];
                             es.playbackDone      = false;
-                            es.transcriptionDone = (!_this->transcriptionOn() || !slot->transcribeHandle);
+                            es.transcriptionDone = (!_this->transcriptionOn() || !transcriptionStarted);
+                            es.finalM4APath      = slot->currentFinalM4APath;
                             es.avgSnrDb          = avgSnrDb;
+                            es.queuedAt          = std::chrono::steady_clock::now();
                         }
 #endif
                         // Log the frequency and queue for playback
@@ -2232,7 +2528,7 @@ private:
                             {
                                 std::lock_guard<std::mutex> lk(_this->playbackMtx);
                                 // deleteAfter=true when recording is disabled — play it back but don't keep the file
-                                _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, !_this->recordingEnabled});
+                                _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, slot->currentFinalM4APath, !_this->recordingEnabled});
                                 qSize = _this->playbackQueue.size();
                                 _this->playbackCv.notify_one();
                             }
@@ -2281,22 +2577,33 @@ private:
         // atomic and fadeOutRemaining is DSP-thread-only.
         float tailFade = 1.0f;
         // Audio fade is driven by rawSignalPresent plus a short independent hold
-        // (200 ms, ~9600 samples).  This hold is separate from signalHoldMs so that
+        // (600 ms, ~28800 samples).  This hold is separate from signalHoldMs so that
         // AM mode doesn't write AGC ramp-up noise for the entire hold period before
-        // the fade kicks in.  200 ms is long enough to bridge SSB inter-word pauses
-        // without creating audible dropouts.
+        // the fade kicks in.  600 ms bridges normal HF SSB inter-word pauses without
+        // forcing Hold Hysteresis low enough to keep marginal noise recordings open.
         //
         // The file stays open for the full signalHoldMs+tailMs period (driven by
         // signalPresent + the silenceElapsed counter above), but any audio written
         // after the fade completes is digital silence (tailFade = 0.0f).
-        const int AUDIO_HOLD_SAMPLES = 9600;  // 200 ms @ 48 kHz
+        const int AUDIO_HOLD_SAMPLES = 16800; // 350 ms @ 48 kHz
+        const int POST_FADE_REOPEN_HITS = 2;  // same 100 ms qualifier used for file-open
         bool rawAlive = slot->rawSignalPresent.load();
-        if (rawAlive) {
+        bool fullyFaded = (slot->fadeOutRemaining <= 0 && slot->audioHoldRemaining <= 0);
+        // Once audio is already at digital silence, still require a qualified raw
+        // detection before unmuting again. Keep this at the same 2-frame threshold
+        // as file-open; stricter post-fade gating clipped resumed voice after
+        // normal HF speech gaps.
+        bool rawAudioQualified = rawAlive && (!fullyFaded || slot->rawConsecutiveHits.load() >= POST_FADE_REOPEN_HITS);
+        if (rawAudioQualified) {
             slot->audioHoldRemaining = AUDIO_HOLD_SAMPLES;
         } else if (slot->audioHoldRemaining > 0) {
             slot->audioHoldRemaining = std::max(0, slot->audioHoldRemaining - count);
         }
-        bool signalAlive = rawAlive || (slot->audioHoldRemaining > 0);
+        // Keep the audio fade stricter than the recording/file lifetime.  The
+        // smoothed SNR/vote path can keep the WAV open through weak HF pauses,
+        // but once raw detection falls away we should let the written audio fade
+        // down instead of holding full-volume static until close.
+        bool signalAlive = rawAudioQualified || (slot->audioHoldRemaining > 0);
         if (signalAlive) {
             slot->fadeOutRemaining = 2400;   // hold at max while signal (or hold) is present
         } else {
@@ -2361,11 +2668,178 @@ private:
 
     // ── Playback monitor ─────────────────────────────────────────────────────
 
-    void triggerEncode(const std::string& wavPath, const std::string& transcript = {}, float avgSnrDb = 0.0f) {
+    void triggerEncode(const std::string& wavPath, const std::string& finalM4APath = {}, const std::string& transcript = {}, float avgSnrDb = 0.0f, int attempt = 0) {
         std::lock_guard<std::mutex> lk(encodeQueueMtx);
-        encodeQueue.push_back({wavPath, transcript, avgSnrDb});
+        encodeQueue.push_back({wavPath, finalM4APath, transcript, avgSnrDb, attempt});
         encodeQueueCv.notify_one();
     }
+
+#if defined(__APPLE__) || defined(_WIN32)
+    static bool m4aLooksComplete(const std::filesystem::path& path) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) return false;
+        if (!std::filesystem::is_regular_file(path, ec) || ec) return false;
+        auto size = std::filesystem::file_size(path, ec);
+        return !ec && size > 512;
+    }
+
+    static bool retryDelay(int attempt) {
+        if (attempt <= 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
+        return true;
+    }
+
+    static bool copyFileWithRetries(const std::filesystem::path& from,
+                                    const std::filesystem::path& to,
+                                    const char* desc,
+                                    std::error_code& lastEc) {
+        for (int attempt = 1; attempt <= kM4AFsRetryAttempts; attempt++) {
+            lastEc.clear();
+            std::filesystem::copy_file(from, to,
+                                       std::filesystem::copy_options::overwrite_existing,
+                                       lastEc);
+            if (!lastEc) return true;
+            retryDelay(attempt);
+        }
+        flog::error("[ChannelBank] M4A staging failed: {0} ({1}): {2}",
+                    desc, lastEc.message(), to.string());
+        return false;
+    }
+
+    static bool removeFileWithRetries(const std::filesystem::path& path,
+                                      const char* desc,
+                                      std::error_code& lastEc,
+                                      bool missingIsOk = true) {
+        for (int attempt = 1; attempt <= kM4AFsRetryAttempts; attempt++) {
+            lastEc.clear();
+            if (missingIsOk && !std::filesystem::exists(path, lastEc)) {
+                if (!lastEc) return true;
+                lastEc.clear();
+            }
+            std::filesystem::remove(path, lastEc);
+            if (!lastEc) return true;
+            retryDelay(attempt);
+        }
+        flog::warn("[ChannelBank] M4A staging warning: {0} ({1}): {2}",
+                   desc, lastEc.message(), path.string());
+        return false;
+    }
+
+    static bool renameFileWithRetries(const std::filesystem::path& from,
+                                      const std::filesystem::path& to,
+                                      const char* desc,
+                                      std::error_code& lastEc) {
+        for (int attempt = 1; attempt <= kM4AFsRetryAttempts; attempt++) {
+            lastEc.clear();
+            std::filesystem::rename(from, to, lastEc);
+            if (!lastEc) return true;
+            retryDelay(attempt);
+        }
+        flog::error("[ChannelBank] M4A staging failed: {0} ({1}): {2}",
+                    desc, lastEc.message(), to.string());
+        return false;
+    }
+
+    std::filesystem::path makeEncodeStagingDir() {
+        static std::atomic<uint64_t> seq { 0 };
+        uint64_t id = seq.fetch_add(1);
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+
+        std::error_code ec;
+        std::filesystem::path base = std::filesystem::path(root) / "channel_bank" / "tmp" / "encode";
+        std::filesystem::create_directories(base, ec);
+        if (ec) {
+            ec.clear();
+            base = std::filesystem::temp_directory_path(ec) / "sdrpp-channel-bank" / "encode";
+            if (ec) return {};
+            std::filesystem::create_directories(base, ec);
+            if (ec) return {};
+        }
+
+        std::filesystem::path dir = base / ("job-" + std::to_string(now) + "-" + std::to_string(id));
+        std::filesystem::create_directories(dir, ec);
+        if (ec) return {};
+        return dir;
+    }
+
+    std::string encodeWavToM4AStaged(const std::string& wavPath, const std::string& finalM4APath, const std::string& transcript, float avgSnrDb) {
+        std::filesystem::path originalWav(wavPath);
+        std::filesystem::path finalM4A = finalM4APath.empty() ? originalWav : std::filesystem::path(finalM4APath);
+        if (finalM4APath.empty()) finalM4A.replace_extension(".m4a");
+
+        std::filesystem::path stagingDir = makeEncodeStagingDir();
+        if (stagingDir.empty()) {
+            flog::error("[ChannelBank] M4A staging failed: could not create local temp directory");
+            return {};
+        }
+
+        auto cleanupStaging = [&]() {
+            std::error_code ec;
+            std::filesystem::remove_all(stagingDir, ec);
+        };
+
+        std::filesystem::path stagedWav = stagingDir / originalWav.filename();
+        std::filesystem::path finalPart(finalM4A.string() + ".part-" +
+                                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+
+        std::error_code ec;
+        if (!copyFileWithRetries(originalWav, stagedWav, "could not copy WAV locally", ec)) {
+            cleanupStaging();
+            return {};
+        }
+
+        std::string stagedM4A = encoding::wavToM4A(stagedWav.string(), transcript, avgSnrDb);
+        if (stagedM4A.empty() || !m4aLooksComplete(stagedM4A)) {
+            flog::error("[ChannelBank] M4A staging failed: local encode did not produce a complete file: {0}",
+                        wavPath);
+            cleanupStaging();
+            return {};
+        }
+
+        std::filesystem::create_directories(finalM4A.parent_path(), ec);
+        ec.clear();
+        removeFileWithRetries(finalPart, "could not remove stale .part file", ec);
+        ec.clear();
+        if (!copyFileWithRetries(stagedM4A, finalPart, "could not copy final M4A to destination", ec)) {
+            removeFileWithRetries(finalPart, "could not remove failed .part file", ec);
+            cleanupStaging();
+            return {};
+        }
+
+        ec.clear();
+        auto stagedTime = std::filesystem::last_write_time(stagedM4A, ec);
+        if (!ec) {
+            std::error_code timeEc;
+            std::filesystem::last_write_time(finalPart, stagedTime, timeEc);
+        }
+
+        ec.clear();
+        removeFileWithRetries(finalM4A, "could not remove previous M4A", ec);
+        ec.clear();
+        if (!renameFileWithRetries(finalPart, finalM4A, "could not publish final M4A", ec)) {
+            removeFileWithRetries(finalPart, "could not remove unpublished .part file", ec);
+            cleanupStaging();
+            return {};
+        }
+
+        if (!m4aLooksComplete(finalM4A)) {
+            flog::error("[ChannelBank] M4A staging failed: published M4A failed size check: {0}",
+                        finalM4A.string());
+            cleanupStaging();
+            return {};
+        }
+
+        ec.clear();
+        removeFileWithRetries(originalWav, "could not remove original WAV after encode", ec, false);
+        if (ec) {
+            flog::warn("[ChannelBank] M4A encoded but original WAV could not be removed ({0}): {1}",
+                       ec.message(), wavPath);
+        }
+
+        cleanupStaging();
+        return finalM4A.string();
+    }
+#endif
 
     // Drain the oldest entries from the playback queue WITHOUT playing them.
     // Each drained entry has its M4A pipeline kicked off (or its WAV deleted if
@@ -2395,7 +2869,7 @@ private:
                 pendingEncodes.erase(entry.path);
 #endif
             } else {
-                normalizeWavFile(entry.path);
+                normalizeRecordingIfEnabled(entry.path);
 #if defined(__APPLE__) || defined(_WIN32)
                 // Mark playbackDone in pendingEncodes; if transcription is also
                 // done, fire the M4A encode now.  Otherwise leave the entry
@@ -2403,6 +2877,7 @@ private:
                 // finishes, with the transcript baked in.
                 if (m4aEnabled && recordingEnabled) {
                     bool        canEncode = false;
+                    std::string encodeFinalM4APath = entry.finalM4APath;
                     std::string encodeTranscript;
                     float       encodeSnrDb = 0.0f;
                     {
@@ -2410,15 +2885,19 @@ private:
                         auto it = pendingEncodes.find(entry.path);
                         if (it != pendingEncodes.end()) {
                             it->second.playbackDone = true;
+                            it->second.playbackDoneAt = std::chrono::steady_clock::now();
                             if (it->second.transcriptionDone) {
                                 canEncode        = true;
+                                encodeFinalM4APath = it->second.finalM4APath;
                                 encodeTranscript = it->second.transcript;
                                 encodeSnrDb      = it->second.avgSnrDb;
                                 pendingEncodes.erase(it);
                             }
+                        } else {
+                            canEncode = true;
                         }
                     }
-                    if (canEncode) triggerEncode(entry.path, encodeTranscript, encodeSnrDb);
+                    if (canEncode) triggerEncode(entry.path, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
                 }
                 // If m4a is disabled the WAV stays as-is on disk — same outcome
                 // as if playback had run to completion with m4aEnabled=false.
@@ -2446,11 +2925,23 @@ private:
             }
             if (!task.wavPath.empty()) {
 #if defined(__APPLE__) || defined(_WIN32)
-                auto result = encoding::wavToM4A(task.wavPath, task.transcript, task.avgSnrDb);
-                if (result.empty())
-                    flog::error("[ChannelBank] M4A encoding failed: {0}", task.wavPath);
-                else
+                auto result = encodeWavToM4AStaged(task.wavPath, task.finalM4APath, task.transcript, task.avgSnrDb);
+                if (result.empty()) {
+                    std::error_code ec;
+                    bool canRetry = task.attempt + 1 < kM4AEncodeMaxAttempts
+                                    && std::filesystem::exists(task.wavPath, ec) && !ec;
+                    if (canRetry) {
+                        int nextAttempt = task.attempt + 1;
+                        flog::warn("[ChannelBank] M4A encoding failed; retrying attempt {0}/{1}: {2}",
+                                   nextAttempt + 1, kM4AEncodeMaxAttempts, task.wavPath);
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        triggerEncode(task.wavPath, task.finalM4APath, task.transcript, task.avgSnrDb, nextAttempt);
+                    } else {
+                        flog::error("[ChannelBank] M4A encoding failed permanently: {0}", task.wavPath);
+                    }
+                } else {
                     flog::info("[ChannelBank] Encoded: {0}", result);
+                }
 #endif
             }
         }
@@ -2464,14 +2955,22 @@ private:
         while (playbackRunning) {
             std::string path;
             double      playFreq    = 0.0;
+            std::string finalM4APath;
             bool        deleteAfter = false;
             {
                 std::lock_guard<std::mutex> lk(playbackMtx);
                 if (!playbackQueue.empty()) {
                     path        = playbackQueue.front().path;
                     playFreq    = playbackQueue.front().freqHz;
+                    finalM4APath = playbackQueue.front().finalM4APath;
                     deleteAfter = playbackQueue.front().deleteAfter;
                     playbackQueue.pop_front();
+#if defined(__APPLE__) || defined(_WIN32)
+                    {
+                        std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
+                        currentPlaybackPath = path;
+                    }
+#endif
                 }
             }
 
@@ -2498,7 +2997,7 @@ private:
                 }
                 playbackPosMs.store(0);
 #endif
-                normalizeWavFile(path);
+                normalizeRecordingIfEnabled(path);
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path);
                 currentlyPlayingFreqKey.store(0);
@@ -2514,6 +3013,7 @@ private:
                 else if (m4aEnabled) {
                     // Playback done — check if transcription is also complete
                     bool        canEncode = false;
+                    std::string encodeFinalM4APath = finalM4APath;
                     std::string encodeTranscript;
                     float       encodeSnrDb = 0.0f;
                     {
@@ -2521,15 +3021,25 @@ private:
                         auto it = pendingEncodes.find(path);
                         if (it != pendingEncodes.end()) {
                             it->second.playbackDone = true;
+                            it->second.playbackDoneAt = std::chrono::steady_clock::now();
                             if (it->second.transcriptionDone) {
                                 canEncode        = true;
+                                encodeFinalM4APath = it->second.finalM4APath;
                                 encodeTranscript = it->second.transcript;
                                 encodeSnrDb      = it->second.avgSnrDb;
                                 pendingEncodes.erase(it);
                             }
+                        } else {
+                            canEncode = true;
                         }
                     }
-                    if (canEncode) triggerEncode(path, encodeTranscript, encodeSnrDb);
+                    if (canEncode) triggerEncode(path, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
+                }
+#endif
+#if defined(__APPLE__) || defined(_WIN32)
+                {
+                    std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
+                    if (currentPlaybackPath == path) currentPlaybackPath.clear();
                 }
 #endif
             } else {
@@ -3151,6 +3661,24 @@ private:
 
         if (_this->running) { style::endDisabled(); }
 
+        bool canLimitPassbands = _this->manualMode;
+        if (!canLimitPassbands) style::beginDisabled();
+        if (ImGui::Checkbox(CONCAT("Limit to manual passbands##_cb_manpb_", _this->name),
+                            &_this->manualPassbandLimit)) {
+            config.acquire();
+            config.conf[_this->name]["manualPassbandLimit"] = _this->manualPassbandLimit;
+            config.release(true);
+            _this->resetDetectorFloor();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Manual mode only.\n"
+                              "USB watches bookmark to +channel spacing.\n"
+                              "LSB watches -channel spacing to bookmark.\n"
+                              "AM/NFM/WFM watch a centered channel-width passband.\n"
+                              "When off, manual detection uses the current full-span floor.");
+        }
+        if (!canLimitPassbands) style::endDisabled();
+
         // Manual frequency list — editable while running
         if (_this->manualMode) {
             // Refresh bookmark JSON once per second so newly-added entries
@@ -3705,6 +4233,52 @@ private:
                                   "If real (slightly off-tuned) signals are discarded, raise it.");
         }
 
+        if (ImGui::Checkbox(CONCAT("Stuck Noise Guard##_cb_stucknoise_", _this->name),
+                            &_this->stuckNoiseGuardEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["stuckNoiseGuardEnabled"] = _this->stuckNoiseGuardEnabled;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Manual passband mode only. Currently debug-only;\n"
+                              "shows whether long recordings stay continuously\n"
+                              "active while the passband centroid wanders like\n"
+                              "drifting local interference. Does not discard.");
+        if (_this->stuckNoiseGuardEnabled) {
+            ImGui::LeftLabel("  Guard After");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_cb_stucksec_", _this->name),
+                                   &_this->stuckNoiseGuardMinSec, 20.0f, 180.0f, "%.0f s")) {
+                config.acquire();
+                config.conf[_this->name]["stuckNoiseGuardMinSec"] = _this->stuckNoiseGuardMinSec;
+                config.release(true);
+            }
+            ImGui::LeftLabel("  Active Min");
+            ImGui::FillWidth();
+            float activePct = _this->stuckNoiseGuardActiveFrac * 100.0f;
+            if (ImGui::SliderFloat(CONCAT("##_cb_stuckactive_", _this->name),
+                                   &activePct, 70.0f, 98.0f, "%.0f %%")) {
+                _this->stuckNoiseGuardActiveFrac = activePct / 100.0f;
+                config.acquire();
+                config.conf[_this->name]["stuckNoiseGuardActiveFrac"] = _this->stuckNoiseGuardActiveFrac;
+                config.release(true);
+            }
+            ImGui::LeftLabel("  Drift Min");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_cb_stuckdrift_", _this->name),
+                                   &_this->stuckNoiseGuardDriftHz, 300.0f, 3000.0f, "%.0f Hz")) {
+                config.acquire();
+                config.conf[_this->name]["stuckNoiseGuardDriftHz"] = _this->stuckNoiseGuardDriftHz;
+                config.release(true);
+            }
+            std::string dbg = _this->getStuckNoiseDebug();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+            ImGui::TextWrapped("Noise guard: %s%s",
+                               (_this->manualMode && _this->manualPassbandLimit) ? "" : "inactive; ",
+                               dbg.empty() ? "waiting for close" : dbg.c_str());
+            ImGui::PopStyleColor();
+        }
+
         // Cooldown (live)
         ImGui::LeftLabel("Cooldown");
         ImGui::FillWidth();
@@ -3872,11 +4446,27 @@ private:
             ImGui::TextUnformatted("32 kbps AAC");
             ImGui::PopStyleColor();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
-            ImGui::TextWrapped("WAV converted after first playback%s. WAV deleted on success.",
-                _this->transcriptionOn() ? " + transcription" : "");
+            if (_this->transcriptionOn()) {
+                ImGui::TextWrapped("WAV converted after playback or %ds transcript wait. WAV deleted on success.",
+                    kM4ATranscriptionMaxWaitSec);
+            } else {
+                ImGui::TextWrapped("WAV converted after first playback. WAV deleted on success.");
+            }
             ImGui::PopStyleColor();
         }
 #endif
+
+        if (ImGui::Checkbox(CONCAT("Normalize recordings##_cb_normrec_", _this->name),
+                            &_this->normalizeRecordings)) {
+            config.acquire();
+            config.conf[_this->name]["normalizeRecordings"] = _this->normalizeRecordings;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("When enabled, completed WAVs are rewritten to trim silence\n"
+                              "and add a small silence pad before playback/M4A encoding.\n"
+                              "Turn off to preserve the raw recorded file.");
+        }
 
         // Record gain (live)
         ImGui::LeftLabel("Rec Gain");
@@ -3993,9 +4583,9 @@ private:
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Skip playback for ALL queued recordings.\n"
                                       "Each is sent straight to M4A encoding instead.\n"
-                                      "WAVs are encoded with full transcripts when\n"
-                                      "transcription is done; otherwise the encode\n"
-                                      "fires once Whisper catches up.");
+                                      "WAVs include transcripts when ready; otherwise\n"
+                                      "encoding proceeds after the transcription wait\n"
+                                      "limit so the recording folder keeps moving.");
             }
 
             // Diagnostic: show noise floor + threshold in dB
@@ -4410,6 +5000,7 @@ private:
     // Manages slots for the current bookmark scan stop.
     // Returns true if any slot currently has signal or an open file.
     bool manageBookmarkScanChannels() {
+        if (retuneFlag.load()) return false;
         if (bookmarkScanStops.empty()) return false;
         auto& stop = bookmarkScanStops[bookmarkScanStopIdx];
 
@@ -4533,6 +5124,7 @@ private:
         config.acquire();
         config.conf[name]["manualMode"]       = manualMode;
         config.conf[name]["bookmarkScanMode"] = bookmarkScanMode;
+        config.conf[name]["manualPassbandLimit"] = manualPassbandLimit;
         auto& arr = config.conf[name]["manualFrequencies"];
         arr = nlohmann::json::array();
         for (double f : manualFrequencies) arr.push_back(f);
@@ -4602,6 +5194,85 @@ private:
         return out;
     }
 
+    bool manualPassbandBinsForFreq(double freqHz, double binHz, int& lo, int& hi) const {
+        if (lastKnownSr <= 0.0 || binHz <= 0.0) return false;
+        double freqOffset = freqHz - lastKnownCenter;
+        if (std::abs(freqOffset) >= lastKnownSr / 2.0) return false;
+
+        int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+        int widthBins = std::max(1, (int)std::round(channelSpacing / binHz));
+
+        if (demodMode == DEMOD_USB) {
+            lo = centerBin;
+            hi = centerBin + widthBins;
+        } else if (demodMode == DEMOD_LSB) {
+            lo = centerBin - widthBins;
+            hi = centerBin;
+        } else {
+            int half = std::max(1, widthBins / 2);
+            lo = centerBin - half;
+            hi = centerBin + half;
+        }
+
+        lo = std::clamp(lo, 0, FFT_SIZE - 1);
+        hi = std::clamp(hi, 0, FFT_SIZE - 1);
+        return lo <= hi;
+    }
+
+    void resetDetectorFloor() {
+        detectorFloorResetRequested.store(true);
+    }
+
+    bool shouldRejectStuckNoise(ChannelSlot& slot, std::string& reason) {
+        int totalFrames  = slot.noiseGuardFramesTotal.load();
+        int activeFrames = slot.noiseGuardFramesActive.load();
+        float activeFrac = (totalFrames > 0) ? (float)activeFrames / (float)totalFrames : 0.0f;
+        float openSec = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - slot.fileOpenTime).count();
+
+        double mean = (activeFrames > 0) ? slot.noiseGuardCentroidSum / (double)activeFrames : 0.0;
+        double var = (activeFrames > 0)
+            ? std::max(0.0, slot.noiseGuardCentroidSumSq / (double)activeFrames - mean * mean)
+            : 0.0;
+        float driftHz = (float)std::sqrt(var);
+        float widthHz = (activeFrames > 0)
+            ? (float)(slot.noiseGuardWidthSum / (double)activeFrames)
+            : 0.0f;
+        constexpr float STUCK_NOISE_MAX_WIDTH_HZ = 650.0f;
+
+        char buf[192];
+        snprintf(buf, sizeof(buf), "sec=%.0f active=%.0f%% drift=%.0fHz width=%.0fHz frames=%d",
+                 openSec, activeFrac * 100.0f, driftHz, widthHz, totalFrames);
+        reason = buf;
+
+        {
+            std::lock_guard<std::mutex> lk(stuckNoiseDebugMtx);
+            lastStuckNoiseDebug = reason;
+        }
+
+        if (!stuckNoiseGuardEnabled || !manualMode || !manualPassbandLimit) return false;
+        // Observation-only for now. Field testing showed this guard can suppress
+        // copyable HF traffic before we have enough shape data to trust it.
+        // Keep the debug line above live, but never discard recordings here.
+        bool allowStuckNoiseDiscard = false;
+        if (!allowStuckNoiseDiscard) return false;
+        if (openSec < stuckNoiseGuardMinSec) return false;
+        if (totalFrames < (int)(stuckNoiseGuardMinSec * SPEC_ANALYSIS_HZ * 0.5f)) return false;
+        if (activeFrac < stuckNoiseGuardActiveFrac) return false;
+        if (driftHz < stuckNoiseGuardDriftHz) return false;
+        // Real SSB voice can be long, continuously active, and centroid-drifty as
+        // syllables move energy around the passband. Only discard when the energy
+        // also stays narrow, which is the more useful signature of a wandering
+        // local-noise line.
+        if (widthHz > STUCK_NOISE_MAX_WIDTH_HZ) return false;
+        return true;
+    }
+
+    std::string getStuckNoiseDebug() {
+        std::lock_guard<std::mutex> lk(stuckNoiseDebugMtx);
+        return lastStuckNoiseDebug;
+    }
+
     void loadFMConfig() {
         fmLists.clear();
         std::map<int64_t, BookmarkEntry> newNames;
@@ -4637,6 +5308,8 @@ private:
     }
 
     void manageManualChannels() {
+        if (retuneFlag.load()) return;
+
         std::set<int>       localDetected;
         std::set<int>       localRawDetected;
         std::map<int,float> localSnrDb;
@@ -4779,6 +5452,12 @@ private:
     // static gate can't (each drifting spur is a carrier, so it reads as "voice-like").
     bool         driftGateEnabled   = true;
     float        driftMaxStdHz      = 700.0f; // carrier-centroid stddev above this (Hz) ⇒ drifting ⇒ discard
+    bool         stuckNoiseGuardEnabled = false;
+    float        stuckNoiseGuardMinSec = 45.0f;
+    float        stuckNoiseGuardActiveFrac = 0.85f;
+    float        stuckNoiseGuardDriftHz = 900.0f;
+    std::mutex   stuckNoiseDebugMtx;
+    std::string  lastStuckNoiseDebug;
     float        leftTrimFrac   = 0.0f;  // fraction of bandwidth to exclude from left edge
     float        rightTrimFrac  = 0.0f;  // fraction of bandwidth to exclude from right edge
     bool         draggingLeft   = false;
@@ -4800,7 +5479,8 @@ private:
     // True if any non-Off backend is selected — most call sites just want to
     // know "is transcription on?", regardless of which backend.
     bool         transcriptionOn() const { return transcriptionBackend != TB_OFF; }
-    bool         m4aEnabled            = false;  // encode to M4A after playback+transcription
+    bool         m4aEnabled            = false;  // encode to M4A after playback plus bounded transcript wait
+    bool         normalizeRecordings   = true;   // trim/pad completed WAVs before playback or M4A
     float        recGain       = 0.25f;     // linear gain applied before WAV write (~-12dB)
     int          minTransmissionMs = 300;   // discard recordings shorter than this
     int          tailMs            = 500;   // ms to keep recording after signal gone
@@ -4852,6 +5532,7 @@ private:
 
     // Manual mode
     bool manualMode = false;
+    bool manualPassbandLimit = false;
     std::mutex manualFreqMtx;
     std::vector<double>   manualFrequencies;    // user-entered frequencies (custom additions)
     std::set<std::string> boundBookmarkLists;   // names of bound FM bookmark lists
@@ -4918,6 +5599,7 @@ private:
     float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
     float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
     std::deque<float>                       floorHistory;             // ring buffer of recent rawFloor values for median filter
+    std::atomic<bool>                       detectorFloorResetRequested { false };
     std::map<int, int>                      slotVotes;
 
     // Deferred retune — set by waterfall thread, consumed by DSP thread
@@ -5112,6 +5794,39 @@ private:
         if (backend >= TB_WHISPER_ATC_LARGE) return transcription_whisper::isFinal(h);
         return true;
     }
+
+    bool startTranscriptionJob(const std::string& path, const std::string& name) {
+        if (path.empty() || !transcriptionOn()) return false;
+
+        int backend = transcriptionBackend;
+        void* handle = txTranscribeFile(backend, path.c_str());
+        if (!handle) return false;
+
+        std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+        auto it = transcriptionJobs.find(path);
+        if (it != transcriptionJobs.end() && it->second.handle) {
+            txCancel(it->second.backend, it->second.handle);
+            txDestroy(it->second.backend, it->second.handle);
+        }
+        transcriptionJobs[path] = TranscriptionJob{path, name, backend, handle};
+        return true;
+    }
+
+    void cancelTranscriptionJobs() {
+        std::vector<TranscriptionJob> jobs;
+        {
+            std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+            for (auto& [path, job] : transcriptionJobs) {
+                if (job.handle) jobs.push_back(job);
+            }
+            transcriptionJobs.clear();
+        }
+
+        for (auto& job : jobs) {
+            txCancel(job.backend, job.handle);
+            txDestroy(job.backend, job.handle);
+        }
+    }
 #endif
 
     void logRecording(double hz) {
@@ -5160,17 +5875,22 @@ private:
     std::mutex       displayMtx;
     DisplaySnapshot  displaySnap;
 
-    // WAV → M4A encode queue (processed after playback + transcription both complete)
+    // WAV → M4A encode queue (processed after playback + transcription, bounded by timeout)
     struct EncodeState {
         bool        playbackDone      = false;
         bool        transcriptionDone = true;   // true = don't wait for transcription
+        std::string finalM4APath;               // empty = derive beside wavPath
         std::string transcript;                 // filled in when transcription finalises
         float       avgSnrDb          = 0.0f;  // average SNR over the recording
+        std::chrono::steady_clock::time_point queuedAt;
+        std::chrono::steady_clock::time_point playbackDoneAt;
     };
     struct EncodeTask {
         std::string wavPath;
+        std::string finalM4APath;
         std::string transcript;
         float       avgSnrDb = 0.0f;
+        int         attempt = 0;
     };
     std::map<std::string, EncodeState> pendingEncodes;
     std::mutex                         pendingEncodesMtx;
@@ -5187,6 +5907,7 @@ private:
     struct PlaybackEntry {
         std::string path;
         double      freqHz;
+        std::string finalM4APath;
         bool        deleteAfter;
 #if defined(__APPLE__) || defined(_WIN32)
         std::vector<transcription_whisper::Segment> segments;
@@ -5194,6 +5915,8 @@ private:
     };
     std::deque<PlaybackEntry> playbackQueue;
 #if defined(__APPLE__) || defined(_WIN32)
+    std::mutex transcriptionJobsMtx;
+    std::map<std::string, TranscriptionJob> transcriptionJobs;
     std::mutex  lastTranscriptMtx;
     std::string lastTranscriptText;  // most recently completed transcript
     std::string lastTranscriptName;  // displayName of the transcribed freq
@@ -5211,6 +5934,10 @@ private:
     std::map<std::string, std::vector<transcription_whisper::Segment>> pendingPlaybackSegments;
 #endif
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
+#if defined(__APPLE__) || defined(_WIN32)
+    std::string                     currentPlaybackPath;
+    std::mutex                      currentPlaybackPathMtx;
+#endif
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
     std::thread                     playbackThread;
@@ -5259,14 +5986,20 @@ private:
         p["staticGateVoiceFrac"]= staticGateVoiceFrac;
         p["driftGateEnabled"]   = driftGateEnabled;
         p["driftMaxStdHz"]      = driftMaxStdHz;
+        p["stuckNoiseGuardEnabled"] = stuckNoiseGuardEnabled;
+        p["stuckNoiseGuardMinSec"] = stuckNoiseGuardMinSec;
+        p["stuckNoiseGuardActiveFrac"] = stuckNoiseGuardActiveFrac;
+        p["stuckNoiseGuardDriftHz"] = stuckNoiseGuardDriftHz;
         p["leftTrimFrac"]       = leftTrimFrac;
         p["rightTrimFrac"]      = rightTrimFrac;
         p["signalHoldMs"]       = signalHoldMs;
         p["recordingEnabled"]   = recordingEnabled;
         p["transcriptionBackend"] = transcriptionBackend;
         p["m4aEnabled"]         = m4aEnabled;
+        p["normalizeRecordings"]= normalizeRecordings;
         p["manualMode"]         = manualMode;
         p["bookmarkScanMode"]   = bookmarkScanMode;
+        p["manualPassbandLimit"]= manualPassbandLimit;
         p["scanMode"]           = scanMode;
         p["scanQuietSec"]       = scanQuietSec;
         p["scanNoSignalSec"]    = scanNoSignalSec;
@@ -5306,14 +6039,20 @@ private:
         staticGateVoiceFrac= p.value("staticGateVoiceFrac", 0.30f);
         driftGateEnabled   = p.value("driftGateEnabled", true);
         driftMaxStdHz      = p.value("driftMaxStdHz", 700.0f);
+        stuckNoiseGuardEnabled = p.value("stuckNoiseGuardEnabled", false);
+        stuckNoiseGuardMinSec = p.value("stuckNoiseGuardMinSec", 45.0f);
+        stuckNoiseGuardActiveFrac = p.value("stuckNoiseGuardActiveFrac", 0.85f);
+        stuckNoiseGuardDriftHz = p.value("stuckNoiseGuardDriftHz", 900.0f);
         leftTrimFrac       = p.value("leftTrimFrac", 0.0f);
         rightTrimFrac      = p.value("rightTrimFrac", 0.0f);
         signalHoldMs       = p.value("signalHoldMs", 500);
         recordingEnabled   = p.value("recordingEnabled", true);
         transcriptionBackend = p.value("transcriptionBackend", (int)TB_OFF);
         m4aEnabled         = p.value("m4aEnabled", false);
+        normalizeRecordings= p.value("normalizeRecordings", true);
         manualMode         = p.value("manualMode", false);
         bookmarkScanMode   = p.value("bookmarkScanMode", false);
+        manualPassbandLimit= p.value("manualPassbandLimit", false);
         scanMode           = p.value("scanMode", false);
         scanQuietSec       = p.value("scanQuietSec", 3.0f);
         scanNoSignalSec    = p.value("scanNoSignalSec", 1.0f);

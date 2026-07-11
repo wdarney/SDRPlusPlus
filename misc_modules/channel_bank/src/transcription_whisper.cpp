@@ -145,7 +145,11 @@ static const char* kAtcPrompt =
 static std::mutex                              g_cacheMtx;
 static std::map<Model, whisper_context*>       g_ctxCache;
 static std::timed_mutex                        g_inferMtx;
+#ifdef _WIN32
+static constexpr int                           kInferTimeoutSec = 1800;
+#else
 static constexpr int                           kInferTimeoutSec = 120;
+#endif
 
 static whisper_context* getOrLoadCtx(Model m) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
@@ -183,7 +187,11 @@ void shutdown() {
 }
 
 // ── Session object ──────────────────────────────────────────────────────────
+#ifdef _WIN32
+static constexpr int kInferWallClockSec = 600;
+#else
 static constexpr int kInferWallClockSec = 90;
+#endif
 
 struct Session {
     std::atomic<bool>      finalFlag { false };
