@@ -36,7 +36,7 @@ SDRPP_MOD_INFO{
     /* Max instances    */ -1
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 enum TimeZone {
     TIME_ZONE_LOCAL,

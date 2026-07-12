@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.13)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.ios.cmake")
+    return()
+endif ()
+
 project(sdrpp_core)
 
 if (USE_INTERNAL_LIBCORRECT)
@@ -11,6 +17,8 @@ endif (USE_BUNDLE_DEFAULTS)
 
 # Main code
 file(GLOB_RECURSE SRC "src/*.cpp" "src/*.c")
+list(FILTER SRC EXCLUDE REGEX "src/core_ios\\.cpp$")
+list(FILTER SRC EXCLUDE REGEX "src/server_ios_stub\\.cpp$")
 
 add_definitions(-DSDRPP_IS_CORE)
 add_definitions(-DFLOG_ANDROID_TAG="SDR++")

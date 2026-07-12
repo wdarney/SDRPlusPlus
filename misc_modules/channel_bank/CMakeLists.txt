@@ -1,7 +1,14 @@
 cmake_minimum_required(VERSION 3.13)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.ios.cmake")
+    return()
+endif ()
+
 project(channel_bank)
 
 file(GLOB SRC "src/*.cpp")
+list(FILTER SRC EXCLUDE REGEX "src/main_ios\\.cpp$")
 if (APPLE AND NOT ANDROID)
     list(APPEND SRC src/transcription.mm src/encoding.mm src/transcription_whisper.mm)
     set_source_files_properties(src/transcription.mm src/encoding.mm src/transcription_whisper.mm PROPERTIES

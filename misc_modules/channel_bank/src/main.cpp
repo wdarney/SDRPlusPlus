@@ -2175,7 +2175,7 @@ private:
         else {
             double demodBw = (demodMode == DEMOD_WFM) ? 150000.0 : audioBw;
             slot.fmDemod = new dsp::demod::FM<dsp::stereo_t>();
-            slot.fmDemod->init(&slot.vfo->out, audioSr, demodBw, true, false);
+            slot.fmDemod->init(&slot.vfo->out, audioSr, demodBw, true);
         }
         dsp::stream<dsp::stereo_t>* demodOut =
             slot.amDemod  ? &slot.amDemod->out  :

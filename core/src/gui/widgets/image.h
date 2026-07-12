@@ -26,7 +26,7 @@ namespace ImGui {
         int _width;
         int _height;
 
-        GLuint textureId;
+        ImTextureID textureId;
 
         bool newData = false;
     };

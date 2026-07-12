@@ -1,4 +1,13 @@
 #include <gui/widgets/image.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#ifndef TARGET_OS_IPHONE
+#define TARGET_OS_IPHONE 0
+#endif
+#if TARGET_OS_IPHONE
+#include <ios_backend.h>
+#endif
 
 namespace ImGui {
     ImageDisplay::ImageDisplay(int width, int height) {
@@ -9,7 +18,13 @@ namespace ImGui {
         memset(buffer, 0, _width * _height * 4);
         memset(activeBuffer, 0, _width * _height * 4);
 
-        glGenTextures(1, &textureId);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        textureId = nullptr; // created lazily in updateTexture()
+#else
+        GLuint glId;
+        glGenTextures(1, &glId);
+        textureId = (ImTextureID)(intptr_t)glId;
+#endif
     }
 
     ImageDisplay::~ImageDisplay() {
@@ -41,7 +56,7 @@ namespace ImGui {
             updateTexture();
         }
 
-        window->DrawList->AddImage((void*)(intptr_t)textureId, min, ImVec2(min.x + width, min.y + height));
+        window->DrawList->AddImage(textureId, min, ImVec2(min.x + width, min.y + height));
     }
 
     void ImageDisplay::swap() {
@@ -54,11 +69,16 @@ namespace ImGui {
     }
 
     void ImageDisplay::updateTexture() {
-        glBindTexture(GL_TEXTURE_2D, textureId);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        backend::iosUpdateTexture(&textureId, _width, _height, activeBuffer);
+#else
+        GLuint glId = (GLuint)(intptr_t)textureId;
+        glBindTexture(GL_TEXTURE_2D, glId);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _width, _height, 0, GL_RGBA, GL_UNSIGNED_BYTE, activeBuffer);
+#endif
     }
 
 }

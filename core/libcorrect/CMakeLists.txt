@@ -71,15 +71,40 @@ set(INSTALL_HEADERS "${PROJECT_BINARY_DIR}/include/correct.h")
 
 add_custom_target(correct-h ALL COMMAND ${CMAKE_COMMAND} -E copy ${PROJECT_SOURCE_DIR}/include/correct.h ${PROJECT_BINARY_DIR}/include/correct.h)
 
+# Source lists used to define correct_static with explicit files.
+# CMake's Xcode generator does not emit a Libtool step when a STATIC library
+# is defined solely via $<TARGET_OBJECTS:…> generator expressions, so the
+# combined archive is never created. Listing sources directly fixes this while
+# keeping the OBJECT-library approach for the shared library and fec shims.
+set(correct_static_srcs
+    src/reed-solomon/polynomial.c
+    src/reed-solomon/reed-solomon.c
+    src/reed-solomon/encode.c
+    src/reed-solomon/decode.c
+    src/convolutional/bit.c
+    src/convolutional/metric.c
+    src/convolutional/history_buffer.c
+    src/convolutional/error_buffer.c
+    src/convolutional/lookup.c
+    src/convolutional/convolutional.c
+    src/convolutional/encode.c
+    src/convolutional/decode.c)
+
 if(HAVE_SSE)
   set(correct_obj_files $<TARGET_OBJECTS:correct-reed-solomon> $<TARGET_OBJECTS:correct-convolutional> $<TARGET_OBJECTS:correct-convolutional-sse>)
+  list(APPEND correct_static_srcs
+      src/convolutional/sse/convolutional.c
+      src/convolutional/sse/decode.c
+      src/convolutional/sse/encode.c
+      src/convolutional/sse/lookup.c)
   set(INSTALL_HEADERS ${INSTALL_HEADERS} ${PROJECT_BINARY_DIR}/include/correct-sse.h)
   add_custom_target(correct-sse-h ALL COMMAND ${CMAKE_COMMAND} -E copy ${PROJECT_SOURCE_DIR}/include/correct-sse.h ${PROJECT_BINARY_DIR}/include/correct-sse.h)
 else()
   set(correct_obj_files $<TARGET_OBJECTS:correct-reed-solomon> $<TARGET_OBJECTS:correct-convolutional>)
 endif()
 add_library(correct SHARED ${correct_obj_files})
-add_library(correct_static STATIC ${correct_obj_files})
+add_library(correct_static STATIC ${correct_static_srcs})
+target_include_directories(correct_static PRIVATE ${PROJECT_SOURCE_DIR}/include)
 set_target_properties(correct_static PROPERTIES OUTPUT_NAME "correct")
 if(HAVE_SSE)
   target_compile_definitions(correct PUBLIC HAVE_SSE=1)
@@ -87,8 +112,10 @@ if(HAVE_SSE)
 endif()
 
 add_subdirectory(util)
-add_subdirectory(tests)
-add_subdirectory(tools)
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_subdirectory(tests)
+    add_subdirectory(tools)
+endif ()
 # add_subdirectory(benchmarks)
 
 # install(TARGETS correct correct_static

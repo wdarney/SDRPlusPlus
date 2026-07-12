@@ -15,6 +15,10 @@ namespace LoadingScreen {
     }
 
     void show(std::string msg) {
+        // On iOS, beginFrame()/render() are main-thread-only. sdrpp_main runs
+        // on a background thread, so skip the loading screen there. Init is
+        // fast enough (<1 s) that the user sees a blank screen briefly.
+        if (!backend::isRenderThread()) return;
         backend::beginFrame();
 
         ImGui::Begin("Main", NULL, WINDOW_FLAGS);

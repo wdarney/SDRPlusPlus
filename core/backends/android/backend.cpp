@@ -170,6 +170,7 @@ namespace backend {
 
     void setFrameRateLimit(int fps) {}
     int getFrameRateLimit() { return 0; }
+    bool isRenderThread() { return true; }
 
     // No screen pos to detect
     void getMouseScreenPos(double& x, double& y) { x = 0; y = 0; }

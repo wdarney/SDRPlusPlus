@@ -20,7 +20,7 @@ SDRPP_MOD_INFO{
     /* Max instances    */ 1
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 class RigctlClientModule : public ModuleManager::Instance {
 public:

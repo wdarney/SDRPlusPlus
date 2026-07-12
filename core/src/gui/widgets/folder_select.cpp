@@ -63,6 +63,15 @@ bool FolderSelect::pathIsValid() {
 }
 
 void FolderSelect::worker() {
+#ifdef TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE
+    // iOS forbids fork(), which pfd uses internally on Apple platforms to
+    // spawn osascript. The "..." button is still rendered (the text field
+    // already lets users type a path directly), but the OS picker is a no-op.
+    dialogOpen = false;
+    return;
+#endif
+#endif
     auto fold = pfd::select_folder("Select Folder", pathValid ? std::filesystem::path(expandString(path)).parent_path().string() : "");
     std::string res = fold.result();
 

@@ -18,7 +18,7 @@
 #include "radio_interface.h"
 #include "demod.h"
 
-ConfigManager config;
+static ConfigManager config;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 

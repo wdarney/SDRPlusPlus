@@ -1,4 +1,10 @@
 #include <gui/main_window.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#ifndef TARGET_OS_IPHONE
+#define TARGET_OS_IPHONE 0
+#endif
 #include <gui/gui.h>
 #include "imgui.h"
 #include <stdio.h>
@@ -27,6 +33,9 @@
 #include <gui/colormaps.h>
 #include <gui/widgets/snr_meter.h>
 #include <gui/tuner.h>
+#if TARGET_OS_IPHONE
+#include <ios_backend.h>
+#endif
 
 void MainWindow::init() {
     LoadingScreen::show("Initializing UI");
@@ -120,16 +129,12 @@ void MainWindow::init() {
     auto modList = core::configManager.conf["moduleInstances"].items();
     core::configManager.release();
 
-    // Load additional modules specified through config
+    // Load additional modules specified through config. In static-link mode
+    // these resolve via the registry — see ModuleManager::loadModule.
     for (auto const& path : modules) {
-#ifndef __ANDROID__
-        std::string apath = std::filesystem::absolute(path).string();
-        flog::info("Loading {0}", apath);
+        flog::info("Loading {0}", path);
         LoadingScreen::show("Loading " + std::filesystem::path(path).filename().string());
-        core::moduleManager.loadModule(apath);
-#else
         core::moduleManager.loadModule(path);
-#endif
     }
 
     // Create module instances
@@ -370,11 +375,14 @@ void MainWindow::draw() {
     ImGui::SameLine();
     float origY = ImGui::GetCursorPosY();
 
+#if !TARGET_OS_IPHONE
+    // On iOS the system hardware volume buttons handle level; showing a
+    // software slider wastes toolbar space and duplicates functionality.
     sigpath::sinkManager.showVolumeSlider(gui::waterfall.selectedVFO, "##_sdrpp_main_volume_", 248 * style::uiScale, btnSize.x, 5, true);
-
     ImGui::SameLine();
-
     ImGui::SetCursorPosY(origY);
+#endif
+
     gui::freqSelect.draw();
 
     ImGui::SameLine();
@@ -445,10 +453,23 @@ void MainWindow::draw() {
         bool down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
         if (grabbingMenu) {
             newWidth = mousePos.x;
+#if TARGET_OS_IPHONE
+            // On iPhone the screen is ~393 logical pts wide; the desktop 250pt
+            // minimum on both sides would make the clamp bounds cross (250 > 143),
+            // which is UB and always pins to 250. Use 100pt margins instead.
+            newWidth = std::clamp<float>(newWidth, 100.0f, winSize.x - 100.0f);
+#else
             newWidth = std::clamp<float>(newWidth, 250, winSize.x - 250);
+#endif
             ImGui::GetForegroundDrawList()->AddLine(ImVec2(newWidth, curY), ImVec2(newWidth, winSize.y - 10), ImGui::GetColorU32(ImGuiCol_SeparatorActive));
         }
-        if (mousePos.x >= newWidth - (2.0f * style::uiScale) && mousePos.x <= newWidth + (2.0f * style::uiScale) && mousePos.y > curY) {
+#if TARGET_OS_IPHONE
+        // Finger-friendly grab zone: 15 pt each side of the divider line.
+        const float menuGrabHalf = 15.0f;
+#else
+        const float menuGrabHalf = 2.0f * style::uiScale;
+#endif
+        if (mousePos.x >= newWidth - menuGrabHalf && mousePos.x <= newWidth + menuGrabHalf && mousePos.y > curY) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (click) {
                 grabbingMenu = true;
@@ -464,18 +485,65 @@ void MainWindow::draw() {
             core::configManager.conf["menuWidth"] = menuWidth;
             core::configManager.release(true);
         }
+
+#if TARGET_OS_IPHONE
+        // Draw a vertical pill grip on the menu/waterfall divider so the user
+        // can see where to touch.
+        {
+            float divX   = newWidth;
+            float midY   = curY + (winSize.y - curY) * 0.5f;
+            float pillH  = 44.0f;
+            float pillW  = 5.0f;
+            float pillR  = pillW * 0.5f;
+            float badgeW = pillW + 10.0f;
+            float badgeH = pillH + 14.0f;
+            float badgeR = badgeW * 0.5f;
+            auto* dl = ImGui::GetForegroundDrawList();
+            dl->AddRectFilled(
+                ImVec2(divX - badgeW * 0.5f, midY - badgeH * 0.5f),
+                ImVec2(divX + badgeW * 0.5f, midY + badgeH * 0.5f),
+                IM_COL32(0, 0, 0, 100), badgeR);
+            dl->AddRectFilled(
+                ImVec2(divX - pillR, midY - pillH * 0.5f),
+                ImVec2(divX + pillR, midY + pillH * 0.5f),
+                IM_COL32(180, 180, 180, 200), pillR);
+        }
+#endif
     }
 
     // Process menu keybinds
     displaymenu::checkKeybinds();
 
     // Left Column
+#if TARGET_OS_IPHONE
+    // Register current panel width so the touch classifier can determine
+    // whether a gesture started inside the panel (no ImGui-context read on
+    // the touch thread — that would be a data race).
+    backend::iosSetMenuWidth(showMenu ? menuWidth : 0.0f);
+    // Register the right-column (WaterfallControls) left edge so the touch
+    // classifier can force DRAG mode for vertical gestures there.  Vertical
+    // sliders (Zoom/Min/Max) need DRAG, not SCROLL.
+    backend::iosSetRightPanelX(showMenu ? (winSize.x - 60.0f * style::uiScale) : FLT_MAX);
+#endif
     if (showMenu) {
         ImGui::Columns(3, "WindowColumns", false);
         ImGui::SetColumnWidth(0, menuWidth);
         ImGui::SetColumnWidth(1, std::max<int>(winSize.x - menuWidth - (60.0f * style::uiScale), 100.0f * style::uiScale));
         ImGui::SetColumnWidth(2, 60.0f * style::uiScale);
+#if TARGET_OS_IPHONE
+        // Wider, rounder scrollbar — easier to see and tap on a touchscreen.
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize,    20.0f * style::uiScale);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 10.0f * style::uiScale);
+#endif
         ImGui::BeginChild("Left Column");
+#if TARGET_OS_IPHONE
+        {
+            float delta = backend::iosTakePanelScrollDelta();
+            if (delta != 0.0f) {
+                ImGui::SetScrollY(ImGui::GetScrollY() + delta * 50.0f);
+            }
+        }
+#endif
 
         if (gui::menu.draw(firstMenuRender)) {
             core::configManager.acquire();
@@ -529,6 +597,9 @@ void MainWindow::draw() {
         }
 
         ImGui::EndChild();
+#if TARGET_OS_IPHONE
+        ImGui::PopStyleVar(2); // ScrollbarSize + ScrollbarRounding
+#endif
     }
     else {
         // When hiding the menu bar

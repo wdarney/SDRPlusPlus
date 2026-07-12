@@ -44,15 +44,27 @@ include(GNUInstallDirs)
 
 set(CPACK_INCLUDED TRUE)
 
-if(NOT ZLIB_CONF_WRITTEN)
+if(NOT EXISTS ${zlib_SOURCE_DIR}/zconf.h)
+    # The vendored snapshot carries the already-portable header as zconf.h.in.
+    # Preserve it whole; the byte-offset generator below is for upstream's
+    # generated zconf.h and truncates this snapshot's input.
+    configure_file(${zlib_SOURCE_DIR}/zconf.h.in
+                   ${zlib_BINARY_DIR}/zconf.h.cmakein COPYONLY)
+    set(ZLIB_CONF_WRITTEN TRUE CACHE BOOL "zconf.h.cmakein was created" FORCE)
+    mark_as_advanced(ZLIB_CONF_WRITTEN)
+elseif(NOT ZLIB_CONF_WRITTEN)
     set(Z_PREFIX ${ZLIB_PREFIX})
     set(CONF_OUT_FILE ${zlib_BINARY_DIR}/zconf.h.cmakein)
-    file(READ ${zlib_SOURCE_DIR}/zconf.h ZCONF_CONTENT LIMIT 245)
+    set(ZCONF_SOURCE ${zlib_SOURCE_DIR}/zconf.h)
+    if(NOT EXISTS ${ZCONF_SOURCE})
+        set(ZCONF_SOURCE ${zlib_SOURCE_DIR}/zconf.h.in)
+    endif()
+    file(READ ${ZCONF_SOURCE} ZCONF_CONTENT LIMIT 245)
     file(WRITE ${CONF_OUT_FILE} ${ZCONF_CONTENT})
     file(APPEND ${CONF_OUT_FILE} "#cmakedefine Z_PREFIX 1\n")
     file(APPEND ${CONF_OUT_FILE} "#cmakedefine HAVE_STDARG_H 1\n")
     file(APPEND ${CONF_OUT_FILE} "#cmakedefine HAVE_UNISTD_H 1\n")
-    file(READ ${zlib_SOURCE_DIR}/zconf.h ZCONF_CONTENT OFFSET 244)
+    file(READ ${ZCONF_SOURCE} ZCONF_CONTENT OFFSET 244)
     set(FIRST_ITEM TRUE)
 
     foreach(item IN LISTS ZCONF_CONTENT)
@@ -69,7 +81,7 @@ if(NOT ZLIB_CONF_WRITTEN)
         TRUE
         CACHE BOOL "zconf.h.cmakein was created")
     mark_as_advanced(ZLIB_CONF_WRITTEN)
-endif(NOT ZLIB_CONF_WRITTEN)
+endif()
 
 #
 # Check to see if we have large file support

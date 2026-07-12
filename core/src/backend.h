@@ -11,4 +11,7 @@ namespace backend {
     void setMouseScreenPos(double x, double y);
     int renderLoop();
     int end();
+    // iOS renders on the MTKView delegate thread. Desktop and Android
+    // backends always return true.
+    bool isRenderThread();
 }

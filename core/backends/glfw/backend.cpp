@@ -242,6 +242,10 @@ namespace backend {
         return frameRateLimit;
     }
 
+    bool isRenderThread() {
+        return true;
+    }
+
     void waitForFrameLimit() {
         if (frameRateLimit <= 0) return;
 

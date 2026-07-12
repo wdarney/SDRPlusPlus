@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.13)
+
+# The iOS client uses static modules and a Metal/UIKit backend. Keep that
+# specialized graph isolated so desktop, Android, macOS, and Windows retain
+# the normal upstream shared-module build.
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/ios/CMakeRoot.cmake")
+    return()
+endif ()
+
 project(sdrpp)
 
 # Backends
@@ -56,6 +65,7 @@ option(OPT_BUILD_METEOR_DEMODULATOR "Build the meteor demodulator module (no dep
 option(OPT_BUILD_PAGER_DECODER "Build the pager decoder module (no dependencies required)" ON)
 option(OPT_BUILD_RADIO "Main audio modulation decoder (AM, FM, SSB, etc...)" ON)
 option(OPT_BUILD_RYFI_DECODER "RyFi data link decoder" OFF)
+option(OPT_BUILD_VDL2_DECODER "Build the VDL2/ACARS decoder module" ON)
 option(OPT_BUILD_VOR_RECEIVER "VOR beacon receiver" OFF)
 option(OPT_BUILD_WEATHER_SAT_DECODER "Build the HRPT decoder module (no dependencies required)" OFF)
 
@@ -72,6 +82,7 @@ option(OPT_BUILD_SCHEDULER "Build the scheduler" OFF)
 
 # Other options
 option(USE_INTERNAL_LIBCORRECT "Use an internal version of libcorrect" ON)
+option(USE_INTERNAL_LIBACARS "Use the vendored libacars for VDL2 decoding" ON)
 option(USE_BUNDLE_DEFAULTS "Set the default resource and module directories to the right ones for a MacOS .app" OFF)
 option(COPY_MSVC_REDISTRIBUTABLES "Copy over the Visual C++ Redistributable" OFF)
 
@@ -124,6 +135,10 @@ endif (ANDROID)
 
 # Core of SDR++
 add_subdirectory("core")
+
+if (USE_INTERNAL_LIBACARS AND OPT_BUILD_VDL2_DECODER)
+add_subdirectory("core/libacars")
+endif ()
 
 # Source modules
 if (OPT_BUILD_AIRSPY_SOURCE)
@@ -305,6 +320,10 @@ endif (OPT_BUILD_RADIO)
 if (OPT_BUILD_RYFI_DECODER)
 add_subdirectory("decoder_modules/ryfi_decoder")
 endif (OPT_BUILD_RYFI_DECODER)
+
+if (OPT_BUILD_VDL2_DECODER)
+add_subdirectory("decoder_modules/vdl2_decoder")
+endif (OPT_BUILD_VDL2_DECODER)
 
 if (OPT_BUILD_VOR_RECEIVER)
 add_subdirectory("decoder_modules/vor_receiver")

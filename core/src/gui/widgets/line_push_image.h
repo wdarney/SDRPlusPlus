@@ -35,7 +35,7 @@ namespace ImGui {
         int _lineCount = 0;
         int reservedCount = 0;
 
-        GLuint textureId;
+        ImTextureID textureId;
 
         bool newData = false;
     };
