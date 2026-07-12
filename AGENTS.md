@@ -48,6 +48,11 @@ file, and confirm the requested runtime target. Commit and push the focused
 branch after validation; merge it into `integration/main` only after it is
 working.
 
+Modules may contain a more specific `AGENTS.md`. Read and follow the nearest
+module-level instructions before changing or deploying that module. A scoped
+instruction file may also direct you to a private deployment guide outside the
+repository; never copy private machine details from that guide into a commit.
+
 ## Validation
 
 Configure the combined macOS build from the repository root:
