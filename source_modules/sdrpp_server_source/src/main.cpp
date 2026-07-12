@@ -1,6 +1,5 @@
 #include "sdrpp_server_client.h"
 #include <imgui.h>
-#include <algorithm>
 #include <utils/flog.h>
 #include <module.h>
 #include <gui/gui.h>
@@ -11,6 +10,8 @@
 #include <gui/widgets/stepped_slider.h>
 #include <utils/optionlist.h>
 #include <gui/dialogs/dialog_box.h>
+#include <vector>
+#include <string>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -52,11 +53,12 @@ public:
         std::string hostStr = config.conf["hostname"];
         strcpy(hostname, hostStr.c_str());
         port = config.conf["port"];
-        if (config.conf.contains("recentServers")) {
-            for (auto& entry : config.conf["recentServers"]) {
-                if (entry.contains("host") && entry.contains("port"))
-                    recentServers.push_back({ entry["host"].get<std::string>(),
-                                              entry["port"].get<int>() });
+        if (config.conf.contains("history")) {
+            for (auto& entry : config.conf["history"]) {
+                ServerEntry e;
+                e.host = entry["host"].get<std::string>();
+                e.port = entry["port"].get<int>();
+                serverHistory.push_back(e);
             }
         }
         config.release();
@@ -84,6 +86,33 @@ public:
     }
 
 private:
+    struct ServerEntry {
+        std::string host;
+        int port;
+    };
+
+    void addToHistory(const char* host, int port) {
+        // Remove duplicate if present
+        for (auto it = serverHistory.begin(); it != serverHistory.end(); ++it) {
+            if (it->host == host && it->port == port) {
+                serverHistory.erase(it);
+                break;
+            }
+        }
+        serverHistory.insert(serverHistory.begin(), {host, port});
+        if (serverHistory.size() > 20) { serverHistory.resize(20); }
+
+        config.acquire();
+        config.conf["history"] = json::array();
+        for (auto& e : serverHistory) {
+            json entry;
+            entry["host"] = e.host;
+            entry["port"] = e.port;
+            config.conf["history"].push_back(entry);
+        }
+        config.release(true);
+    }
+
     std::string getBandwdithScaled(double bw) {
         char buf[1024];
         if (bw >= 1000000.0) {
@@ -162,48 +191,49 @@ private:
         });
 
         if (connected) { style::beginDisabled(); }
-
-        // Hostname field + recent-servers dropdown button
-        {
-            float btnW = ImGui::CalcTextSize("v").x + ImGui::GetStyle().FramePadding.x * 2 + 6.0f;
-            ImGui::SetNextItemWidth(menuWidth - btnW - ImGui::GetStyle().ItemSpacing.x);
-            if (ImGui::InputText(CONCAT("##sdrpp_srv_srv_host_", _this->name), _this->hostname, 1023)) {
-                config.acquire();
-                config.conf["hostname"] = _this->hostname;
-                config.release(true);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button(CONCAT("v##sdrpp_srv_hist_btn_", _this->name), ImVec2(btnW, 0))) {
-                ImGui::OpenPopup(CONCAT("##sdrpp_srv_hist_", _this->name));
-            }
-            if (ImGui::BeginPopup(CONCAT("##sdrpp_srv_hist_", _this->name))) {
-                if (_this->recentServers.empty()) {
-                    ImGui::TextDisabled("No recent servers");
-                }
-                for (auto& [h, p] : _this->recentServers) {
-                    char lbl[1152];
-                    snprintf(lbl, sizeof(lbl), "%s:%d", h.c_str(), p);
-                    if (ImGui::Selectable(lbl)) {
-                        strncpy(_this->hostname, h.c_str(), 1023);
-                        _this->hostname[1023] = '\0';
-                        _this->port = p;
-                        config.acquire();
-                        config.conf["hostname"] = _this->hostname;
-                        config.conf["port"]     = _this->port;
-                        config.release(true);
-                    }
-                }
-                ImGui::EndPopup();
-            }
+        float histBtnWidth = ImGui::CalcTextSize("v").x + ImGui::GetStyle().FramePadding.x * 2.0f + 4.0f;
+        float portWidth = 80.0f;
+        float hostWidth = menuWidth - histBtnWidth - portWidth - ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        ImGui::SetNextItemWidth(hostWidth);
+        if (ImGui::InputText(CONCAT("##sdrpp_srv_srv_host_", _this->name), _this->hostname, 1023)) {
+            config.acquire();
+            config.conf["hostname"] = _this->hostname;
+            config.release(true);
         }
-
-        ImGui::SetNextItemWidth(menuWidth);
+        ImGui::SameLine();
+        if (ImGui::Button(CONCAT("v##sdrpp_srv_hist_btn_", _this->name), ImVec2(histBtnWidth, 0))) {
+            ImGui::OpenPopup(CONCAT("##sdrpp_srv_hist_popup_", _this->name));
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
         if (ImGui::InputInt(CONCAT("##sdrpp_srv_srv_port_", _this->name), &_this->port, 0, 0)) {
             config.acquire();
             config.conf["port"] = _this->port;
             config.release(true);
         }
         if (connected) { style::endDisabled(); }
+
+        if (ImGui::BeginPopup(CONCAT("##sdrpp_srv_hist_popup_", _this->name))) {
+            if (_this->serverHistory.empty()) {
+                ImGui::TextUnformatted("No history yet");
+            }
+            else {
+                for (auto& e : _this->serverHistory) {
+                    char label[2048];
+                    snprintf(label, sizeof(label), "%s:%d", e.host.c_str(), e.port);
+                    if (ImGui::Selectable(label)) {
+                        strncpy(_this->hostname, e.host.c_str(), 1023);
+                        _this->hostname[1023] = '\0';
+                        _this->port = e.port;
+                        config.acquire();
+                        config.conf["hostname"] = _this->hostname;
+                        config.conf["port"] = _this->port;
+                        config.release(true);
+                    }
+                }
+            }
+            ImGui::EndPopup();
+        }
 
         if (_this->running) { style::beginDisabled(); }
         if (!connected && ImGui::Button("Connect##sdrpp_srv_source", ImVec2(menuWidth, 0))) {
@@ -272,6 +302,7 @@ private:
         try {
             if (client) { client.reset(); }
             client = server::connect(hostname, port, &stream);
+            addToHistory(hostname, port);
             deviceInit();
         }
         catch (const std::exception& e) {
@@ -285,24 +316,6 @@ private:
         char buf[4096];
         sprintf(buf, "%s:%05d", hostname, port);
         devConfName = buf;
-
-        // Update recent-servers list: remove duplicate, prepend, cap at 10.
-        std::string h = hostname;
-        int         p = port;
-        recentServers.erase(std::remove_if(recentServers.begin(), recentServers.end(),
-            [&](const std::pair<std::string,int>& e){ return e.first == h && e.second == p; }),
-            recentServers.end());
-        recentServers.insert(recentServers.begin(), {h, p});
-        if (recentServers.size() > 10) recentServers.resize(10);
-
-        // Persist
-        config.acquire();
-        config.conf["recentServers"] = json::array();
-        for (auto& [rh, rp] : recentServers) {
-            json entry; entry["host"] = rh; entry["port"] = rp;
-            config.conf["recentServers"].push_back(entry);
-        }
-        config.release(true);
 
         // Load settings
         sampleTypeId = sampleTypeList.valueId(dsp::compression::PCM_TYPE_I16);
@@ -326,15 +339,13 @@ private:
     double freq;
     bool serverBusy = false;
 
-    // Recent servers list — most-recently-used first, max 10 entries.
-    std::vector<std::pair<std::string, int>> recentServers;
-
     float datarate = 0;
     float frametimeCounter = 0;
 
     char hostname[1024];
     int port = 50000;
     std::string devConfName = "";
+    std::vector<ServerEntry> serverHistory;
 
     dsp::stream<dsp::complex_t> stream;
     SourceManager::SourceHandler handler;

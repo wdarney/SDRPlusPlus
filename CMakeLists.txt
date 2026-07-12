@@ -65,6 +65,7 @@ option(OPT_BUILD_METEOR_DEMODULATOR "Build the meteor demodulator module (no dep
 option(OPT_BUILD_PAGER_DECODER "Build the pager decoder module (no dependencies required)" ON)
 option(OPT_BUILD_RADIO "Main audio modulation decoder (AM, FM, SSB, etc...)" ON)
 option(OPT_BUILD_RYFI_DECODER "RyFi data link decoder" OFF)
+option(OPT_BUILD_SELCAL_DECODER "Build the SELCAL decoder module" ON)
 option(OPT_BUILD_VDL2_DECODER "Build the VDL2/ACARS decoder module" ON)
 option(OPT_BUILD_VOR_RECEIVER "VOR beacon receiver" OFF)
 option(OPT_BUILD_WEATHER_SAT_DECODER "Build the HRPT decoder module (no dependencies required)" OFF)
@@ -320,6 +321,10 @@ endif (OPT_BUILD_RADIO)
 if (OPT_BUILD_RYFI_DECODER)
 add_subdirectory("decoder_modules/ryfi_decoder")
 endif (OPT_BUILD_RYFI_DECODER)
+
+if (OPT_BUILD_SELCAL_DECODER)
+add_subdirectory("decoder_modules/selcal_decoder")
+endif (OPT_BUILD_SELCAL_DECODER)
 
 if (OPT_BUILD_VDL2_DECODER)
 add_subdirectory("decoder_modules/vdl2_decoder")

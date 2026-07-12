@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(sdrpp)
 
-# This is the iOS fork of SDR++. Single build mode: iOS-only, statically
-# linked, client modules only. See ios/README.md.
+# This is the iOS build graph for SDR++. It is statically linked and contains
+# client modules only. See ios/README.md.
 
 # Modules are built into the main binary and selected here. Defaults match the
 # "useful for a remote-server iOS client" set; flip OFF to slim further.

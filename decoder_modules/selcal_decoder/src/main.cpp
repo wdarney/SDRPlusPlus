@@ -31,7 +31,7 @@ SDRPP_MOD_INFO{
     /* Max instances*/ -1
 };
 
-ConfigManager config;
+static ConfigManager config;
 
 // ── SELCAL constants (ICAO Annex 10 / ARINC 714A) ───────────────────────────
 
