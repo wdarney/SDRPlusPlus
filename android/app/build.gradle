@@ -14,7 +14,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments "-DOPT_BACKEND_GLFW=OFF", "-DOPT_BACKEND_ANDROID=ON", "-DOPT_BUILD_SOAPY_SOURCE=OFF", "-DOPT_BUILD_ANDROID_AUDIO_SINK=ON", "-DOPT_BUILD_AUDIO_SINK=OFF", "-DOPT_BUILD_DISCORD_PRESENCE=OFF", "-DOPT_BUILD_M17_DECODER=ON", "-DOPT_BUILD_PLUTOSDR_SOURCE=ON", "-DOPT_BUILD_AUDIO_SOURCE=OFF", "-DOPT_BUILD_HYDRASDR_SOURCE=ON"
+                arguments "-DOPT_BACKEND_GLFW=OFF", "-DOPT_BACKEND_ANDROID=ON", "-DOPT_BUILD_SOAPY_SOURCE=OFF", "-DOPT_BUILD_ANDROID_AUDIO_SINK=ON", "-DOPT_BUILD_AUDIO_SINK=OFF", "-DOPT_BUILD_DISCORD_PRESENCE=OFF", "-DOPT_BUILD_M17_DECODER=ON", "-DOPT_BUILD_PLUTOSDR_SOURCE=ON", "-DOPT_BUILD_AUDIO_SOURCE=OFF", "-DOPT_BUILD_HYDRASDR_SOURCE=OFF"
             }
         }
     }
@@ -48,7 +48,14 @@ android {
     sourceSets {
         main {
             assets.srcDirs += ['assets']
+            jniLibs.srcDirs += ['jniLibs']
         }
+    }
+
+    // Some kit libs (e.g. libzstd.so) get bundled via more than one path
+    // (CMake IMPORTED + our jniLibs copy). Take the first instance.
+    packagingOptions {
+        pickFirst '**/*.so'
     }
 }
 
@@ -63,6 +70,23 @@ task copyResources(type: Copy) {
     include('**/*')
 }
 
+// Copy android-sdr-kit shared libraries into jniLibs so they get packaged
+// into the APK and are loadable at runtime via dlopen.
+task copyKitLibs(type: Copy) {
+    description = 'Copy android-sdr-kit shared libraries into jniLibs/<ABI>/'
+    ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'].each { abi ->
+        from("/sdr-kit/${abi}/lib") {
+            include '*.so'
+            into abi
+        }
+    }
+    into 'jniLibs'
+}
+
+task deleteJniLibs (type: Delete) {
+    delete 'jniLibs'
+}
+
 repositories {
     mavenCentral()
 }
@@ -73,4 +97,6 @@ dependencies {
 }
 
 copyResources.dependsOn deleteTempAssets
+copyKitLibs.dependsOn deleteJniLibs
 preBuild.dependsOn copyResources
+preBuild.dependsOn copyKitLibs

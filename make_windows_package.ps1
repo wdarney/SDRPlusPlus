@@ -108,6 +108,14 @@ cp $build_dir/misc_modules/rigctl_server/Release/rigctl_server.dll sdrpp_windows
 
 cp $build_dir/misc_modules/scanner/Release/scanner.dll sdrpp_windows_x64/modules/
 
+cp $build_dir/misc_modules/channel_bank/Release/channel_bank.dll sdrpp_windows_x64/modules/
+
+# Copy whisper.cpp + ggml DLLs (channel_bank transcription engine)
+cp $build_dir/bin/Release/whisper.dll sdrpp_windows_x64/
+cp $build_dir/bin/Release/ggml.dll sdrpp_windows_x64/
+cp $build_dir/bin/Release/ggml-base.dll sdrpp_windows_x64/
+cp $build_dir/bin/Release/ggml-cpu.dll sdrpp_windows_x64/
+
 
 # Copy supporting libs
 cp 'C:/Program Files/PothosSDR/bin/libusb-1.0.dll' sdrpp_windows_x64/

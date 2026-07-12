@@ -11,6 +11,9 @@
 #include <stb_image.h>
 #include <stb_image_resize.h>
 #include <gui/gui.h>
+#include <algorithm>
+#include <chrono>
+#include <thread>
 
 namespace backend {
     const char* OPENGL_VERSIONS_GLSL[] = {
@@ -48,6 +51,9 @@ namespace backend {
     int _winWidth, _winHeight;
     GLFWwindow* window;
     GLFWmonitor* monitor;
+    int frameRateLimit = 30;
+    int appliedSwapInterval = -1;
+    std::chrono::steady_clock::time_point nextFrameTime;
 
     static void glfw_error_callback(int error, const char* description) {
         flog::error("Glfw Error {0}: {1}", error, description);
@@ -69,6 +75,7 @@ namespace backend {
         winHeight = core::configManager.conf["windowSize"]["h"];
         maximized = core::configManager.conf["maximized"];
         fullScreen = core::configManager.conf["fullscreen"];
+        frameRateLimit = std::clamp<int>(core::configManager.conf["uiFrameRateLimit"], 0, 240);
         core::configManager.release();
 
         // Setup window
@@ -218,8 +225,34 @@ namespace backend {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        glfwSwapInterval(vsync);
+        int swapInterval = vsync ? 1 : 0;
+        if (swapInterval != appliedSwapInterval) {
+            glfwSwapInterval(swapInterval);
+            appliedSwapInterval = swapInterval;
+        }
         glfwSwapBuffers(window);
+    }
+
+    void setFrameRateLimit(int fps) {
+        frameRateLimit = std::clamp<int>(fps, 0, 240);
+        nextFrameTime = std::chrono::steady_clock::now();
+    }
+
+    int getFrameRateLimit() {
+        return frameRateLimit;
+    }
+
+    void waitForFrameLimit() {
+        if (frameRateLimit <= 0) return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto framePeriod = std::chrono::microseconds(1000000 / frameRateLimit);
+        if (nextFrameTime == std::chrono::steady_clock::time_point{} || nextFrameTime < now - framePeriod) {
+            nextFrameTime = now;
+        }
+
+        nextFrameTime += framePeriod;
+        std::this_thread::sleep_until(nextFrameTime);
     }
 
     void getMouseScreenPos(double& x, double& y) {
@@ -289,6 +322,7 @@ namespace backend {
             }
 
             render();
+            waitForFrameLimit();
         }
 
         return 0;

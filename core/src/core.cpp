@@ -128,6 +128,7 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["fftWindow"] = 2;
     defConfig["frequency"] = 100000000.0;
     defConfig["fullWaterfallUpdate"] = false;
+    defConfig["uiFrameRateLimit"] = 30;
     defConfig["max"] = 0.0;
     defConfig["maximized"] = false;
     defConfig["fullscreen"] = false;
@@ -218,6 +219,7 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["Radio"] = "radio";
 
     defConfig["moduleInstances"]["Frequency Manager"] = "frequency_manager";
+    defConfig["moduleInstances"]["Channel Bank"] = "channel_bank";
     defConfig["moduleInstances"]["Recorder"] = "recorder";
     defConfig["moduleInstances"]["Rigctl Server"] = "rigctl_server";
     // defConfig["moduleInstances"]["Rigctl Client"] = "rigctl_client";
@@ -315,6 +317,7 @@ int sdrpp_main(int argc, char* argv[]) {
     core::configManager.conf["modules"][modCount++] = "radio.so";
 
     core::configManager.conf["modules"][modCount++] = "frequency_manager.so";
+    core::configManager.conf["modules"][modCount++] = "channel_bank.so";
     core::configManager.conf["modules"][modCount++] = "recorder.so";
     core::configManager.conf["modules"][modCount++] = "rigctl_server.so";
     core::configManager.conf["modules"][modCount++] = "scanner.so";

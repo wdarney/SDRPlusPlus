@@ -1,3 +1,23 @@
+# SDR++ — Fork with Channel Bank Module
+
+> **This is a fork of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) with the Channel Bank module — a multi-channel auto-demodulator and scanner for SDR++.**
+
+## Channel Bank Features
+
+- **Auto-detect mode** — FFT-based squelch automatically finds signals across the full SDR bandwidth, spawns VFOs, demodulates, and records transmissions to WAV
+- **Manual mode** — specify exact frequencies or import from the Frequency Manager
+- **Scan mode** — define frequency ranges and sweep through them automatically, with configurable quiet timeout and no-signal skip
+- **AM, USB, LSB, NFM, WFM demodulation** — with per-channel BFO trim for SSB
+- **Monitor queue** — plays back recorded transmissions through audio output
+- **Frequency history** — grouped by 50 MHz bands, with block/unblock support
+- **Block frequencies** — from history or directly from the active channel list; blocked channels are immediately torn down
+- **Mini spectrum display** — real-time power, threshold, and detection visualization
+- **Configurable** — channel spacing (5–50 kHz), SNR threshold, cooldown, recording gain, min TX duration, tail length
+
+See the full [Channel Bank README](misc_modules/channel_bank/README.md) for details.
+
+---
+
 # SDR++, The bloat-free SDR software<br>
 
 ![Screenshot](https://i.imgur.com/Ter2MQJ.png)
