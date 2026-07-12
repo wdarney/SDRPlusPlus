@@ -1,11 +1,15 @@
 #pragma once
 #include "../sink.h"
+#include <chrono>
+#include <cstdint>
 
 namespace dsp::routing {
     template <class T>
     class StreamLink : public Sink<T> {
         using base_type = Sink<T>;
     public:
+        using SwapWaitHandler = void (*)(uint64_t waitNs, int count, void* ctx);
+
         StreamLink() {}
 
         StreamLink(stream<T>* in, stream<T>* out) { init(in, out); }
@@ -26,6 +30,11 @@ namespace dsp::routing {
             base_type::tempStart();
         }
 
+        void setSwapWaitHandler(SwapWaitHandler handler, void* ctx) {
+            swapWaitHandler = handler;
+            swapWaitHandlerCtx = ctx;
+        }
+
         int run() {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
@@ -33,12 +42,26 @@ namespace dsp::routing {
             memcpy(_out->writeBuf, base_type::_in->readBuf, count * sizeof(T));
 
             base_type::_in->flush();
-            if (!_out->swap(count)) { return -1; }
+            bool swapped;
+            if (swapWaitHandler) {
+                auto swapStart = std::chrono::steady_clock::now();
+                swapped = _out->swap(count);
+                uint64_t waitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - swapStart
+                ).count();
+                swapWaitHandler(waitNs, count, swapWaitHandlerCtx);
+            }
+            else {
+                swapped = _out->swap(count);
+            }
+            if (!swapped) { return -1; }
             return count;
         }
 
     protected:
         stream<T>* _out;
+        SwapWaitHandler swapWaitHandler = nullptr;
+        void* swapWaitHandlerCtx = nullptr;
 
     };
 }

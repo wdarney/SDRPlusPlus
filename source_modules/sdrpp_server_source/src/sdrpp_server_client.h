@@ -5,7 +5,6 @@
 #include <atomic>
 #include <queue>
 #include <server_protocol.h>
-#include <atomic>
 #include <map>
 #include <vector>
 #include <dsp/compression/sample_stream_decompressor.h>
@@ -108,11 +107,13 @@ namespace server {
         void sendCommand(Command cmd, int len);
         void sendCommandAck(Command cmd, int len);
 
+        bool swapDecompInput(int size);
+        static void outputSwapWaitHandler(uint64_t waitNs, int count, void* ctx);
+        void maybeLogTransportStats();
+
         PacketWaiter* awaitCommandAck(Command cmd);
         void commandAckHandled(PacketWaiter* waiter);
         std::map<PacketWaiter*, Command> commandAckWaiters;
-
-        static void dHandler(dsp::complex_t *data, int count, void *ctx);
 
         std::shared_ptr<net::Socket> sock;
 
@@ -142,6 +143,17 @@ namespace server {
         std::thread workerThread;
 
         double currentSampleRate = 1000000.0;
+
+        std::chrono::steady_clock::time_point transportStatsStart = std::chrono::steady_clock::now();
+        uint64_t transportBytes = 0;
+        std::atomic<uint64_t> decompSwapWaitNs { 0 };
+        std::atomic<uint64_t> decompSwapCount { 0 };
+        std::atomic<uint64_t> decompSwapMaxNs { 0 };
+        std::atomic<uint64_t> decompSlowSwaps { 0 };
+        std::atomic<uint64_t> outputSwapWaitNs { 0 };
+        std::atomic<uint64_t> outputSwapCount { 0 };
+        std::atomic<uint64_t> outputSwapMaxNs { 0 };
+        std::atomic<uint64_t> outputSlowSwaps { 0 };
     };
 
     std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out);

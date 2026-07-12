@@ -222,6 +222,21 @@ SoapySDR-based source module for the RX888 MkII direct-sampling SDR. Wraps the S
 
 ---
 
+## Planned: shared Frequency Manager library for multi-instance use
+
+Visible SDR++ instances should continue to use separate `--root` directories so source selection, VFO state, layouts, and module settings remain independent. Frequency Manager is the exception: all instances should be able to point at one shared bookmark library.
+
+The implementation should split the current `frequency_manager_config.json` responsibilities:
+
+- Shared file: frequency lists and bookmarks.
+- Per-instance file: selected list, waterfall visibility, and bookmark display mode.
+- Launch/config option: one explicit shared-library path used by every instance.
+- Runtime behavior: atomic writes plus change detection so edits in one visible instance safely refresh in the others.
+
+Do not implement this by symlinking the current config file. `ConfigManager` only synchronizes threads inside one process, and each SDR++ instance keeps its own in-memory JSON copy; simultaneous saves could overwrite newer changes from another instance.
+
+---
+
 ## Core patch: config.cpp
 
 `core/src/config.cpp` — `ConfigManager::save()` wraps `conf.dump(4)` in a try/catch. If `dump_escaped()` throws on invalid UTF-8 (e.g. garbage device names from stale USB firmware), it retries with `error_handler_t::replace` instead of crashing the app. This is a defense-in-depth fix; `rx888_source` also sanitizes labels at the source.

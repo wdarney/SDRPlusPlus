@@ -11,6 +11,9 @@
 #include "dsp/compression/sample_stream_compressor.h"
 #include "dsp/sink/handler_sink.h"
 #include <zstd.h>
+#include <algorithm>
+#include <chrono>
+#include <mutex>
 
 namespace server {
     dsp::stream<dsp::complex_t> dummyInput;
@@ -45,6 +48,64 @@ namespace server {
     bool running = false;
     bool compression = false;
     double sampleRate = 1000000.0;
+
+    namespace {
+        constexpr double SLOW_WRITE_MS = 10.0;
+        constexpr auto TRANSPORT_STATS_INTERVAL = std::chrono::seconds(5);
+
+        struct ServerTransportStats {
+            std::chrono::steady_clock::time_point intervalStart = std::chrono::steady_clock::now();
+            uint64_t bytesWritten = 0;
+            uint64_t packets = 0;
+            uint64_t sendCalls = 0;
+            uint64_t partialSends = 0;
+            uint64_t slowWrites = 0;
+            double totalWriteMs = 0.0;
+            double maxWriteMs = 0.0;
+        };
+
+        ServerTransportStats transportStats;
+        std::mutex transportStatsMtx;
+
+        void resetTransportStats() {
+            std::lock_guard lck(transportStatsMtx);
+            transportStats = ServerTransportStats{};
+        }
+
+        void recordTransportWrite(const net::ConnWriteResult& result, double writeMs) {
+            std::lock_guard lck(transportStatsMtx);
+            transportStats.bytesWritten += result.bytesWritten;
+            transportStats.packets++;
+            transportStats.sendCalls += result.sendCalls;
+            transportStats.partialSends += result.partialSends;
+            transportStats.totalWriteMs += writeMs;
+            transportStats.maxWriteMs = std::max(transportStats.maxWriteMs, writeMs);
+            if (writeMs >= SLOW_WRITE_MS) { transportStats.slowWrites++; }
+
+            auto now = std::chrono::steady_clock::now();
+            double elapsedSec = std::chrono::duration<double>(now - transportStats.intervalStart).count();
+            if (elapsedSec < std::chrono::duration<double>(TRANSPORT_STATS_INTERVAL).count()) { return; }
+
+            double mbps = (transportStats.bytesWritten * 8.0) / (elapsedSec * 1000000.0);
+            double avgWriteMs = transportStats.packets ? transportStats.totalWriteMs / transportStats.packets : 0.0;
+            double writeBlockedPct = (transportStats.totalWriteMs / (elapsedSec * 1000.0)) * 100.0;
+            flog::info(
+                "[Server transport] {:.1f} Mb/s, packets={}, send calls={}, partial sends={}, "
+                "write avg/max={:.3f}/{:.3f} ms, writes >=10 ms={}, handler blocked={:.1f}%",
+                mbps,
+                transportStats.packets,
+                transportStats.sendCalls,
+                transportStats.partialSends,
+                avgWriteMs,
+                transportStats.maxWriteMs,
+                transportStats.slowWrites,
+                writeBlockedPct
+            );
+
+            transportStats = ServerTransportStats{};
+            transportStats.intervalStart = now;
+        }
+    }
 
     int main() {
         flog::info("=====| SERVER MODE |=====");
@@ -186,6 +247,7 @@ namespace server {
 
         flog::info("Connection from {0}:{1}", "TODO", "TODO");
         client = std::move(conn);
+        resetTransportStats();
         client->readAsync(sizeof(PacketHeader), rbuf, _packetHandler, NULL);
 
         // Perform settings reset
@@ -238,8 +300,15 @@ namespace server {
             memcpy(&bbuf[sizeof(PacketHeader)], data, count);
         }
 
-        // Write to network
-        if (client && client->isOpen()) { client->write(bb_pkt_hdr->size, bbuf); }
+        // Keep transport writes measurable while this path is still synchronous.
+        if (client && client->isOpen()) {
+            net::ConnWriteResult result;
+            auto writeStart = std::chrono::steady_clock::now();
+            bool written = client->write(bb_pkt_hdr->size, bbuf, &result);
+            double writeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - writeStart).count();
+            recordTransportWrite(result, writeMs);
+            if (!written) { flog::warn("[Server transport] Baseband write failed after {} bytes", result.bytesWritten); }
+        }
     }
 
     void setInput(dsp::stream<dsp::complex_t>* stream) {
