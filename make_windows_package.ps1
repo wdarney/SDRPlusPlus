@@ -66,6 +66,10 @@ cp $build_dir/source_modules/sdrpp_server_source/Release/sdrpp_server_source.dll
 
 cp $build_dir/source_modules/spyserver_source/Release/spyserver_source.dll sdrpp_windows_x64/modules/
 
+cp $build_dir/source_modules/rx888_source/Release/rx888_source.dll sdrpp_windows_x64/modules/ -ErrorAction SilentlyContinue
+
+cp $build_dir/source_modules/sddc_source/Release/sddc_source.dll sdrpp_windows_x64/modules/ -ErrorAction SilentlyContinue
+
 # cp $build_dir/source_modules/usrp_source/Release/usrp_source.dll sdrpp_windows_x64/modules/
 
 
@@ -88,6 +92,8 @@ cp $build_dir/decoder_modules/radio/Release/radio.dll sdrpp_windows_x64/modules/
 
 
 # Copy misc modules
+cp $build_dir/misc_modules/channel_bank/Release/channel_bank.dll sdrpp_windows_x64/modules/
+
 cp $build_dir/misc_modules/discord_integration/Release/discord_integration.dll sdrpp_windows_x64/modules/
 
 cp $build_dir/misc_modules/frequency_manager/Release/frequency_manager.dll sdrpp_windows_x64/modules/

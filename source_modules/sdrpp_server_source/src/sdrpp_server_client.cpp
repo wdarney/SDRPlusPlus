@@ -6,6 +6,29 @@
 
 using namespace std::chrono_literals;
 
+namespace {
+    constexpr uint64_t SLOW_SWAP_NS = 10'000'000;
+    constexpr auto TRANSPORT_STATS_INTERVAL = std::chrono::seconds(5);
+
+    void updateMax(std::atomic<uint64_t>& maximum, uint64_t value) {
+        uint64_t current = maximum.load(std::memory_order_relaxed);
+        while (current < value && !maximum.compare_exchange_weak(current, value, std::memory_order_relaxed)) {}
+    }
+
+    void recordSwapWait(
+        uint64_t waitNs,
+        std::atomic<uint64_t>& total,
+        std::atomic<uint64_t>& count,
+        std::atomic<uint64_t>& maximum,
+        std::atomic<uint64_t>& slowCount
+    ) {
+        total.fetch_add(waitNs, std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_relaxed);
+        updateMax(maximum, waitNs);
+        if (waitNs >= SLOW_SWAP_NS) { slowCount.fetch_add(1, std::memory_order_relaxed); }
+    }
+}
+
 namespace server {
     Client::Client(std::shared_ptr<net::Socket> sock, dsp::stream<dsp::complex_t>* out) {
         this->sock = sock;
@@ -34,6 +57,7 @@ namespace server {
         decompIn.clearWriteStop();
         decomp.init(&decompIn);
         link.init(&decomp.out, output);
+        link.setSwapWaitHandler(outputSwapWaitHandler, this);
         decomp.start();
         link.start();
 
@@ -175,6 +199,7 @@ namespace server {
 
             // Increment data counter
             bytes += r_pkt_hdr->size;
+            transportBytes += r_pkt_hdr->size;
 
             // Decode packet
             if (r_pkt_hdr->type == PACKET_TYPE_COMMAND) {
@@ -218,12 +243,12 @@ namespace server {
             }
             else if (r_pkt_hdr->type == PACKET_TYPE_BASEBAND) {
                 memcpy(decompIn.writeBuf, &rbuffer[sizeof(PacketHeader)], r_pkt_hdr->size - sizeof(PacketHeader));
-                if (!decompIn.swap(r_pkt_hdr->size - sizeof(PacketHeader))) { break; }
+                if (!swapDecompInput(r_pkt_hdr->size - sizeof(PacketHeader))) { break; }
             }
             else if (r_pkt_hdr->type == PACKET_TYPE_BASEBAND_COMPRESSED) {
                 size_t outCount = ZSTD_decompressDCtx(dctx, decompIn.writeBuf, STREAM_BUFFER_SIZE*sizeof(dsp::complex_t)+8, r_pkt_data, r_pkt_hdr->size - sizeof(PacketHeader));
                 if (outCount) {
-                    if (!decompIn.swap(outCount)) { break; }
+                    if (!swapDecompInput(outCount)) { break; }
                 };
             }
             else if (r_pkt_hdr->type == PACKET_TYPE_ERROR) {
@@ -232,7 +257,66 @@ namespace server {
             else {
                 flog::error("Invalid packet type: {0}", r_pkt_hdr->type);
             }
+
+            maybeLogTransportStats();
         }
+    }
+
+    bool Client::swapDecompInput(int size) {
+        auto swapStart = std::chrono::steady_clock::now();
+        bool swapped = decompIn.swap(size);
+        uint64_t waitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - swapStart
+        ).count();
+        recordSwapWait(waitNs, decompSwapWaitNs, decompSwapCount, decompSwapMaxNs, decompSlowSwaps);
+        return swapped;
+    }
+
+    void Client::outputSwapWaitHandler(uint64_t waitNs, int count, void* ctx) {
+        (void)count;
+        Client* client = (Client*)ctx;
+        recordSwapWait(
+            waitNs,
+            client->outputSwapWaitNs,
+            client->outputSwapCount,
+            client->outputSwapMaxNs,
+            client->outputSlowSwaps
+        );
+    }
+
+    void Client::maybeLogTransportStats() {
+        auto now = std::chrono::steady_clock::now();
+        double elapsedSec = std::chrono::duration<double>(now - transportStatsStart).count();
+        if (elapsedSec < std::chrono::duration<double>(TRANSPORT_STATS_INTERVAL).count()) { return; }
+
+        uint64_t decompWait = decompSwapWaitNs.exchange(0, std::memory_order_relaxed);
+        uint64_t decompCount = decompSwapCount.exchange(0, std::memory_order_relaxed);
+        uint64_t decompMax = decompSwapMaxNs.exchange(0, std::memory_order_relaxed);
+        uint64_t decompSlow = decompSlowSwaps.exchange(0, std::memory_order_relaxed);
+        uint64_t outputWait = outputSwapWaitNs.exchange(0, std::memory_order_relaxed);
+        uint64_t outputCount = outputSwapCount.exchange(0, std::memory_order_relaxed);
+        uint64_t outputMax = outputSwapMaxNs.exchange(0, std::memory_order_relaxed);
+        uint64_t outputSlow = outputSlowSwaps.exchange(0, std::memory_order_relaxed);
+
+        double mbps = (transportBytes * 8.0) / (elapsedSec * 1000000.0);
+        double decompAvgMs = decompCount ? (decompWait / (double)decompCount) / 1000000.0 : 0.0;
+        double outputAvgMs = outputCount ? (outputWait / (double)outputCount) / 1000000.0 : 0.0;
+        flog::info(
+            "[Server client transport] {:.1f} Mb/s, decompIn.swap avg/max={:.3f}/{:.3f} ms "
+            "(count={}, >=10 ms={}), output.swap avg/max={:.3f}/{:.3f} ms (count={}, >=10 ms={})",
+            mbps,
+            decompAvgMs,
+            decompMax / 1000000.0,
+            decompCount,
+            decompSlow,
+            outputAvgMs,
+            outputMax / 1000000.0,
+            outputCount,
+            outputSlow
+        );
+
+        transportBytes = 0;
+        transportStatsStart = now;
     }
 
     int Client::getUI() {
@@ -272,12 +356,6 @@ namespace server {
         PacketWaiter* waiter = new PacketWaiter;
         commandAckWaiters[waiter] = cmd;
         return waiter;
-    }
-
-    void Client::dHandler(dsp::complex_t *data, int count, void *ctx) {
-        Client* _this = (Client*)ctx;
-        memcpy(_this->output->writeBuf, data, count * sizeof(dsp::complex_t));
-        _this->output->swap(count);
     }
 
     std::shared_ptr<Client> connect(std::string host, uint16_t port, dsp::stream<dsp::complex_t>* out) {

@@ -47,7 +47,23 @@ void ConfigManager::load(json def, bool lock) {
 void ConfigManager::save(bool lock) {
     if (lock) { mtx.lock(); }
     std::ofstream file(path.c_str());
-    file << conf.dump(4);
+    try {
+        file << conf.dump(4);
+    }
+    catch (const std::exception& e) {
+        // Invalid UTF-8 in a JSON string value (e.g. garbage from a USB
+        // descriptor) causes dump() to throw.  Fall back to a safe dump
+        // that replaces invalid bytes with U+FFFD rather than crashing.
+        flog::error("Config save failed ({}), retrying with UTF-8 replace", e.what());
+        file.clear();
+        file.seekp(0);
+        try {
+            file << conf.dump(4, ' ', false, nlohmann::detail::error_handler_t::replace);
+        }
+        catch (const std::exception& e2) {
+            flog::error("Config save still failed: {}", e2.what());
+        }
+    }
     file.close();
     if (lock) { mtx.unlock(); }
 }

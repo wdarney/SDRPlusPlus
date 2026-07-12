@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 project(libsddc VERSION 0.2.0)
 
 # Options
-option(BUILD_SDDC_UTILS "Build SDDC utilities such as sddc_info" ON)
+option(BUILD_SDDC_UTILS "Build SDDC utilities such as sddc_info" OFF)
 option(INSTALL_UDEV_RULES "Install UDEV rules (Linux only)" ON)
 
 # List all source files
@@ -37,11 +37,19 @@ add_library(sddc SHARED ${SRC})
 target_include_directories(sddc PUBLIC "include/")
 
 # Find libusb
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
-
-# Link to libusb
-target_link_libraries(sddc PRIVATE PkgConfig::libusb)
+if (WIN32)
+    find_path(LIBUSB_INCLUDE_DIR libusb.h PATH_SUFFIXES libusb-1.0)
+    find_library(LIBUSB_LIBRARY NAMES libusb-1.0 usb-1.0)
+    if (NOT LIBUSB_INCLUDE_DIR OR NOT LIBUSB_LIBRARY)
+        message(FATAL_ERROR "libusb not found. Install via vcpkg: vcpkg install libusb:x64-windows")
+    endif()
+    target_include_directories(sddc PRIVATE ${LIBUSB_INCLUDE_DIR})
+    target_link_libraries(sddc PRIVATE ${LIBUSB_LIBRARY})
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
+    target_link_libraries(sddc PRIVATE PkgConfig::libusb)
+endif()
 
 # TODO: Have it default instead of override
 if (MSVC)

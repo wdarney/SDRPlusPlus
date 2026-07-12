@@ -41,6 +41,12 @@ namespace net {
         uint8_t* buf;
     };
 
+    struct ConnWriteResult {
+        uint64_t bytesWritten = 0;
+        uint32_t sendCalls = 0;
+        uint32_t partialSends = 0;
+    };
+
     class ConnClass {
     public:
         ConnClass(Socket sock, struct sockaddr_in raddr = {}, bool udp = false);
@@ -51,7 +57,7 @@ namespace net {
         void waitForEnd();
 
         int read(int count, uint8_t* buf, bool enforceSize = true);
-        bool write(int count, uint8_t* buf);
+        bool write(int count, const uint8_t* buf, ConnWriteResult* result = nullptr);
         void readAsync(int count, uint8_t* buf, void (*handler)(int count, uint8_t* buf, void* ctx), void* ctx, bool enforceSize = true);
         void writeAsync(int count, uint8_t* buf);
 

@@ -104,13 +104,21 @@ namespace net {
         return beenRead;
     }
 
-    bool ConnClass::write(int count, uint8_t* buf) {
+    bool ConnClass::write(int count, const uint8_t* buf, ConnWriteResult* result) {
+        if (result) { *result = ConnWriteResult{}; }
         if (!connectionOpen) { return false; }
         std::lock_guard lck(writeMtx);
         int ret;
 
         if (_udp) {
-            ret = sendto(_sock, (char*)buf, count, 0, (struct sockaddr*)&remoteAddr, sizeof(remoteAddr));
+            ret = sendto(_sock, (const char*)buf, count, 0, (struct sockaddr*)&remoteAddr, sizeof(remoteAddr));
+            if (result) {
+                result->sendCalls++;
+                if (ret > 0) {
+                    result->bytesWritten += ret;
+                    if (ret < count) { result->partialSends++; }
+                }
+            }
             if (ret <= 0) {
                 {
                     std::lock_guard lck(connectionOpenMtx);
@@ -123,7 +131,15 @@ namespace net {
 
         int beenWritten = 0;
         while (beenWritten < count) {
-            ret = send(_sock, (char*)buf, count, 0);
+            int remaining = count - beenWritten;
+            ret = send(_sock, (const char*)&buf[beenWritten], remaining, 0);
+            if (result) {
+                result->sendCalls++;
+                if (ret > 0) {
+                    result->bytesWritten += ret;
+                    if (ret < remaining) { result->partialSends++; }
+                }
+            }
             if (ret <= 0) {
                 {
                     std::lock_guard lck(connectionOpenMtx);
