@@ -71,6 +71,13 @@ endif()
 
 include(${SDRPP_MODULE_CMAKE})
 
+# Desktop modules are loaded with dlsym/GetProcAddress using the legacy
+# unscoped entry-point names (_INFO_, _INIT_, and friends).  The unified core
+# header's fallback token is reserved for core/static-module translation units;
+# explicitly empty it for this dynamically loaded target.  iOS returns above
+# and supplies its own per-module token in CMakeLists.ios.cmake.
+target_compile_definitions(channel_bank PRIVATE SDRPP_MODULE_TOKEN=)
+
 # Cross-module FM interface
 target_include_directories(channel_bank PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../frequency_manager/src
