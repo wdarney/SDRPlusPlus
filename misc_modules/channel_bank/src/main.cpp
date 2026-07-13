@@ -134,9 +134,9 @@ struct ChannelSlot {
     bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
 
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
-    int fadeOutRemaining  = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
-    int audioHoldRemaining = 0;   // short independent audio-hold (200ms) before fade starts;
-                                  // decoupled from signalHoldMs so AM AGC ramp doesn't bleed into recording
+    int fadeOutRemaining   = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
+    int audioHoldRemaining = 0;    // independent post-detection hold before fade starts;
+                                   // AM bypasses it to suppress carrier-AGC release noise
 
     // Pre-roll circular buffer — always running once warmup is done (DSP thread only).
     // When a file opens we flush the last PREROLL_SAMPLES of audio first so we
@@ -948,6 +948,7 @@ public:
         slot.noiseGuardCentroidSumSq = 0.0;
         slot.noiseGuardWidthSum      = 0.0;
         slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
+        slot.audioHoldRemaining   = 0;    // never carry a previous recording's tail state forward
         // NOTE: deliberately do NOT register the frequency in permanent history here.
         // Doing so created an entry for every file-open — including the flood of opens
         // from broadband/drifting interference whose recordings are then discarded by the
@@ -1085,9 +1086,10 @@ private:
         // Why not use an EMA for rawSignalPresent?  A charged EMA (even alpha=0.50) takes
         // 5–7 frames (250–350 ms) to decay below the SNR threshold after a strong carrier
         // drops — because signal power during a long transmission fully charges the accumulator.
-        // Instantaneous power drops to noise level in ONE frame (50 ms), so with a
-        // 2-consecutive-miss guard the fade starts within ≤100 ms regardless of how long
-        // or strong the transmission was.
+        // Instantaneous power drops to noise level in ONE frame (50 ms), so carrier
+        // modes can begin fading after the normal 2-miss guard (≤100 ms) regardless
+        // of how long or strong the transmission was. SSB gets a longer guard below
+        // because normal inter-word pauses contain no carrier.
         constexpr float alpha = 0.15f;
         bool firstFrame = avgPower.empty();
         if (firstFrame) {
@@ -1525,14 +1527,13 @@ private:
                 displaySnap.dBmax = sorted[hi95] + 15.0f;
             }
             // Immediately propagate raw detection to active slots — same FFT frame,
-            // no management-thread hop. Before file-open this keeps the old fast
-            // 2-frame miss guard; after file-open it debounces below-threshold dips
-            // for ~400 ms so marginal copyable HF does not flicker raw state between
-            // words or syllables.
+            // no management-thread hop. Use the normal 2-frame miss guard before
+            // file-open and for AM. Other modes retain 4 frames (~200 ms) after
+            // file-open so this AM-tail fix does not change their dropout behavior.
             if (!widebandEvent) {
                 std::lock_guard<std::mutex> clck(channelsMtx);
                 for (auto& [idx, slot] : activeChannels) {
-                    const int missLimit = slot->fileOpen ? 4 : 2;
+                    const int missLimit = (slot->fileOpen && !slot->amDemod) ? 4 : 2;
                     bool above = (newRawDetected.count(idx) > 0);
                     auto ssit = newManualInstantSnr.find(idx);
                     if (slot->fileOpen && ssit != newManualInstantSnr.end())
@@ -1657,16 +1658,15 @@ private:
             // Immediately propagate raw (un-voted) detection to active slots.
             // Uses instantaneous power with a miss debounce:
             //   • above threshold → reset miss counter, hold rawSignalPresent true
-            //   • before file-open: 2 misses (fast start/stop behavior)
-            //   • after file-open: 8 misses (~400 ms) to stabilize marginal HF
-            //     through word/syllable dips before the cosine fade begins.
+            //   • before file-open and for AM: 2 misses (fast stop)
+            //   • other modes after file-open: retain 4 misses (~200 ms)
             //
             // During wideband events (lightning, etc.) the update is skipped entirely:
             // active real signals keep their current state; quiet channels don't get
             // their miss counter reset by broadband noise.
             if (!widebandEvent) {
                 for (auto& [idx, slot] : activeChannels) {
-                    const int missLimit = slot->fileOpen ? 4 : 2;
+                    const int missLimit = (slot->fileOpen && !slot->amDemod) ? 4 : 2;
                     float effSnrRaw = slot->fileOpen ? holdSnrLinear : snrLinear;
                     bool above = (idx < numSlots && instSlotMeans[idx] > globalNoiseFloor * effSnrRaw);
                     if (slot->fileOpen && idx < numSlots && globalNoiseFloor > 0.0f && instSlotMeans[idx] > 1e-30f) {
@@ -1999,7 +1999,7 @@ private:
                     it->second->lastDetected  = now;
                     it->second->signalPresent = true;
                     // rawSignalPresent is maintained exclusively by the DSP thread
-                    // (analyzeSpectrum NMS pass) with 2-consecutive-miss logic.
+                    // (analyzeSpectrum NMS pass) with mode-aware miss debounce.
                     // Accumulate SNR while the slot is actively recording
                     if (it->second->fileOpen && idx < (int)localSnrDb.size()) {
                         it->second->snrSum   += localSnrDb[idx];
@@ -2358,7 +2358,8 @@ private:
         // Two flags drive this:
         //   rawSignalPresent – updated in the DSP thread every FFT frame (50 ms).
         //                      Goes TRUE on the very first frame above the SNR
-        //                      threshold; goes FALSE only after 2 consecutive misses.
+        //                      threshold; goes FALSE after 2 consecutive misses in
+        //                      AM, or 4 for other open recording modes.
         //                      Fast but has no vote smoothing.
         //   signalPresent    – updated by the management thread every 250 ms.
         //                      Requires SPAWN_VOTES consecutive detections and
@@ -2559,33 +2560,21 @@ private:
         // halves the file size with no audible difference.
         const int totalFade = 4800;
 
-        // Fade-out: raised-cosine from 1→0 driven by signal absence.
-        //
-        // The fade only begins when BOTH the instantaneous power (rawSignalPresent,
-        // 2-frame miss counter) AND the vote accumulator (signalPresent) agree the
-        // signal is gone.  Using rawSignalPresent alone caused mid-transmission
-        // squelch: USB inter-word pauses (50-300ms) are long enough for the 2-miss
-        // counter to fire and begin a 50ms fade, producing audible dropouts.
-        //
-        // signalPresent (vote-based) holds true through brief pauses — MAX_VOTES=8
-        // takes 6 frames (300ms) to drain below SPAWN_VOTES — so it acts as a hold
-        // that keeps the audio at full gain while speech is momentarily quiet.
-        // The fade only starts once the slot is genuinely idle (votes exhausted AND
-        // instantaneous power below threshold).
-        //
-        // This runs entirely on the DSP thread (no mutex needed) — both flags are
-        // atomic and fadeOutRemaining is DSP-thread-only.
+        // Fade-out: raised-cosine from 1→0 driven by raw RF signal absence. The
+        // AM-specific detector debounce and audio-hold bypass below remove carrier
+        // AGC release noise without changing the other demodulators' tail behavior.
+        // This runs entirely on the DSP thread (no mutex needed).
         float tailFade = 1.0f;
-        // Audio fade is driven by rawSignalPresent plus a short independent hold
-        // (600 ms, ~28800 samples).  This hold is separate from signalHoldMs so that
-        // AM mode doesn't write AGC ramp-up noise for the entire hold period before
-        // the fade kicks in.  600 ms bridges normal HF SSB inter-word pauses without
-        // forcing Hold Hysteresis low enough to keep marginal noise recordings open.
+        // Audio fade is driven by rawSignalPresent plus a short independent hold.
+        // AM bypasses that hold because its keyed carrier remains present through
+        // speech pauses; after unkey, holding full gain records the carrier AGC's
+        // recovery as a rising burst of static. Other modes retain the established
+        // hold unchanged so this fix remains strictly AM-specific.
         //
         // The file stays open for the full signalHoldMs+tailMs period (driven by
         // signalPresent + the silenceElapsed counter above), but any audio written
         // after the fade completes is digital silence (tailFade = 0.0f).
-        const int AUDIO_HOLD_SAMPLES = 16800; // 350 ms @ 48 kHz
+        const int AUDIO_HOLD_SAMPLES = slot->amDemod ? 0 : 16800; // 350 ms @ 48 kHz outside AM
         const int POST_FADE_REOPEN_HITS = 2;  // same 100 ms qualifier used for file-open
         bool rawAlive = slot->rawSignalPresent.load();
         bool fullyFaded = (slot->fadeOutRemaining <= 0 && slot->audioHoldRemaining <= 0);
