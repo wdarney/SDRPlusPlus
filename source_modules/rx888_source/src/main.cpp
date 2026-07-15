@@ -10,6 +10,7 @@
 #include <signal_path/signal_path.h>
 #include <core.h>
 #include <algorithm>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,7 +71,36 @@ private:
     // regardless of where the app bundle lives or how it was launched.
     // Falls back silently if the module is already loaded or not found.
     static void loadSoapySDDC() {
-#ifdef __APPLE__
+#ifdef _WIN32
+        HMODULE selfModule = NULL;
+        if (!GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(&_INFO_),
+                &selfModule)) {
+            return;
+        }
+
+        std::vector<char> modulePath(32768);
+        DWORD pathLength = GetModuleFileNameA(
+            selfModule,
+            modulePath.data(),
+            static_cast<DWORD>(modulePath.size())
+        );
+        if (pathLength == 0 || pathLength >= modulePath.size()) { return; }
+
+        // rx888_source.dll is at modules/rx888_source.dll.
+        // SoapySDDC is at SoapySDR/modules0.8/SDDCSupport.dll.
+        std::filesystem::path sddc =
+            std::filesystem::path(modulePath.data()).parent_path().parent_path() /
+            "SoapySDR" / "modules0.8" / "SDDCSupport.dll";
+
+        std::string err = SoapySDR::loadModule(sddc.string());
+        if (!err.empty())
+            flog::warn("RX888: SoapySDDC load: {}", err);
+        else
+            flog::info("RX888: Loaded SoapySDDC from {}", sddc.string());
+#elif defined(__APPLE__)
         Dl_info info;
         if (!dladdr((void*)&loadSoapySDDC, &info) || !info.dli_fname) return;
 

@@ -8,6 +8,7 @@ extern "C" {
 }
 
 #include <cstdio>
+#include <chrono>
 #include <ctime>
 
 // ============================================================================
@@ -701,9 +702,9 @@ void VDL2Channel::parseAVLC(const uint8_t* data, int len, float snr) {
     msg.is_acars = false;
 
     // Get timestamp
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    msg.timestamp = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    msg.timestamp = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
 
     // Parse addresses (4 bytes each)
     // Destination: bytes 0-3, Source: bytes 4-7, Control: byte 8

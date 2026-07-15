@@ -48,6 +48,7 @@ endif ()
 
 add_library(sdrpp_core STATIC ${SRC} ${BACKEND_SRC})
 target_compile_options(sdrpp_core PRIVATE ${SDRPP_COMPILER_FLAGS})
+target_compile_definitions(sdrpp_core PRIVATE SDRPP_STATIC_MODULES)
 # Public C++17 — consumers (modules, the iOS app target) need this too.
 # DSP templates use std::is_same_v / `if constexpr`, which are C++17.
 target_compile_features(sdrpp_core PUBLIC cxx_std_17)
