@@ -7,6 +7,7 @@ extern "C" {
 }
 
 #include <cstdio>
+#include <chrono>
 #include <ctime>
 
 // ============================================================================
@@ -357,9 +358,9 @@ void ACARSChannel::buildMessage() {
     }
 
     // Timestamp
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    msg.timestamp = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    msg.timestamp = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
 
     // Strip parity bits from message bytes
     std::vector<uint8_t> clean(msgBuf.size());

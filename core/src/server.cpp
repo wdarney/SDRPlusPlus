@@ -79,7 +79,9 @@ namespace server {
             transportStats.sendCalls += result.sendCalls;
             transportStats.partialSends += result.partialSends;
             transportStats.totalWriteMs += writeMs;
-            transportStats.maxWriteMs = std::max(transportStats.maxWriteMs, writeMs);
+            // Parenthesize std::max so the Windows headers' max macro cannot
+            // rewrite this call when building with MSVC.
+            transportStats.maxWriteMs = (std::max)(transportStats.maxWriteMs, writeMs);
             if (writeMs >= SLOW_WRITE_MS) { transportStats.slowWrites++; }
 
             auto now = std::chrono::steady_clock::now();
