@@ -167,7 +167,7 @@ private:
         gainRanges.clear();
         uiGains.clear();
         for (const auto& g : gainList) {
-            gainRanges.push_back(dev->getGainRange(SOAPY_SDR_RX, 0, g));
+            gainRanges.push_back(defaultGainRange(g, queryMode));
             // Default to 0 dB clamped to the valid range, not minimum (which is too low)
             double def = std::max(gainRanges.back().minimum(),
                          std::min(0.0, gainRanges.back().maximum()));
@@ -194,8 +194,52 @@ private:
         refreshSampleRates(dev);
     }
 
+    void setDefaultCapabilities() {
+        gainList = { "RF", "IF" };
+        gainRanges.clear();
+        uiGains.clear();
+        for (const auto& g : gainList) {
+            gainRanges.push_back(defaultGainRange(g, mode));
+            double def = std::max(gainRanges.back().minimum(),
+                         std::min(0.0, gainRanges.back().maximum()));
+            uiGains.push_back((float)def);
+        }
+
+        hasHF  = true;
+        hasVHF = true;
+        supportsNewBiasTee = true;
+        supportsAdcFreq    = true;
+        supportsBiasTee    = false;
+        supportsDithering  = false;
+        refreshDefaultSampleRates();
+    }
+
+    static SoapySDR::Range defaultGainRange(const std::string& name, const std::string& rangeMode) {
+        if (name == "RF")
+            return rangeMode == "VHF" ? SoapySDR::Range(0.0, 49.6) : SoapySDR::Range(-31.5, 0.0);
+        if (name == "IF")
+            return rangeMode == "VHF" ? SoapySDR::Range(-4.7, 40.8) : SoapySDR::Range(-24.6, 33.1);
+        return SoapySDR::Range();
+    }
+
     void refreshSampleRates(SoapySDR::Device* dev) {
         sampleRates = dev->listSampleRates(SOAPY_SDR_RX, 0);
+        buildSrText();
+    }
+
+    void refreshDefaultSampleRates() {
+        sampleRates.clear();
+
+        int numRates = adcFreq > 80000000.0 ? 6 : 5;
+        double bwmin = adcFreq / 64.0;
+        if (adcFreq > 80000000.0) bwmin /= 2.0;
+
+        for (int idx = 0; idx < numRates; idx++) {
+            double rate = bwmin * (double)(1 << idx) * 2.0;
+            if ((rate / adcFreq) * 2.0 <= 1.1)
+                sampleRates.push_back(rate);
+        }
+
         buildSrText();
     }
 
@@ -240,10 +284,10 @@ private:
     // Called in start() after setAntenna() — re-queries gain ranges for the active mode
     // and clamps existing slider values into the new valid range.
     void updateGainRanges() {
-        auto newList   = dev->listGains(SOAPY_SDR_RX, 0);
+        auto newList   = gainList.empty() ? std::vector<std::string>{ "RF", "IF" } : gainList;
         std::vector<SoapySDR::Range> newRanges;
         for (const auto& g : newList)
-            newRanges.push_back(dev->getGainRange(SOAPY_SDR_RX, 0, g));
+            newRanges.push_back(defaultGainRange(g, mode));
 
         if (newList.size() != gainList.size()) {
             gainList   = newList;
@@ -264,32 +308,19 @@ private:
     // spawns a background thread so the firmware-upload open doesn't block the UI.
     void reQueryGainsForMode() {
         if (devList.empty() || devId < 0 || running) return;
-        auto args = devList[devId];
         auto m    = mode;
-        std::thread([this, args, m]() {
-            SoapySDR::Device* d = nullptr;
-            try { d = SoapySDR::Device::make(args); }
-            catch (const std::exception& e) {
-                flog::warn("RX888: reQueryGainsForMode open failed: {}", e.what());
-                return;
-            }
-            try { d->setAntenna(SOAPY_SDR_RX, 0, m); } catch (...) {}
-            auto newList = d->listGains(SOAPY_SDR_RX, 0);
-            std::vector<SoapySDR::Range> newRanges;
-            for (const auto& g : newList)
-                newRanges.push_back(d->getGainRange(SOAPY_SDR_RX, 0, g));
-            SoapySDR::Device::unmake(d);
-            // Only update if mode hasn't changed since we started
-            if (m == mode) {
-                gainList   = newList;
-                gainRanges = newRanges;
-                uiGains.resize(gainList.size(), 0.0f);
-                for (int i = 0; i < (int)gainList.size(); i++) {
-                    uiGains[i] = std::max((float)gainRanges[i].minimum(),
-                                 std::min(uiGains[i], (float)gainRanges[i].maximum()));
-                }
-            }
-        }).detach();
+        auto newList = std::vector<std::string>{ "RF", "IF" };
+        std::vector<SoapySDR::Range> newRanges;
+        for (const auto& g : newList)
+            newRanges.push_back(defaultGainRange(g, m));
+
+        gainList   = newList;
+        gainRanges = newRanges;
+        uiGains.resize(gainList.size(), 0.0f);
+        for (int i = 0; i < (int)gainList.size(); i++) {
+            uiGains[i] = std::max((float)gainRanges[i].minimum(),
+                         std::min(uiGains[i], (float)gainRanges[i].maximum()));
+        }
     }
 
     void applyModeRateCap() {
@@ -309,36 +340,35 @@ private:
             if (deviceLabel(devList[i]) == label) { found = i; break; }
         }
         devId = found;
+        std::string selectedLabel = deviceLabel(devList[devId]);
 
-        SoapySDR::Device* dev = nullptr;
-        try {
-            dev = SoapySDR::Device::make(devList[devId]);
-        }
-        catch (const std::exception& e) {
-            flog::error("RX888: open failed during select: {}", e.what());
-            devId = -1;
-            return;
-        }
-
-        queryCapabilities(dev, mode);
-        SoapySDR::Device::unmake(dev);
-
-        // Load saved config for this device
+        json savedDevice;
+        bool hasSavedDevice = false;
         config.acquire();
         auto& dc = config.conf["devices"];
-        if (dc.contains(label)) {
-            auto& c = dc[label];
-            if (c.contains("mode"))       mode       = c["mode"].get<std::string>();
-            if (c.contains("adcFreq"))    adcFreq    = c["adcFreq"].get<double>();
-            if (c.contains("biasTeeHF"))  biasTeeHF  = c["biasTeeHF"].get<bool>();
-            if (c.contains("biasTeeVHF")) biasTeeVHF = c["biasTeeVHF"].get<bool>();
-            if (c.contains("dithering"))  dithering  = c["dithering"].get<bool>();
+        if (dc.contains(selectedLabel) || dc.contains(label)) {
+            savedDevice = dc.contains(selectedLabel) ? dc[selectedLabel] : dc[label];
+            hasSavedDevice = true;
+            if (savedDevice.contains("mode"))       mode       = savedDevice["mode"].get<std::string>();
+            if (savedDevice.contains("adcFreq"))    adcFreq    = savedDevice["adcFreq"].get<double>();
+            if (savedDevice.contains("biasTeeHF"))  biasTeeHF  = savedDevice["biasTeeHF"].get<bool>();
+            if (savedDevice.contains("biasTeeVHF")) biasTeeVHF = savedDevice["biasTeeVHF"].get<bool>();
+            if (savedDevice.contains("dithering"))  dithering  = savedDevice["dithering"].get<bool>();
+        }
+        config.release();
+
+        setDefaultCapabilities();
+
+        // Load saved config for this device
+        if (hasSavedDevice) {
             for (int i = 0; i < (int)gainList.size(); i++) {
-                if (c.contains("gains") && c["gains"].contains(gainList[i]))
-                    uiGains[i] = c["gains"][gainList[i]].get<float>();
+                if (savedDevice.contains("gains") && savedDevice["gains"].contains(gainList[i]))
+                    uiGains[i] = savedDevice["gains"][gainList[i]].get<float>();
             }
-            double savedSr = c.contains("sampleRate") ? c["sampleRate"].get<double>() : sampleRates[0];
-            selectSampleRate(savedSr);
+            if (!sampleRates.empty()) {
+                double savedSr = savedDevice.contains("sampleRate") ? savedDevice["sampleRate"].get<double>() : sampleRates[0];
+                selectSampleRate(savedSr);
+            }
         }
         else {
             // Defaults
@@ -349,7 +379,6 @@ private:
             dithering  = true;
             if (!sampleRates.empty()) selectSampleRate(sampleRates[0]);
         }
-        config.release();
 
         // Sync visible combo index after mode and rate are set
         applyModeRateCap();
@@ -419,7 +448,7 @@ private:
             _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
 
         // Re-query sample rates (they depend on ADC freq) and reselect
-        _this->refreshSampleRates(_this->dev);
+        _this->refreshDefaultSampleRates();
         _this->selectSampleRate(_this->sampleRate);
 
         // Antenna / mode — re-query gains after switching so ranges are correct for this mode
