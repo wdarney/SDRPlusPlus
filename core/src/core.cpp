@@ -202,6 +202,8 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["RTL-SDR Source"]["enabled"] = true;
     defConfig["moduleInstances"]["RTL-TCP Source"]["module"] = "rtl_tcp_source";
     defConfig["moduleInstances"]["RTL-TCP Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["RX888"]["module"] = "rx888_source";
+    defConfig["moduleInstances"]["RX888"]["enabled"] = true;
     defConfig["moduleInstances"]["SDRplay Source"]["module"] = "sdrplay_source";
     defConfig["moduleInstances"]["SDRplay Source"]["enabled"] = true;
     defConfig["moduleInstances"]["SDR++ Server Source"]["module"] = "sdrpp_server_source";
@@ -306,6 +308,7 @@ int sdrpp_main(int argc, char* argv[]) {
     core::configManager.conf["modules"][modCount++] = "rfspace_source.so";
     core::configManager.conf["modules"][modCount++] = "rtl_sdr_source.so";
     core::configManager.conf["modules"][modCount++] = "rtl_tcp_source.so";
+    core::configManager.conf["modules"][modCount++] = "rx888_source.so";
     core::configManager.conf["modules"][modCount++] = "sdrpp_server_source.so";
     core::configManager.conf["modules"][modCount++] = "spyserver_source.so";
 

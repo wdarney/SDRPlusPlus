@@ -34,6 +34,7 @@ public:
 
         void setVolume(float volume);
         float getVolume();
+        bool getMuted();
 
         void setSampleRate(float sampleRate);
         float getSampleRate();
@@ -98,6 +99,7 @@ public:
     void stopStream(std::string name);
 
     float getStreamSampleRate(std::string name);
+    std::string getStreamSink(std::string name);
 
     void setStreamSink(std::string name, std::string providerName);
 

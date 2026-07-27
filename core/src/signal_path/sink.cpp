@@ -58,6 +58,10 @@ float SinkManager::Stream::getVolume() {
     return guiVolume;
 }
 
+bool SinkManager::Stream::getMuted() {
+    return volumeAjust.getMuted();
+}
+
 float SinkManager::Stream::getSampleRate() {
     return _sampleRate;
 }
@@ -197,6 +201,14 @@ float SinkManager::getStreamSampleRate(std::string name) {
         return -1.0f;
     }
     return streams[name]->getSampleRate();
+}
+
+std::string SinkManager::getStreamSink(std::string name) {
+    if (streams.find(name) == streams.end()) {
+        flog::error("Cannot get sink for stream '{0}', this stream doesn't exist", name);
+        return "";
+    }
+    return streams[name]->providerName;
 }
 
 dsp::stream<dsp::stereo_t>* SinkManager::bindStream(std::string name) {

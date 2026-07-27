@@ -9,6 +9,9 @@ project(channel_bank)
 
 file(GLOB SRC "src/*.cpp")
 list(FILTER SRC EXCLUDE REGEX "src/main_ios\\.cpp$")
+if (ANDROID)
+    list(FILTER SRC EXCLUDE REGEX "src/transcription_whisper\\.cpp$")
+endif()
 if (APPLE AND NOT ANDROID)
     list(APPEND SRC src/transcription.mm src/encoding.mm src/transcription_whisper.mm)
     set_source_files_properties(src/transcription.mm src/encoding.mm src/transcription_whisper.mm PROPERTIES
@@ -77,6 +80,9 @@ include(${SDRPP_MODULE_CMAKE})
 # explicitly empty it for this dynamically loaded target.  iOS returns above
 # and supplies its own per-module token in CMakeLists.ios.cmake.
 target_compile_definitions(channel_bank PRIVATE SDRPP_MODULE_TOKEN=)
+if (ANDROID)
+    target_compile_definitions(channel_bank PRIVATE CB_NO_WHISPER)
+endif()
 
 # Cross-module FM interface
 target_include_directories(channel_bank PRIVATE
