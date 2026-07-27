@@ -66,8 +66,8 @@ int sddc_fx3_reset(libusb_device_handle* dev) {
 
 int sddc_fx3_set_param(libusb_device_handle* dev, sddc_param_t param, uint16_t value) {
     // Send the parameter
-    uint32_t dummy;
-    return libusb_control_transfer(dev, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE, SDDC_CMD_FX3_SET_PARAM, value, param, &dummy, sizeof(uint32_t), SDDC_TIMEOUT_MS);
+    uint8_t dummy = 0;
+    return libusb_control_transfer(dev, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE, SDDC_CMD_FX3_SET_PARAM, value, param, &dummy, sizeof(dummy), SDDC_TIMEOUT_MS);
 }
 
 int sddc_adc_set_samplerate(libusb_device_handle* dev, uint32_t samplerate) {

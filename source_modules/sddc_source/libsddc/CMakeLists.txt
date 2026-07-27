@@ -37,7 +37,15 @@ add_library(sddc SHARED ${SRC})
 target_include_directories(sddc PUBLIC "include/")
 
 # Find libusb
-if (WIN32)
+if (ANDROID)
+    target_include_directories(sddc PRIVATE
+        /sdr-kit/${ANDROID_ABI}/include
+    )
+
+    target_link_libraries(sddc PRIVATE
+        /sdr-kit/${ANDROID_ABI}/lib/libusb1.0.so
+    )
+elseif (WIN32)
     find_path(LIBUSB_INCLUDE_DIR libusb.h PATH_SUFFIXES libusb-1.0)
     find_library(LIBUSB_LIBRARY NAMES libusb-1.0 usb-1.0)
     if (NOT LIBUSB_INCLUDE_DIR OR NOT LIBUSB_LIBRARY)
@@ -57,13 +65,13 @@ if (MSVC)
     set(CMAKE_INSTALL_BINDIR "bin")
     set(CMAKE_INSTALL_LIBDIR "lib")
     set(CMAKE_INSTALL_INCLUDEDIR "include")
-else ()
+elseif (NOT ANDROID)
     include(GNUInstallDirs)
 endif ()
 
-if (NOT MSVC)
+if (NOT MSVC AND NOT ANDROID)
     # Configure pkgconfig file
-    configure_file(${CMAKE_SOURCE_DIR}/libsddc.pc.in ${CMAKE_CURRENT_BINARY_DIR}/libsddc.pc @ONLY)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/libsddc.pc.in ${CMAKE_CURRENT_BINARY_DIR}/libsddc.pc @ONLY)
 
     # Install pkgconfig file
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libsddc.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
@@ -72,12 +80,14 @@ endif ()
 # Install the library
 if (MSVC)
     install(TARGETS sddc)
-else ()
+elseif (NOT ANDROID)
     install(TARGETS sddc DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif ()
 
 # Install the headers
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if (NOT ANDROID)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif ()
 
 # On Windows, install dependencies
 if (MSVC)

@@ -21,6 +21,12 @@ enum sddc_model {
 };
 typedef enum sddc_model sddc_model_t;
 
+enum sddc_port {
+    SDDC_PORT_VHF = 0,
+    SDDC_PORT_HF = 1
+};
+typedef enum sddc_port sddc_port_t;
+
 enum sddc_error {
     SDDC_ERROR_UNKNOWN                  = -99,
     SDDC_ERROR_NOT_IMPLEMENTED          = -98,
@@ -44,7 +50,7 @@ typedef struct sddc_dev sddc_dev_t;
  * Device information.
 */
 struct sddc_devinfo {
-    const char serial[SDDC_SERIAL_MAX_LEN];
+    char serial[SDDC_SERIAL_MAX_LEN];
     sddc_model_t model;
     int firmwareMajor;
     int firmwareMinor;
@@ -90,6 +96,16 @@ sddc_error_t sddc_set_firmware_path(const char* path);
 int sddc_get_device_list(sddc_devinfo_t** dev_list);
 
 /**
+ * Get device information from an Android USB file descriptor.
+ * @param fd Android USB device file descriptor.
+ * @param vid USB vendor ID for the descriptor behind fd.
+ * @param pid USB product ID for the descriptor behind fd.
+ * @param dev_list Pointer to a list of devices.
+ * @return Number of devices in the list or an error code if an error occured.
+*/
+int sddc_get_device_list_fd(int fd, int vid, int pid, sddc_devinfo_t** dev_list);
+
+/**
  * Free a device list returned by `sddc_get_device_list()`. Attempting to free a list returned empty has no effect.
  * @param dev_list Device list to free.
 */
@@ -102,6 +118,15 @@ void sddc_free_device_list(sddc_devinfo_t* dev_list);
  * @return SDDC_SUCCESS on success or an error code otherwise.
 */
 sddc_error_t sddc_open(const char* serial, sddc_dev_t** dev);
+
+/**
+ * Open a device from an Android USB file descriptor.
+ * @param fd Android USB device file descriptor.
+ * @param serial Serial number of the device to open.
+ * @param dev Pointer to a SDDC device pointer to populate once open.
+ * @return SDDC_SUCCESS on success or an error code otherwise.
+*/
+sddc_error_t sddc_open_fd(int fd, const char* serial, sddc_dev_t** dev);
 
 /**
  * Close an opened SDDC device.
@@ -139,6 +164,38 @@ sddc_error_t sddc_set_dithering(sddc_dev_t* dev, bool enabled);
  * @return SDDC_SUCCESS on success or an error code otherwise.
 */
 sddc_error_t sddc_set_randomizer(sddc_dev_t* dev, bool enabled);
+
+/**
+ * Select the RX888 input path.
+ * @param dev SDDC device.
+ * @param port Input path to select.
+ * @return SDDC_SUCCESS on success or an error code otherwise.
+*/
+sddc_error_t sddc_set_port(sddc_dev_t* dev, sddc_port_t port);
+
+/**
+ * Set the R82xx attenuator value used by the tuner path.
+ * @param dev SDDC device.
+ * @param value Attenuator value.
+ * @return SDDC_SUCCESS on success or an error code otherwise.
+*/
+sddc_error_t sddc_set_rf_attenuator(sddc_dev_t* dev, uint16_t value);
+
+/**
+ * Set the R83xx VGA value used by the tuner path.
+ * @param dev SDDC device.
+ * @param value VGA value.
+ * @return SDDC_SUCCESS on success or an error code otherwise.
+*/
+sddc_error_t sddc_set_if_gain(sddc_dev_t* dev, uint16_t value);
+
+/**
+ * Set the VHF attenuator value.
+ * @param dev SDDC device.
+ * @param value Attenuator value.
+ * @return SDDC_SUCCESS on success or an error code otherwise.
+*/
+sddc_error_t sddc_set_vhf_attenuator(sddc_dev_t* dev, uint16_t value);
 
 /**
  * Set the LO of the tuner.
