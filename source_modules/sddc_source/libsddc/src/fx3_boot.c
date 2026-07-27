@@ -1,5 +1,6 @@
 #include "fx3_boot.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 #define FX3_TIMEOUT         1000
 #define FX3_VENDOR_REQUEST  0xA0
@@ -83,7 +84,7 @@ int sddc_fx3_boot_upload_firmware(libusb_device_handle* dev, const char* path) {
         // Re-allocate buffer if needed
         if (size > bufferSize) {
             bufferSize = size;
-            realloc(buffer, bufferSize);
+            buffer = realloc(buffer, bufferSize);
         }
 
         // Read the section data

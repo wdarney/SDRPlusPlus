@@ -7,6 +7,13 @@
 #include <utils/optionlist.h>
 #include <atomic>
 #include <sddc.h>
+#include <filesystem>
+#include <algorithm>
+#include <fftw3.h>
+
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
 
 SDRPP_MOD_INFO{
     /* Name:            */ "sddc_source",
@@ -26,8 +33,10 @@ public:
     SDDCSourceModule(std::string name) {
         this->name = name;
 
-        // Set firmware image path for debugging
-        sddc_set_firmware_path("C:/Users/ryzerth/Downloads/SDDC_FX3 (1).img");
+        // The Android asset copy places bundled resources under root/res.
+        std::filesystem::path firmwarePath = (std::string)core::args["root"];
+        firmwarePath /= "res/SDDC_FX3.img";
+        sddc_set_firmware_path(firmwarePath.string().c_str());
 
         sampleRate = 128e6;
 
@@ -74,9 +83,8 @@ public:
     }
 
     enum Port {
-        PORT_RF,
-        PORT_HF1,
-        PORT_HF2
+        PORT_VHF,
+        PORT_HF
     };
 
 private:
@@ -97,30 +105,35 @@ private:
     void refresh() {
         devices.clear();
         
-        // // Get device list
-        // sddc_devinfo_t* devList;
-        // int count = sddc_get_device_list(&devList);
-        // if (count < 0) {
-        //     flog::error("Failed to list SDDC devices: {}", count);
-        //     return;
-        // }
+        sddc_devinfo_t* devList = nullptr;
+#ifdef __ANDROID__
+        int vid = -1;
+        int pid = -1;
+        devFd = backend::getDeviceFD(vid, pid, backend::SDDC_VIDPIDS);
+        if (devFd < 0) {
+            flog::error("No Android USB fd available for SDDC device");
+            return;
+        }
+        int count = sddc_get_device_list_fd(devFd, vid, pid, &devList);
+#else
+        int count = sddc_get_device_list(&devList);
+#endif
+        if (count < 0) {
+            flog::error("Failed to list SDDC devices: {}", count);
+            return;
+        }
 
-        // // Add every device found
-        // for (int i = 0; i < count; i++) {
-        //     // Create device name
-        //     std::string name = sddc_model_to_string(devList[i].model);
-        //     name += '[';
-        //     name += devList[i].serial;
-        //     name += ']';
+        for (int i = 0; i < count; i++) {
+            std::string name = sddc_model_to_string(devList[i].model);
+            name += '[';
+            name += devList[i].serial;
+            name += ']';
+            devices.define(devList[i].serial, name, devList[i].serial);
+        }
 
-        //     // Add an entry to the device list
-        //     devices.define(devList[i].serial, name, devList[i].serial);
-        // }
-
-        devices.define("0009072C00C40C32", "TESTING", "0009072C00C40C32");
-
-        // // Free the device list
-        // sddc_free_device_list(devList);
+        if (devList) {
+            sddc_free_device_list(devList);
+        }
     }
 
     void select(const std::string& serial) {
@@ -141,7 +154,11 @@ private:
 
         // Open the device
         sddc_dev_t* dev;
+#ifdef __ANDROID__
+        int err = sddc_open_fd(devFd, serial.c_str(), &dev);
+#else
         int err = sddc_open(serial.c_str(), &dev);
+#endif
         if (err) {
             flog::error("Failed to open device: {}", err);
             return;
@@ -150,15 +167,18 @@ private:
         // Generate samplerate list
         samplerates.clear();
         samplerates.define(4e6, "4 MHz", 4e6);
+#ifndef __ANDROID__
         samplerates.define(8e6, "8 MHz", 8e6);
         samplerates.define(16e6, "16 MHz", 16e6);
         samplerates.define(32e6, "32 MHz", 32e6);
         samplerates.define(64e6, "64 MHz", 64e6);
+#else
+        samplerates.define(8e6, "8 MHz", 8e6);
+#endif
 
-        // // Define the ports
-        // ports.clear();
-        // ports.define("hf", "HF", PORT_RF);
-        // ports.define("vhf", "VHF", PORT_HF1);
+        ports.clear();
+        ports.define("vhf", "VHF", PORT_VHF);
+        ports.define("hf", "HF", PORT_HF);
 
         // Close the device
         sddc_close(dev);
@@ -168,12 +188,15 @@ private:
         devId = id;
 
         // Load default options
-        sampleRate = 64e6;
+        sampleRate = 4e6;
         srId = samplerates.valueId(sampleRate);
-        // port = PORT_RF;
-        // portId = ports.valueId(port);
-        // lnaGain = 0;
-        // vgaGain = 0;
+        port = PORT_VHF;
+        portId = ports.valueId(port);
+        rfAtt = 15;
+        ifGain = 9;
+        vhfAtt = 0;
+        dithering = false;
+        randomizer = false;
 
         // Load config
         config.acquire();
@@ -184,23 +207,63 @@ private:
                 sampleRate = samplerates[srId];
             }
         }
-        // if (config.conf["devices"][selectedSerial].contains("port")) {
-        //     std::string desiredPort = config.conf["devices"][selectedSerial]["port"];
-        //     if (ports.keyExists(desiredPort)) {
-        //         portId = ports.keyId(desiredPort);
-        //         port = ports[portId];
-        //     }
-        // }
-        // if (config.conf["devices"][selectedSerial].contains("lnaGain")) {
-        //     lnaGain = std::clamp<int>(config.conf["devices"][selectedSerial]["lnaGain"], FOBOS_LNA_GAIN_MIN, FOBOS_LNA_GAIN_MAX);
-        // }
-        // if (config.conf["devices"][selectedSerial].contains("vgaGain")) {
-        //     vgaGain = std::clamp<int>(config.conf["devices"][selectedSerial]["vgaGain"], FOBOS_VGA_GAIN_MIN, FOBOS_VGA_GAIN_MAX);
-        // }
+        if (config.conf["devices"][selectedSerial].contains("port")) {
+            std::string desiredPort = config.conf["devices"][selectedSerial]["port"];
+            if (desiredPort == "hf1" || desiredPort == "hf2") {
+                desiredPort = "hf";
+            }
+            if (ports.keyExists(desiredPort)) {
+                portId = ports.keyId(desiredPort);
+                port = ports[portId];
+            }
+        }
+        if (config.conf["devices"][selectedSerial].contains("rfAtt")) {
+            rfAtt = std::clamp<int>(config.conf["devices"][selectedSerial]["rfAtt"], 0, 63);
+        }
+        else if (config.conf["devices"][selectedSerial].contains("r82xxAtt")) {
+            rfAtt = std::clamp<int>(config.conf["devices"][selectedSerial]["r82xxAtt"], 0, 63);
+        }
+        if (config.conf["devices"][selectedSerial].contains("ifGain")) {
+            ifGain = std::clamp<int>(config.conf["devices"][selectedSerial]["ifGain"], 0, 126);
+        }
+        else if (config.conf["devices"][selectedSerial].contains("r83xxVga")) {
+            ifGain = std::clamp<int>(config.conf["devices"][selectedSerial]["r83xxVga"], 0, 126);
+        }
+        if (config.conf["devices"][selectedSerial].contains("vhfAtt")) {
+            vhfAtt = std::clamp<int>(config.conf["devices"][selectedSerial]["vhfAtt"], 0, 31);
+        }
+        if (config.conf["devices"][selectedSerial].contains("dithering")) {
+            dithering = config.conf["devices"][selectedSerial]["dithering"];
+        }
+        if (config.conf["devices"][selectedSerial].contains("randomizer")) {
+            randomizer = config.conf["devices"][selectedSerial]["randomizer"];
+        }
         config.release();
 
         // Update the samplerate
         core::setInputSampleRate(sampleRate);
+    }
+
+    void applySettings() {
+        if (!openDev) { return; }
+        sddc_set_port(openDev, (sddc_port_t)port);
+        sddc_set_rf_attenuator(openDev, rfAtt);
+        sddc_set_if_gain(openDev, ifGain);
+        sddc_set_vhf_attenuator(openDev, vhfAtt);
+        sddc_set_dithering(openDev, dithering);
+        sddc_set_randomizer(openDev, randomizer);
+    }
+
+    void saveDeviceSettings() {
+        if (selectedSerial.empty()) { return; }
+        config.acquire();
+        config.conf["devices"][selectedSerial]["port"] = ports.key(portId);
+        config.conf["devices"][selectedSerial]["rfAtt"] = rfAtt;
+        config.conf["devices"][selectedSerial]["ifGain"] = ifGain;
+        config.conf["devices"][selectedSerial]["vhfAtt"] = vhfAtt;
+        config.conf["devices"][selectedSerial]["dithering"] = dithering;
+        config.conf["devices"][selectedSerial]["randomizer"] = randomizer;
+        config.release(true);
     }
 
     static void menuSelected(void* ctx) {
@@ -219,17 +282,21 @@ private:
         if (_this->running) { return; }
 
         // Open the device
+#ifdef __ANDROID__
+        sddc_error_t err = sddc_open_fd(_this->devFd, _this->selectedSerial.c_str(), &_this->openDev);
+#else
         sddc_error_t err = sddc_open(_this->selectedSerial.c_str(), &_this->openDev);
+#endif
         if (err) {
             flog::error("Failed to open device: {}", (int)err);
             return;
         }
 
-        // // Get the selected port
-        // _this->port = _this->ports[_this->portId];
+        _this->port = _this->ports[_this->portId];
 
         // Configure the device
         sddc_set_samplerate(_this->openDev, _this->sampleRate * 2);
+        _this->applySettings();
 
         // // Configure the DDC
         // if (_this->port == PORT_RF && _this->sampleRate >= 50e6) {
@@ -255,7 +322,7 @@ private:
         // }
 
         // Compute buffer size (Lower than usual, but it's a workaround for their API having broken streaming)
-        _this->bufferSize = _this->sampleRate / 100.0;
+        _this->bufferSize = (_this->sampleRate * 2.0) / 100.0;
 
         // Start streaming
         err = sddc_start(_this->openDev);
@@ -279,7 +346,7 @@ private:
 
         // Stop worker
         _this->run = false;
-        if (_this->port == PORT_RF && _this->sampleRate >= 50e6) {
+        if (false) {
             _this->ddc.out.stopWriter();
             if (_this->workerThread.joinable()) { _this->workerThread.join(); }
             _this->ddc.out.clearWriteStop();
@@ -351,114 +418,92 @@ private:
             core::setInputSampleRate(_this->sampleRate);
         }
 
-        // SmGui::LeftLabel("Antenna Port");
-        // SmGui::FillWidth();
-        // if (SmGui::Combo(CONCAT("##_sddc_port_", _this->name), &_this->portId, _this->ports.txt)) {
-        //     if (!_this->selectedSerial.empty()) {
-        //         config.acquire();
-        //         config.conf["devices"][_this->selectedSerial]["port"] = _this->ports.key(_this->portId);
-        //         config.release(true);
-        //     }
-        // }
+        SmGui::LeftLabel("Input");
+        SmGui::FillWidth();
+        if (SmGui::Combo(CONCAT("##_sddc_port_", _this->name), &_this->portId, _this->ports.txt)) {
+            _this->port = _this->ports[_this->portId];
+            if (_this->running) { _this->applySettings(); }
+            _this->saveDeviceSettings();
+        }
 
         if (_this->running) { SmGui::EndDisabled(); }
 
-        // if (_this->port == PORT_RF) {
-        //     SmGui::LeftLabel("LNA Gain");
-        //     SmGui::FillWidth();
-        //     if (SmGui::SliderInt(CONCAT("##_sddc_lna_gain_", _this->name), &_this->lnaGain, FOBOS_LNA_GAIN_MIN, FOBOS_LNA_GAIN_MAX)) {
-        //         if (_this->running) {
-        //             fobos_rx_set_lna_gain(_this->openDev, _this->lnaGain);
-        //         }
-        //         if (!_this->selectedSerial.empty()) {
-        //             config.acquire();
-        //             config.conf["devices"][_this->selectedSerial]["lnaGain"] = _this->lnaGain;
-        //             config.release(true);
-        //         }
-        //     }
+        int rfAttMax = (_this->port == PORT_HF) ? 63 : 28;
+        if (_this->rfAtt > rfAttMax) { _this->rfAtt = rfAttMax; }
+        SmGui::LeftLabel("RF Att");
+        SmGui::FillWidth();
+        if (SmGui::SliderInt(CONCAT("##_sddc_rf_att_", _this->name), &_this->rfAtt, 0, rfAttMax)) {
+            if (_this->running) { _this->applySettings(); }
+            _this->saveDeviceSettings();
+        }
 
-        //     SmGui::LeftLabel("VGA Gain");
-        //     SmGui::FillWidth();
-        //     if (SmGui::SliderInt(CONCAT("##_sddc_vga_gain_", _this->name), &_this->vgaGain, FOBOS_VGA_GAIN_MIN, FOBOS_VGA_GAIN_MAX)) {
-        //         if (_this->running) {
-        //             fobos_rx_set_vga_gain(_this->openDev, _this->vgaGain);
-        //         }
-        //         if (!_this->selectedSerial.empty()) {
-        //             config.acquire();
-        //             config.conf["devices"][_this->selectedSerial]["vgaGain"] = _this->vgaGain;
-        //             config.release(true);
-        //         }
-        //     }
-        // }
+        int ifGainMax = (_this->port == PORT_HF) ? 126 : 15;
+        if (_this->ifGain > ifGainMax) { _this->ifGain = ifGainMax; }
+        SmGui::LeftLabel("IF Gain");
+        SmGui::FillWidth();
+        if (SmGui::SliderInt(CONCAT("##_sddc_if_gain_", _this->name), &_this->ifGain, 0, ifGainMax)) {
+            if (_this->running) { _this->applySettings(); }
+            _this->saveDeviceSettings();
+        }
+
+        SmGui::LeftLabel("VHF Att");
+        SmGui::FillWidth();
+        if (SmGui::SliderInt(CONCAT("##_sddc_vhf_att_", _this->name), &_this->vhfAtt, 0, 31)) {
+            if (_this->running) { _this->applySettings(); }
+            _this->saveDeviceSettings();
+        }
+
+        if (SmGui::Checkbox(CONCAT("Dithering##_sddc_dither_", _this->name), &_this->dithering)) {
+            if (_this->running) { _this->applySettings(); }
+            _this->saveDeviceSettings();
+        }
+
+        if (SmGui::Checkbox(CONCAT("Randomizer##_sddc_rand_", _this->name), &_this->randomizer)) {
+            if (_this->running) { _this->applySettings(); }
+            _this->saveDeviceSettings();
+        }
     }
 
     void worker() {
-        // // Select different processing depending on the mode
-        // if (port == PORT_RF && sampleRate >= 50e6) {
-        //     while (run) {
-        //         // Read samples
-        //         unsigned int sampCount = 0;
-        //         int err = fobos_rx_read_sync(openDev, (float*)ddc.out.writeBuf, &sampCount);
-        //         if (err) { break; }
-                
-        //         // Send out samples to the core
-        //         if (!ddc.out.swap(sampCount)) { break; }
-        //     }
-        // }
-        // else if (port == PORT_RF) {
-        //     while (run) {
-        //         // Read samples
-        //         unsigned int sampCount = 0;
-        //         int err = fobos_rx_read_sync(openDev, (float*)ddcIn.writeBuf, &sampCount);
-        //         if (err) { break; }
-                
-        //         // Send samples to the DDC
-        //         if (!ddcIn.swap(sampCount)) { break; }
-        //     }
-        // }
-        // else if (port == PORT_HF1) {
-        //     while (run) {
-        //         // Read samples
-        //         unsigned int sampCount = 0;
-        //         int err = fobos_rx_read_sync(openDev, (float*)ddcIn.writeBuf, &sampCount);
-        //         if (err) { break; }
+        int16_t* buffer = dsp::buffer::alloc<int16_t>(bufferSize);
+        dsp::complex_t* fftIn = (dsp::complex_t*)fftwf_malloc(sizeof(fftwf_complex) * bufferSize);
+        dsp::complex_t* fftOut = (dsp::complex_t*)fftwf_malloc(sizeof(fftwf_complex) * bufferSize);
+        fftwf_plan forwardPlan = fftwf_plan_dft_1d(bufferSize, (fftwf_complex*)fftIn, (fftwf_complex*)fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
+        fftwf_plan inversePlan = fftwf_plan_dft_1d(bufferSize, (fftwf_complex*)fftOut, (fftwf_complex*)fftIn, FFTW_BACKWARD, FFTW_ESTIMATE);
+        float scale = 1.0f / (float)bufferSize;
 
-        //         // Null out the HF2 samples
-        //         for (int i = 0; i < sampCount; i++) {
-        //             ddcIn.writeBuf[i].im = 0.0f;
-        //         }
-                
-        //         // Send samples to the DDC
-        //         if (!ddcIn.swap(sampCount)) { break; }
-        //     }
-        // }
-        // else if (port == PORT_HF2) {
-            // Allocate the sample buffer
-            int16_t* buffer = dsp::buffer::alloc<int16_t>(bufferSize);
-            float* fbuffer = dsp::buffer::alloc<float>(bufferSize);
-            float* nullBuffer = dsp::buffer::alloc<float>(bufferSize);
+        while (run) {
+            int err = sddc_rx(openDev, buffer, bufferSize);
+            if (err) { break; }
 
-            // Clear the null buffer
-            dsp::buffer::clear(nullBuffer, bufferSize);
-
-            while (run) {
-                // Read samples
-                int err = sddc_rx(openDev, buffer, bufferSize);
-                if (err) { break; }
-
-                // Convert the samples to float
-                volk_16i_s32f_convert_32f(fbuffer, buffer, 32768.0f, bufferSize);
-
-                // Interleave into a complex value
-                volk_32f_x2_interleave_32fc((lv_32fc_t*)ddcIn.writeBuf, fbuffer, nullBuffer, bufferSize);
-                
-                // Send samples to the DDC
-                if (!ddcIn.swap(bufferSize)) { break; }
+            for (int i = 0; i < bufferSize; i++) {
+                fftIn[i].re = (float)buffer[i] / 32768.0f;
+                fftIn[i].im = 0.0f;
+            }
+            fftwf_execute(forwardPlan);
+            int half = bufferSize / 2;
+            for (int i = 1; i < half; i++) {
+                fftOut[i].re *= 2.0f;
+                fftOut[i].im *= 2.0f;
+            }
+            for (int i = half + 1; i < bufferSize; i++) {
+                fftOut[i].re = 0.0f;
+                fftOut[i].im = 0.0f;
+            }
+            fftwf_execute(inversePlan);
+            for (int i = 0; i < bufferSize; i++) {
+                ddcIn.writeBuf[i].re = fftIn[i].re * scale;
+                ddcIn.writeBuf[i].im = fftIn[i].im * scale;
             }
 
-            // Free the buffer
-            dsp::buffer::free(buffer);
-        // }
+            if (!ddcIn.swap(bufferSize)) { break; }
+        }
+
+        fftwf_destroy_plan(forwardPlan);
+        fftwf_destroy_plan(inversePlan);
+        fftwf_free(fftIn);
+        fftwf_free(fftOut);
+        dsp::buffer::free(buffer);
     }
 
     std::string name;
@@ -474,12 +519,18 @@ private:
     int devId = 0;
     int srId = 0;
     int portId = 0;
-    Port port;
-    int lnaGain = 0;
-    int vgaGain = 0;
+    Port port = PORT_VHF;
+    int rfAtt = 15;
+    int ifGain = 9;
+    int vhfAtt = 0;
+    bool dithering = false;
+    bool randomizer = false;
     std::string selectedSerial;
 
     sddc_dev_t* openDev;
+#ifdef __ANDROID__
+    int devFd = -1;
+#endif
 
     int bufferSize;
     std::thread workerThread;

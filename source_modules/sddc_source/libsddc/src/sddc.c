@@ -3,7 +3,12 @@
 #include <stdint.h>
 #include <libusb.h>
 #include <stdio.h>
+#include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "usb_interface.h"
+#include "fx3_boot.h"
 
 struct sddc_dev {
     // USB handles
@@ -17,15 +22,18 @@ struct sddc_dev {
     uint32_t samplerate;
     uint64_t tunerFreq;
     sddc_gpio_t gpioState;
+    sddc_port_t port;
 };
 
 struct libusb_context* ctx = NULL;
 char* sddc_firmware_path = NULL;
 bool sddc_is_init = false;
 
-void sddc_init() {
+static int sddc_gpio_put(sddc_dev_t* dev, sddc_gpio_t gpios, bool value);
+
+static sddc_error_t sddc_init() {
     // If already initialized, do nothing
-    if (sddc_is_init) { return; }
+    if (sddc_is_init) { return SDDC_SUCCESS; }
 
     // If the firmware isn't already found, find it
     if (!sddc_firmware_path) {
@@ -33,7 +41,40 @@ void sddc_init() {
     }
 
     // Init libusb
-    libusb_init(&ctx);
+#ifdef __ANDROID__
+    libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+#endif
+    int err = libusb_init(&ctx);
+    if (err != LIBUSB_SUCCESS || !ctx) {
+        fprintf(stderr, "Failed to initialize libusb for SDDC: %d\n", err);
+        ctx = NULL;
+        return SDDC_ERROR_USB_ERROR;
+    }
+
+    sddc_is_init = true;
+    return SDDC_SUCCESS;
+}
+
+static sddc_error_t sddc_wrap_fd(int fd, libusb_device_handle** openDev) {
+    *openDev = NULL;
+
+    sddc_error_t initErr = sddc_init();
+    if (initErr != SDDC_SUCCESS) { return initErr; }
+
+    int fdDup = dup(fd);
+    if (fdDup < 0) {
+        fprintf(stderr, "Failed to duplicate Android USB fd for SDDC\n");
+        return SDDC_ERROR_USB_ERROR;
+    }
+
+    int err = libusb_wrap_sys_device(ctx, (intptr_t)fdDup, openDev);
+    if (err != LIBUSB_SUCCESS || !*openDev) {
+        fprintf(stderr, "Failed to wrap Android USB fd for SDDC: %d\n", err);
+        close(fdDup);
+        return SDDC_ERROR_USB_ERROR;
+    }
+
+    return SDDC_SUCCESS;
 }
 
 const char* sddc_model_to_string(sddc_model_t model) {
@@ -76,8 +117,11 @@ sddc_error_t sddc_set_firmware_path(const char* path) {
 }
 
 int sddc_get_device_list(sddc_devinfo_t** dev_list) {
+    *dev_list = NULL;
+
     // Initialize libsddc in case it isn't already
-    sddc_init();
+    sddc_error_t initErr = sddc_init();
+    if (initErr != SDDC_SUCCESS) { return initErr; }
 
     // Get a list of USB devices
     libusb_device** devices;
@@ -194,9 +238,79 @@ void sddc_free_device_list(sddc_devinfo_t* dev_list) {
     if (dev_list) { free(dev_list); };
 }
 
+int sddc_get_device_list_fd(int fd, int vid, int pid, sddc_devinfo_t** dev_list) {
+    *dev_list = NULL;
+
+    if (fd < 0 || vid != SDDC_VID) { return SDDC_ERROR_NOT_FOUND; }
+
+    libusb_device_handle* openDev;
+    sddc_error_t err = sddc_wrap_fd(fd, &openDev);
+    if (err != SDDC_SUCCESS) { return err; }
+
+    if (pid == SDDC_UNINIT_PID) {
+        fprintf(stderr, "Found uninitialized SDDC device, uploading firmware...\n");
+        int fwErr = sddc_fx3_boot_upload_firmware(openDev, sddc_firmware_path);
+        libusb_close(openDev);
+        if (fwErr != LIBUSB_SUCCESS) {
+            fprintf(stderr, "Failed to upload firmware to uninitialized device: %d\n", fwErr);
+            return SDDC_ERROR_FIRMWARE_UPLOAD_FAILED;
+        }
+        return 0;
+    }
+
+    if (pid != SDDC_PID) {
+        libusb_close(openDev);
+        return SDDC_ERROR_NOT_FOUND;
+    }
+
+    *dev_list = malloc(sizeof(sddc_devinfo_t));
+    if (!*dev_list) {
+        libusb_close(openDev);
+        return SDDC_ERROR_USB_ERROR;
+    }
+
+    sddc_devinfo_t* info = *dev_list;
+    memset(info, 0, sizeof(sddc_devinfo_t));
+
+    libusb_device* dev = libusb_get_device(openDev);
+    struct libusb_device_descriptor desc;
+    int usbErr = libusb_get_device_descriptor(dev, &desc);
+    if (usbErr == LIBUSB_SUCCESS && desc.iSerialNumber) {
+        usbErr = libusb_get_string_descriptor_ascii(openDev, desc.iSerialNumber, (unsigned char*)info->serial, SDDC_SERIAL_MAX_LEN - 1);
+        if (usbErr < LIBUSB_SUCCESS) {
+            fprintf(stderr, "Failed to get SDDC serial descriptor: %d\n", usbErr);
+            info->serial[0] = '\0';
+        }
+    }
+
+    if (!info->serial[0]) {
+        strcpy(info->serial, "android-fd");
+    }
+
+    sddc_hwinfo_t hwinfo;
+    usbErr = sddc_fx3_get_info(openDev, &hwinfo, 0);
+    if (usbErr < LIBUSB_SUCCESS) {
+        fprintf(stderr, "Failed to get SDDC device info: %d\n", usbErr);
+        libusb_close(openDev);
+        free(*dev_list);
+        *dev_list = NULL;
+        return SDDC_ERROR_USB_ERROR;
+    }
+
+    info->model = (sddc_model_t)hwinfo.model;
+    info->firmwareMajor = hwinfo.firmwareConfigH;
+    info->firmwareMinor = hwinfo.firmwareConfigL;
+
+    libusb_close(openDev);
+    return 1;
+}
+
 sddc_error_t sddc_open(const char* serial, sddc_dev_t** dev) {
+    *dev = NULL;
+
     // Initialize libsddc in case it isn't already
-    sddc_init();
+    sddc_error_t initErr = sddc_init();
+    if (initErr != SDDC_SUCCESS) { return initErr; }
 
     // Get a list of USB devices
     libusb_device** devices;
@@ -305,12 +419,68 @@ sddc_error_t sddc_open(const char* serial, sddc_dev_t** dev) {
     (*dev)->samplerate = 128e6;
     (*dev)->tunerFreq = 100e6;
     (*dev)->gpioState = SDDC_GPIO_SHUTDOWN | SDDC_GPIO_SEL0; // ADC shutdown and HF port selected
+    (*dev)->port = SDDC_PORT_VHF;
     
     // Stop everything in case the device is partially started
     printf("Stopping...\n");
     sddc_stop(*dev);
 
     // TODO: Setup all of the other state
+    sddc_gpio_put(*dev, SDDC_GPIO_SEL0, false);
+    sddc_gpio_put(*dev, SDDC_GPIO_SEL1, true);
+    sddc_gpio_put(*dev, SDDC_GPIO_VHF_EN, true);
+    sddc_tuner_start((*dev)->openDev, 16e6);
+    sddc_tuner_tune((*dev)->openDev, 100e6);
+    sddc_fx3_set_param((*dev)->openDev, SDDC_PARAM_R82XX_ATT, 15);
+    sddc_fx3_set_param((*dev)->openDev, SDDC_PARAM_R83XX_VGA, 9);
+    sddc_fx3_set_param((*dev)->openDev, SDDC_PARAM_AD8340_VGA, 5);
+
+    return SDDC_SUCCESS;
+}
+
+sddc_error_t sddc_open_fd(int fd, const char* serial, sddc_dev_t** dev) {
+    *dev = NULL;
+
+    libusb_device_handle* openDev;
+    sddc_error_t err = sddc_wrap_fd(fd, &openDev);
+    if (err != SDDC_SUCCESS) { return err; }
+
+    libusb_device* usbDev = libusb_get_device(openDev);
+    struct libusb_device_descriptor desc;
+    int usbErr = libusb_get_device_descriptor(usbDev, &desc);
+    if (usbErr != LIBUSB_SUCCESS || desc.idVendor != SDDC_VID || desc.idProduct != SDDC_PID) {
+        libusb_close(openDev);
+        return SDDC_ERROR_NOT_FOUND;
+    }
+
+    if (serial && serial[0]) {
+        char dserial[SDDC_SERIAL_MAX_LEN];
+        usbErr = libusb_get_string_descriptor_ascii(openDev, desc.iSerialNumber, (unsigned char*)dserial, SDDC_SERIAL_MAX_LEN - 1);
+        if (usbErr >= LIBUSB_SUCCESS) {
+            dserial[usbErr] = '\0';
+            if (strcmp(dserial, serial)) {
+                libusb_close(openDev);
+                return SDDC_ERROR_NOT_FOUND;
+            }
+        }
+    }
+
+    libusb_claim_interface(openDev, 0);
+
+    *dev = malloc(sizeof(sddc_dev_t));
+    if (!*dev) {
+        libusb_close(openDev);
+        return SDDC_ERROR_USB_ERROR;
+    }
+
+    (*dev)->openDev = openDev;
+    (*dev)->running = false;
+    (*dev)->samplerate = 128e6;
+    (*dev)->tunerFreq = 100e6;
+    (*dev)->gpioState = SDDC_GPIO_SHUTDOWN | SDDC_GPIO_SEL0;
+    (*dev)->port = SDDC_PORT_VHF;
+
+    sddc_stop(*dev);
     sddc_gpio_put(*dev, SDDC_GPIO_SEL0, false);
     sddc_gpio_put(*dev, SDDC_GPIO_SEL1, true);
     sddc_gpio_put(*dev, SDDC_GPIO_VHF_EN, true);
@@ -348,10 +518,10 @@ int sddc_gpio_set(sddc_dev_t* dev, sddc_gpio_t gpios) {
     dev->gpioState = gpios;
 
     // Push to the device
-    sddc_fx3_gpio(dev->openDev, gpios);
+    return sddc_fx3_gpio(dev->openDev, gpios);
 }
 
-int sddc_gpio_put(sddc_dev_t* dev, sddc_gpio_t gpios, bool value) {
+static int sddc_gpio_put(sddc_dev_t* dev, sddc_gpio_t gpios, bool value) {
     // Update the state of the given GPIOs only
     return sddc_gpio_set(dev, (dev->gpioState & (~gpios)) | (value ? gpios : 0));
 }
@@ -379,6 +549,61 @@ sddc_error_t sddc_set_dithering(sddc_dev_t* dev, bool enabled) {
 sddc_error_t sddc_set_randomizer(sddc_dev_t* dev, bool enabled) {
     // Update the GPIOs according to the desired state
     int err = sddc_gpio_put(dev, SDDC_GPIO_RANDOM, enabled);
+    return (err < LIBUSB_SUCCESS) ? SDDC_ERROR_USB_ERROR : SDDC_SUCCESS;
+}
+
+sddc_error_t sddc_set_port(sddc_dev_t* dev, sddc_port_t port) {
+    int err;
+    switch (port) {
+    case SDDC_PORT_VHF:
+        sddc_fx3_set_param(dev->openDev, SDDC_PARAM_DAT31_ATT, 63);
+        err = sddc_gpio_put(dev, SDDC_GPIO_VHF_EN, true);
+        if (err < LIBUSB_SUCCESS) { return SDDC_ERROR_USB_ERROR; }
+        err = sddc_fx3_set_param(dev->openDev, SDDC_PARAM_AD8340_VGA, 0x80 | 3);
+        if (err < LIBUSB_SUCCESS) { return SDDC_ERROR_USB_ERROR; }
+        err = sddc_tuner_start(dev->openDev, 16000000);
+        break;
+    case SDDC_PORT_HF:
+        sddc_tuner_stop(dev->openDev);
+        err = sddc_gpio_put(dev, SDDC_GPIO_VHF_EN, false);
+        break;
+    default:
+        return SDDC_ERROR_NOT_IMPLEMENTED;
+    }
+    if (err < LIBUSB_SUCCESS) { return SDDC_ERROR_USB_ERROR; }
+    dev->port = port;
+    return SDDC_SUCCESS;
+}
+
+sddc_error_t sddc_set_rf_attenuator(sddc_dev_t* dev, uint16_t value) {
+    int err;
+    if (dev->port == SDDC_PORT_HF) {
+        if (value > 63) { value = 63; }
+        err = sddc_fx3_set_param(dev->openDev, SDDC_PARAM_DAT31_ATT, 63 - value);
+    }
+    else {
+        if (value > 28) { value = 28; }
+        err = sddc_fx3_set_param(dev->openDev, SDDC_PARAM_R82XX_ATT, value);
+    }
+    return (err < LIBUSB_SUCCESS) ? SDDC_ERROR_USB_ERROR : SDDC_SUCCESS;
+}
+
+sddc_error_t sddc_set_if_gain(sddc_dev_t* dev, uint16_t value) {
+    int err;
+    if (dev->port == SDDC_PORT_HF) {
+        if (value > 126) { value = 126; }
+        uint16_t gain = (value > 18) ? (0x80 | (value - 18 + 3)) : (value + 1);
+        err = sddc_fx3_set_param(dev->openDev, SDDC_PARAM_AD8340_VGA, gain);
+    }
+    else {
+        if (value > 15) { value = 15; }
+        err = sddc_fx3_set_param(dev->openDev, SDDC_PARAM_R83XX_VGA, value);
+    }
+    return (err < LIBUSB_SUCCESS) ? SDDC_ERROR_USB_ERROR : SDDC_SUCCESS;
+}
+
+sddc_error_t sddc_set_vhf_attenuator(sddc_dev_t* dev, uint16_t value) {
+    int err = sddc_fx3_set_param(dev->openDev, SDDC_PARAM_VHF_ATT, value);
     return (err < LIBUSB_SUCCESS) ? SDDC_ERROR_USB_ERROR : SDDC_SUCCESS;
 }
 
