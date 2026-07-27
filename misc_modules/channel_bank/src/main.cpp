@@ -501,7 +501,22 @@ public:
         monitorSrHandler.handler = [](float, void*) {};
         monitorSinkStream = new SinkManager::Stream();
         monitorSinkStream->init(&monitorStream, &monitorSrHandler, 48000.0f);
+#if defined(__ANDROID__)
+        monitorProviderRegisteredHandler.ctx = this;
+        monitorProviderRegisteredHandler.handler = [](std::string provider, void* ctx) {
+            if (provider == "Audio") {
+                ((ChannelBankModule*)ctx)->ensureAndroidMonitorAudioSink();
+            }
+        };
+        sigpath::sinkManager.onSinkProviderRegistered.bindHandler(&monitorProviderRegisteredHandler);
+        monitorProviderHandlerBound = true;
+#endif
         sigpath::sinkManager.registerStream(name + "_monitor", monitorSinkStream);
+#if defined(__ANDROID__)
+        // Android has no comfortable desktop-style sink setup flow; make preview
+        // playback audible by default instead of leaving the monitor on "None".
+        ensureAndroidMonitorAudioSink();
+#endif
         monitorSinkStream->start();
 
         // Start playback thread
@@ -535,6 +550,12 @@ public:
 
         // Tear down monitor stream
         monitorSinkStream->stop();
+#if defined(__ANDROID__)
+        if (monitorProviderHandlerBound) {
+            sigpath::sinkManager.onSinkProviderRegistered.unbindHandler(&monitorProviderRegisteredHandler);
+            monitorProviderHandlerBound = false;
+        }
+#endif
         sigpath::sinkManager.unregisterStream(name + "_monitor");
         delete monitorSinkStream;
         monitorSinkStream = nullptr;
@@ -891,7 +912,7 @@ public:
         std::string path = requestedWav.string();
         slot.currentFinalM4APath.clear();
 
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         // Intermediate WAVs are scratch files when recording is disabled or
         // when the final output will be M4A. Keep those off network shares.
         if (!recordingEnabled || m4aEnabled) {
@@ -2249,8 +2270,8 @@ private:
             if (slot.module) {
                 // Same time-based signal duration as the normal close path — immune to
                 // signalHoldMs inflating the sample count (see comment there for details).
-                int64_t signalMs = std::max(int64_t(0),
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                int64_t signalMs = std::max<int64_t>(0,
+                    (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                         slot.lastDetected - slot.fileOpenTime).count());
                 // Min TX on cumulative on-air time (see normal close path) — discards
                 // bursty data (ACARS) even when bridged into a long span.
@@ -2434,8 +2455,8 @@ private:
                     // so even a 50ms noise burst appeared as (holdMs) worth of "signal time"
                     // and passed the min-TX check.  lastDetected is only updated when the FFT
                     // actually sees power above the SNR threshold, so it's hold-period-immune.
-                    int64_t signalMs = std::max(int64_t(0),
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                    int64_t signalMs = std::max<int64_t>(0,
+                        (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                             slot->lastDetected - slot->fileOpenTime).count());
                     // Min TX is judged on cumulative ON-AIR time (frames the carrier was
                     // actually present), not the open→last-seen span. Intermittent data
@@ -3032,30 +3053,56 @@ private:
                 }
 #endif
             } else {
+#if !defined(__ANDROID__)
                 // Write silence to keep monitorStream continuously flowing.
                 // swap() naturally throttles to the consumer's 48 kHz read rate.
                 memcpy(monitorStream.writeBuf, silence.data(), CHUNK * sizeof(dsp::stereo_t));
                 if (!monitorStream.swap(CHUNK)) { return; }
+#else
+                std::unique_lock<std::mutex> lk(playbackMtx);
+                playbackCv.wait_for(lk, std::chrono::milliseconds(100), [this] {
+                    return !playbackQueue.empty() || !playbackRunning;
+                });
+#endif
             }
         }
     }
 
     void playbackWavFile(const std::string& path) {
+#if defined(__ANDROID__)
+        ensureAndroidMonitorAudioSink();
+#endif
+        playbackStartedCount++;
         // Write one silence chunk before opening the file so the file I/O
         // happens while the consumer processes audio — prevents underrun pop.
         const int PREBUF = 1024;
         memset(monitorStream.writeBuf, 0, PREBUF * sizeof(dsp::stereo_t));
-        if (!monitorStream.swap(PREBUF)) { return; }
+        if (!monitorStream.swap(PREBUF)) {
+            playbackSwapFailCount++;
+            return;
+        }
 
         std::ifstream f(path, std::ios::binary);
-        if (!f.is_open()) { return; }
+        if (!f.is_open()) {
+            playbackOpenFailCount++;
+            flog::warn("[ChannelBank] Playback failed to open WAV: {0}", path);
+            return;
+        }
 
         // Parse minimal WAV header to find data start
         char riff[4]; f.read(riff, 4);
-        if (std::string(riff, 4) != "RIFF") { return; }
+        if (std::string(riff, 4) != "RIFF") {
+            playbackBadWavCount++;
+            flog::warn("[ChannelBank] Playback invalid WAV RIFF: {0}", path);
+            return;
+        }
         uint32_t fileSize; f.read((char*)&fileSize, 4);
         char wave[4]; f.read(wave, 4);
-        if (std::string(wave, 4) != "WAVE") { return; }
+        if (std::string(wave, 4) != "WAVE") {
+            playbackBadWavCount++;
+            flog::warn("[ChannelBank] Playback invalid WAV WAVE: {0}", path);
+            return;
+        }
 
         // Walk chunks — parse fmt for channel count, find data
         uint16_t fmtChannels = 2;
@@ -3076,7 +3123,11 @@ private:
                 f.seekg(chunkSize, std::ios::cur);
             }
         }
-        if (dataSize == 0) { return; }
+        if (dataSize == 0) {
+            playbackNoDataCount++;
+            flog::warn("[ChannelBank] Playback WAV has no data chunk: {0}", path);
+            return;
+        }
 
         // Read int16 (mono or stereo) → float stereo_t, write to monitorStream in chunks
         const int CHUNK       = 1024;
@@ -3109,9 +3160,13 @@ private:
                 }
             }
             memcpy(monitorStream.writeBuf, buf.data(), samples * sizeof(dsp::stereo_t));
-            if (!monitorStream.swap(samples)) { break; }
+            if (!monitorStream.swap(samples)) {
+                playbackSwapFailCount++;
+                break;
+            }
             remaining    -= bytesRead;
             samplesRead  += samples;
+            playbackSamplesCount += samples;
 #if defined(__APPLE__) || defined(_WIN32)
             // Publish the playback cursor for the synced-transcript overlay.
             // The WAV is 48 kHz so ms = samples * 1000 / 48000.  Atomic store —
@@ -3535,7 +3590,6 @@ private:
             config.conf[_this->name]["maxChannels"] = _this->maxChannels;
             config.release(true);
         }
-
         ImGui::LeftLabel("BW Usage");
         ImGui::FillWidth();
         {
@@ -4563,6 +4617,14 @@ private:
             }
             ImGui::Text("Active: %d  Recording: %d", total, recording);
             ImGui::Text("Monitor queue: %d pending", queued);
+            ImGui::Text("Monitor sink: %s", sigpath::sinkManager.getStreamSink(_this->name + "_monitor").c_str());
+            ImGui::Text("Playback: start %llu openFail %llu bad %llu noData %llu swapFail %llu samples %llu",
+                        (unsigned long long)_this->playbackStartedCount.load(),
+                        (unsigned long long)_this->playbackOpenFailCount.load(),
+                        (unsigned long long)_this->playbackBadWavCount.load(),
+                        (unsigned long long)_this->playbackNoDataCount.load(),
+                        (unsigned long long)_this->playbackSwapFailCount.load(),
+                        (unsigned long long)_this->playbackSamplesCount.load());
             // Inline "Flush" button — only useful when the queue actually has items
             if (queued > 0) {
                 ImGui::SameLine();
@@ -5893,6 +5955,16 @@ private:
     // PlaybackEntry now carries the segments alongside the WAV path so the
     // playback thread can install them as `playingSegments` for the synced
     // display.  Empty segments = no sync overlay (Apple Speech / transcription off).
+#if defined(__ANDROID__)
+    void ensureAndroidMonitorAudioSink() {
+        const std::string streamName = name + "_monitor";
+        if (sigpath::sinkManager.getStreamSink(streamName) == "Audio") {
+            return;
+        }
+        sigpath::sinkManager.setStreamSink(streamName, "Audio");
+    }
+#endif
+
     struct PlaybackEntry {
         std::string path;
         double      freqHz;
@@ -5931,9 +6003,19 @@ private:
     std::condition_variable         playbackCv;
     std::thread                     playbackThread;
     std::atomic<bool>               playbackRunning { false };
+    std::atomic<uint64_t>           playbackStartedCount { 0 };
+    std::atomic<uint64_t>           playbackOpenFailCount { 0 };
+    std::atomic<uint64_t>           playbackBadWavCount { 0 };
+    std::atomic<uint64_t>           playbackNoDataCount { 0 };
+    std::atomic<uint64_t>           playbackSwapFailCount { 0 };
+    std::atomic<uint64_t>           playbackSamplesCount { 0 };
     dsp::stream<dsp::stereo_t>      monitorStream;
     SinkManager::Stream*            monitorSinkStream = nullptr;
     EventHandler<float>             monitorSrHandler;
+#if defined(__ANDROID__)
+    EventHandler<std::string>       monitorProviderRegisteredHandler;
+    bool                            monitorProviderHandlerBound = false;
+#endif
 
     // SDR state
     double lastKnownSr     = 0.0;
