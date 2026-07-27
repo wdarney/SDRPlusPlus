@@ -27,6 +27,12 @@ import java.io.*;
 
 private const val ACTION_USB_PERMISSION = "org.sdrpp.sdrpp.USB_PERMISSION";
 
+private fun requestDevicePermission(context: Context, dev: UsbDevice) {
+    val activity = context as MainActivity
+    val permissionIntent = PendingIntent.getBroadcast(activity, 0, Intent(ACTION_USB_PERMISSION), 0)
+    activity.usbManager!!.requestPermission(dev, permissionIntent)
+}
+
 private val usbReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (ACTION_USB_PERMISSION == intent.action) {
@@ -42,11 +48,14 @@ private val usbReceiver = object : BroadcastReceiver() {
                     _this.SDR_FD = _this.SDR_conn!!.getFileDescriptor();
                 }
                 
-                // Whatever the hell this does
-                context.unregisterReceiver(this);
-
                 // Hide again the system bars
                 _this.hideSystemBars();
+            }
+        }
+        else if (UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action) {
+            val dev: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+            if (dev != null) {
+                requestDevicePermission(context, dev)
             }
         }
     }
@@ -85,14 +94,14 @@ class MainActivity : NativeActivity() {
 
         // Register events
         usbManager = getSystemService(Context.USB_SERVICE) as UsbManager;
-        val permissionIntent = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), 0)
         val filter = IntentFilter(ACTION_USB_PERMISSION)
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
         registerReceiver(usbReceiver, filter)
 
         // Get permission for all USB devices
         val devList = usbManager!!.getDeviceList();
         for ((name, dev) in devList) {
-            usbManager!!.requestPermission(dev, permissionIntent);
+            requestDevicePermission(this, dev);
         }
 
         // Ask for internet permission

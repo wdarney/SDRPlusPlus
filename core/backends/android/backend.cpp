@@ -29,6 +29,26 @@ namespace backend {
     bool pauseRendering = false;
     bool exited = false;
 
+    bool getJniEnv(JavaVM* java_vm, JNIEnv** java_env, bool& didAttach) {
+        didAttach = false;
+        if (!java_vm) { return false; }
+
+        jint jni_return = java_vm->GetEnv((void**)java_env, JNI_VERSION_1_6);
+        if (jni_return == JNI_OK) { return true; }
+        if (jni_return != JNI_EDETACHED) { return false; }
+
+        jni_return = java_vm->AttachCurrentThread(java_env, NULL);
+        if (jni_return != JNI_OK) { return false; }
+
+        didAttach = true;
+        return true;
+    }
+
+    bool detachJniEnv(JavaVM* java_vm, bool didAttach) {
+        if (!didAttach) { return true; }
+        return java_vm && java_vm->DetachCurrentThread() == JNI_OK;
+    }
+
     // Forward declaration
     int ShowSoftKeyboardInput();
     int PollUnicodeChars();
@@ -257,14 +277,10 @@ namespace backend {
     int ShowSoftKeyboardInput() {
         JavaVM* java_vm = app->activity->vm;
         JNIEnv* java_env = NULL;
+        bool did_attach = false;
 
-        jint jni_return = java_vm->GetEnv((void**)&java_env, JNI_VERSION_1_6);
-        if (jni_return == JNI_ERR)
+        if (!getJniEnv(java_vm, &java_env, did_attach))
             return -1;
-
-        jni_return = java_vm->AttachCurrentThread(&java_env, NULL);
-        if (jni_return != JNI_OK)
-            return -2;
 
         jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
         if (native_activity_clazz == NULL)
@@ -276,8 +292,7 @@ namespace backend {
 
         java_env->CallVoidMethod(app->activity->clazz, method_id);
 
-        jni_return = java_vm->DetachCurrentThread();
-        if (jni_return != JNI_OK)
+        if (!detachJniEnv(java_vm, did_attach))
             return -5;
 
         return 0;
@@ -286,13 +301,9 @@ namespace backend {
     int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids) {
         JavaVM* java_vm = app->activity->vm;
         JNIEnv* java_env = NULL;
+        bool did_attach = false;
 
-        jint jni_return = java_vm->GetEnv((void**)&java_env, JNI_VERSION_1_6);
-        if (jni_return == JNI_ERR)
-            return -1;
-
-        jni_return = java_vm->AttachCurrentThread(&java_env, NULL);
-        if (jni_return != JNI_OK)
+        if (!getJniEnv(java_vm, &java_env, did_attach))
             return -1;
 
         jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
@@ -310,8 +321,7 @@ namespace backend {
         vid = java_env->GetIntField(app->activity->clazz, vid_field_id);
         pid = java_env->GetIntField(app->activity->clazz, pid_field_id);
 
-        jni_return = java_vm->DetachCurrentThread();
-        if (jni_return != JNI_OK)
+        if (!detachJniEnv(java_vm, did_attach))
             return -1;
 
         // If no vid/pid was given, just return successfully
@@ -334,14 +344,10 @@ namespace backend {
     int PollUnicodeChars() {
         JavaVM* java_vm = app->activity->vm;
         JNIEnv* java_env = NULL;
+        bool did_attach = false;
 
-        jint jni_return = java_vm->GetEnv((void**)&java_env, JNI_VERSION_1_6);
-        if (jni_return == JNI_ERR)
+        if (!getJniEnv(java_vm, &java_env, did_attach))
             return -1;
-
-        jni_return = java_vm->AttachCurrentThread(&java_env, NULL);
-        if (jni_return != JNI_OK)
-            return -2;
 
         jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
         if (native_activity_clazz == NULL)
@@ -357,8 +363,7 @@ namespace backend {
         while ((unicode_character = java_env->CallIntMethod(app->activity->clazz, method_id)) != 0)
             io.AddInputCharacter(unicode_character);
 
-        jni_return = java_vm->DetachCurrentThread();
-        if (jni_return != JNI_OK)
+        if (!detachJniEnv(java_vm, did_attach))
             return -5;
 
         return 0;
@@ -367,14 +372,10 @@ namespace backend {
     std::string getAppFilesDir() {
         JavaVM* java_vm = app->activity->vm;
         JNIEnv* java_env = NULL;
+        bool did_attach = false;
 
-        jint jni_return = java_vm->GetEnv((void**)&java_env, JNI_VERSION_1_6);
-        if (jni_return == JNI_ERR)
+        if (!getJniEnv(java_vm, &java_env, did_attach))
             throw std::runtime_error("Could not get JNI environment");
-
-        jni_return = java_vm->AttachCurrentThread(&java_env, NULL);
-        if (jni_return != JNI_OK)
-            throw std::runtime_error("Could not attach to thread");
 
         jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
         if (native_activity_clazz == NULL)
@@ -390,8 +391,7 @@ namespace backend {
         std::string str(_str);
         java_env->ReleaseStringUTFChars(jstr, _str);
 
-        jni_return = java_vm->DetachCurrentThread();
-        if (jni_return != JNI_OK)
+        if (!detachJniEnv(java_vm, did_attach))
             throw std::runtime_error("Could not detach from thread");
 
         
@@ -415,6 +415,11 @@ namespace backend {
     const std::vector<DevVIDPID> HYDRASDR_VIDPIDS = {
         { 0x1d50, 0x60a1 },
         { 0x38af, 0x0001 }
+    };
+
+    const std::vector<DevVIDPID> SDDC_VIDPIDS = {
+        { 0x04b4, 0x00f1 },
+        { 0x04b4, 0x00f3 }
     };
 
     const std::vector<DevVIDPID> RTL_SDR_VIDPIDS = {
