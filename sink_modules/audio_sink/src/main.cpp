@@ -9,6 +9,8 @@
 #include <RtAudio.h>
 #include <config.h>
 #include <core.h>
+#include <algorithm>
+#include <cstring>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -224,7 +226,11 @@ private:
         int count = _this->stereoPacker.out.read();
         if (count < 0) { return 0; }
 
-        memcpy(outputBuffer, _this->stereoPacker.out.readBuf, nBufferFrames * sizeof(dsp::stereo_t));
+        unsigned int copyFrames = std::min<unsigned int>(nBufferFrames, count);
+        memcpy(outputBuffer, _this->stereoPacker.out.readBuf, copyFrames * sizeof(dsp::stereo_t));
+        if (copyFrames < nBufferFrames) {
+            memset((dsp::stereo_t*)outputBuffer + copyFrames, 0, (nBufferFrames - copyFrames) * sizeof(dsp::stereo_t));
+        }
         _this->stereoPacker.out.flush();
         return 0;
     }
