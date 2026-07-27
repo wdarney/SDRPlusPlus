@@ -740,6 +740,7 @@ namespace ImGui {
     }
 
     void WaterFall::onResize() {
+        std::lock_guard<std::recursive_mutex> bufLck(buf_mtx);
         std::lock_guard<std::recursive_mutex> lck(latestFFTMtx);
         std::lock_guard<std::mutex> lck2(smoothingBufMtx);
         // return if widget is too small
@@ -914,6 +915,14 @@ namespace ImGui {
     void WaterFall::pushFFT() {
         if (rawFFTs == NULL) { return; }
         std::lock_guard<std::recursive_mutex> lck(latestFFTMtx);
+        if (rawFFTSize <= 0 || dataWidth <= 0 || latestFFT == NULL) {
+            buf_mtx.unlock();
+            return;
+        }
+        if (waterfallVisible && (waterfallHeight <= 1 || waterfallFb == NULL)) {
+            buf_mtx.unlock();
+            return;
+        }
         double offsetRatio = viewOffset / (wholeBandwidth / 2.0);
         int drawDataSize = (viewBandwidth / wholeBandwidth) * rawFFTSize;
         int drawDataStart = (((double)rawFFTSize / 2.0) * (offsetRatio + 1)) - (drawDataSize / 2);
