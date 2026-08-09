@@ -1,0 +1,25 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "browndsd-macos",
+            "displayName": "Brown DSD macOS",
+            "description": "Configure the macOS BrownDSD test build with the DSD module enabled.",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build-brown-dsd",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "OPT_BUILD_CH_EXTRAVHF_DECODER": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "browndsd-macos",
+            "configurePreset": "browndsd-macos",
+            "targets": [
+                "ch_extravhf_decoder"
+            ]
+        }
+    ]
+}

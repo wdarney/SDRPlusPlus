@@ -27,6 +27,7 @@ The pre-consolidation feature tips are protected by remote tags under
 | VDL2 decoder and libacars | `decoder_modules/vdl2_decoder/`, `core/libacars/` |
 | RX888 source | `source_modules/rx888_source/` |
 | SELCAL decoder | `decoder_modules/selcal_decoder/` |
+| Brown DSD decoder | `decoder_modules/ch_extravhf_decoder/`, `decoder_modules/radio/src/radio_module_interface.h` |
 | iOS application and build support | `ios/`, `core/backends/ios/`, `sink_modules/coreaudio_sink/` |
 | macOS packaging/deployment | `make_macos_bundle.sh`, `deploy.sh` |
 
@@ -62,6 +63,22 @@ cmake -S . -B build-integration-macos \
   -DOPT_BUILD_SELCAL_DECODER=ON
 cmake --build build-integration-macos --target sdrpp channel_bank rx888_source vdl2_decoder selcal_decoder -j8
 ```
+
+For Brown DSD work in `SDRPlusPlus-brown-dsd`, keep the DSD module enabled
+explicitly. Fresh configures default it on, and the named preset forces it on
+even when an old CMake cache is reused:
+
+```sh
+cmake --preset browndsd-macos
+cmake --build --preset browndsd-macos
+python3 tools/enable_browndsd_original_config.py
+```
+
+The BrownDSD macOS test app is
+`/Applications/SDR++MODULETESTING-BrownDSD.app`. Its launcher intentionally
+uses the original SDR++ profile at
+`~/Library/Application Support/sdrpp`, so do not create a second hidden profile
+unless the user asks for isolation.
 
 For macOS runtime work, validate the installed test bundle at
 `/Applications/SDR++MODULETESTING.app`, including codesign verification and a
