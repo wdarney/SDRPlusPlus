@@ -20,6 +20,11 @@ public:
         void setReference(int ref);
         void setSnapInterval(double interval);
         void setBandwidthLimits(double minBandwidth, double maxBandwidth, bool bandwidthLocked);
+        void setFrequencyLock(bool locked, double centerFrequency);
+        void restoreFrequencyLock(bool locked, double lockedFrequency, double centerFrequency);
+        bool getFrequencyLock();
+        double getLockedFrequency();
+        void applyFrequencyLock(double centerFrequency);
         bool getBandwidthChanged(bool erase = true);
         double getBandwidth();
         int getReference();
@@ -49,6 +54,11 @@ public:
     void setSampleRate(std::string name, double sampleRate, double bandwidth);
     void setReference(std::string name, int ref);
     void setBandwidthLimits(std::string name, double minBandwidth, double maxBandwidth, bool bandwidthLocked);
+    void setFrequencyLock(std::string name, bool locked, double centerFrequency);
+    void restoreFrequencyLock(std::string name, bool locked, double lockedFrequency, double centerFrequency);
+    bool getFrequencyLock(std::string name);
+    double getLockedFrequency(std::string name);
+    void applyFrequencyLocks(double centerFrequency);
     bool getBandwidthChanged(std::string name, bool erase = true);
     double getBandwidth(std::string name);
     void setColor(std::string name, ImU32 color);

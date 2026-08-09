@@ -67,6 +67,36 @@ void VFOManager::VFO::setBandwidthLimits(double minBandwidth, double maxBandwidt
     wtfVFO->bandwidthLocked = bandwidthLocked;
 }
 
+void VFOManager::VFO::setFrequencyLock(bool locked, double centerFrequency) {
+    wtfVFO->frequencyLocked = locked;
+    if (locked) {
+        wtfVFO->lockedFrequency = centerFrequency + wtfVFO->generalOffset;
+    }
+}
+
+void VFOManager::VFO::restoreFrequencyLock(bool locked, double lockedFrequency, double centerFrequency) {
+    wtfVFO->frequencyLocked = locked;
+    wtfVFO->lockedFrequency = lockedFrequency;
+    applyFrequencyLock(centerFrequency);
+}
+
+bool VFOManager::VFO::getFrequencyLock() {
+    return wtfVFO->frequencyLocked;
+}
+
+double VFOManager::VFO::getLockedFrequency() {
+    return wtfVFO->lockedFrequency;
+}
+
+void VFOManager::VFO::applyFrequencyLock(double centerFrequency) {
+    if (!wtfVFO->frequencyLocked) { return; }
+    wtfVFO->setOffset(wtfVFO->lockedFrequency - centerFrequency);
+    dspVFO->setOffset(wtfVFO->centerOffset);
+    wtfVFO->centerOffsetChanged = false;
+    wtfVFO->lowerOffsetChanged = false;
+    wtfVFO->upperOffsetChanged = false;
+}
+
 bool VFOManager::VFO::getBandwidthChanged(bool erase) {
     bool val = wtfVFO->bandwidthChanged;
     if (erase) { wtfVFO->bandwidthChanged = false; }
@@ -166,6 +196,40 @@ void VFOManager::setBandwidthLimits(std::string name, double minBandwidth, doubl
         return;
     }
     vfos[name]->setBandwidthLimits(minBandwidth, maxBandwidth, bandwidthLocked);
+}
+
+void VFOManager::setFrequencyLock(std::string name, bool locked, double centerFrequency) {
+    if (vfos.find(name) == vfos.end()) {
+        return;
+    }
+    vfos[name]->setFrequencyLock(locked, centerFrequency);
+}
+
+void VFOManager::restoreFrequencyLock(std::string name, bool locked, double lockedFrequency, double centerFrequency) {
+    if (vfos.find(name) == vfos.end()) {
+        return;
+    }
+    vfos[name]->restoreFrequencyLock(locked, lockedFrequency, centerFrequency);
+}
+
+bool VFOManager::getFrequencyLock(std::string name) {
+    if (vfos.find(name) == vfos.end()) {
+        return false;
+    }
+    return vfos[name]->getFrequencyLock();
+}
+
+double VFOManager::getLockedFrequency(std::string name) {
+    if (vfos.find(name) == vfos.end()) {
+        return 0.0;
+    }
+    return vfos[name]->getLockedFrequency();
+}
+
+void VFOManager::applyFrequencyLocks(double centerFrequency) {
+    for (auto const& [name, vfo] : vfos) {
+        vfo->applyFrequencyLock(centerFrequency);
+    }
 }
 
 bool VFOManager::getBandwidthChanged(std::string name, bool erase) {
