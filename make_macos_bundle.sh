@@ -4,6 +4,13 @@ set -e
 # ========================= Boilerplate =========================
 BUILD_DIR=$1
 BUNDLE=$2
+APP_NAME=${SDRPP_APP_NAME:-sdrpp}
+DISPLAY_NAME=${SDRPP_DISPLAY_NAME:-SDR++}
+BUNDLE_ID=${SDRPP_BUNDLE_ID:-org.sdrpp.sdrpp}
+VERSION=${SDRPP_APP_VERSION:-1.2.1}
+SIGNATURE=${SDRPP_APP_SIGNATURE:-sdrp}
+EXECUTABLE=${SDRPP_EXECUTABLE_NAME:-sdrpp}
+ICON_NAME=${SDRPP_ICON_NAME:-sdrpp}
 
 source macos/bundle_utils.sh
 
@@ -22,7 +29,7 @@ cp -R root/res/* $BUNDLE/Contents/Resources/
 bundle_create_icns root/res/icons/sdrpp.macos.png $BUNDLE/Contents/Resources/sdrpp
 
 # Create the property list
-bundle_create_plist sdrpp SDR++ org.sdrpp.sdrpp 1.2.1 sdrp sdrpp sdrpp $BUNDLE/Contents/Info.plist
+bundle_create_plist "$APP_NAME" "$DISPLAY_NAME" "$BUNDLE_ID" "$VERSION" "$SIGNATURE" "$EXECUTABLE" "$ICON_NAME" "$BUNDLE/Contents/Info.plist"
 
 # ========================= Install binaries =========================
 
