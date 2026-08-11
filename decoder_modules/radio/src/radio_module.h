@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <utils/optionlist.h>
 #include "radio_interface.h"
+#include "radio_module_interface.h"
 #include "demod.h"
 
 static ConfigManager config;
@@ -35,9 +36,9 @@ std::map<IFNRPreset, double> ifnrTaps = {
     { IFNR_PRESET_BROADCAST, 32 }
 };
 
-class RadioModule : public ModuleManager::Instance {
+class RadioModule : public ModuleManager::Instance, public RadioModuleInterface {
 public:
-    RadioModule(std::string name) {
+    RadioModule(std::string name) : RadioModuleInterface() {
         this->name = name;
 
         // Initialize option lists
@@ -117,6 +118,10 @@ public:
 
         // Select the demodulator
         selectDemodByID((DemodID)selectedDemodID);
+        if (!selectedDemod) {
+            flog::warn("Falling back to WFM after failing to restore demodulator {0}", selectedDemodID);
+            selectDemodByID(RADIO_DEMOD_WFM);
+        }
 
         // Start IF chain
         ifChain.start();
@@ -171,6 +176,13 @@ public:
         return enabled;
     }
 
+    void* getInterface(const char* name) {
+        if (!strcmp(name, "RadioModuleInterface")) {
+            return (RadioModuleInterface*)this;
+        }
+        return NULL;
+    }
+
     std::string name;
 
     enum DemodID {
@@ -194,34 +206,17 @@ private:
         float menuWidth = ImGui::GetContentRegionAvail().x;
         ImGui::BeginGroup();
 
-        ImGui::Columns(4, CONCAT("RadioModeColumns##_", _this->name), false);
-        if (ImGui::RadioButton(CONCAT("NFM##_", _this->name), _this->selectedDemodID == 0) && _this->selectedDemodID != 0) {
-            _this->selectDemodByID(RADIO_DEMOD_NFM);
+        int columnCount = std::min<int>(4, std::max<int>(1, (int)_this->radioModes.size()));
+        ImGui::Columns(columnCount, CONCAT("RadioModeColumns##_", _this->name), false);
+        for (int i = 0; i < _this->radioModes.size(); i++) {
+            const auto& mode = _this->radioModes[i];
+            if (ImGui::RadioButton(CONCAT(mode.first.c_str(), "##_" + _this->name), _this->selectedDemodID == mode.second) && _this->selectedDemodID != mode.second) {
+                _this->selectDemodByID((DemodID)mode.second);
+            }
+            if ((i % 2) == 1 && i != (_this->radioModes.size() - 1)) {
+                ImGui::NextColumn();
+            }
         }
-        if (ImGui::RadioButton(CONCAT("WFM##_", _this->name), _this->selectedDemodID == 1) && _this->selectedDemodID != 1) {
-            _this->selectDemodByID(RADIO_DEMOD_WFM);
-        }
-        ImGui::NextColumn();
-        if (ImGui::RadioButton(CONCAT("AM##_", _this->name), _this->selectedDemodID == 2) && _this->selectedDemodID != 2) {
-            _this->selectDemodByID(RADIO_DEMOD_AM);
-        }
-        if (ImGui::RadioButton(CONCAT("DSB##_", _this->name), _this->selectedDemodID == 3) && _this->selectedDemodID != 3) {
-            _this->selectDemodByID(RADIO_DEMOD_DSB);
-        }
-        ImGui::NextColumn();
-        if (ImGui::RadioButton(CONCAT("USB##_", _this->name), _this->selectedDemodID == 4) && _this->selectedDemodID != 4) {
-            _this->selectDemodByID(RADIO_DEMOD_USB);
-        }
-        if (ImGui::RadioButton(CONCAT("CW##_", _this->name), _this->selectedDemodID == 5) && _this->selectedDemodID != 5) {
-            _this->selectDemodByID(RADIO_DEMOD_CW);
-        };
-        ImGui::NextColumn();
-        if (ImGui::RadioButton(CONCAT("LSB##_", _this->name), _this->selectedDemodID == 6) && _this->selectedDemodID != 6) {
-            _this->selectDemodByID(RADIO_DEMOD_LSB);
-        }
-        if (ImGui::RadioButton(CONCAT("RAW##_", _this->name), _this->selectedDemodID == 7) && _this->selectedDemodID != 7) {
-            _this->selectDemodByID(RADIO_DEMOD_RAW);
-        };
         ImGui::Columns(1, CONCAT("EndRadioModeColumns##_", _this->name), false);
 
         ImGui::EndGroup();
@@ -332,7 +327,9 @@ private:
         }
 
         // Demodulator specific menu
-        _this->selectedDemod->showMenu();
+        if (_this->selectedDemod) {
+            _this->selectedDemod->showMenu();
+        }
 
         // Display the squelch diagnostics
         switch (_this->squelchModes[_this->squelchModeId]) {
@@ -387,6 +384,12 @@ private:
             case DemodID::RADIO_DEMOD_RAW:  demod = new demod::RAW(); break;
             default:                        demod = NULL;             break;
         }
+        if (!demod) {
+            for (auto provider : demodulatorProviders) {
+                demod = provider((int)id);
+                if (demod) { break; }
+            }
+        }
         if (!demod) { return NULL; }
 
         // Default config
@@ -415,6 +418,9 @@ private:
         demod::Demodulator* demod = instantiateDemod(id);
         if (!demod) {
             flog::error("Demodulator {0} not implemented", (int)id);
+            if (!selectedDemod && id != RADIO_DEMOD_WFM) {
+                selectDemodByID(RADIO_DEMOD_WFM);
+            }
             return;
         }
         selectedDemodID = id;
