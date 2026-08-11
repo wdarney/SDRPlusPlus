@@ -288,6 +288,7 @@ namespace ImGui {
 
         std::string hoveredVFOName = "";
         for (auto const& [name, _vfo] : vfos) {
+            if (!_vfo->rectVisible) { continue; }
             if (ImGui::IsMouseHoveringRect(_vfo->rectMin, _vfo->rectMax) || ImGui::IsMouseHoveringRect(_vfo->wfRectMin, _vfo->wfRectMax)) {
                 hoveredVFOName = name;
                 break;
@@ -325,6 +326,7 @@ namespace ImGui {
 
             // First, check if a VFO border was selected
             for (auto const& [name, _vfo] : vfos) {
+                if (!_vfo->rectVisible) { continue; }
                 if (_vfo->bandwidthLocked) { continue; }
                 if (_vfo->rectMax.x - _vfo->rectMin.x < 10) { continue; }
                 bool resizing = false;
@@ -578,6 +580,9 @@ namespace ImGui {
         double vfoMinFreq = _vfo->centerOffset - (_vfo->bandwidth / 2.0);
         double vfoMaxFreq = _vfo->centerOffset + (_vfo->bandwidth / 2.0);
         double vfoMaxSizeFreq = _vfo->centerOffset + _vfo->bandwidth;
+        if (_vfo->frequencyLocked && (vfoMaxFreq < -(wholeBandwidth / 2.0) || vfoMinFreq > (wholeBandwidth / 2.0))) {
+            return false;
+        }
         int lastFFTIndex = rawFFTSize - 1;
         int vfoMinSideOffset = std::clamp<int>(((vfoMinSizeFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, lastFFTIndex);
         int vfoMinOffset = std::clamp<int>(((vfoMinFreq / (wholeBandwidth / 2.0)) * (double)(rawFFTSize / 2)) + (rawFFTSize / 2), 0, lastFFTIndex);
@@ -1031,6 +1036,7 @@ namespace ImGui {
         wholeBandwidth = bandWidth;
         setViewBandwidth(bandWidth * currentRatio);
         for (auto const& [name, vfo] : vfos) {
+            if (vfo->frequencyLocked) { continue; }
             if (vfo->lowerOffset < -(bandWidth / 2)) {
                 vfo->setCenterOffset(-(bandWidth / 2));
             }
@@ -1361,6 +1367,7 @@ namespace ImGui {
 
         int _left = left;
         int _right = right;
+        rectVisible = !(frequencyLocked && ((_right < 0 && _left < 0) || (_right >= dataWidth && _left >= dataWidth)));
         left = std::clamp<int>(left, 0, dataWidth - 1);
         right = std::clamp<int>(right, 0, dataWidth - 1);
         leftClamped = (left != _left);
@@ -1380,6 +1387,7 @@ namespace ImGui {
     }
 
     void WaterfallVFO::draw(ImGuiWindow* window, bool selected) {
+        if (!rectVisible) { return; }
         window->DrawList->AddRectFilled(rectMin, rectMax, color);
         if (lineVisible) {
             window->DrawList->AddLine(lineMin, lineMax, selected ? IM_COL32(255, 0, 0, 255) : IM_COL32(255, 255, 0, 255), style::uiScale);

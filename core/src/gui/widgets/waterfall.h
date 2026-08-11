@@ -78,6 +78,10 @@ namespace ImGui {
 
         Event<double> onUserChangedBandwidth;
         Event<double> onUserChangedNotch;
+
+        bool rectVisible = true;
+        bool frequencyLocked = false;
+        double lockedFrequency = 0.0;
     };
 
     class WaterFall {
