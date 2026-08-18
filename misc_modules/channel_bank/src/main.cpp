@@ -1139,6 +1139,8 @@ private:
     json channelBankSettingsJson() {
         return {
             {"mode", detectionModeName()},
+            {"spacingId", spacingId},
+            {"channelSpacingHz", channelSpacing},
             {"demodMode", demodModeName(demodMode)},
             {"snrThresholdDb", snrThreshold},
             {"maxChannels", maxChannels},
@@ -1156,9 +1158,9 @@ private:
             error = "settings payload must be an object";
             return false;
         }
-        bool structural = body.contains("mode") || body.contains("demodMode");
+        bool structural = body.contains("mode") || body.contains("spacingId") || body.contains("demodMode");
         if (running && structural) {
-            error = "stop Channel Bank before changing mode or demod";
+            error = "stop Channel Bank before changing mode, spacing, or demod";
             return false;
         }
 
@@ -1201,6 +1203,10 @@ private:
             saveScanConfig();
         }
 
+        if (body.contains("spacingId") && !body["spacingId"].is_number_integer()) {
+            error = "channel spacing must be an integer preset";
+            return false;
+        }
         if (body.contains("demodMode") && !body["demodMode"].is_string()) {
             error = "demod mode must be a string";
             return false;
@@ -1239,6 +1245,11 @@ private:
         }
 
         config.acquire();
+        if (body.contains("spacingId")) {
+            spacingId = std::clamp(body["spacingId"].get<int>(), 0, 5);
+            channelSpacing = SPACINGS[spacingId];
+            config.conf[name]["spacingId"] = spacingId;
+        }
         if (body.contains("demodMode")) {
             int next = demodModeFromName(body["demodMode"].get<std::string>());
             if (next < 0) {
@@ -1557,6 +1568,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="muted" id="settingsStatus" style="margin-top:8px">Settings ready</div>
 <div class="settings-grid" style="margin-top:10px">
 <label class="control"><span class="label">Mode</span><select id="cbMode"><option value="auto">Auto</option><option value="manual">Manual</option><option value="scan">Scan</option><option value="bookmark_scan">Bookmark Scan</option></select></label>
+<label class="control slider-control"><span class="label">Channel spacing</span><span class="slider-value" id="cbSpacingValue">-</span><input id="cbSpacing" type="range" min="0" max="5" step="1"></label>
 <label class="control"><span class="label">Demod</span><select id="cbDemod"><option>AM</option><option>NFM</option><option>WFM</option><option>USB</option><option>LSB</option></select></label>
 <label class="control slider-control"><span class="label">SNR dB</span><span class="slider-value" id="cbSnrValue">-</span><input id="cbSnr" type="range" min="1" max="30" step="0.1"></label>
 <label class="control slider-control"><span class="label">Max channels</span><span class="slider-value" id="cbMaxChannelsValue">-</span><input id="cbMaxChannels" type="range" min="1" max="256" step="1"></label>
@@ -1590,6 +1602,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 const fmtMHz = hz => hz ? (hz / 1e6).toFixed(4) + " MHz" : "-";
 const fmtRate = hz => hz > 0 ? (hz >= 1e6 ? (hz / 1e6).toFixed(3) + " MS/s" : Math.round(hz).toLocaleString() + " S/s") : "-";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const spacingLabels = ["8.33 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz", "200 kHz"];
 let monitorCtx = null;
 let monitorAbort = null;
 let monitorNode = null;
@@ -1607,6 +1620,7 @@ let monitorLastStatusMs = 0;
 const pendingSettingTimers = new Map();
 let currentRecordingEnabled = true;
 const sliderFormatters = {
+  cbSpacing: v => spacingLabels[Math.max(0, Math.min(5, Math.round(v)))] || "-",
   cbSnr: v => v.toFixed(1),
   cbMaxChannels: v => String(Math.round(v)),
   cbMinTx: v => `${Math.round(v)} ms`,
@@ -1898,6 +1912,7 @@ async function refresh() {
     }
     const settings = s.settings || {};
     setControlValue("cbMode", settings.mode || s.mode || "auto");
+    setSliderValue("cbSpacing", settings.spacingId);
     setControlValue("cbDemod", settings.demodMode || s.demodMode || "AM");
     setSliderValue("cbSnr", settings.snrThresholdDb, v => v.toFixed(1));
     setSliderValue("cbMaxChannels", settings.maxChannels, v => String(Math.round(v)));
@@ -1911,6 +1926,7 @@ async function refresh() {
     recToggle.textContent = currentRecordingEnabled ? "On - keeping files" : "Off - monitor only";
     recToggle.className = currentRecordingEnabled ? "primary" : "danger";
     document.getElementById("cbMode").disabled = !!s.running;
+    document.getElementById("cbSpacing").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
     renderHeatMap(s);
     document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
@@ -1979,6 +1995,7 @@ function saveSetting(id, key, read) {
   }
 }
 saveSetting("cbMode", "mode");
+saveSetting("cbSpacing", "spacingId", v => Number.parseInt(v, 10));
 saveSetting("cbDemod", "demodMode");
 saveSetting("cbSnr", "snrThresholdDb", Number);
 saveSetting("cbMaxChannels", "maxChannels", v => Number.parseInt(v, 10));
