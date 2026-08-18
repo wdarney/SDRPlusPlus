@@ -1287,6 +1287,22 @@ private:
         return true;
     }
 
+    bool setFrequencyBlocked(double hz, bool blocked, std::string& error) {
+        if (!std::isfinite(hz) || hz <= 0.0) {
+            error = "hz must be positive";
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(freqLogMtx);
+            auto& entry = freqLog[freqKey(hz)];
+            if (entry.freqHz == 0.0) entry.freqHz = hz;
+            entry.blocked = blocked;
+        }
+        saveFreqLog();
+        mgmtCv.notify_one();
+        return true;
+    }
+
     std::string selectedSourceName() {
         std::string source;
         core::configManager.acquire();
@@ -1344,6 +1360,7 @@ private:
                     {"freqHz", slot->freqHz},
                     {"gridFreqHz", slot->gridFreqHz},
                     {"name", displayName(slot->freqHz)},
+                    {"blocked", isBlocked(slot->gridFreqHz)},
                     {"recording", slot->fileOpen},
                     {"signalPresent", slot->signalPresent.load()},
                     {"rawSignalPresent", slot->rawSignalPresent.load()},
@@ -1356,6 +1373,7 @@ private:
                 recent.push_back({
                     {"freqHz", ch.freqHz},
                     {"name", displayName(ch.freqHz)},
+                    {"blocked", isBlocked(ch.freqHz)},
                     {"ageMs", ageMs}
                 });
             }
@@ -1384,7 +1402,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(freqLogMtx);
             int emitted = 0;
-            for (auto it = freqLog.rbegin(); it != freqLog.rend() && emitted < 40; ++it, ++emitted) {
+            for (auto it = freqLog.rbegin(); it != freqLog.rend() && emitted < 160; ++it, ++emitted) {
                 const auto& e = it->second;
                 history.push_back({
                     {"freqHz", e.freqHz},
@@ -1468,6 +1486,10 @@ select, input { border: 1px solid #4a4a4a; background: #101010; color: #fff; pad
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }
 .status-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; margin-top: 10px; }
 .control { display: flex; flex-direction: column; gap: 5px; }
+.slider-control { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+.slider-control .label { grid-column: 1 / 2; }
+.slider-value { color: #ddd; font-size: 12px; min-width: 58px; text-align: right; font-variant-numeric: tabular-nums; }
+input[type="range"] { grid-column: 1 / 3; padding: 0; width: 100%; accent-color: #2b7cff; }
 .label { color: #aaa; font-size: 12px; }
 .value { font-size: 20px; margin-top: 3px; }
 .small-value { font-size: 15px; margin-top: 3px; }
@@ -1481,6 +1503,14 @@ th { color: #aaa; font-weight: 500; }
 .off { color: #ffb15c; }
 .bad { color: #ff6b6b; }
 pre { white-space: pre-wrap; margin: 0; color: #ddd; }
+.heatmap { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 7px; }
+.heat-cell { border: 1px solid #343434; border-radius: 7px; padding: 8px; background: #202020; cursor: pointer; min-height: 58px; display: flex; flex-direction: column; justify-content: space-between; gap: 5px; }
+.heat-cell:hover { border-color: #7aa7ff; }
+.heat-cell.blocked { border-color: #bc3d3d; background: #321818; }
+.heat-cell.live { box-shadow: inset 0 0 0 1px #2b7cff; }
+.heat-freq { font-size: 14px; font-variant-numeric: tabular-nums; }
+.heat-name, .heat-meta { color: #aaa; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inline-action { padding: 4px 8px; font-size: 12px; }
 @media (max-width: 720px) { .controls, .server-controls, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -1528,19 +1558,24 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="settings-grid" style="margin-top:10px">
 <label class="control"><span class="label">Mode</span><select id="cbMode"><option value="auto">Auto</option><option value="manual">Manual</option><option value="scan">Scan</option><option value="bookmark_scan">Bookmark Scan</option></select></label>
 <label class="control"><span class="label">Demod</span><select id="cbDemod"><option>AM</option><option>NFM</option><option>WFM</option><option>USB</option><option>LSB</option></select></label>
-<label class="control"><span class="label">SNR dB</span><input id="cbSnr" inputmode="decimal"></label>
-<label class="control"><span class="label">Max channels</span><input id="cbMaxChannels" inputmode="numeric"></label>
-<label class="control"><span class="label">Min TX ms</span><input id="cbMinTx" inputmode="numeric"></label>
-<label class="control"><span class="label">Signal hold ms</span><input id="cbSignalHold" inputmode="numeric"></label>
-<label class="control"><span class="label">TX tail ms</span><input id="cbTail" inputmode="numeric"></label>
-<label class="control"><span class="label">Scan quiet s</span><input id="cbScanQuiet" inputmode="decimal"></label>
-<label class="control"><span class="label">No-signal skip s</span><input id="cbScanNoSignal" inputmode="decimal"></label>
+<label class="control slider-control"><span class="label">SNR dB</span><span class="slider-value" id="cbSnrValue">-</span><input id="cbSnr" type="range" min="1" max="30" step="0.1"></label>
+<label class="control slider-control"><span class="label">Max channels</span><span class="slider-value" id="cbMaxChannelsValue">-</span><input id="cbMaxChannels" type="range" min="1" max="256" step="1"></label>
+<label class="control slider-control"><span class="label">Min TX ms</span><span class="slider-value" id="cbMinTxValue">-</span><input id="cbMinTx" type="range" min="0" max="10000" step="50"></label>
+<label class="control slider-control"><span class="label">Signal hold ms</span><span class="slider-value" id="cbSignalHoldValue">-</span><input id="cbSignalHold" type="range" min="0" max="5000" step="50"></label>
+<label class="control slider-control"><span class="label">TX tail ms</span><span class="slider-value" id="cbTailValue">-</span><input id="cbTail" type="range" min="100" max="2000" step="25"></label>
+<label class="control slider-control"><span class="label">Scan quiet s</span><span class="slider-value" id="cbScanQuietValue">-</span><input id="cbScanQuiet" type="range" min="1" max="30" step="0.5"></label>
+<label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
 </div>
 </section>
 <section>
+<h2>Frequency Heat Map</h2>
+<div class="heatmap" id="heatmap"></div>
+<div class="muted" id="heatmapStatus" style="margin-top:8px">Click a frequency to block or unblock it.</div>
+</section>
+<section>
 <h2>Active Channels</h2>
-<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Signal</th><th>Recording</th></tr></thead><tbody id="channels"></tbody></table>
+<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Signal</th><th>Recording</th><th>Block</th></tr></thead><tbody id="channels"></tbody></table>
 </section>
 <section>
 <h2>Playback / Transcript</h2>
@@ -1554,6 +1589,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <script>
 const fmtMHz = hz => hz ? (hz / 1e6).toFixed(4) + " MHz" : "-";
 const fmtRate = hz => hz > 0 ? (hz >= 1e6 ? (hz / 1e6).toFixed(3) + " MS/s" : Math.round(hz).toLocaleString() + " S/s") : "-";
+const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let monitorCtx = null;
 let monitorAbort = null;
 let monitorNode = null;
@@ -1570,6 +1606,15 @@ let monitorBufferedSamples = 0;
 let monitorLastStatusMs = 0;
 const pendingSettingTimers = new Map();
 let currentRecordingEnabled = true;
+const sliderFormatters = {
+  cbSnr: v => v.toFixed(1),
+  cbMaxChannels: v => String(Math.round(v)),
+  cbMinTx: v => `${Math.round(v)} ms`,
+  cbSignalHold: v => `${Math.round(v)} ms`,
+  cbTail: v => `${Math.round(v)} ms`,
+  cbScanQuiet: v => `${v.toFixed(1)} s`,
+  cbScanNoSignal: v => `${v.toFixed(1)} s`
+};
 async function post(path, body) {
   const r = await fetch(path, {
     method: "POST",
@@ -1586,6 +1631,21 @@ async function post(path, body) {
 function setControlValue(id, value) {
   const el = document.getElementById(id);
   if (document.activeElement !== el && value !== undefined && value !== null) el.value = value;
+}
+function setSliderValue(id, value, format) {
+  const el = document.getElementById(id);
+  if (!el || value === undefined || value === null) return;
+  if (document.activeElement !== el) el.value = value;
+  const out = document.getElementById(id + "Value");
+  const formatter = format || sliderFormatters[id];
+  if (out) out.textContent = formatter ? formatter(Number(el.value)) : el.value;
+}
+function updateSliderOutput(id) {
+  const el = document.getElementById(id);
+  const out = document.getElementById(id + "Value");
+  if (!el || !out) return;
+  const formatter = sliderFormatters[id];
+  out.textContent = formatter ? formatter(Number(el.value)) : el.value;
 }
 async function postAndReport(path, body) {
   try {
@@ -1604,6 +1664,72 @@ async function saveSettingValue(key, value) {
   if (settingsStatus) settingsStatus.textContent = "Saving settings...";
   const ok = await postAndReport("/api/channel-bank/settings", { [key]: value });
   if (ok && settingsStatus) settingsStatus.textContent = "Settings saved";
+}
+async function blockFrequency(hz, blocked) {
+  const status = document.getElementById("heatmapStatus");
+  if (status) status.textContent = blocked ? "Blocking frequency..." : "Unblocking frequency...";
+  const ok = await postAndReport("/api/frequency/block", { hz, blocked });
+  if (status) status.textContent = ok ? (blocked ? "Frequency blocked" : "Frequency unblocked") : "Block action failed";
+}
+function renderHeatMap(s) {
+  const rows = new Map();
+  const put = (hz, data = {}) => {
+    if (!hz || !Number.isFinite(Number(hz))) return;
+    const key = Math.round(Number(hz) / 1000);
+    const row = rows.get(key) || {
+      freqHz: Number(hz),
+      name: "",
+      count: 0,
+      blocked: false,
+      live: false,
+      recent: false,
+      lastSeen: 0
+    };
+    row.freqHz = data.gridFreqHz || data.freqHz || row.freqHz;
+    row.name = data.name || row.name;
+    row.count = Math.max(row.count, data.count || 0);
+    row.blocked = row.blocked || !!data.blocked;
+    row.live = row.live || !!data.live;
+    row.recent = row.recent || !!data.recent;
+    row.lastSeen = Math.max(row.lastSeen, data.lastSeen || 0);
+    rows.set(key, row);
+  };
+  (s.history || []).forEach(h => put(h.freqHz, h));
+  (s.recentChannels || []).forEach(ch => put(ch.freqHz, { ...ch, recent: true, count: 1 }));
+  (s.activeChannels || []).forEach(ch => put(ch.gridFreqHz || ch.freqHz, { ...ch, live: true, count: 2 }));
+  const items = Array.from(rows.values()).sort((a, b) =>
+    (Number(b.blocked) - Number(a.blocked)) ||
+    (Number(b.live) - Number(a.live)) ||
+    (b.count - a.count) ||
+    (b.lastSeen - a.lastSeen) ||
+    (a.freqHz - b.freqHz)
+  ).slice(0, 72);
+  const maxCount = Math.max(1, ...items.map(i => i.count || 0));
+  const heatmap = document.getElementById("heatmap");
+  if (!items.length) {
+    heatmap.innerHTML = `<div class="muted">No active or logged frequencies yet.</div>`;
+    return;
+  }
+  heatmap.innerHTML = items.map(item => {
+    const heat = Math.max(0.18, Math.min(1, (item.count || 0) / maxCount));
+    const bg = item.blocked
+      ? `linear-gradient(135deg, rgba(124,29,29,${0.42 + heat * 0.35}), #201414)`
+      : `linear-gradient(135deg, rgba(13,110,253,${0.16 + heat * 0.50}), rgba(35,49,61,0.75))`;
+    const meta = [
+      item.live ? "live" : "",
+      item.recent ? "recent" : "",
+      `${item.count || 0} hits`,
+      item.blocked ? "blocked" : "open"
+    ].filter(Boolean).join(" / ");
+    return `<div class="heat-cell ${item.blocked ? "blocked" : ""} ${item.live ? "live" : ""}"
+        style="background:${bg}"
+        onclick="blockFrequency(${Number(item.freqHz).toFixed(0)}, ${item.blocked ? "false" : "true"})"
+        title="${item.blocked ? "Unblock" : "Block"} ${esc(fmtMHz(item.freqHz))}">
+        <div class="heat-freq">${esc(fmtMHz(item.freqHz))}</div>
+        <div class="heat-name">${esc(item.name || "")}</div>
+        <div class="heat-meta">${esc(meta)}</div>
+      </div>`;
+  }).join("");
 }
 function coerceSettingValue(raw, read) {
   const value = read ? read(raw) : raw;
@@ -1748,7 +1874,7 @@ async function refresh() {
     const source = document.getElementById("source");
     const prev = source.value;
     source.innerHTML = (s.sources || []).map(name =>
-      `<option value="${name.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;")}">${name}</option>`
+      `<option value="${esc(name)}">${esc(name)}</option>`
     ).join("");
     source.value = s.selectedSource || prev;
     source.disabled = !!s.radioPlaying;
@@ -1773,24 +1899,25 @@ async function refresh() {
     const settings = s.settings || {};
     setControlValue("cbMode", settings.mode || s.mode || "auto");
     setControlValue("cbDemod", settings.demodMode || s.demodMode || "AM");
-    setControlValue("cbSnr", settings.snrThresholdDb);
-    setControlValue("cbMaxChannels", settings.maxChannels);
-    setControlValue("cbMinTx", settings.minTransmissionMs);
-    setControlValue("cbSignalHold", settings.signalHoldMs);
-    setControlValue("cbTail", settings.tailMs);
-    setControlValue("cbScanQuiet", settings.scanQuietSec);
-    setControlValue("cbScanNoSignal", settings.scanNoSignalSec);
+    setSliderValue("cbSnr", settings.snrThresholdDb, v => v.toFixed(1));
+    setSliderValue("cbMaxChannels", settings.maxChannels, v => String(Math.round(v)));
+    setSliderValue("cbMinTx", settings.minTransmissionMs, v => `${Math.round(v)} ms`);
+    setSliderValue("cbSignalHold", settings.signalHoldMs, v => `${Math.round(v)} ms`);
+    setSliderValue("cbTail", settings.tailMs, v => `${Math.round(v)} ms`);
+    setSliderValue("cbScanQuiet", settings.scanQuietSec, v => `${v.toFixed(1)} s`);
+    setSliderValue("cbScanNoSignal", settings.scanNoSignalSec, v => `${v.toFixed(1)} s`);
     currentRecordingEnabled = settings.recordingEnabled !== false;
     const recToggle = document.getElementById("cbRecordingToggle");
     recToggle.textContent = currentRecordingEnabled ? "On - keeping files" : "Off - monitor only";
     recToggle.className = currentRecordingEnabled ? "primary" : "danger";
     document.getElementById("cbMode").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
+    renderHeatMap(s);
     document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
-      `<tr><td>${ch.slot}</td><td>${fmtMHz(ch.freqHz)}</td><td>${ch.name || ""}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td></tr>`
-    ).join("") || `<tr><td colspan="5" class="muted">No active channels</td></tr>`;
+      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
     document.getElementById("history").innerHTML = (s.history || []).map(h =>
-      `<tr><td>${fmtMHz(h.freqHz)}</td><td>${h.name || ""}</td><td>${h.count}</td><td>${h.blocked ? "yes" : "no"}</td></tr>`
+      `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count}</td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`
     ).join("") || `<tr><td colspan="4" class="muted">No history yet</td></tr>`;
     const tx = (s.lastTranscriptText || "").trim();
     document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
@@ -1832,6 +1959,7 @@ function saveSetting(id, key, read) {
   };
   if (el.tagName === "INPUT") {
     el.oninput = () => {
+      if (el.type === "range") updateSliderOutput(id);
       clearTimeout(pendingSettingTimers.get(id));
       pendingSettingTimers.set(id, setTimeout(queueSave, 350));
     };
@@ -2116,6 +2244,19 @@ setInterval(refresh, 500);
                         {"error", error},
                         {"_httpStatus", running ? "409 Conflict" : "400 Bad Request"}
                     });
+                }
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/frequency/block") {
+            json body = requestJsonBody(reqText);
+            double hz = body.value("hz", 0.0);
+            bool blocked = body.value("blocked", true);
+            sendUiActionResponse(fd, [this, hz, blocked] {
+                std::string error;
+                if (!setFrequencyBlocked(hz, blocked, error)) {
+                    return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
                 }
                 return webStateSnapshot();
             });
