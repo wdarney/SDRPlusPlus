@@ -1144,6 +1144,7 @@ private:
             {"demodMode", demodModeName(demodMode)},
             {"snrThresholdDb", snrThreshold},
             {"maxChannels", maxChannels},
+            {"bwUsage", bwUsage},
             {"recordingEnabled", recordingEnabled},
             {"minTransmissionMs", minTransmissionMs},
             {"signalHoldMs", signalHoldMs},
@@ -1219,6 +1220,10 @@ private:
             error = "max channels must be an integer";
             return false;
         }
+        if (body.contains("bwUsage") && !body["bwUsage"].is_number()) {
+            error = "frequency span must be numeric";
+            return false;
+        }
         if (body.contains("recordingEnabled") && !body["recordingEnabled"].is_boolean()) {
             error = "recording must be true or false";
             return false;
@@ -1267,6 +1272,10 @@ private:
         if (body.contains("maxChannels")) {
             maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, 256);
             config.conf[name]["maxChannels"] = maxChannels;
+        }
+        if (body.contains("bwUsage")) {
+            bwUsage = std::clamp(body["bwUsage"].get<float>(), 0.5f, 1.0f);
+            config.conf[name]["bwUsage"] = bwUsage;
         }
         if (body.contains("recordingEnabled")) {
             recordingEnabled = body["recordingEnabled"].get<bool>();
@@ -1435,6 +1444,8 @@ private:
         j["centerHz"] = lastKnownCenter;
         j["waterfallCenterHz"] = gui::waterfall.getCenterFrequency();
         j["sampleRate"] = lastKnownSr;
+        j["usableSpanHz"] = lastKnownSr > 0.0 ? lastKnownSr * bwUsage : 0.0;
+        j["bwUsage"] = bwUsage;
         j["radioPlaying"] = gui::mainWindow.isPlaying();
         j["sdrppHeartbeat"] = webHeartbeat.fetch_add(1) + 1;
         j["serverTimeMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1541,7 +1552,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="status-strip">
 <div class="tile"><div class="label">SDR++</div><div class="small-value ok" id="sdrppStatus">Connected</div></div>
 <div class="tile"><div class="label">Radio</div><div class="small-value" id="radioState">-</div></div>
-<div class="tile"><div class="label">Sample Rate</div><div class="small-value" id="sampleRate">-</div></div>
+<div class="tile"><div class="label">Sample Rate</div><div class="small-value" id="sampleRate">-</div><div class="small-value muted" id="freqSpan">Span -</div></div>
 <div class="tile"><div class="label">Heartbeat</div><div class="small-value" id="heartbeat">-</div></div>
 </div>
 <div class="server-controls" id="serverControls">
@@ -1572,6 +1583,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control"><span class="label">Demod</span><select id="cbDemod"><option>AM</option><option>NFM</option><option>WFM</option><option>USB</option><option>LSB</option></select></label>
 <label class="control slider-control"><span class="label">SNR dB</span><span class="slider-value" id="cbSnrValue">-</span><input id="cbSnr" type="range" min="1" max="30" step="0.1"></label>
 <label class="control slider-control"><span class="label">Max channels</span><span class="slider-value" id="cbMaxChannelsValue">-</span><input id="cbMaxChannels" type="range" min="1" max="256" step="1"></label>
+<label class="control slider-control"><span class="label">Freq span</span><span class="slider-value" id="cbBwUsageValue">-</span><input id="cbBwUsage" type="range" min="50" max="100" step="1"></label>
 <label class="control slider-control"><span class="label">Min TX ms</span><span class="slider-value" id="cbMinTxValue">-</span><input id="cbMinTx" type="range" min="0" max="10000" step="50"></label>
 <label class="control slider-control"><span class="label">Signal hold ms</span><span class="slider-value" id="cbSignalHoldValue">-</span><input id="cbSignalHold" type="range" min="0" max="5000" step="50"></label>
 <label class="control slider-control"><span class="label">TX tail ms</span><span class="slider-value" id="cbTailValue">-</span><input id="cbTail" type="range" min="100" max="2000" step="25"></label>
@@ -1623,6 +1635,7 @@ const sliderFormatters = {
   cbSpacing: v => spacingLabels[Math.max(0, Math.min(5, Math.round(v)))] || "-",
   cbSnr: v => v.toFixed(1),
   cbMaxChannels: v => String(Math.round(v)),
+  cbBwUsage: v => `${Math.round(v)}%`,
   cbMinTx: v => `${Math.round(v)} ms`,
   cbSignalHold: v => `${Math.round(v)} ms`,
   cbTail: v => `${Math.round(v)} ms`,
@@ -1879,6 +1892,7 @@ async function refresh() {
     document.getElementById("radioState").textContent = s.radioPlaying ? "Playing" : "Stopped";
     document.getElementById("radioState").className = "small-value " + (s.radioPlaying ? "ok" : "off");
     document.getElementById("sampleRate").textContent = fmtRate(s.sampleRate);
+    document.getElementById("freqSpan").textContent = `Span ${fmtRate(s.usableSpanHz)}`;
     document.getElementById("heartbeat").textContent = `#${s.sdrppHeartbeat || 0}  ${now}`;
     document.getElementById("state").textContent = s.running ? "Running" : "Stopped";
     document.getElementById("state").className = "value " + (s.running ? "ok" : "off");
@@ -1916,6 +1930,7 @@ async function refresh() {
     setControlValue("cbDemod", settings.demodMode || s.demodMode || "AM");
     setSliderValue("cbSnr", settings.snrThresholdDb, v => v.toFixed(1));
     setSliderValue("cbMaxChannels", settings.maxChannels, v => String(Math.round(v)));
+    setSliderValue("cbBwUsage", Math.round((settings.bwUsage ?? s.bwUsage ?? 0.8) * 100));
     setSliderValue("cbMinTx", settings.minTransmissionMs, v => `${Math.round(v)} ms`);
     setSliderValue("cbSignalHold", settings.signalHoldMs, v => `${Math.round(v)} ms`);
     setSliderValue("cbTail", settings.tailMs, v => `${Math.round(v)} ms`);
@@ -1999,6 +2014,7 @@ saveSetting("cbSpacing", "spacingId", v => Number.parseInt(v, 10));
 saveSetting("cbDemod", "demodMode");
 saveSetting("cbSnr", "snrThresholdDb", Number);
 saveSetting("cbMaxChannels", "maxChannels", v => Number.parseInt(v, 10));
+saveSetting("cbBwUsage", "bwUsage", v => Number.parseInt(v, 10) / 100);
 saveSetting("cbMinTx", "minTransmissionMs", v => Number.parseInt(v, 10));
 saveSetting("cbSignalHold", "signalHoldMs", v => Number.parseInt(v, 10));
 saveSetting("cbTail", "tailMs", v => Number.parseInt(v, 10));
