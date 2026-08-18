@@ -100,6 +100,10 @@ cp $build_dir/sink_modules/network_sink/Release/network_sink.dll sdrpp_windows_x
 # Copy decoder modules
 cp $build_dir/decoder_modules/atv_decoder/Release/atv_decoder.dll sdrpp_windows_x64/modules/
 
+cp $build_dir/decoder_modules/ch_extravhf_decoder/Release/ch_extravhf_decoder.dll sdrpp_windows_x64/modules/
+cp $build_dir/mbelib-build/Release/mbe-shared.dll sdrpp_windows_x64/
+cp "C:/vcpkg/installed/x64-windows/bin/itpp.dll" sdrpp_windows_x64/
+
 Copy-Optional $build_dir/decoder_modules/m17_decoder/Release/m17_decoder.dll sdrpp_windows_x64/modules/
 Copy-Optional "C:/Program Files/codec2/lib/libcodec2.dll" sdrpp_windows_x64/
 
