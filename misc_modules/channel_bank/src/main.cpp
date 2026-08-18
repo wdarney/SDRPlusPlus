@@ -1411,6 +1411,59 @@ private:
             manualDetectedCount = (int)manualDetected.size();
         }
 
+        json snrOverview = json::array();
+        if (lastKnownSr > 0.0 && lastKnownCenter > 0.0) {
+            double usableLo = lastKnownCenter - (lastKnownSr * bwUsage) * 0.5;
+            double usableHi = lastKnownCenter + (lastKnownSr * bwUsage) * 0.5;
+            if (manualMode || bookmarkScanMode) {
+                std::set<int> localDetected;
+                std::set<int> localRawDetected;
+                std::map<int, float> localSnr;
+                {
+                    std::lock_guard<std::mutex> lk(manualDetectedMtx);
+                    localDetected = manualDetected;
+                    localRawDetected = rawManualDetected;
+                    localSnr = manualSnrDb;
+                }
+                std::vector<double> localFreqs = getActiveManualFreqs();
+                for (auto& [idx, snrDb] : localSnr) {
+                    if (idx < 0 || idx >= (int)localFreqs.size()) continue;
+                    double freqHz = localFreqs[idx];
+                    if (freqHz < usableLo || freqHz > usableHi) continue;
+                    snrOverview.push_back({
+                        {"freqHz", freqHz},
+                        {"snrDb", snrDb},
+                        {"detected", localDetected.count(idx) > 0},
+                        {"rawDetected", localRawDetected.count(idx) > 0},
+                        {"blocked", isBlocked(freqHz)}
+                    });
+                }
+            } else {
+                std::vector<float> localSnr;
+                std::set<int> localDetected;
+                std::set<int> localRawDetected;
+                {
+                    std::lock_guard<std::mutex> lk(detectedMtx);
+                    localSnr = slotSnrDb;
+                    localDetected = detectedSlots;
+                    localRawDetected = rawDetectedSlots;
+                }
+                int numSlots = (int)localSnr.size();
+                for (int i = 0; i < numSlots; i++) {
+                    double slotOffset = ((double)i - (double)(numSlots - 1) / 2.0) * channelSpacing;
+                    double freqHz = lastKnownCenter + slotOffset;
+                    if (freqHz < usableLo || freqHz > usableHi) continue;
+                    snrOverview.push_back({
+                        {"freqHz", freqHz},
+                        {"snrDb", localSnr[i]},
+                        {"detected", localDetected.count(i) > 0},
+                        {"rawDetected", localRawDetected.count(i) > 0},
+                        {"blocked", isBlocked(freqHz)}
+                    });
+                }
+            }
+        }
+
         int playbackQueued = 0;
         int64_t playingKey = currentlyPlayingFreqKey.load();
         {
@@ -1461,6 +1514,7 @@ private:
         j["recentChannels"] = recent;
         j["detectedSlots"] = detectedCount;
         j["manualDetected"] = manualDetectedCount;
+        j["snrOverview"] = snrOverview;
         j["playbackQueued"] = playbackQueued;
         j["currentlyPlayingFreqKey"] = playingKey;
         j["history"] = history;
@@ -1535,6 +1589,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 .inline-action { padding: 4px 8px; font-size: 12px; }
 .span-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 8px; }
 .span-waterfall { width: 100%; height: 180px; display: block; background: #090b0e; border: 1px solid #2b3440; border-radius: 7px; cursor: crosshair; }
+.snr-chart { width: 100%; height: 170px; display: block; background: #0b0d10; border: 1px solid #2b3440; border-radius: 7px; }
 @media (max-width: 720px) { .controls, .server-controls, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -1593,6 +1648,14 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
 </div>
+</section>
+<section>
+<div class="span-head">
+<h2>SNR Overview</h2>
+<div class="muted" id="snrSummary">-</div>
+</div>
+<canvas class="snr-chart" id="snrChart"></canvas>
+<div class="muted" style="margin-top:8px">Bars above the line are at or above the current SNR threshold.</div>
 </section>
 <section>
 <div class="span-head">
@@ -1771,6 +1834,84 @@ function renderHeatMap(s) {
         <div class="heat-meta">${esc(meta)}</div>
       </div>`;
   }).join("");
+}
+function drawSnrChart(s) {
+  const canvas = document.getElementById("snrChart");
+  const summary = document.getElementById("snrSummary");
+  const points = (s.snrOverview || []).filter(p => Number.isFinite(Number(p.snrDb)) && Number.isFinite(Number(p.freqHz)));
+  const info = spanInfo(s);
+  if (!canvas || !info) return;
+  const cssWidth = Math.max(320, canvas.clientWidth || 800);
+  const cssHeight = Math.max(140, canvas.clientHeight || 170);
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const width = cssWidth;
+  const height = cssHeight;
+  const padL = 42;
+  const padR = 10;
+  const padT = 12;
+  const padB = 22;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  const threshold = Number(s.snrThresholdDb || s.settings?.snrThresholdDb || 0);
+  const peak = points.length ? Math.max(...points.map(p => Number(p.snrDb))) : 0;
+  const maxDb = Math.max(30, threshold + 5, Math.ceil(peak + 2));
+  const minDb = -5;
+  const yFor = db => padT + (1 - ((db - minDb) / (maxDb - minDb))) * plotH;
+  const xFor = hz => padL + ((hz - info.lo) / info.span) * plotW;
+  const above = points.filter(p => Number(p.snrDb) >= threshold).length;
+  const detected = points.filter(p => p.detected).length;
+  if (summary) {
+    summary.textContent = points.length
+      ? `${above}/${points.length} above / peak ${peak.toFixed(1)} dB / detected ${detected}`
+      : "No SNR data yet";
+  }
+
+  ctx.fillStyle = "#080a0d";
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = "#1a2530";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = padT + (i / 5) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(width - padR, y);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#8d98a5";
+  ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  ctx.fillText(`${maxDb.toFixed(0)} dB`, 4, padT + 4);
+  ctx.fillText("0 dB", 12, yFor(0) + 4);
+  ctx.fillText(`${fmtMHz(info.lo)}`, padL, height - 6);
+  const hiLabel = fmtMHz(info.hi);
+  ctx.fillText(hiLabel, Math.max(padL, width - padR - ctx.measureText(hiLabel).width), height - 6);
+
+  const baseY = yFor(0);
+  const barW = Math.max(1, Math.min(8, plotW / Math.max(1, points.length) * 0.82));
+  points.forEach(p => {
+    const db = Math.max(minDb, Math.min(maxDb, Number(p.snrDb)));
+    const x = xFor(Number(p.freqHz));
+    const y = yFor(Math.max(0, db));
+    const h = Math.max(1, Math.abs(baseY - y));
+    ctx.fillStyle = p.blocked ? "#bc3d3d" : p.detected ? "#62d26f" : p.rawDetected ? "#ffb15c" : (db >= threshold ? "#7aa7ff" : "#36516d");
+    ctx.fillRect(x - barW / 2, Math.min(baseY, y), barW, h);
+  });
+
+  const thresholdY = yFor(threshold);
+  ctx.strokeStyle = "#f4d35e";
+  ctx.setLineDash([7, 5]);
+  ctx.beginPath();
+  ctx.moveTo(padL, thresholdY);
+  ctx.lineTo(width - padR, thresholdY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#f4d35e";
+  ctx.fillText(`threshold ${threshold.toFixed(1)} dB`, padL + 6, Math.max(padT + 12, thresholdY - 5));
 }
 function spanInfo(s) {
   const center = Number(s.centerHz || s.waterfallCenterHz || 0);
@@ -2083,6 +2224,7 @@ async function refresh() {
     document.getElementById("cbMode").disabled = !!s.running;
     document.getElementById("cbSpacing").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
+    drawSnrChart(s);
     drawSpanWaterfall(s);
     renderHeatMap(s);
     document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
