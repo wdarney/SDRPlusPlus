@@ -1685,7 +1685,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 </main>
 <script>
 const fmtMHz = hz => hz ? (hz / 1e6).toFixed(4) + " MHz" : "-";
-const fmtSpanMHz = hz => hz > 0 ? (hz / 1e6).toFixed(3) + " MHz" : "-";
+const fmtRangeMHz = (lo, hi) => lo > 0 && hi > 0 ? `${(lo / 1e6).toFixed(3)} to ${(hi / 1e6).toFixed(3)} MHz` : "-";
 const fmtRate = hz => hz > 0 ? (hz >= 1e6 ? (hz / 1e6).toFixed(3) + " MS/s" : Math.round(hz).toLocaleString() + " S/s") : "-";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const spacingLabels = ["8.33 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz", "200 kHz"];
@@ -2174,7 +2174,9 @@ async function refresh() {
     document.getElementById("radioState").textContent = s.radioPlaying ? "Playing" : "Stopped";
     document.getElementById("radioState").className = "small-value " + (s.radioPlaying ? "ok" : "off");
     document.getElementById("sampleRate").textContent = fmtRate(s.sampleRate);
-    document.getElementById("freqSpan").textContent = `Waterfall ${fmtSpanMHz(s.sampleRate)}`;
+    const wfCenter = Number(s.waterfallCenterHz || s.centerHz || 0);
+    const wfSpan = Number(s.sampleRate || 0);
+    document.getElementById("freqSpan").textContent = `Waterfall ${fmtRangeMHz(wfCenter - wfSpan / 2, wfCenter + wfSpan / 2)}`;
     document.getElementById("heartbeat").textContent = `#${s.sdrppHeartbeat || 0}  ${now}`;
     document.getElementById("state").textContent = s.running ? "Running" : "Stopped";
     document.getElementById("state").className = "value " + (s.running ? "ok" : "off");
