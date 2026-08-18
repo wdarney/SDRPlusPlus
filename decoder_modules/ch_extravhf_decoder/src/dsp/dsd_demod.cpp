@@ -160,11 +160,7 @@ namespace dsp {
             if (!probeTone) {
                 audioProbePhase = 0.0;
             }
-#ifdef _WIN32
-            outSymsCtr -= (min(outSymsCtr, requiredOut));
-#else
             outSymsCtr -= (std::min(outSymsCtr, requiredOut));
-#endif
             inSymsCtr -= requiredOut * 3 / 5;
             return outcnt;
         }
