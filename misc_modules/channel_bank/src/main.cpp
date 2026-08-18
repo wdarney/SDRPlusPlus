@@ -1533,6 +1533,8 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 .heat-freq { font-size: 14px; font-variant-numeric: tabular-nums; }
 .heat-name, .heat-meta { color: #aaa; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .inline-action { padding: 4px 8px; font-size: 12px; }
+.span-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 8px; }
+.span-waterfall { width: 100%; height: 180px; display: block; background: #090b0e; border: 1px solid #2b3440; border-radius: 7px; cursor: crosshair; }
 @media (max-width: 720px) { .controls, .server-controls, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -1593,6 +1595,14 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 </div>
 </section>
 <section>
+<div class="span-head">
+<h2>Activity Span</h2>
+<div class="muted" id="spanRange">-</div>
+</div>
+<canvas class="span-waterfall" id="spanWaterfall"></canvas>
+<div class="muted" id="spanStatus" style="margin-top:8px">Click lit activity to block or unblock it.</div>
+</section>
+<section>
 <h2>Frequency Heat Map</h2>
 <div class="heatmap" id="heatmap"></div>
 <div class="muted" id="heatmapStatus" style="margin-top:8px">Click a frequency to block or unblock it.</div>
@@ -1631,6 +1641,10 @@ let monitorBufferedSamples = 0;
 let monitorLastStatusMs = 0;
 const pendingSettingTimers = new Map();
 let currentRecordingEnabled = true;
+const spanWaterfallFrames = [];
+const spanWaterfallMaxFrames = 72;
+let spanWaterfallKey = "";
+let spanWaterfallClick = null;
 const sliderFormatters = {
   cbSpacing: v => spacingLabels[Math.max(0, Math.min(5, Math.round(v)))] || "-",
   cbSnr: v => v.toFixed(1),
@@ -1757,6 +1771,132 @@ function renderHeatMap(s) {
         <div class="heat-meta">${esc(meta)}</div>
       </div>`;
   }).join("");
+}
+function spanInfo(s) {
+  const center = Number(s.centerHz || s.waterfallCenterHz || 0);
+  const span = Number(s.usableSpanHz || ((s.sampleRate || 0) * (s.bwUsage || 0.8)));
+  if (!Number.isFinite(center) || !Number.isFinite(span) || center <= 0 || span <= 0) return null;
+  return { center, span, lo: center - span / 2, hi: center + span / 2 };
+}
+function spanX(freqHz, info, width) {
+  return Math.round(((freqHz - info.lo) / info.span) * width);
+}
+function collectSpanPoints(s, info) {
+  const points = [];
+  const add = (freqHz, data = {}) => {
+    const freq = Number(freqHz);
+    if (!Number.isFinite(freq) || freq < info.lo || freq > info.hi) return;
+    points.push({
+      freqHz: freq,
+      name: data.name || "",
+      blocked: !!data.blocked,
+      live: !!data.live,
+      recent: !!data.recent,
+      history: !!data.history,
+      strength: Math.max(0.06, Math.min(1, Number(data.strength || 0.25)))
+    });
+  };
+  (s.history || []).forEach(h => add(h.freqHz, { ...h, history: true, strength: Math.min(0.32, 0.08 + (h.count || 0) * 0.025) }));
+  (s.recentChannels || []).forEach(ch => add(ch.freqHz, {
+    ...ch,
+    recent: true,
+    strength: Math.max(0.18, 0.58 * (1 - Math.min(30000, ch.ageMs || 0) / 30000))
+  }));
+  (s.activeChannels || []).forEach(ch => add(ch.gridFreqHz || ch.freqHz, {
+    ...ch,
+    live: true,
+    strength: ch.signalPresent ? 1 : 0.65
+  }));
+  return points;
+}
+function drawSpanWaterfall(s) {
+  const canvas = document.getElementById("spanWaterfall");
+  const status = document.getElementById("spanStatus");
+  const range = document.getElementById("spanRange");
+  const info = spanInfo(s);
+  if (!canvas || !info) {
+    if (range) range.textContent = "-";
+    return;
+  }
+  range.textContent = `${fmtMHz(info.lo)} to ${fmtMHz(info.hi)}`;
+  const cssWidth = Math.max(320, canvas.clientWidth || 800);
+  const cssHeight = Math.max(140, canvas.clientHeight || 180);
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const key = `${Math.round(info.center / 1000)}:${Math.round(info.span / 1000)}`;
+  if (key !== spanWaterfallKey) {
+    spanWaterfallKey = key;
+    spanWaterfallFrames.length = 0;
+  }
+  const points = collectSpanPoints(s, info);
+  spanWaterfallFrames.push(points.filter(p => p.live || p.recent));
+  while (spanWaterfallFrames.length > spanWaterfallMaxFrames) spanWaterfallFrames.shift();
+  spanWaterfallClick = { info, points, channelSpacingHz: Number(s.settings?.channelSpacingHz || s.channelSpacingHz || 0) };
+
+  const width = cssWidth;
+  const height = cssHeight;
+  ctx.fillStyle = "#080a0d";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#111820";
+  for (let i = 0; i <= 8; i++) {
+    const x = Math.round((i / 8) * width);
+    ctx.fillRect(x, 0, 1, height);
+  }
+  (s.history || []).forEach(h => {
+    if (!h.freqHz || h.freqHz < info.lo || h.freqHz > info.hi) return;
+    const x = spanX(h.freqHz, info, width);
+    const alpha = h.blocked ? 0.42 : Math.min(0.24, 0.06 + (h.count || 0) * 0.015);
+    ctx.fillStyle = h.blocked ? `rgba(210,70,70,${alpha})` : `rgba(70,130,210,${alpha})`;
+    ctx.fillRect(x - 1, 0, 2, height);
+  });
+  const rowH = height / spanWaterfallMaxFrames;
+  spanWaterfallFrames.forEach((frame, i) => {
+    const y = height - (spanWaterfallFrames.length - i) * rowH;
+    frame.forEach(p => {
+      const x = spanX(p.freqHz, info, width);
+      const alpha = p.blocked ? 0.95 : p.strength;
+      ctx.fillStyle = p.blocked ? `rgba(255,74,74,${alpha})` : p.live ? `rgba(80,210,115,${alpha})` : `rgba(255,177,92,${alpha})`;
+      ctx.fillRect(x - 3, y, 6, Math.max(2, rowH + 1));
+    });
+  });
+  points.filter(p => p.live).slice(0, 20).forEach(p => {
+    const x = spanX(p.freqHz, info, width);
+    ctx.strokeStyle = p.blocked ? "#ff6b6b" : "#62d26f";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+    ctx.fillStyle = p.blocked ? "#ff9b9b" : "#d8ffe0";
+    ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    const label = (p.name || fmtMHz(p.freqHz)).slice(0, 18);
+    ctx.fillText(label, Math.min(width - 96, Math.max(4, x + 5)), 14);
+  });
+  if (status && points.some(p => p.live || p.recent)) status.textContent = "Click lit activity to block or unblock it.";
+}
+function nearestSpanPoint(clientX) {
+  const canvas = document.getElementById("spanWaterfall");
+  if (!canvas || !spanWaterfallClick) return null;
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const info = spanWaterfallClick.info;
+  const freq = info.lo + (x / Math.max(1, rect.width)) * info.span;
+  const tolerance = Math.max((spanWaterfallClick.channelSpacingHz || 0) / 2, info.span / 160);
+  let best = null;
+  let bestDist = tolerance;
+  spanWaterfallClick.points.filter(p => p.live || p.recent || p.blocked).forEach(p => {
+    const dist = Math.abs(p.freqHz - freq);
+    if (dist <= bestDist) {
+      best = p;
+      bestDist = dist;
+    }
+  });
+  return best;
 }
 function coerceSettingValue(raw, read) {
   const value = read ? read(raw) : raw;
@@ -1943,6 +2083,7 @@ async function refresh() {
     document.getElementById("cbMode").disabled = !!s.running;
     document.getElementById("cbSpacing").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
+    drawSpanWaterfall(s);
     renderHeatMap(s);
     document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
       `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
@@ -2023,6 +2164,15 @@ saveSetting("cbScanNoSignal", "scanNoSignalSec", Number);
 document.getElementById("centerInput").onchange = e => {
   const mhz = Number(e.target.value);
   if (Number.isFinite(mhz) && mhz > 0) postAndReport("/api/center", { hz: mhz * 1e6 });
+};
+document.getElementById("spanWaterfall").onclick = e => {
+  const point = nearestSpanPoint(e.clientX);
+  const status = document.getElementById("spanStatus");
+  if (!point) {
+    if (status) status.textContent = "Click closer to a lit frequency.";
+    return;
+  }
+  blockFrequency(point.freqHz, !point.blocked);
 };
 refresh();
 setInterval(refresh, 500);
