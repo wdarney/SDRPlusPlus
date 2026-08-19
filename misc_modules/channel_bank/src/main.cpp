@@ -237,10 +237,10 @@ struct ChannelSlot {
     DenoiseState*  nrState    = nullptr;
     float          nrInBuf[480] = {};
     int            nrInPos    = 0;
+#endif
     int            rnVadFrames = 0;
     int            rnVadVoiceFrames = 0;
     float          rnVadSum = 0.0f;
-#endif
 };
 
 class ChannelBankModule : public ModuleManager::Instance {
