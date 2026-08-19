@@ -2174,9 +2174,8 @@ async function refresh() {
     document.getElementById("radioState").textContent = s.radioPlaying ? "Playing" : "Stopped";
     document.getElementById("radioState").className = "small-value " + (s.radioPlaying ? "ok" : "off");
     document.getElementById("sampleRate").textContent = fmtRate(s.sampleRate);
-    const wfCenter = Number(s.waterfallCenterHz || s.centerHz || 0);
-    const wfSpan = Number(s.sampleRate || 0);
-    document.getElementById("freqSpan").textContent = `Waterfall ${fmtRangeMHz(wfCenter - wfSpan / 2, wfCenter + wfSpan / 2)}`;
+    const wfInfo = spanInfo(s);
+    document.getElementById("freqSpan").textContent = wfInfo ? `Waterfall ${fmtRangeMHz(wfInfo.lo, wfInfo.hi)}` : "Waterfall -";
     document.getElementById("heartbeat").textContent = `#${s.sdrppHeartbeat || 0}  ${now}`;
     document.getElementById("state").textContent = s.running ? "Running" : "Stopped";
     document.getElementById("state").className = "value " + (s.running ? "ok" : "off");
