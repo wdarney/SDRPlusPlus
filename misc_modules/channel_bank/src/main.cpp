@@ -1,6 +1,9 @@
 #ifdef _WIN32
 #define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #define _USE_MATH_DEFINES
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #endif
 #include <imgui.h>
@@ -39,16 +42,30 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 #include <regex>
 #include <queue>
 #include <deque>
 #include <fstream>
+#include <sstream>
+#include <cstring>
+#include <cerrno>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #ifdef __APPLE__
 #include "transcription.h"
 #endif
 #if defined(__APPLE__) || defined(_WIN32)
 #include "transcription_whisper.h"
 #include "encoding.h"
+#endif
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -62,6 +79,16 @@ SDRPP_MOD_INFO{
 };
 
 ConfigManager config;
+
+#ifdef _WIN32
+using WebSocket = SOCKET;
+using WebSockLen = int;
+static const WebSocket INVALID_WEB_SOCKET = INVALID_SOCKET;
+#else
+using WebSocket = int;
+using WebSockLen = socklen_t;
+static const WebSocket INVALID_WEB_SOCKET = -1;
+#endif
 
 #if defined(__APPLE__) || defined(_WIN32)
 #ifdef _WIN32
@@ -83,6 +110,14 @@ struct TranscriptionJob {
     void*       handle  = nullptr;
 };
 #endif
+
+struct SDRPPServerSourceControlV1 {
+    char host[1024];
+    int port = 0;
+    bool connected = false;
+    bool running = false;
+    bool ok = false;
+};
 
 struct ChannelSlot {
     int    gridIdx = 0;
@@ -202,6 +237,9 @@ struct ChannelSlot {
     DenoiseState*  nrState    = nullptr;
     float          nrInBuf[480] = {};
     int            nrInPos    = 0;
+    int            rnVadFrames = 0;
+    int            rnVadVoiceFrames = 0;
+    float          rnVadSum = 0.0f;
 #endif
 };
 
@@ -276,6 +314,14 @@ public:
             noiseReduction = config.conf[name]["noiseReduction"];
         if (config.conf[name].contains("nrMix"))
             nrMix = config.conf[name]["nrMix"];
+        if (config.conf[name].contains("rnVoiceGateEnabled"))
+            rnVoiceGateEnabled = config.conf[name]["rnVoiceGateEnabled"];
+        if (config.conf[name].contains("rnVoiceGateVoiceFrac"))
+            rnVoiceGateVoiceFrac = config.conf[name]["rnVoiceGateVoiceFrac"];
+        if (config.conf[name].contains("rnVoiceGateProbeSec"))
+            rnVoiceGateProbeSec = config.conf[name]["rnVoiceGateProbeSec"];
+        if (config.conf[name].contains("rnVoiceGateQuarantineSec"))
+            rnVoiceGateQuarantineSec = config.conf[name]["rnVoiceGateQuarantineSec"];
         if (config.conf[name].contains("recPath"))
             folderSelect.setPath(config.conf[name]["recPath"]);
         if (config.conf[name].contains("freqLog")) {
@@ -331,6 +377,8 @@ public:
             rightTrimFrac = config.conf[name]["rightTrimFrac"];
         if (config.conf[name].contains("recordingEnabled"))
             recordingEnabled = config.conf[name]["recordingEnabled"];
+        if (config.conf[name].contains("portableRecordingGroup"))
+            portableRecordingGroup = config.conf[name]["portableRecordingGroup"];
         // Transcription backend: prefer the new enum key, fall back to the legacy
         // boolean so existing configs keep working (true → Apple Speech, false → Off).
         if (config.conf[name].contains("transcriptionBackend")) {
@@ -355,6 +403,14 @@ public:
                 scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });
         if (config.conf[name].contains("autoStart"))
             autoStart = config.conf[name]["autoStart"];
+        if (config.conf[name].contains("webControlEnabled"))
+            webControlEnabled = config.conf[name]["webControlEnabled"];
+        if (config.conf[name].contains("webControlPort"))
+            webControlPort = config.conf[name]["webControlPort"];
+        if (config.conf[name].contains("webControlBind"))
+            webControlBind = config.conf[name]["webControlBind"].get<std::string>();
+        strncpy(webControlBindBuf, webControlBind.c_str(), sizeof(webControlBindBuf) - 1);
+        webControlBindBuf[sizeof(webControlBindBuf) - 1] = '\0';
         config.release();
 
         channelSpacing = SPACINGS[std::clamp(spacingId, 0, 5)];
@@ -398,6 +454,7 @@ public:
     }
 
     ~ChannelBankModule() {
+        stopWebServer();
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
@@ -433,6 +490,7 @@ public:
                 flog::warn("[ChannelBank] autoStart requested but recording path is invalid: {0}", folderSelect.path);
             }
         }
+        if (webControlEnabled) startWebServer();
     }
     void enable()  { enabled = true; }
     void disable() { enabled = false; restoreWaterfallVisibility(); }
@@ -872,14 +930,21 @@ public:
         tm* ltm = localtime(&now);
         char buf[320];
         auto bmInfo = bookmarkForFilename(slot.freqHz);
-        if (!bmInfo.bmName.empty() && !bmInfo.listName.empty())
+        std::string groupName = portableRecordingGroup ? "Portable-System" : bmInfo.listName;
+        if (!groupName.empty()) groupName = sanitizeForFilename(groupName);
+        if (!bmInfo.bmName.empty() && !groupName.empty())
             snprintf(buf, sizeof(buf), "%s_%s_%s_%.4fMHz_%02d-%02d-%02d_%02d-%02d-%04d.wav",
-                bmInfo.listName.c_str(), bmInfo.bmName.c_str(), name.c_str(), slot.freqHz / 1e6,
+                groupName.c_str(), bmInfo.bmName.c_str(), name.c_str(), slot.freqHz / 1e6,
                 ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
                 ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
         else if (!bmInfo.bmName.empty())
             snprintf(buf, sizeof(buf), "%s_%s_%.4fMHz_%02d-%02d-%02d_%02d-%02d-%04d.wav",
                 bmInfo.bmName.c_str(), name.c_str(), slot.freqHz / 1e6,
+                ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
+                ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
+        else if (!groupName.empty())
+            snprintf(buf, sizeof(buf), "%s_%s_%.4fMHz_%02d-%02d-%02d_%02d-%02d-%04d.wav",
+                groupName.c_str(), name.c_str(), slot.freqHz / 1e6,
                 ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
                 ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
         else
@@ -940,6 +1005,11 @@ public:
         slot.gateFramesAbove.store(0);   // fresh static-gate tally per recording
         slot.gateFramesVoice.store(0);
         slot.onAirFrames.store(0);       // fresh on-air (min-TX) tally per recording
+#ifndef CB_NO_RNNOISE
+        slot.rnVadFrames = 0;
+        slot.rnVadVoiceFrames = 0;
+        slot.rnVadSum = 0.0f;
+#endif
         slot.driftSum             = 0.0; // fresh drift-gate stats per recording
         slot.driftSumSq           = 0.0;
         slot.noiseGuardFramesTotal.store(0);
@@ -960,6 +1030,1804 @@ public:
     }
 
 private:
+    struct WebUiAction {
+        std::function<json()> fn;
+        json result;
+        std::string error;
+        bool done = false;
+        std::mutex mtx;
+        std::condition_variable cv;
+    };
+
+    static void closeFd(WebSocket fd) {
+        if (fd == INVALID_WEB_SOCKET) return;
+#ifdef _WIN32
+        closesocket(fd);
+#else
+        close(fd);
+#endif
+    }
+
+    static std::string socketErrorString(const char* what) {
+#ifdef _WIN32
+        return std::string(what) + " failed: WSA " + std::to_string(WSAGetLastError());
+#else
+        return std::string(what) + " failed: " + strerror(errno);
+#endif
+    }
+
+    static bool isRetryableAcceptError() {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        return err == WSAEINTR || err == WSAECONNABORTED;
+#else
+        return errno == EINTR || errno == ECONNABORTED || errno == EPROTO;
+#endif
+    }
+
+    void processWebUiActions() {
+        std::deque<std::shared_ptr<WebUiAction>> actions;
+        {
+            std::lock_guard<std::mutex> lk(webUiActionMtx);
+            actions.swap(webUiActions);
+        }
+        for (auto& action : actions) {
+            json result;
+            std::string error;
+            try {
+                result = action->fn ? action->fn() : webStateSnapshot();
+            }
+            catch (const std::exception& e) {
+                error = e.what();
+            }
+            catch (...) {
+                error = "UI action failed";
+            }
+            {
+                std::lock_guard<std::mutex> lk(action->mtx);
+                action->result = result;
+                action->error = error;
+                action->done = true;
+            }
+            action->cv.notify_one();
+        }
+    }
+
+    bool runOnUiThread(std::function<json()> fn, json& result, std::string& error) {
+        auto action = std::make_shared<WebUiAction>();
+        action->fn = std::move(fn);
+        {
+            std::lock_guard<std::mutex> lk(webUiActionMtx);
+            webUiActions.push_back(action);
+        }
+        std::unique_lock<std::mutex> lk(action->mtx);
+        if (!action->cv.wait_for(lk, std::chrono::seconds(5), [&] { return action->done; })) {
+            error = "SDR++ UI thread did not respond";
+            return false;
+        }
+        result = action->result;
+        error = action->error;
+        return error.empty();
+    }
+    static const char* demodModeName(int mode) {
+        switch (mode) {
+            case DEMOD_AM:  return "AM";
+            case DEMOD_NFM: return "NFM";
+            case DEMOD_WFM: return "WFM";
+            case DEMOD_USB: return "USB";
+            case DEMOD_LSB: return "LSB";
+            default:        return "Unknown";
+        }
+    }
+
+    int demodModeFromName(const std::string& mode) const {
+        if (mode == "AM") return DEMOD_AM;
+        if (mode == "NFM") return DEMOD_NFM;
+        if (mode == "WFM") return DEMOD_WFM;
+        if (mode == "USB") return DEMOD_USB;
+        if (mode == "LSB") return DEMOD_LSB;
+        return -1;
+    }
+
+    std::string detectionModeName() const {
+        if (manualMode) return "manual";
+        if (scanMode) return "scan";
+        if (bookmarkScanMode) return "bookmark_scan";
+        return "auto";
+    }
+
+    json channelBankSettingsJson() {
+        return {
+            {"mode", detectionModeName()},
+            {"spacingId", spacingId},
+            {"channelSpacingHz", channelSpacing},
+            {"demodMode", demodModeName(demodMode)},
+            {"snrThresholdDb", snrThreshold},
+            {"maxChannels", maxChannels},
+            {"bwUsage", bwUsage},
+            {"recordingEnabled", recordingEnabled},
+            {"minTransmissionMs", minTransmissionMs},
+            {"signalHoldMs", signalHoldMs},
+            {"tailMs", tailMs},
+            {"scanQuietSec", scanQuietSec},
+            {"scanNoSignalSec", scanNoSignalSec}
+        };
+    }
+
+    bool applyChannelBankSettings(const json& body, std::string& error) {
+        if (!body.is_object()) {
+            error = "settings payload must be an object";
+            return false;
+        }
+        bool structural = body.contains("mode") || body.contains("spacingId") || body.contains("demodMode");
+        if (running && structural) {
+            error = "stop Channel Bank before changing mode, spacing, or demod";
+            return false;
+        }
+
+        if (body.contains("mode")) {
+            if (!body["mode"].is_string()) {
+                error = "mode must be a string";
+                return false;
+            }
+            std::string mode = body["mode"].get<std::string>();
+            if (mode == "auto") {
+                if (manualMode || bookmarkScanMode) restoreWaterfallVisibility();
+                manualMode = false;
+                scanMode = false;
+                bookmarkScanMode = false;
+            }
+            else if (mode == "manual") {
+                manualMode = true;
+                scanMode = false;
+                bookmarkScanMode = false;
+                if (!boundBookmarkLists.empty()) applyWaterfallVisibility();
+            }
+            else if (mode == "scan") {
+                if (manualMode || bookmarkScanMode) restoreWaterfallVisibility();
+                manualMode = false;
+                scanMode = true;
+                bookmarkScanMode = false;
+            }
+            else if (mode == "bookmark_scan") {
+                if (manualMode) restoreWaterfallVisibility();
+                manualMode = false;
+                scanMode = false;
+                bookmarkScanMode = true;
+                if (!boundBookmarkLists.empty()) applyWaterfallVisibility();
+            }
+            else {
+                error = "invalid Channel Bank mode";
+                return false;
+            }
+            saveManualConfig();
+            saveScanConfig();
+        }
+
+        if (body.contains("spacingId") && !body["spacingId"].is_number_integer()) {
+            error = "channel spacing must be an integer preset";
+            return false;
+        }
+        if (body.contains("demodMode") && !body["demodMode"].is_string()) {
+            error = "demod mode must be a string";
+            return false;
+        }
+        if (body.contains("snrThresholdDb") && !body["snrThresholdDb"].is_number()) {
+            error = "snr threshold must be numeric";
+            return false;
+        }
+        if (body.contains("maxChannels") && !body["maxChannels"].is_number_integer()) {
+            error = "max channels must be an integer";
+            return false;
+        }
+        if (body.contains("bwUsage") && !body["bwUsage"].is_number()) {
+            error = "frequency span must be numeric";
+            return false;
+        }
+        if (body.contains("recordingEnabled") && !body["recordingEnabled"].is_boolean()) {
+            error = "recording must be true or false";
+            return false;
+        }
+        if (body.contains("minTransmissionMs") && !body["minTransmissionMs"].is_number_integer()) {
+            error = "min tx duration must be an integer";
+            return false;
+        }
+        if (body.contains("signalHoldMs") && !body["signalHoldMs"].is_number_integer()) {
+            error = "signal hold must be an integer";
+            return false;
+        }
+        if (body.contains("tailMs") && !body["tailMs"].is_number_integer()) {
+            error = "tail must be an integer";
+            return false;
+        }
+        if (body.contains("scanQuietSec") && !body["scanQuietSec"].is_number()) {
+            error = "scan quiet must be numeric";
+            return false;
+        }
+        if (body.contains("scanNoSignalSec") && !body["scanNoSignalSec"].is_number()) {
+            error = "no-signal skip must be numeric";
+            return false;
+        }
+
+        config.acquire();
+        if (body.contains("spacingId")) {
+            spacingId = std::clamp(body["spacingId"].get<int>(), 0, 5);
+            channelSpacing = SPACINGS[spacingId];
+            config.conf[name]["spacingId"] = spacingId;
+        }
+        if (body.contains("demodMode")) {
+            int next = demodModeFromName(body["demodMode"].get<std::string>());
+            if (next < 0) {
+                config.release();
+                error = "invalid demod mode";
+                return false;
+            }
+            demodMode = next;
+            config.conf[name]["demodMode"] = demodMode;
+        }
+        if (body.contains("snrThresholdDb")) {
+            snrThreshold = std::clamp(body["snrThresholdDb"].get<float>(), 1.0f, 30.0f);
+            config.conf[name]["snrThreshold"] = snrThreshold;
+        }
+        if (body.contains("maxChannels")) {
+            maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, 256);
+            config.conf[name]["maxChannels"] = maxChannels;
+        }
+        if (body.contains("bwUsage")) {
+            bwUsage = std::clamp(body["bwUsage"].get<float>(), 0.5f, 1.0f);
+            config.conf[name]["bwUsage"] = bwUsage;
+        }
+        if (body.contains("recordingEnabled")) {
+            recordingEnabled = body["recordingEnabled"].get<bool>();
+            config.conf[name]["recordingEnabled"] = recordingEnabled;
+        }
+        if (body.contains("minTransmissionMs")) {
+            minTransmissionMs = std::clamp(body["minTransmissionMs"].get<int>(), 0, 10000);
+            config.conf[name]["minTransmissionMs"] = minTransmissionMs;
+        }
+        if (body.contains("signalHoldMs")) {
+            signalHoldMs = std::clamp(body["signalHoldMs"].get<int>(), 0, 5000);
+            config.conf[name]["signalHoldMs"] = signalHoldMs;
+        }
+        if (body.contains("tailMs")) {
+            tailMs = std::clamp(body["tailMs"].get<int>(), 100, 2000);
+            config.conf[name]["tailMs"] = tailMs;
+        }
+        if (body.contains("scanQuietSec")) {
+            scanQuietSec = std::clamp(body["scanQuietSec"].get<float>(), 1.0f, 30.0f);
+            config.conf[name]["scanQuietSec"] = scanQuietSec;
+        }
+        if (body.contains("scanNoSignalSec")) {
+            scanNoSignalSec = std::clamp(body["scanNoSignalSec"].get<float>(), 0.1f, 5.0f);
+            config.conf[name]["scanNoSignalSec"] = scanNoSignalSec;
+        }
+        config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
+        config.conf[name]["activeProfile"] = activeProfileName;
+        config.release(true);
+        return true;
+    }
+
+    bool setFrequencyBlocked(double hz, bool blocked, std::string& error) {
+        if (!std::isfinite(hz) || hz <= 0.0) {
+            error = "hz must be positive";
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(freqLogMtx);
+            auto& entry = freqLog[freqKey(hz)];
+            if (entry.freqHz == 0.0) entry.freqHz = hz;
+            entry.blocked = blocked;
+        }
+        saveFreqLog();
+        mgmtCv.notify_one();
+        return true;
+    }
+
+    std::string selectedSourceName() {
+        std::string source;
+        core::configManager.acquire();
+        if (core::configManager.conf.contains("source")) {
+            source = core::configManager.conf["source"].get<std::string>();
+        }
+        core::configManager.release();
+        return source;
+    }
+
+    json sourceNamesJson() {
+        json arr = json::array();
+        for (auto& source : sigpath::sourceManager.getSourceNames()) {
+            arr.push_back(source);
+        }
+        return arr;
+    }
+
+    enum ServerSourceControlCode {
+        SERVER_SOURCE_CONTROL_GET = 1,
+        SERVER_SOURCE_CONTROL_SET = 2,
+        SERVER_SOURCE_CONTROL_CONNECT = 3,
+        SERVER_SOURCE_CONTROL_DISCONNECT = 4
+    };
+
+    bool callServerSourceControl(int code, SDRPPServerSourceControlV1* inout) {
+        if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1")) return false;
+        return core::modComManager.callInterface(
+            "sdrpp_server_source.control.v1", code, inout, inout);
+    }
+
+    json serverSourceStateJson() {
+        json j;
+        j["available"] = false;
+        SDRPPServerSourceControlV1 state{};
+        if (!callServerSourceControl(SERVER_SOURCE_CONTROL_GET, &state) || !state.ok) return j;
+
+        j["available"] = true;
+        j["host"] = state.host;
+        j["port"] = state.port;
+        j["connected"] = state.connected;
+        j["sourceRunning"] = state.running;
+        return j;
+    }
+
+    json webStateSnapshot() {
+        json channels = json::array();
+        json recent = json::array();
+        {
+            std::lock_guard<std::mutex> lk(channelsMtx);
+            for (auto& [idx, slot] : activeChannels) {
+                if (!slot) continue;
+                channels.push_back({
+                    {"slot", idx},
+                    {"freqHz", slot->freqHz},
+                    {"gridFreqHz", slot->gridFreqHz},
+                    {"name", displayName(slot->freqHz)},
+                    {"blocked", isBlocked(slot->gridFreqHz)},
+                    {"recording", slot->fileOpen},
+                    {"signalPresent", slot->signalPresent.load()},
+                    {"rawSignalPresent", slot->rawSignalPresent.load()},
+                    {"file", slot->currentFilePath}
+                });
+            }
+            auto now = std::chrono::steady_clock::now();
+            for (auto& ch : recentChannels) {
+                auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - ch.destroyedAt).count();
+                recent.push_back({
+                    {"freqHz", ch.freqHz},
+                    {"name", displayName(ch.freqHz)},
+                    {"blocked", isBlocked(ch.freqHz)},
+                    {"ageMs", ageMs}
+                });
+            }
+        }
+
+        int detectedCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(detectedMtx);
+            detectedCount = (int)detectedSlots.size();
+        }
+
+        int manualDetectedCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(manualDetectedMtx);
+            manualDetectedCount = (int)manualDetected.size();
+        }
+
+        json snrOverview = json::array();
+        if (lastKnownSr > 0.0 && lastKnownCenter > 0.0) {
+            double usableLo = lastKnownCenter - (lastKnownSr * bwUsage) * 0.5;
+            double usableHi = lastKnownCenter + (lastKnownSr * bwUsage) * 0.5;
+            if (manualMode || bookmarkScanMode) {
+                std::set<int> localDetected;
+                std::set<int> localRawDetected;
+                std::map<int, float> localSnr;
+                {
+                    std::lock_guard<std::mutex> lk(manualDetectedMtx);
+                    localDetected = manualDetected;
+                    localRawDetected = rawManualDetected;
+                    localSnr = manualSnrDb;
+                }
+                std::vector<double> localFreqs = getActiveManualFreqs();
+                for (auto& [idx, snrDb] : localSnr) {
+                    if (idx < 0 || idx >= (int)localFreqs.size()) continue;
+                    double freqHz = localFreqs[idx];
+                    if (freqHz < usableLo || freqHz > usableHi) continue;
+                    snrOverview.push_back({
+                        {"freqHz", freqHz},
+                        {"snrDb", snrDb},
+                        {"detected", localDetected.count(idx) > 0},
+                        {"rawDetected", localRawDetected.count(idx) > 0},
+                        {"blocked", isBlocked(freqHz)}
+                    });
+                }
+            } else {
+                std::vector<float> localSnr;
+                std::set<int> localDetected;
+                std::set<int> localRawDetected;
+                {
+                    std::lock_guard<std::mutex> lk(detectedMtx);
+                    localSnr = slotSnrDb;
+                    localDetected = detectedSlots;
+                    localRawDetected = rawDetectedSlots;
+                }
+                int numSlots = (int)localSnr.size();
+                for (int i = 0; i < numSlots; i++) {
+                    double slotOffset = ((double)i - (double)(numSlots - 1) / 2.0) * channelSpacing;
+                    double freqHz = lastKnownCenter + slotOffset;
+                    if (freqHz < usableLo || freqHz > usableHi) continue;
+                    snrOverview.push_back({
+                        {"freqHz", freqHz},
+                        {"snrDb", localSnr[i]},
+                        {"detected", localDetected.count(i) > 0},
+                        {"rawDetected", localRawDetected.count(i) > 0},
+                        {"blocked", isBlocked(freqHz)}
+                    });
+                }
+            }
+        }
+
+        int playbackQueued = 0;
+        int64_t playingKey = currentlyPlayingFreqKey.load();
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            playbackQueued = (int)playbackQueue.size();
+        }
+
+        json history = json::array();
+        {
+            std::lock_guard<std::mutex> lk(freqLogMtx);
+            int emitted = 0;
+            for (auto it = freqLog.rbegin(); it != freqLog.rend() && emitted < 160; ++it, ++emitted) {
+                const auto& e = it->second;
+                history.push_back({
+                    {"freqHz", e.freqHz},
+                    {"name", displayName(e.freqHz)},
+                    {"count", e.count},
+                    {"blocked", e.blocked},
+                    {"lastSeen", e.lastSeen},
+                    {"description", e.description}
+                });
+            }
+        }
+
+        json j;
+        j["module"] = name;
+        j["enabled"] = enabled;
+        j["running"] = running;
+        j["mode"] = detectionModeName();
+        j["demodMode"] = demodModeName(demodMode);
+        j["centerHz"] = lastKnownCenter;
+        j["waterfallCenterHz"] = gui::waterfall.getCenterFrequency();
+        j["sampleRate"] = lastKnownSr;
+        j["usableSpanHz"] = lastKnownSr > 0.0 ? lastKnownSr * bwUsage : 0.0;
+        j["bwUsage"] = bwUsage;
+        j["radioPlaying"] = gui::mainWindow.isPlaying();
+        j["sdrppHeartbeat"] = webHeartbeat.fetch_add(1) + 1;
+        j["serverTimeMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        j["selectedSource"] = selectedSourceName();
+        j["sources"] = sourceNamesJson();
+        j["sdrppServer"] = serverSourceStateJson();
+        j["settings"] = channelBankSettingsJson();
+        j["snrThresholdDb"] = snrThreshold;
+        j["maxChannels"] = maxChannels;
+        j["recordingEnabled"] = recordingEnabled;
+        j["activeChannels"] = channels;
+        j["recentChannels"] = recent;
+        j["detectedSlots"] = detectedCount;
+        j["manualDetected"] = manualDetectedCount;
+        j["snrOverview"] = snrOverview;
+        j["playbackQueued"] = playbackQueued;
+        j["currentlyPlayingFreqKey"] = playingKey;
+        j["history"] = history;
+        if (scanMode) {
+            j["scanStopIndex"] = scanStopIdx;
+            j["scanStopCount"] = (int)scanStops.size();
+        }
+        if (bookmarkScanMode) {
+            j["bookmarkScanStopIndex"] = bookmarkScanStopIdx;
+            j["bookmarkScanStopCount"] = (int)bookmarkScanStops.size();
+        }
+#if defined(__APPLE__) || defined(_WIN32)
+        {
+            std::lock_guard<std::mutex> lk(lastTranscriptMtx);
+            j["lastTranscriptName"] = lastTranscriptName;
+            j["lastTranscriptText"] = lastTranscriptText;
+        }
+#endif
+        return j;
+    }
+
+    std::string webIndexHtml() const {
+        return R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channel Bank Control</title>
+<style>
+:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111; color: #f3f3f3; }
+body { margin: 0; background: #111; }
+main { max-width: 980px; margin: 0 auto; padding: 18px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+h1 { font-size: 22px; margin: 0; font-weight: 650; }
+button { border: 1px solid #4a4a4a; background: #202020; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
+button:hover { background: #2b2b2b; }
+select, input { border: 1px solid #4a4a4a; background: #101010; color: #fff; padding: 8px 10px; border-radius: 6px; font-size: 14px; min-width: 0; }
+.primary { background: #0d6efd; border-color: #2b7cff; }
+.danger { background: #7c1d1d; border-color: #ad2f2f; }
+.secondary { background: #26313d; border-color: #405166; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.tile, section { background: #191919; border: 1px solid #303030; border-radius: 8px; padding: 12px; }
+.controls { display: grid; grid-template-columns: 1.2fr 1fr auto auto; gap: 8px; align-items: end; }
+.server-controls { display: none; grid-template-columns: 1.3fr .7fr auto auto; gap: 8px; align-items: end; margin-top: 10px; }
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }
+.status-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; margin-top: 10px; }
+.control { display: flex; flex-direction: column; gap: 5px; }
+.slider-control { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+.slider-control .label { grid-column: 1 / 2; }
+.slider-value { color: #ddd; font-size: 12px; min-width: 58px; text-align: right; font-variant-numeric: tabular-nums; }
+input[type="range"] { grid-column: 1 / 3; padding: 0; width: 100%; accent-color: #2b7cff; }
+.label { color: #aaa; font-size: 12px; }
+.value { font-size: 20px; margin-top: 3px; }
+.small-value { font-size: 15px; margin-top: 3px; }
+section { margin-top: 12px; }
+h2 { font-size: 15px; margin: 0 0 8px; color: #ddd; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; border-top: 1px solid #2d2d2d; padding: 7px 6px; }
+th { color: #aaa; font-weight: 500; }
+.muted { color: #999; }
+.ok { color: #62d26f; }
+.off { color: #ffb15c; }
+.bad { color: #ff6b6b; }
+pre { white-space: pre-wrap; margin: 0; color: #ddd; }
+.heatmap { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 7px; }
+.heat-cell { border: 1px solid #343434; border-radius: 7px; padding: 8px; background: #202020; cursor: pointer; min-height: 58px; display: flex; flex-direction: column; justify-content: space-between; gap: 5px; }
+.heat-cell:hover { border-color: #7aa7ff; }
+.heat-cell.blocked { border-color: #bc3d3d; background: #321818; }
+.heat-cell.live { box-shadow: inset 0 0 0 1px #2b7cff; }
+.heat-freq { font-size: 14px; font-variant-numeric: tabular-nums; }
+.heat-name, .heat-meta { color: #aaa; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inline-action { padding: 4px 8px; font-size: 12px; }
+.span-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 8px; }
+.span-waterfall { width: 100%; height: 180px; display: block; background: #090b0e; border: 1px solid #2b3440; border-radius: 7px; cursor: crosshair; }
+.snr-chart { width: 100%; height: 170px; display: block; background: #0b0d10; border: 1px solid #2b3440; border-radius: 7px; }
+@media (max-width: 720px) { .controls, .server-controls, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>Channel Bank</h1>
+</header>
+<section>
+<h2>SDR Source</h2>
+<div class="controls">
+<label class="control"><span class="label">Source</span><select id="source"></select></label>
+<label class="control"><span class="label">Center MHz</span><input id="centerInput" inputmode="decimal" placeholder="157.06745"></label>
+<button class="primary" id="radioPlay">Play</button>
+<button class="danger" id="radioStop">Stop</button>
+</div>
+<div class="status-strip">
+<div class="tile"><div class="label">SDR++</div><div class="small-value ok" id="sdrppStatus">Connected</div></div>
+<div class="tile"><div class="label">Radio</div><div class="small-value" id="radioState">-</div></div>
+<div class="tile"><div class="label">Sample Rate</div><div class="small-value" id="sampleRate">-</div><div class="small-value muted" id="freqSpan">Span -</div></div>
+<div class="tile"><div class="label">Heartbeat</div><div class="small-value" id="heartbeat">-</div></div>
+</div>
+<div class="server-controls" id="serverControls">
+<label class="control"><span class="label">Server host</span><input id="serverHost" autocomplete="off" placeholder="192.168.1.150"></label>
+<label class="control"><span class="label">Port</span><input id="serverPort" inputmode="numeric" placeholder="8081"></label>
+<button class="secondary" id="serverApply">Apply</button>
+<button class="secondary" id="serverConnect">Connect</button>
+</div>
+</section>
+<section>
+<h2>Channel Bank</h2>
+<div class="grid">
+<div class="tile"><div class="label">State</div><div class="value" id="state">-</div></div>
+<div class="tile"><div class="label">Mode</div><div class="value" id="mode">-</div></div>
+<div class="tile"><div class="label">Center</div><div class="value" id="center">-</div></div>
+<div class="tile"><div class="label">Active</div><div class="value" id="active">-</div></div>
+</div>
+<div class="controls">
+<button class="primary" id="start">Start Channel Bank</button>
+<button class="danger" id="stop">Stop Channel Bank</button>
+<button class="secondary" id="monitorAudio">Monitor Audio</button>
+<div class="muted" id="monitorState">Monitor stopped</div>
+</div>
+<div class="muted" id="settingsStatus" style="margin-top:8px">Settings ready</div>
+<div class="settings-grid" style="margin-top:10px">
+<label class="control"><span class="label">Mode</span><select id="cbMode"><option value="auto">Auto</option><option value="manual">Manual</option><option value="scan">Scan</option><option value="bookmark_scan">Bookmark Scan</option></select></label>
+<label class="control slider-control"><span class="label">Channel spacing</span><span class="slider-value" id="cbSpacingValue">-</span><input id="cbSpacing" type="range" min="0" max="5" step="1"></label>
+<label class="control"><span class="label">Demod</span><select id="cbDemod"><option>AM</option><option>NFM</option><option>WFM</option><option>USB</option><option>LSB</option></select></label>
+<label class="control slider-control"><span class="label">SNR dB</span><span class="slider-value" id="cbSnrValue">-</span><input id="cbSnr" type="range" min="1" max="30" step="0.1"></label>
+<label class="control slider-control"><span class="label">Max channels</span><span class="slider-value" id="cbMaxChannelsValue">-</span><input id="cbMaxChannels" type="range" min="1" max="256" step="1"></label>
+<label class="control slider-control"><span class="label">Freq span</span><span class="slider-value" id="cbBwUsageValue">-</span><input id="cbBwUsage" type="range" min="50" max="100" step="1"></label>
+<label class="control slider-control"><span class="label">Min TX ms</span><span class="slider-value" id="cbMinTxValue">-</span><input id="cbMinTx" type="range" min="0" max="10000" step="50"></label>
+<label class="control slider-control"><span class="label">Signal hold ms</span><span class="slider-value" id="cbSignalHoldValue">-</span><input id="cbSignalHold" type="range" min="0" max="5000" step="50"></label>
+<label class="control slider-control"><span class="label">TX tail ms</span><span class="slider-value" id="cbTailValue">-</span><input id="cbTail" type="range" min="100" max="2000" step="25"></label>
+<label class="control slider-control"><span class="label">Scan quiet s</span><span class="slider-value" id="cbScanQuietValue">-</span><input id="cbScanQuiet" type="range" min="1" max="30" step="0.5"></label>
+<label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
+<label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
+</div>
+</section>
+<section>
+<div class="span-head">
+<h2>SNR Overview</h2>
+<div class="muted" id="snrSummary">-</div>
+</div>
+<canvas class="snr-chart" id="snrChart"></canvas>
+<div class="muted" style="margin-top:8px">Bars above the line are at or above the current SNR threshold.</div>
+</section>
+<section>
+<div class="span-head">
+<h2>Activity Span</h2>
+<div class="muted" id="spanRange">-</div>
+</div>
+<canvas class="span-waterfall" id="spanWaterfall"></canvas>
+<div class="muted" id="spanStatus" style="margin-top:8px">Click lit activity to block or unblock it.</div>
+</section>
+<section>
+<h2>Frequency Heat Map</h2>
+<div class="heatmap" id="heatmap"></div>
+<div class="muted" id="heatmapStatus" style="margin-top:8px">Click a frequency to block or unblock it.</div>
+</section>
+<section>
+<h2>Active Channels</h2>
+<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Signal</th><th>Recording</th><th>Block</th></tr></thead><tbody id="channels"></tbody></table>
+</section>
+<section>
+<h2>Playback / Transcript</h2>
+<pre id="transcript" class="muted">No transcript yet.</pre>
+</section>
+<section>
+<h2>History</h2>
+<table><thead><tr><th>Frequency</th><th>Name</th><th>Count</th><th>Blocked</th></tr></thead><tbody id="history"></tbody></table>
+</section>
+</main>
+<script>
+const fmtMHz = hz => hz ? (hz / 1e6).toFixed(4) + " MHz" : "-";
+const fmtRangeMHz = (lo, hi) => lo > 0 && hi > 0 ? `${(lo / 1e6).toFixed(3)} to ${(hi / 1e6).toFixed(3)} MHz` : "-";
+const fmtRate = hz => hz > 0 ? (hz >= 1e6 ? (hz / 1e6).toFixed(3) + " MS/s" : Math.round(hz).toLocaleString() + " S/s") : "-";
+const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const spacingLabels = ["8.33 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz", "200 kHz"];
+let monitorCtx = null;
+let monitorAbort = null;
+let monitorNode = null;
+let monitorRunning = false;
+let monitorRunId = 0;
+const monitorSampleRate = 48000;
+const monitorBufferCapacity = monitorSampleRate * 2;
+const monitorTargetSamples = Math.round(monitorSampleRate * 0.16);
+const monitorMaxSamples = Math.round(monitorSampleRate * 0.42);
+const monitorRing = new Float32Array(monitorBufferCapacity);
+let monitorReadPos = 0;
+let monitorWritePos = 0;
+let monitorBufferedSamples = 0;
+let monitorLastStatusMs = 0;
+const pendingSettingTimers = new Map();
+let currentRecordingEnabled = true;
+const spanWaterfallFrames = [];
+const spanWaterfallMaxFrames = 72;
+let spanWaterfallKey = "";
+let spanWaterfallClick = null;
+const sliderFormatters = {
+  cbSpacing: v => spacingLabels[Math.max(0, Math.min(5, Math.round(v)))] || "-",
+  cbSnr: v => v.toFixed(1),
+  cbMaxChannels: v => String(Math.round(v)),
+  cbBwUsage: v => `${Math.round(v)}%`,
+  cbMinTx: v => `${Math.round(v)} ms`,
+  cbSignalHold: v => `${Math.round(v)} ms`,
+  cbTail: v => `${Math.round(v)} ms`,
+  cbScanQuiet: v => `${v.toFixed(1)} s`,
+  cbScanNoSignal: v => `${v.toFixed(1)} s`
+};
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { msg = (await r.json()).error || msg; } catch (_) {}
+    throw new Error(msg);
+  }
+  await refresh();
+}
+function setControlValue(id, value) {
+  const el = document.getElementById(id);
+  if (document.activeElement !== el && value !== undefined && value !== null) el.value = value;
+}
+function setSliderValue(id, value, format) {
+  const el = document.getElementById(id);
+  if (!el || value === undefined || value === null) return;
+  if (document.activeElement !== el) el.value = value;
+  const out = document.getElementById(id + "Value");
+  const formatter = format || sliderFormatters[id];
+  if (out) out.textContent = formatter ? formatter(Number(el.value)) : el.value;
+}
+function updateSliderOutput(id) {
+  const el = document.getElementById(id);
+  const out = document.getElementById(id + "Value");
+  if (!el || !out) return;
+  const formatter = sliderFormatters[id];
+  out.textContent = formatter ? formatter(Number(el.value)) : el.value;
+}
+async function postAndReport(path, body) {
+  try {
+    await post(path, body);
+    return true;
+  } catch (e) {
+    console.warn(e);
+    const settingsStatus = document.getElementById("settingsStatus");
+    if (settingsStatus) settingsStatus.textContent = e?.message || "Save failed";
+    await refresh();
+    return false;
+  }
+}
+async function saveSettingValue(key, value) {
+  const settingsStatus = document.getElementById("settingsStatus");
+  if (settingsStatus) settingsStatus.textContent = "Saving settings...";
+  const ok = await postAndReport("/api/channel-bank/settings", { [key]: value });
+  if (ok && settingsStatus) settingsStatus.textContent = "Settings saved";
+}
+async function blockFrequency(hz, blocked) {
+  const status = document.getElementById("heatmapStatus");
+  if (status) status.textContent = blocked ? "Blocking frequency..." : "Unblocking frequency...";
+  const ok = await postAndReport("/api/frequency/block", { hz, blocked });
+  if (status) status.textContent = ok ? (blocked ? "Frequency blocked" : "Frequency unblocked") : "Block action failed";
+}
+function renderHeatMap(s) {
+  const rows = new Map();
+  const put = (hz, data = {}) => {
+    if (!hz || !Number.isFinite(Number(hz))) return;
+    const key = Math.round(Number(hz) / 1000);
+    const row = rows.get(key) || {
+      freqHz: Number(hz),
+      name: "",
+      count: 0,
+      blocked: false,
+      live: false,
+      recent: false,
+      lastSeen: 0
+    };
+    row.freqHz = data.gridFreqHz || data.freqHz || row.freqHz;
+    row.name = data.name || row.name;
+    row.count = Math.max(row.count, data.count || 0);
+    row.blocked = row.blocked || !!data.blocked;
+    row.live = row.live || !!data.live;
+    row.recent = row.recent || !!data.recent;
+    row.lastSeen = Math.max(row.lastSeen, data.lastSeen || 0);
+    rows.set(key, row);
+  };
+  (s.history || []).forEach(h => put(h.freqHz, h));
+  (s.recentChannels || []).forEach(ch => put(ch.freqHz, { ...ch, recent: true, count: 1 }));
+  (s.activeChannels || []).forEach(ch => put(ch.gridFreqHz || ch.freqHz, { ...ch, live: true, count: 2 }));
+  const items = Array.from(rows.values()).sort((a, b) =>
+    (Number(b.blocked) - Number(a.blocked)) ||
+    (Number(b.live) - Number(a.live)) ||
+    (b.count - a.count) ||
+    (b.lastSeen - a.lastSeen) ||
+    (a.freqHz - b.freqHz)
+  ).slice(0, 72);
+  const maxCount = Math.max(1, ...items.map(i => i.count || 0));
+  const heatmap = document.getElementById("heatmap");
+  if (!items.length) {
+    heatmap.innerHTML = `<div class="muted">No active or logged frequencies yet.</div>`;
+    return;
+  }
+  heatmap.innerHTML = items.map(item => {
+    const heat = Math.max(0.18, Math.min(1, (item.count || 0) / maxCount));
+    const bg = item.blocked
+      ? `linear-gradient(135deg, rgba(124,29,29,${0.42 + heat * 0.35}), #201414)`
+      : `linear-gradient(135deg, rgba(13,110,253,${0.16 + heat * 0.50}), rgba(35,49,61,0.75))`;
+    const meta = [
+      item.live ? "live" : "",
+      item.recent ? "recent" : "",
+      `${item.count || 0} hits`,
+      item.blocked ? "blocked" : "open"
+    ].filter(Boolean).join(" / ");
+    return `<div class="heat-cell ${item.blocked ? "blocked" : ""} ${item.live ? "live" : ""}"
+        style="background:${bg}"
+        onclick="blockFrequency(${Number(item.freqHz).toFixed(0)}, ${item.blocked ? "false" : "true"})"
+        title="${item.blocked ? "Unblock" : "Block"} ${esc(fmtMHz(item.freqHz))}">
+        <div class="heat-freq">${esc(fmtMHz(item.freqHz))}</div>
+        <div class="heat-name">${esc(item.name || "")}</div>
+        <div class="heat-meta">${esc(meta)}</div>
+      </div>`;
+  }).join("");
+}
+function drawSnrChart(s) {
+  const canvas = document.getElementById("snrChart");
+  const summary = document.getElementById("snrSummary");
+  const points = (s.snrOverview || []).filter(p => Number.isFinite(Number(p.snrDb)) && Number.isFinite(Number(p.freqHz)));
+  const info = spanInfo(s);
+  if (!canvas || !info) return;
+  const cssWidth = Math.max(320, canvas.clientWidth || 800);
+  const cssHeight = Math.max(140, canvas.clientHeight || 170);
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const width = cssWidth;
+  const height = cssHeight;
+  const padL = 42;
+  const padR = 10;
+  const padT = 12;
+  const padB = 22;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  const threshold = Number(s.snrThresholdDb || s.settings?.snrThresholdDb || 0);
+  const peak = points.length ? Math.max(...points.map(p => Number(p.snrDb))) : 0;
+  const maxDb = Math.max(30, threshold + 5, Math.ceil(peak + 2));
+  const minDb = -5;
+  const yFor = db => padT + (1 - ((db - minDb) / (maxDb - minDb))) * plotH;
+  const xFor = hz => padL + ((hz - info.lo) / info.span) * plotW;
+  const above = points.filter(p => Number(p.snrDb) >= threshold).length;
+  const detected = points.filter(p => p.detected).length;
+  if (summary) {
+    summary.textContent = points.length
+      ? `${above}/${points.length} above / peak ${peak.toFixed(1)} dB / detected ${detected}`
+      : "No SNR data yet";
+  }
+
+  ctx.fillStyle = "#080a0d";
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = "#1a2530";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = padT + (i / 5) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(width - padR, y);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#8d98a5";
+  ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  ctx.fillText(`${maxDb.toFixed(0)} dB`, 4, padT + 4);
+  ctx.fillText("0 dB", 12, yFor(0) + 4);
+  ctx.fillText(`${fmtMHz(info.lo)}`, padL, height - 6);
+  const hiLabel = fmtMHz(info.hi);
+  ctx.fillText(hiLabel, Math.max(padL, width - padR - ctx.measureText(hiLabel).width), height - 6);
+
+  const baseY = yFor(0);
+  const barW = Math.max(1, Math.min(8, plotW / Math.max(1, points.length) * 0.82));
+  points.forEach(p => {
+    const db = Math.max(minDb, Math.min(maxDb, Number(p.snrDb)));
+    const x = xFor(Number(p.freqHz));
+    const y = yFor(Math.max(0, db));
+    const h = Math.max(1, Math.abs(baseY - y));
+    ctx.fillStyle = p.blocked ? "#bc3d3d" : p.detected ? "#62d26f" : p.rawDetected ? "#ffb15c" : (db >= threshold ? "#7aa7ff" : "#36516d");
+    ctx.fillRect(x - barW / 2, Math.min(baseY, y), barW, h);
+  });
+
+  const thresholdY = yFor(threshold);
+  ctx.strokeStyle = "#f4d35e";
+  ctx.setLineDash([7, 5]);
+  ctx.beginPath();
+  ctx.moveTo(padL, thresholdY);
+  ctx.lineTo(width - padR, thresholdY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#f4d35e";
+  ctx.fillText(`threshold ${threshold.toFixed(1)} dB`, padL + 6, Math.max(padT + 12, thresholdY - 5));
+}
+function spanInfo(s) {
+  const center = Number(s.centerHz || s.waterfallCenterHz || 0);
+  const span = Number(s.usableSpanHz || ((s.sampleRate || 0) * (s.bwUsage || 0.8)));
+  if (!Number.isFinite(center) || !Number.isFinite(span) || center <= 0 || span <= 0) return null;
+  return { center, span, lo: center - span / 2, hi: center + span / 2 };
+}
+function spanX(freqHz, info, width) {
+  return Math.round(((freqHz - info.lo) / info.span) * width);
+}
+function collectSpanPoints(s, info) {
+  const points = [];
+  const add = (freqHz, data = {}) => {
+    const freq = Number(freqHz);
+    if (!Number.isFinite(freq) || freq < info.lo || freq > info.hi) return;
+    points.push({
+      freqHz: freq,
+      name: data.name || "",
+      blocked: !!data.blocked,
+      live: !!data.live,
+      recent: !!data.recent,
+      history: !!data.history,
+      strength: Math.max(0.06, Math.min(1, Number(data.strength || 0.25)))
+    });
+  };
+  (s.history || []).forEach(h => add(h.freqHz, { ...h, history: true, strength: Math.min(0.32, 0.08 + (h.count || 0) * 0.025) }));
+  (s.recentChannels || []).forEach(ch => add(ch.freqHz, {
+    ...ch,
+    recent: true,
+    strength: Math.max(0.18, 0.58 * (1 - Math.min(30000, ch.ageMs || 0) / 30000))
+  }));
+  (s.activeChannels || []).forEach(ch => add(ch.gridFreqHz || ch.freqHz, {
+    ...ch,
+    live: true,
+    strength: ch.signalPresent ? 1 : 0.65
+  }));
+  return points;
+}
+function drawSpanWaterfall(s) {
+  const canvas = document.getElementById("spanWaterfall");
+  const status = document.getElementById("spanStatus");
+  const range = document.getElementById("spanRange");
+  const info = spanInfo(s);
+  if (!canvas || !info) {
+    if (range) range.textContent = "-";
+    return;
+  }
+  range.textContent = `${fmtMHz(info.lo)} to ${fmtMHz(info.hi)}`;
+  const cssWidth = Math.max(320, canvas.clientWidth || 800);
+  const cssHeight = Math.max(140, canvas.clientHeight || 180);
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const key = `${Math.round(info.center / 1000)}:${Math.round(info.span / 1000)}`;
+  if (key !== spanWaterfallKey) {
+    spanWaterfallKey = key;
+    spanWaterfallFrames.length = 0;
+  }
+  const points = collectSpanPoints(s, info);
+  spanWaterfallFrames.push(points.filter(p => p.live || p.recent));
+  while (spanWaterfallFrames.length > spanWaterfallMaxFrames) spanWaterfallFrames.shift();
+  spanWaterfallClick = { info, points, channelSpacingHz: Number(s.settings?.channelSpacingHz || s.channelSpacingHz || 0) };
+
+  const width = cssWidth;
+  const height = cssHeight;
+  ctx.fillStyle = "#080a0d";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#111820";
+  for (let i = 0; i <= 8; i++) {
+    const x = Math.round((i / 8) * width);
+    ctx.fillRect(x, 0, 1, height);
+  }
+  (s.history || []).forEach(h => {
+    if (!h.freqHz || h.freqHz < info.lo || h.freqHz > info.hi) return;
+    const x = spanX(h.freqHz, info, width);
+    const alpha = h.blocked ? 0.42 : Math.min(0.24, 0.06 + (h.count || 0) * 0.015);
+    ctx.fillStyle = h.blocked ? `rgba(210,70,70,${alpha})` : `rgba(70,130,210,${alpha})`;
+    ctx.fillRect(x - 1, 0, 2, height);
+  });
+  const rowH = height / spanWaterfallMaxFrames;
+  spanWaterfallFrames.forEach((frame, i) => {
+    const y = height - (spanWaterfallFrames.length - i) * rowH;
+    frame.forEach(p => {
+      const x = spanX(p.freqHz, info, width);
+      const alpha = p.blocked ? 0.95 : p.strength;
+      ctx.fillStyle = p.blocked ? `rgba(255,74,74,${alpha})` : p.live ? `rgba(80,210,115,${alpha})` : `rgba(255,177,92,${alpha})`;
+      ctx.fillRect(x - 3, y, 6, Math.max(2, rowH + 1));
+    });
+  });
+  points.filter(p => p.live).slice(0, 20).forEach(p => {
+    const x = spanX(p.freqHz, info, width);
+    ctx.strokeStyle = p.blocked ? "#ff6b6b" : "#62d26f";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+    ctx.fillStyle = p.blocked ? "#ff9b9b" : "#d8ffe0";
+    ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    const label = (p.name || fmtMHz(p.freqHz)).slice(0, 18);
+    ctx.fillText(label, Math.min(width - 96, Math.max(4, x + 5)), 14);
+  });
+  if (status && points.some(p => p.live || p.recent)) status.textContent = "Click lit activity to block or unblock it.";
+}
+function nearestSpanPoint(clientX) {
+  const canvas = document.getElementById("spanWaterfall");
+  if (!canvas || !spanWaterfallClick) return null;
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const info = spanWaterfallClick.info;
+  const freq = info.lo + (x / Math.max(1, rect.width)) * info.span;
+  const tolerance = Math.max((spanWaterfallClick.channelSpacingHz || 0) / 2, info.span / 160);
+  let best = null;
+  let bestDist = tolerance;
+  spanWaterfallClick.points.filter(p => p.live || p.recent || p.blocked).forEach(p => {
+    const dist = Math.abs(p.freqHz - freq);
+    if (dist <= bestDist) {
+      best = p;
+      bestDist = dist;
+    }
+  });
+  return best;
+}
+function coerceSettingValue(raw, read) {
+  const value = read ? read(raw) : raw;
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "number" && !Number.isFinite(value)) return undefined;
+  return value;
+}
+function setMonitorUi(active, text) {
+  document.getElementById("monitorAudio").textContent = active ? "Stop Monitor" : "Monitor Audio";
+  document.getElementById("monitorState").textContent = text;
+}
+function resetMonitorBuffer() {
+  monitorReadPos = 0;
+  monitorWritePos = 0;
+  monitorBufferedSamples = 0;
+}
+function dropMonitorSamples(count) {
+  const drop = Math.min(count, monitorBufferedSamples);
+  monitorReadPos = (monitorReadPos + drop) % monitorBufferCapacity;
+  monitorBufferedSamples -= drop;
+}
+function writeMonitorSample(sample) {
+  if (monitorBufferedSamples >= monitorBufferCapacity) dropMonitorSamples(monitorBufferedSamples - monitorTargetSamples);
+  monitorRing[monitorWritePos] = sample;
+  monitorWritePos = (monitorWritePos + 1) % monitorBufferCapacity;
+  monitorBufferedSamples++;
+}
+function updateMonitorBufferStatus() {
+  const now = performance.now();
+  if (now - monitorLastStatusMs < 400) return;
+  monitorLastStatusMs = now;
+  setMonitorUi(true, `Monitor live  ${Math.round(monitorBufferedSamples * 1000 / monitorSampleRate)} ms`);
+}
+function enqueuePcm16(bytes) {
+  if (!monitorCtx || bytes.length < 2) return;
+  const samples = Math.floor(bytes.length / 2);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, samples * 2);
+  if (monitorBufferedSamples > monitorMaxSamples) dropMonitorSamples(monitorBufferedSamples - monitorTargetSamples);
+  for (let i = 0; i < samples; i++) writeMonitorSample(view.getInt16(i * 2, true) / 32768);
+  if (monitorBufferedSamples > monitorMaxSamples) dropMonitorSamples(monitorBufferedSamples - monitorTargetSamples);
+  updateMonitorBufferStatus();
+}
+function startMonitorOutput() {
+  resetMonitorBuffer();
+  monitorNode = monitorCtx.createScriptProcessor(1024, 0, 1);
+  monitorNode.onaudioprocess = e => {
+    const out = e.outputBuffer.getChannelData(0);
+    for (let i = 0; i < out.length; i++) {
+      if (monitorBufferedSamples > 0) {
+        out[i] = monitorRing[monitorReadPos];
+        monitorReadPos = (monitorReadPos + 1) % monitorBufferCapacity;
+        monitorBufferedSamples--;
+      } else {
+        out[i] = 0;
+      }
+    }
+  };
+  monitorNode.connect(monitorCtx.destination);
+}
+function stopMonitorOutput() {
+  if (monitorNode) {
+    monitorNode.disconnect();
+    monitorNode.onaudioprocess = null;
+  }
+  monitorNode = null;
+  resetMonitorBuffer();
+}
+async function startMonitorAudio() {
+  if (monitorRunning) return;
+  const runId = ++monitorRunId;
+  monitorRunning = true;
+  setMonitorUi(true, "Monitor connecting...");
+  const AudioCtor = window.AudioContext || window.webkitAudioContext;
+  let carry = new Uint8Array(0);
+  try {
+    if (!monitorCtx) {
+      try { monitorCtx = new AudioCtor({ sampleRate: monitorSampleRate }); }
+      catch (_) { monitorCtx = new AudioCtor(); }
+    }
+    await monitorCtx.resume();
+    if (!monitorRunning || runId !== monitorRunId) return;
+    monitorAbort = new AbortController();
+    startMonitorOutput();
+    const r = await fetch("/api/audio/live.pcm", { cache: "no-store", signal: monitorAbort.signal });
+    if (!r.ok || !r.body) throw new Error("monitor stream unavailable");
+    setMonitorUi(true, "Monitor live");
+    const reader = r.body.getReader();
+    while (true) {
+      if (!monitorRunning || runId !== monitorRunId) break;
+      const { value, done } = await reader.read();
+      if (done) break;
+      let chunk = value;
+      if (carry.length) {
+        const joined = new Uint8Array(carry.length + chunk.length);
+        joined.set(carry, 0);
+        joined.set(chunk, carry.length);
+        chunk = joined;
+        carry = new Uint8Array(0);
+      }
+      if (chunk.length & 1) {
+        carry = chunk.slice(chunk.length - 1);
+        chunk = chunk.slice(0, chunk.length - 1);
+      }
+      enqueuePcm16(chunk);
+    }
+  } catch (e) {
+    if (monitorRunning && runId === monitorRunId && !monitorAbort?.signal.aborted) console.warn(e);
+  } finally {
+    if (runId === monitorRunId) {
+      monitorRunning = false;
+      monitorAbort = null;
+      stopMonitorOutput();
+      setMonitorUi(false, "Monitor stopped");
+    }
+  }
+}
+function stopMonitorAudio() {
+  monitorRunning = false;
+  monitorRunId++;
+  if (monitorAbort) monitorAbort.abort();
+  monitorAbort = null;
+  stopMonitorOutput();
+  if (monitorCtx && monitorCtx.state === "running") monitorCtx.suspend().catch(() => {});
+  setMonitorUi(false, "Monitor stopped");
+}
+async function refresh() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    const s = await r.json();
+    const now = s.serverTimeMs ? new Date(s.serverTimeMs).toLocaleTimeString() : new Date().toLocaleTimeString();
+    document.getElementById("sdrppStatus").textContent = "Connected";
+    document.getElementById("sdrppStatus").className = "small-value ok";
+    document.getElementById("radioState").textContent = s.radioPlaying ? "Playing" : "Stopped";
+    document.getElementById("radioState").className = "small-value " + (s.radioPlaying ? "ok" : "off");
+    document.getElementById("sampleRate").textContent = fmtRate(s.sampleRate);
+    const wfInfo = spanInfo(s);
+    document.getElementById("freqSpan").textContent = wfInfo ? `Waterfall ${fmtRangeMHz(wfInfo.lo, wfInfo.hi)}` : "Waterfall -";
+    document.getElementById("heartbeat").textContent = `#${s.sdrppHeartbeat || 0}  ${now}`;
+    document.getElementById("state").textContent = s.running ? "Running" : "Stopped";
+    document.getElementById("state").className = "value " + (s.running ? "ok" : "off");
+    document.getElementById("mode").textContent = s.mode + " / " + s.demodMode;
+    document.getElementById("center").textContent = fmtMHz(s.centerHz);
+    document.getElementById("active").textContent = (s.activeChannels || []).length + " / " + s.maxChannels;
+    const source = document.getElementById("source");
+    const prev = source.value;
+    source.innerHTML = (s.sources || []).map(name =>
+      `<option value="${esc(name)}">${esc(name)}</option>`
+    ).join("");
+    source.value = s.selectedSource || prev;
+    source.disabled = !!s.radioPlaying;
+    document.getElementById("radioPlay").disabled = !!s.radioPlaying;
+    document.getElementById("radioStop").disabled = !s.radioPlaying;
+    document.getElementById("centerInput").placeholder = s.waterfallCenterHz ? (s.waterfallCenterHz / 1e6).toFixed(6) : "157.06745";
+    const server = s.sdrppServer || {};
+    const serverControls = document.getElementById("serverControls");
+    const showServer = s.selectedSource === "SDR++ Server" && server.available;
+    serverControls.style.display = showServer ? "grid" : "none";
+    if (showServer) {
+      const host = document.getElementById("serverHost");
+      const port = document.getElementById("serverPort");
+      if (document.activeElement !== host) host.value = server.host || "";
+      if (document.activeElement !== port) port.value = server.port || "";
+      host.disabled = !!s.radioPlaying || !!server.connected;
+      port.disabled = !!s.radioPlaying || !!server.connected;
+      document.getElementById("serverApply").disabled = !!s.radioPlaying || !!server.connected;
+      document.getElementById("serverConnect").textContent = server.connected ? "Disconnect" : "Connect";
+      document.getElementById("serverConnect").disabled = !!s.radioPlaying;
+    }
+    const settings = s.settings || {};
+    setControlValue("cbMode", settings.mode || s.mode || "auto");
+    setSliderValue("cbSpacing", settings.spacingId);
+    setControlValue("cbDemod", settings.demodMode || s.demodMode || "AM");
+    setSliderValue("cbSnr", settings.snrThresholdDb, v => v.toFixed(1));
+    setSliderValue("cbMaxChannels", settings.maxChannels, v => String(Math.round(v)));
+    setSliderValue("cbBwUsage", Math.round((settings.bwUsage ?? s.bwUsage ?? 0.8) * 100));
+    setSliderValue("cbMinTx", settings.minTransmissionMs, v => `${Math.round(v)} ms`);
+    setSliderValue("cbSignalHold", settings.signalHoldMs, v => `${Math.round(v)} ms`);
+    setSliderValue("cbTail", settings.tailMs, v => `${Math.round(v)} ms`);
+    setSliderValue("cbScanQuiet", settings.scanQuietSec, v => `${v.toFixed(1)} s`);
+    setSliderValue("cbScanNoSignal", settings.scanNoSignalSec, v => `${v.toFixed(1)} s`);
+    currentRecordingEnabled = settings.recordingEnabled !== false;
+    const recToggle = document.getElementById("cbRecordingToggle");
+    recToggle.textContent = currentRecordingEnabled ? "On - keeping files" : "Off - monitor only";
+    recToggle.className = currentRecordingEnabled ? "primary" : "danger";
+    document.getElementById("cbMode").disabled = !!s.running;
+    document.getElementById("cbSpacing").disabled = !!s.running;
+    document.getElementById("cbDemod").disabled = !!s.running;
+    drawSnrChart(s);
+    drawSpanWaterfall(s);
+    renderHeatMap(s);
+    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
+      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
+    document.getElementById("history").innerHTML = (s.history || []).map(h =>
+      `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count}</td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`
+    ).join("") || `<tr><td colspan="4" class="muted">No history yet</td></tr>`;
+    const tx = (s.lastTranscriptText || "").trim();
+    document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
+  } catch (e) {
+    document.getElementById("state").textContent = "Disconnected";
+    document.getElementById("state").className = "value off";
+    document.getElementById("sdrppStatus").textContent = "Disconnected";
+    document.getElementById("sdrppStatus").className = "small-value bad";
+    document.getElementById("radioState").textContent = "-";
+    document.getElementById("radioState").className = "small-value off";
+  }
+}
+document.getElementById("start").onclick = () => postAndReport("/api/start");
+document.getElementById("stop").onclick = () => postAndReport("/api/stop");
+document.getElementById("source").onchange = e => postAndReport("/api/source", { name: e.target.value });
+document.getElementById("radioPlay").onclick = () => postAndReport("/api/play");
+document.getElementById("radioStop").onclick = () => postAndReport("/api/stop-radio");
+document.getElementById("monitorAudio").onclick = () => {
+  if (monitorRunning) stopMonitorAudio();
+  else startMonitorAudio();
+};
+document.getElementById("cbRecordingToggle").onclick = () => {
+  saveSettingValue("recordingEnabled", !currentRecordingEnabled);
+};
+document.getElementById("serverApply").onclick = () => {
+  const host = document.getElementById("serverHost").value.trim();
+  const port = Number(document.getElementById("serverPort").value);
+  if (host && Number.isInteger(port)) postAndReport("/api/sdrpp-server", { host, port });
+};
+document.getElementById("serverConnect").onclick = async e => {
+  const connecting = e.target.textContent !== "Disconnect";
+  await postAndReport(connecting ? "/api/sdrpp-server/connect" : "/api/sdrpp-server/disconnect");
+};
+function saveSetting(id, key, read) {
+  const el = document.getElementById(id);
+  const queueSave = () => {
+    const value = coerceSettingValue(el.value, read);
+    if (value !== undefined) saveSettingValue(key, value);
+  };
+  if (el.tagName === "INPUT") {
+    el.oninput = () => {
+      if (el.type === "range") updateSliderOutput(id);
+      clearTimeout(pendingSettingTimers.get(id));
+      pendingSettingTimers.set(id, setTimeout(queueSave, 350));
+    };
+    el.onkeydown = e => {
+      if (e.key === "Enter") {
+        clearTimeout(pendingSettingTimers.get(id));
+        queueSave();
+        el.blur();
+      }
+    };
+    el.onblur = () => {
+      clearTimeout(pendingSettingTimers.get(id));
+      queueSave();
+    };
+  } else {
+    el.onchange = queueSave;
+  }
+}
+saveSetting("cbMode", "mode");
+saveSetting("cbSpacing", "spacingId", v => Number.parseInt(v, 10));
+saveSetting("cbDemod", "demodMode");
+saveSetting("cbSnr", "snrThresholdDb", Number);
+saveSetting("cbMaxChannels", "maxChannels", v => Number.parseInt(v, 10));
+saveSetting("cbBwUsage", "bwUsage", v => Number.parseInt(v, 10) / 100);
+saveSetting("cbMinTx", "minTransmissionMs", v => Number.parseInt(v, 10));
+saveSetting("cbSignalHold", "signalHoldMs", v => Number.parseInt(v, 10));
+saveSetting("cbTail", "tailMs", v => Number.parseInt(v, 10));
+saveSetting("cbScanQuiet", "scanQuietSec", Number);
+saveSetting("cbScanNoSignal", "scanNoSignalSec", Number);
+document.getElementById("centerInput").onchange = e => {
+  const mhz = Number(e.target.value);
+  if (Number.isFinite(mhz) && mhz > 0) postAndReport("/api/center", { hz: mhz * 1e6 });
+};
+document.getElementById("spanWaterfall").onclick = e => {
+  const point = nearestSpanPoint(e.clientX);
+  const status = document.getElementById("spanStatus");
+  if (!point) {
+    if (status) status.textContent = "Click closer to a lit frequency.";
+    return;
+  }
+  blockFrequency(point.freqHz, !point.blocked);
+};
+refresh();
+setInterval(refresh, 500);
+</script>
+</body>
+</html>)HTML";
+    }
+
+    bool sendAll(WebSocket fd, const void* data, size_t size) {
+        const char* p = (const char*)data;
+        size_t left = size;
+        while (left > 0) {
+            int toSend = (int)std::min<size_t>(left, 64 * 1024);
+            int n = send(fd, p, toSend, 0);
+            if (n <= 0) return false;
+            p += n;
+            left -= (size_t)n;
+        }
+        return true;
+    }
+
+    void sendHttpResponse(WebSocket fd, const std::string& status, const std::string& contentType,
+                          const std::string& body) {
+        std::ostringstream oss;
+        oss << "HTTP/1.1 " << status << "\r\n"
+            << "Content-Type: " << contentType << "\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Cache-Control: no-store\r\n"
+            << "Access-Control-Allow-Origin: *\r\n"
+            << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            << "Access-Control-Allow-Headers: Content-Type\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+        std::string out = oss.str();
+        sendAll(fd, out.data(), out.size());
+    }
+
+    static uint64_t steadyMs() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void publishLiveAudio(ChannelSlot& slot, const float* mono, int count) {
+        if (liveAudioClients.load() <= 0 || !mono || count <= 0) return;
+
+        int64_t slotKey = freqKey(slot.freqHz);
+        uint64_t nowMs = steadyMs();
+        int64_t selectedKey = liveAudioSelectedFreqKey.load();
+        if (selectedKey != slotKey) {
+            uint64_t lastMs = liveAudioSelectedMs.load();
+            if (selectedKey != 0 && nowMs <= lastMs + 500) return;
+            int64_t expected = selectedKey;
+            if (!liveAudioSelectedFreqKey.compare_exchange_strong(expected, slotKey) &&
+                expected != slotKey) {
+                return;
+            }
+        }
+        liveAudioSelectedMs.store(nowMs);
+
+        std::vector<int16_t> chunk;
+        chunk.resize((size_t)count);
+        for (int i = 0; i < count; i++) {
+            float s = std::clamp(mono[i], -1.0f, 1.0f);
+            chunk[(size_t)i] = (int16_t)std::lround(s * 32767.0f);
+        }
+
+        std::unique_lock<std::mutex> lk(liveAudioMtx, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            liveAudioDroppedChunks.fetch_add(1);
+            return;
+        }
+
+        liveAudioQueuedSamples += chunk.size();
+        liveAudioChunks.push_back(std::move(chunk));
+        while (liveAudioQueuedSamples > LIVE_AUDIO_MAX_SAMPLES && !liveAudioChunks.empty()) {
+            liveAudioQueuedSamples -= liveAudioChunks.front().size();
+            liveAudioChunks.pop_front();
+            liveAudioDroppedChunks.fetch_add(1);
+        }
+        lk.unlock();
+        liveAudioCv.notify_one();
+    }
+
+    void handleLiveAudioStream(WebSocket fd) {
+        int expected = 0;
+        if (!liveAudioClients.compare_exchange_strong(expected, 1)) {
+            sendHttpResponse(fd, "409 Conflict", "application/json",
+                json({{"ok", false}, {"error", "live monitor already connected"}}).dump());
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(liveAudioMtx);
+            liveAudioChunks.clear();
+            liveAudioQueuedSamples = 0;
+            liveAudioSelectedFreqKey.store(0);
+            liveAudioSelectedMs.store(0);
+        }
+
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: application/octet-stream\r\n"
+            << "Cache-Control: no-store\r\n"
+            << "Access-Control-Allow-Origin: *\r\n"
+            << "Connection: close\r\n"
+            << "X-Audio-Format: pcm_s16le; rate=48000; channels=1\r\n\r\n";
+
+        std::string header = hdr.str();
+        bool ok = sendAll(fd, header.data(), header.size());
+        auto nextAudioSend = std::chrono::steady_clock::now();
+        while (ok && webServerRunning.load()) {
+            std::vector<int16_t> chunk;
+            {
+                std::unique_lock<std::mutex> lk(liveAudioMtx);
+                liveAudioCv.wait_for(lk, std::chrono::milliseconds(100), [&] {
+                    return !liveAudioChunks.empty() || !webServerRunning.load();
+                });
+                if (!webServerRunning.load()) break;
+                if (!liveAudioChunks.empty()) {
+                    chunk = std::move(liveAudioChunks.front());
+                    liveAudioQueuedSamples -= chunk.size();
+                    liveAudioChunks.pop_front();
+                }
+            }
+            size_t sendSamples = chunk.empty() ? 4800 : chunk.size();
+            auto now = std::chrono::steady_clock::now();
+            if (nextAudioSend < now - std::chrono::milliseconds(250)) {
+                nextAudioSend = now;
+            }
+            if (nextAudioSend > now) {
+                std::this_thread::sleep_until(nextAudioSend);
+            }
+            if (chunk.empty()) {
+                static const int16_t silence[4800] = {};
+                ok = sendAll(fd, silence, sizeof(silence));
+            } else {
+                ok = sendAll(fd, chunk.data(), chunk.size() * sizeof(int16_t));
+            }
+            nextAudioSend += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>((double)sendSamples / 48000.0));
+        }
+
+        liveAudioClients.store(0);
+        std::lock_guard<std::mutex> lk(liveAudioMtx);
+        liveAudioChunks.clear();
+        liveAudioQueuedSamples = 0;
+        liveAudioSelectedFreqKey.store(0);
+        liveAudioSelectedMs.store(0);
+    }
+
+    json requestJsonBody(const std::string& reqText) {
+        size_t pos = reqText.find("\r\n\r\n");
+        if (pos == std::string::npos) return json::object();
+        std::string body = reqText.substr(pos + 4);
+        if (body.empty()) return json::object();
+        try {
+            return json::parse(body);
+        }
+        catch (...) {
+            return json::object();
+        }
+    }
+
+    bool sourceExists(const std::string& name) {
+        auto sources = sigpath::sourceManager.getSourceNames();
+        return std::find(sources.begin(), sources.end(), name) != sources.end();
+    }
+
+    void sendUiActionResponse(WebSocket fd, std::function<json()> fn) {
+        json result;
+        std::string error;
+        if (!runOnUiThread(std::move(fn), result, error)) {
+            sendHttpResponse(fd, "503 Service Unavailable", "application/json",
+                json({{"ok", false}, {"error", error.empty() ? "UI action failed" : error}}).dump());
+            return;
+        }
+        std::string status = result.value("_httpStatus", std::string("200 OK"));
+        result.erase("_httpStatus");
+        sendHttpResponse(fd, status, "application/json", result.dump());
+    }
+
+    void handleWebClient(WebSocket fd) {
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+        char buf[4096];
+        int n = recv(fd, buf, (int)sizeof(buf) - 1, 0);
+        if (n <= 0) return;
+        buf[n] = '\0';
+        std::string reqText(buf, (size_t)n);
+
+        std::istringstream req(reqText);
+        std::string method, path, version;
+        req >> method >> path >> version;
+
+        if (method == "OPTIONS") {
+            sendHttpResponse(fd, "204 No Content", "text/plain", "");
+            return;
+        }
+        if (method == "GET" && (path == "/" || path == "/index.html")) {
+            sendHttpResponse(fd, "200 OK", "text/html; charset=utf-8", webIndexHtml());
+            return;
+        }
+        if (method == "GET" && (path == "/api/state" || path == "/state")) {
+            sendHttpResponse(fd, "200 OK", "application/json", webStateSnapshot().dump());
+            return;
+        }
+        if (method == "GET" && path == "/api/sources") {
+            sendHttpResponse(fd, "200 OK", "application/json", json({
+                {"selected", selectedSourceName()},
+                {"sources", sourceNamesJson()}
+            }).dump());
+            return;
+        }
+        if (method == "GET" && path == "/api/sdrpp-server") {
+            sendHttpResponse(fd, "200 OK", "application/json", serverSourceStateJson().dump());
+            return;
+        }
+        if (method == "GET" && path == "/api/channel-bank/settings") {
+            sendHttpResponse(fd, "200 OK", "application/json", channelBankSettingsJson().dump());
+            return;
+        }
+        if (method == "GET" && path == "/api/audio/live.pcm") {
+            handleLiveAudioStream(fd);
+            return;
+        }
+        if (method == "POST" && path == "/api/start") {
+            sendUiActionResponse(fd, [this] {
+                if (!folderSelect.pathIsValid()) {
+                    return json({{"ok", false}, {"error", "recording path is invalid"}, {"_httpStatus", "409 Conflict"}});
+                }
+                start();
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/stop") {
+            sendUiActionResponse(fd, [this] {
+                stop();
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/channel-bank/settings") {
+            json body = requestJsonBody(reqText);
+            sendUiActionResponse(fd, [this, body] {
+                std::string error;
+                if (!applyChannelBankSettings(body, error)) {
+                    return json({
+                        {"ok", false},
+                        {"error", error},
+                        {"_httpStatus", running ? "409 Conflict" : "400 Bad Request"}
+                    });
+                }
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/frequency/block") {
+            json body = requestJsonBody(reqText);
+            double hz = body.value("hz", 0.0);
+            bool blocked = body.value("blocked", true);
+            sendUiActionResponse(fd, [this, hz, blocked] {
+                std::string error;
+                if (!setFrequencyBlocked(hz, blocked, error)) {
+                    return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
+                }
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/source") {
+            json body = requestJsonBody(reqText);
+            std::string source = body.value("name", std::string());
+            sendUiActionResponse(fd, [this, source] {
+                if (gui::mainWindow.isPlaying()) {
+                    return json({{"ok", false}, {"error", "stop SDR before changing source"}, {"_httpStatus", "409 Conflict"}});
+                }
+                if (source.empty() || !sourceExists(source)) {
+                    return json({{"ok", false}, {"error", "source not found"}, {"_httpStatus", "404 Not Found"}});
+                }
+                sigpath::sourceManager.selectSource(source);
+                core::configManager.acquire();
+                core::configManager.conf["source"] = source;
+                core::configManager.release(true);
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/sdrpp-server") {
+            json body = requestJsonBody(reqText);
+            std::string host = body.value("host", std::string());
+            int port = body.value("port", 0);
+            sendUiActionResponse(fd, [this, host, port] {
+                if (gui::mainWindow.isPlaying()) {
+                    return json({{"ok", false}, {"error", "stop SDR before changing server target"}, {"_httpStatus", "409 Conflict"}});
+                }
+                if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1")) {
+                    return json({{"ok", false}, {"error", "SDR++ Server source control unavailable"}, {"_httpStatus", "404 Not Found"}});
+                }
+                if (host.empty() || port <= 0 || port > 65535) {
+                    return json({{"ok", false}, {"error", "host and valid port required"}, {"_httpStatus", "400 Bad Request"}});
+                }
+                SDRPPServerSourceControlV1 req{};
+                strncpy(req.host, host.c_str(), sizeof(req.host) - 1);
+                req.host[sizeof(req.host) - 1] = '\0';
+                req.port = port;
+                if (!callServerSourceControl(SERVER_SOURCE_CONTROL_SET, &req) || !req.ok) {
+                    return json({{"ok", false}, {"error", "server target is busy or invalid"}, {"_httpStatus", "409 Conflict"}});
+                }
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/sdrpp-server/connect") {
+            sendUiActionResponse(fd, [this] {
+                if (gui::mainWindow.isPlaying()) {
+                    return json({{"ok", false}, {"error", "stop SDR before connecting server source"}, {"_httpStatus", "409 Conflict"}});
+                }
+                if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1")) {
+                    return json({{"ok", false}, {"error", "SDR++ Server source control unavailable"}, {"_httpStatus", "404 Not Found"}});
+                }
+                SDRPPServerSourceControlV1 state{};
+                bool ok = callServerSourceControl(SERVER_SOURCE_CONTROL_CONNECT, &state) && state.connected;
+                json snapshot = webStateSnapshot();
+                if (!ok) snapshot["_httpStatus"] = "502 Bad Gateway";
+                return snapshot;
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/sdrpp-server/disconnect") {
+            sendUiActionResponse(fd, [this] {
+                if (gui::mainWindow.isPlaying()) {
+                    return json({{"ok", false}, {"error", "stop SDR before disconnecting server source"}, {"_httpStatus", "409 Conflict"}});
+                }
+                if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1")) {
+                    return json({{"ok", false}, {"error", "SDR++ Server source control unavailable"}, {"_httpStatus", "404 Not Found"}});
+                }
+                SDRPPServerSourceControlV1 state{};
+                callServerSourceControl(SERVER_SOURCE_CONTROL_DISCONNECT, &state);
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/play") {
+            sendUiActionResponse(fd, [this] {
+                gui::mainWindow.setPlayState(true);
+                sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency());
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && (path == "/api/stop-radio" || path == "/api/radio/stop")) {
+            sendUiActionResponse(fd, [this] {
+                gui::mainWindow.setPlayState(false);
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/center") {
+            json body = requestJsonBody(reqText);
+            double hz = body.value("hz", 0.0);
+            if (!std::isfinite(hz) || hz <= 0.0) {
+                sendHttpResponse(fd, "400 Bad Request", "application/json",
+                    json({{"ok", false}, {"error", "hz must be positive"}}).dump());
+                return;
+            }
+            sendUiActionResponse(fd, [this, hz] {
+                gui::waterfall.setCenterFrequency(hz);
+                gui::waterfall.centerFreqMoved = true;
+                sigpath::sourceManager.tune(hz);
+                lastKnownCenter = hz;
+                return webStateSnapshot();
+            });
+            return;
+        }
+
+        sendHttpResponse(fd, "404 Not Found", "application/json",
+            json({{"ok", false}, {"error", "not found"}}).dump());
+    }
+
+    void webServerLoop() {
+        while (webServerRunning.load()) {
+            sockaddr_in clientAddr{};
+            WebSockLen clientLen = sizeof(clientAddr);
+            WebSocket clientFd = accept(webServerFd, (sockaddr*)&clientAddr, &clientLen);
+            if (clientFd == INVALID_WEB_SOCKET) {
+                if (webServerRunning.load() && isRetryableAcceptError()) {
+                    continue;
+                }
+                break;
+            }
+            std::lock_guard<std::mutex> lk(webClientThreadsMtx);
+            webClientThreads.emplace_back(&ChannelBankModule::webClientThreadMain, this, clientFd);
+        }
+    }
+
+    void webClientThreadMain(WebSocket fd) {
+        handleWebClient(fd);
+        closeFd(fd);
+    }
+
+    bool parseWebBindAddress(in_addr& out) {
+        if (webControlBind.empty() || webControlBind == "localhost") {
+            out.s_addr = htonl(INADDR_LOOPBACK);
+            return true;
+        }
+        if (webControlBind == "*" || webControlBind == "0.0.0.0") {
+            out.s_addr = htonl(INADDR_ANY);
+            return true;
+        }
+#ifdef _WIN32
+        return InetPtonA(AF_INET, webControlBind.c_str(), &out) == 1;
+#else
+        return inet_pton(AF_INET, webControlBind.c_str(), &out) == 1;
+#endif
+    }
+
+    std::string webDisplayBindAddress() const {
+        if (webControlBind.empty() || webControlBind == "localhost") return "127.0.0.1";
+        if (webControlBind == "*") return "0.0.0.0";
+        return webControlBind;
+    }
+
+    void startWebServer() {
+        std::lock_guard<std::mutex> lk(webServerMtx);
+        if (webServerRunning.load()) return;
+        webControlError.clear();
+
+#ifdef _WIN32
+        if (!webSocketsStarted) {
+            WSADATA wsa{};
+            int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsa);
+            if (wsaResult != 0) {
+                webControlError = "WSAStartup failed: " + std::to_string(wsaResult);
+                return;
+            }
+            webSocketsStarted = true;
+        }
+#endif
+
+        webServerFd = socket(AF_INET, SOCK_STREAM, 0);
+        if (webServerFd == INVALID_WEB_SOCKET) {
+            webControlError = socketErrorString("socket");
+            return;
+        }
+
+        int one = 1;
+        setsockopt(webServerFd, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)webControlPort);
+        if (!parseWebBindAddress(addr.sin_addr)) {
+            webControlError = "invalid bind address: " + webControlBind;
+            closeFd(webServerFd);
+            webServerFd = INVALID_WEB_SOCKET;
+            return;
+        }
+
+        if (bind(webServerFd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            webControlError = socketErrorString("bind");
+            closeFd(webServerFd);
+            webServerFd = INVALID_WEB_SOCKET;
+            return;
+        }
+        if (listen(webServerFd, 8) != 0) {
+            webControlError = socketErrorString("listen");
+            closeFd(webServerFd);
+            webServerFd = INVALID_WEB_SOCKET;
+            return;
+        }
+
+        webServerRunning.store(true);
+        webServerThread = std::thread(&ChannelBankModule::webServerLoop, this);
+        flog::info("[ChannelBank] Web control listening at http://{0}:{1}/", webDisplayBindAddress(), webControlPort);
+    }
+
+    void stopWebServer() {
+        std::thread threadToJoin;
+        WebSocket fdToClose = INVALID_WEB_SOCKET;
+        {
+            std::lock_guard<std::mutex> lk(webServerMtx);
+            if (!webServerRunning.load() && !webServerThread.joinable()) return;
+            webServerRunning.store(false);
+            fdToClose = webServerFd;
+            webServerFd = INVALID_WEB_SOCKET;
+            if (webServerThread.joinable()) threadToJoin = std::move(webServerThread);
+        }
+        if (fdToClose != INVALID_WEB_SOCKET) {
+#ifdef _WIN32
+            shutdown(fdToClose, SD_BOTH);
+#else
+            shutdown(fdToClose, SHUT_RDWR);
+#endif
+            closeFd(fdToClose);
+        }
+        if (threadToJoin.joinable()) threadToJoin.join();
+        liveAudioCv.notify_all();
+
+        std::vector<std::thread> clientThreads;
+        {
+            std::lock_guard<std::mutex> lk(webClientThreadsMtx);
+            clientThreads.swap(webClientThreads);
+        }
+        for (auto& t : clientThreads) {
+            if (t.joinable()) t.join();
+        }
+    }
+
     void updateSustainSnr(ChannelSlot& slot, float instantSnrDb) {
         if (!std::isfinite(instantSnrDb)) return;
 
@@ -1042,6 +2910,29 @@ private:
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
             floorHistory.clear();
+            avgPower.clear();
+            instPower.clear();
+            slotVotes.clear();
+            manualVotes.clear();
+            rawSlotMisses.clear();
+            rawManualMisses.clear();
+            {
+                std::lock_guard<std::mutex> lk(detectedMtx);
+                detectedSlots.clear();
+                rawDetectedSlots.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lk(manualDetectedMtx);
+                manualDetected.clear();
+                rawManualDetected.clear();
+                manualSnrDb.clear();
+            }
+#ifndef CB_NO_RNNOISE
+            {
+                std::lock_guard<std::mutex> lk(rnVoiceQuarantineMtx);
+                rnVoiceQuarantineUntil.clear();
+            }
+#endif
         }
 
         // Determine how many real samples are in fftAccum this frame.
@@ -1986,7 +3877,7 @@ private:
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
                     if (!isInActiveSpan(slotFreq)) continue;
-                    if (isBlocked(slotFreq)) { blkSkip++; continue; }
+                    if (isBlocked(slotFreq) || isRnVoiceQuarantined(slotFreq)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
                     slot->lastDetected      = now;
@@ -2022,6 +3913,13 @@ private:
                 // jittered to).  gridFreqHz makes the whole loop coherent.
                 if (isBlocked(slot->gridFreqHz)) {
                     flog::info("[ChannelBank] Destroying blocked slot {0}", it->first);
+                    destroySlot(*slot);
+                    delete slot;
+                    it = activeChannels.erase(it);
+                    continue;
+                }
+                if (isRnVoiceQuarantined(slot->gridFreqHz)) {
+                    flog::info("[ChannelBank] Destroying RNNoise-quarantined slot {0}", it->first);
                     destroySlot(*slot);
                     delete slot;
                     it = activeChannels.erase(it);
@@ -2198,7 +4096,7 @@ private:
 
         // RNNoise noise reduction (per-slot)
 #ifndef CB_NO_RNNOISE
-        if (noiseReduction) {
+        if (noiseReduction || rnVoiceGateEnabled) {
             slot.nrState = rnnoise_create(nullptr);
             slot.nrInPos = 0;
         }
@@ -2250,8 +4148,8 @@ private:
                 // Same time-based signal duration as the normal close path — immune to
                 // signalHoldMs inflating the sample count (see comment there for details).
                 int64_t signalMs = std::max(int64_t(0),
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        slot.lastDetected - slot.fileOpenTime).count());
+                    static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        slot.lastDetected - slot.fileOpenTime).count()));
                 // Min TX on cumulative on-air time (see normal close path) — discards
                 // bursty data (ACARS) even when bridged into a long span.
                 int64_t onAirMs = (int64_t)(slot.onAirFrames.load() * (1000.0 / SPEC_ANALYSIS_HZ));
@@ -2273,11 +4171,26 @@ private:
                                      && driftStd > slot.module->driftMaxStdHz;
                 std::string stuckNoiseReason;
                 bool stuckNoiseReject = slot.module->shouldRejectStuckNoise(slot, stuckNoiseReason);
+                float rnVoiceFrac = 1.0f;
+                bool rnVoiceReject = false;
+#ifndef CB_NO_RNNOISE
+                rnVoiceFrac = (slot.rnVadFrames > 0)
+                    ? (float)slot.rnVadVoiceFrames / (float)slot.rnVadFrames : 1.0f;
+                rnVoiceReject = slot.module->rnVoiceGateEnabled
+                                && slot.rnVadFrames >= slot.module->rnVoiceGateMinFrames
+                                && rnVoiceFrac < slot.module->rnVoiceGateVoiceFrac;
+#endif
                 if (stuckNoiseReject) {
                     flog::info("[ChannelBank] Discarding stuck-noise recording ({0}) slot {1}",
                                stuckNoiseReason, slot.gridIdx);
                 }
-                if (staticReject || driftReject || stuckNoiseReject || onAirMs < (int64_t)slot.module->minTransmissionMs) {
+                if (rnVoiceReject) {
+                    flog::info("[ChannelBank] Discarding RNNoise non-voice recording (voice in {0}/{1} frames = {2:.0f}% < {3:.0f}%) slot {4}",
+                               slot.rnVadVoiceFrames, slot.rnVadFrames, rnVoiceFrac * 100.0f,
+                               slot.module->rnVoiceGateVoiceFrac * 100.0f, slot.gridIdx);
+                    slot.module->quarantineRnVoice(slot.gridFreqHz);
+                }
+                if (staticReject || driftReject || stuckNoiseReject || rnVoiceReject || onAirMs < (int64_t)slot.module->minTransmissionMs) {
                     std::remove(slot.currentFilePath.c_str());
                 } else {
                     // Recording meets the minimum duration — process it even though
@@ -2381,7 +4294,8 @@ private:
         // heard in the recording is ~0ms even though detection takes 100ms to fire.
         // signalPresent still controls the hold/silence-countdown (unchanged).
         bool rawOpen     = (slot->rawSignalPresent.load() && slot->rawConsecutiveHits.load() >= 2);
-        bool activeSignal = slot->signalPresent.load() || rawOpen;
+        bool quarantined = _this->isRnVoiceQuarantined(slot->gridFreqHz);
+        bool activeSignal = !quarantined && (slot->signalPresent.load() || rawOpen);
 
         // Hard duration cap: a recording open longer than maxRecordingSec is force-closed
         // regardless of whether the signal is still "present". Persistent come-and-go
@@ -2395,6 +4309,16 @@ private:
                 std::chrono::steady_clock::now() - slot->fileOpenTime).count();
             forceClose = (openSec >= _this->maxRecordingSec);
         }
+#ifndef CB_NO_RNNOISE
+        if (slot->fileOpen && !forceClose && _this->rnVoiceGateEnabled && _this->rnVoiceGateProbeSec > 0.0f) {
+            float rnVoiceFrac = (slot->rnVadFrames > 0)
+                ? (float)slot->rnVadVoiceFrames / (float)slot->rnVadFrames : 1.0f;
+            int probeFrames = std::max(_this->rnVoiceGateMinFrames,
+                (int)std::ceil(_this->rnVoiceGateProbeSec * 100.0f));
+            forceClose = slot->rnVadFrames >= probeFrames
+                         && rnVoiceFrac < _this->rnVoiceGateVoiceFrac;
+        }
+#endif
 
         if (activeSignal && !forceClose) {
             slot->inSilence = false;
@@ -2435,8 +4359,8 @@ private:
                     // and passed the min-TX check.  lastDetected is only updated when the FFT
                     // actually sees power above the SNR threshold, so it's hold-period-immune.
                     int64_t signalMs = std::max(int64_t(0),
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            slot->lastDetected - slot->fileOpenTime).count());
+                        static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            slot->lastDetected - slot->fileOpenTime).count()));
                     // Min TX is judged on cumulative ON-AIR time (frames the carrier was
                     // actually present), not the open→last-seen span. Intermittent data
                     // bursts (ACARS) get bridged into a long span by the signal-hold, but
@@ -2465,6 +4389,15 @@ private:
                                          && driftStd > _this->driftMaxStdHz;
                     std::string stuckNoiseReason;
                     bool stuckNoiseReject = _this->shouldRejectStuckNoise(*slot, stuckNoiseReason);
+                    float rnVoiceFrac = 1.0f;
+                    bool rnVoiceReject = false;
+#ifndef CB_NO_RNNOISE
+                    rnVoiceFrac = (slot->rnVadFrames > 0)
+                        ? (float)slot->rnVadVoiceFrames / (float)slot->rnVadFrames : 1.0f;
+                    rnVoiceReject = _this->rnVoiceGateEnabled
+                                    && slot->rnVadFrames >= _this->rnVoiceGateMinFrames
+                                    && rnVoiceFrac < _this->rnVoiceGateVoiceFrac;
+#endif
 
                     if (staticReject) {
                         flog::info("[ChannelBank] Discarding static recording (carrier in {0}/{1} frames = {2:.0f}%% < {3:.0f}%%) slot {4}{5}",
@@ -2482,12 +4415,26 @@ private:
                                    stuckNoiseReason, slot->gridIdx,
                                    forceClose ? " [dur-cap]" : "");
                         std::remove(slot->currentFilePath.c_str());
+                    } else if (rnVoiceReject) {
+                        flog::info("[ChannelBank] Discarding RNNoise non-voice recording (voice in {0}/{1} frames = {2:.0f}%% < {3:.0f}%%) slot {4}{5}",
+                                   slot->rnVadVoiceFrames, slot->rnVadFrames, rnVoiceFrac * 100.0f,
+                                   _this->rnVoiceGateVoiceFrac * 100.0f, slot->gridIdx,
+                                   forceClose ? " [dur-cap]" : "");
+                        _this->quarantineRnVoice(slot->gridFreqHz);
+                        std::remove(slot->currentFilePath.c_str());
                     } else if (onAirMs < (int64_t)_this->minTransmissionMs) {
                         flog::info("[ChannelBank] Discarding short recording (on-air {0}ms < {1}ms threshold; span was {2}ms)", onAirMs, _this->minTransmissionMs, signalMs);
                         std::remove(slot->currentFilePath.c_str());
                     } else {
+#ifndef CB_NO_RNNOISE
+                        flog::info("[ChannelBank] Keeping recording (on-air {0}ms / span {1}ms, carrier {2}/{3} = {4:.0f}%%, RNNoise voice {5}/{6} = {7:.0f}%%, drift {8:.0f}Hz) slot {9}",
+                                   onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f,
+                                   slot->rnVadVoiceFrames, slot->rnVadFrames, rnVoiceFrac * 100.0f,
+                                   driftStd, slot->gridIdx);
+#else
                         flog::info("[ChannelBank] Keeping recording (on-air {0}ms / span {1}ms, carrier {2}/{3} = {4:.0f}%%, drift {5:.0f}Hz) slot {6}",
                                    onAirMs, signalMs, gVoice, gAbove, voiceFrac * 100.0f, driftStd, slot->gridIdx);
+#endif
 #if defined(__APPLE__) || defined(_WIN32)
                         bool transcriptionStarted = false;
                         if (_this->transcriptionOn()) {
@@ -2634,16 +4581,23 @@ private:
 
                 if (slot->nrInPos >= 480) {
                     float outBuf[480];
-                    rnnoise_process_frame(slot->nrState, outBuf, slot->nrInBuf);
+                    float vadProb = rnnoise_process_frame(slot->nrState, outBuf, slot->nrInBuf);
+                    slot->rnVadFrames++;
+                    slot->rnVadSum += vadProb;
+                    if (vadProb >= _this->rnVoiceGateFrameThreshold)
+                        slot->rnVadVoiceFrames++;
                     float mix = _this->nrMix;
                     float nrMono[480];
                     for (int i = 0; i < 480; i++) {
                         float dry = slot->nrInBuf[i] / 32768.0f;
                         float wet = outBuf[i] / 32768.0f;
-                        nrMono[i] = std::clamp(dry * (1.0f - mix) + wet * mix, -1.0f, 1.0f);
+                        nrMono[i] = _this->noiseReduction
+                            ? std::clamp(dry * (1.0f - mix) + wet * mix, -1.0f, 1.0f)
+                            : std::clamp(dry, -1.0f, 1.0f);
                     }
                     slot->writer.write(nrMono, 480);
                     slot->audioSamplesWritten += 480;
+                    _this->publishLiveAudio(*slot, nrMono, 480);
                     slot->nrInPos = 0;
                 }
             }
@@ -2652,6 +4606,7 @@ private:
         {
             slot->writer.write(mono, count);
             slot->audioSamplesWritten += count;
+            _this->publishLiveAudio(*slot, mono, count);
         }
     }
 
@@ -3409,6 +5364,7 @@ private:
 
     static void menuHandler(void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
+        _this->processWebUiActions();
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         // Reset each frame; set below whenever a channel/history row is hovered.
@@ -3584,6 +5540,63 @@ private:
                                   "100%% = full noise reduction\n"
                                   "50-70%% = good balance for weak signals");
         }
+
+#ifndef CB_NO_RNNOISE
+        if (ImGui::Checkbox(CONCAT("RNNoise Voice Gate##_cb_rn_vad_", _this->name),
+                            &_this->rnVoiceGateEnabled)) {
+            config.acquire();
+            config.conf[_this->name]["rnVoiceGateEnabled"] = _this->rnVoiceGateEnabled;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Test feature: use RNNoise voice probability to\n"
+                              "discard finished recordings that look non-voice.\n"
+                              "Independent of Noise Reduction; saved audio can\n"
+                              "remain completely dry.");
+        if (_this->rnVoiceGateEnabled) {
+            ImGui::LeftLabel("  RN Voice %");
+            ImGui::FillWidth();
+            float pct = _this->rnVoiceGateVoiceFrac * 100.0f;
+            if (ImGui::SliderFloat(CONCAT("##_cb_rn_vad_frac_", _this->name),
+                                   &pct, 5.0f, 75.0f, "%.0f %%")) {
+                _this->rnVoiceGateVoiceFrac = std::clamp(pct / 100.0f, 0.05f, 0.75f);
+                config.acquire();
+                config.conf[_this->name]["rnVoiceGateVoiceFrac"] = _this->rnVoiceGateVoiceFrac;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Minimum fraction of RNNoise frames that must\n"
+                                  "look speech-like for the recording to be kept.\n"
+                                  "Lower is safer while testing weak radio audio.");
+            ImGui::LeftLabel("  Probe Time");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_cb_rn_vad_probe_", _this->name),
+                                   &_this->rnVoiceGateProbeSec, 3.0f, 30.0f, "%.0f s")) {
+                _this->rnVoiceGateProbeSec = std::clamp(_this->rnVoiceGateProbeSec, 3.0f, 30.0f);
+                config.acquire();
+                config.conf[_this->name]["rnVoiceGateProbeSec"] = _this->rnVoiceGateProbeSec;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("After this many seconds of a still-open recording,\n"
+                                  "RNNoise can force a close if the accumulated audio\n"
+                                  "still looks non-voice. The normal close-time gate\n"
+                                  "then decides whether to delete the file.");
+            ImGui::LeftLabel("  Quarantine");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_cb_rn_vad_quarantine_", _this->name),
+                                   &_this->rnVoiceGateQuarantineSec, 0.0f, 300.0f, "%.0f s")) {
+                _this->rnVoiceGateQuarantineSec = std::clamp(_this->rnVoiceGateQuarantineSec, 0.0f, 300.0f);
+                config.acquire();
+                config.conf[_this->name]["rnVoiceGateQuarantineSec"] = _this->rnVoiceGateQuarantineSec;
+                config.release(true);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("After RNNoise rejects a non-voice recording,\n"
+                                  "temporarily suppress that frequency before\n"
+                                  "probing it again. 0 disables quarantine.");
+        }
+#endif
 
         // Active span trim
         {
@@ -4104,6 +6117,7 @@ private:
             config.acquire();
             config.conf[_this->name]["snrThreshold"] = _this->snrThreshold;
             config.release(true);
+            _this->resetDetectorFloor();
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Minimum SNR above noise floor required to START\n"
@@ -4118,6 +6132,7 @@ private:
             config.acquire();
             config.conf[_this->name]["holdHysteresisDb"] = _this->holdHysteresisDb;
             config.release(true);
+            _this->resetDetectorFloor();
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("dB below SNR Threshold that keeps an open\n"
@@ -4126,6 +6141,13 @@ private:
                               "the dropout timer.\n"
                               "4 dB covers typical HF QSB fading.\n"
                               "0 = disabled (symmetric open/hold threshold).");
+
+        if (ImGui::SmallButton(CONCAT("Reset detector##_cb_reset_detector_", _this->name))) {
+            _this->resetDetectorFloor();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Clear detector averaging, votes, raw hits, and\n"
+                              "temporary RNNoise quarantine without restarting.");
 
         // NMS radius — how far around a detected center to suppress neighbors
         ImGui::LeftLabel("NMS Radius");
@@ -4457,6 +6479,18 @@ private:
                               "Turn off to preserve the raw recorded file.");
         }
 
+        if (ImGui::Checkbox(CONCAT("Portable recording group##_cb_portable_group_", _this->name),
+                            &_this->portableRecordingGroup)) {
+            config.acquire();
+            config.conf[_this->name]["portableRecordingGroup"] = _this->portableRecordingGroup;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("When enabled, new recording filenames use Portable-System\n"
+                              "as the group prefix while keeping the bookmark or\n"
+                              "frequency name intact for Web Audio Monitor filters.");
+        }
+
         // Record gain (live)
         ImGui::LeftLabel("Rec Gain");
         ImGui::FillWidth();
@@ -4533,6 +6567,50 @@ private:
             config.acquire();
             config.conf[_this->name]["autoStart"] = _this->autoStart;
             config.release(true);
+        }
+
+        if (ImGui::Checkbox(CONCAT("Web Control##_cb_webctl_", _this->name),
+                            &_this->webControlEnabled)) {
+            if (_this->webControlEnabled) _this->startWebServer();
+            else {
+                _this->stopWebServer();
+                _this->webControlError.clear();
+            }
+            config.acquire();
+            config.conf[_this->name]["webControlEnabled"] = _this->webControlEnabled;
+            config.release(true);
+        }
+
+        bool webControlListening = _this->webServerRunning.load();
+        if (webControlListening) style::beginDisabled();
+        ImGui::LeftLabel("Web Bind");
+        ImGui::FillWidth();
+        if (ImGui::InputText(CONCAT("##_cb_webbind_", _this->name),
+                             _this->webControlBindBuf,
+                             sizeof(_this->webControlBindBuf))) {
+            _this->webControlBind = _this->webControlBindBuf;
+            config.acquire();
+            config.conf[_this->name]["webControlBind"] = _this->webControlBind;
+            config.release(true);
+        }
+        ImGui::LeftLabel("Web Port");
+        ImGui::FillWidth();
+        if (ImGui::InputInt(CONCAT("##_cb_webport_", _this->name), &_this->webControlPort)) {
+            _this->webControlPort = std::clamp(_this->webControlPort, 1024, 65535);
+            config.acquire();
+            config.conf[_this->name]["webControlPort"] = _this->webControlPort;
+            config.release(true);
+        }
+        if (webControlListening) style::endDisabled();
+
+        if (webControlListening) {
+            ImGui::Text("http://%s:%d/", _this->webDisplayBindAddress().c_str(), _this->webControlPort);
+        }
+        else if (_this->webControlEnabled && !_this->webControlError.empty()) {
+            ImGui::TextWrapped("Web control error: %s", _this->webControlError.c_str());
+        }
+        else {
+            ImGui::TextDisabled("Web control stopped");
         }
 
         // Start / Stop
@@ -5034,6 +7112,13 @@ private:
                 it = activeChannels.erase(it);
                 continue;
             }
+            if (isRnVoiceQuarantined(it->second->gridFreqHz)) {
+                flog::info("[ChannelBank] BkScan: removing RNNoise-quarantined slot {0}", idx);
+                destroySlot(*it->second);
+                delete it->second;
+                it = activeChannels.erase(it);
+                continue;
+            }
             // Tear down channels outside the active span trim
             if (!isInActiveSpan(it->second->freqHz)) {
                 flog::info("[ChannelBank] BkScan: removing out-of-span slot {0}", idx);
@@ -5077,7 +7162,7 @@ private:
         for (int i : desired) {
             if (activeChannels.find(i) != activeChannels.end()) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
-            if (isBlocked(stop.freqsHz[i])) continue;
+            if (isBlocked(stop.freqsHz[i]) || isRnVoiceQuarantined(stop.freqsHz[i])) continue;
             double offset = stop.freqsHz[i] - lastKnownCenter;
             flog::info("[ChannelBank] BkScan: spawning slot {0} at {1:.3f}MHz", i, stop.freqsHz[i] / 1e6);
             auto* slot = new ChannelSlot();
@@ -5209,7 +7294,21 @@ private:
     }
 
     void resetDetectorFloor() {
+        {
+            std::lock_guard<std::mutex> lk(channelsMtx);
+            for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
+                ChannelSlot* slot = it->second;
+                if (slot->fileOpen) {
+                    ++it;
+                    continue;
+                }
+                destroySlot(*slot);
+                delete slot;
+                it = activeChannels.erase(it);
+            }
+        }
         detectorFloorResetRequested.store(true);
+        mgmtCv.notify_one();
     }
 
     bool shouldRejectStuckNoise(ChannelSlot& slot, std::string& reason) {
@@ -5344,6 +7443,13 @@ private:
                 it = activeChannels.erase(it);
                 continue;
             }
+            if (isRnVoiceQuarantined(it->second->gridFreqHz)) {
+                flog::info("[ChannelBank] Manual: removing RNNoise-quarantined slot {0}", idx);
+                destroySlot(*it->second);
+                delete it->second;
+                it = activeChannels.erase(it);
+                continue;
+            }
             // Tear down channels outside the active span trim
             if (!isInActiveSpan(it->second->freqHz)) {
                 flog::info("[ChannelBank] Manual: removing out-of-span slot {0}", idx);
@@ -5394,7 +7500,7 @@ private:
         for (int i : desired) {
             if (activeChannels.find(i) != activeChannels.end()) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
-            if (isBlocked(localFreqs[i])) continue;
+            if (isBlocked(localFreqs[i]) || isRnVoiceQuarantined(localFreqs[i])) continue;
             double offset = localFreqs[i] - lastKnownCenter;
             flog::info("[ChannelBank] Manual: spawning slot {0} at {1:.3f}MHz", i, localFreqs[i] / 1e6);
             auto* slot = new ChannelSlot();
@@ -5414,6 +7520,32 @@ private:
     bool         running       = false;
     bool         autoStart     = false;
     std::mutex   runMtx;
+    bool         webControlEnabled = false;
+    int          webControlPort    = 18080;
+    std::string  webControlBind    = "127.0.0.1";
+    char         webControlBindBuf[64] = "127.0.0.1";
+    std::atomic<uint64_t> webHeartbeat { 0 };
+    std::atomic<bool> webServerRunning { false };
+    std::thread  webServerThread;
+    std::mutex   webServerMtx;
+    std::string  webControlError;
+#ifdef _WIN32
+    bool         webSocketsStarted = false;
+#endif
+    WebSocket    webServerFd = INVALID_WEB_SOCKET;
+    std::mutex   webClientThreadsMtx;
+    std::vector<std::thread> webClientThreads;
+    std::mutex webUiActionMtx;
+    std::deque<std::shared_ptr<WebUiAction>> webUiActions;
+    static constexpr size_t LIVE_AUDIO_MAX_SAMPLES = 48000;
+    std::atomic<int> liveAudioClients { 0 };
+    std::mutex liveAudioMtx;
+    std::condition_variable liveAudioCv;
+    std::deque<std::vector<int16_t>> liveAudioChunks;
+    size_t liveAudioQueuedSamples = 0;
+    std::atomic<int64_t> liveAudioSelectedFreqKey { 0 };
+    std::atomic<uint64_t> liveAudioSelectedMs { 0 };
+    std::atomic<uint64_t> liveAudioDroppedChunks { 0 };
 
     FolderSelect folderSelect;
     int          spacingId     = 2;         // default → 25kHz
@@ -5453,6 +7585,7 @@ private:
     bool         draggingRight  = false;
     int          signalHoldMs          = 500;    // hold signalPresent true N ms after last detection (dropout hysteresis)
     bool         recordingEnabled      = true;   // global recording on/off toggle
+    bool         portableRecordingGroup = false; // save new recordings under the Portable group name
     // Transcription backend selector.  ChannelSlot::transcribeBackend stores the
     // raw int form of this enum so it can live in the slot struct (which is
     // declared above ChannelBankModule).  Order is config-stable — DO NOT
@@ -5494,6 +7627,12 @@ private:
     float        bwUsage       = 0.8f;      // fraction of SDR bandwidth to use (avoids filter rolloff edges)
     bool         noiseReduction = false;    // RNNoise neural noise suppression on recordings
     float        nrMix          = 0.7f;    // 0=dry (original), 1=full NR
+    bool         rnVoiceGateEnabled = false; // RNNoise VAD test gate, independent of noise reduction
+    float        rnVoiceGateFrameThreshold = 0.50f;
+    float        rnVoiceGateVoiceFrac = 0.20f;
+    int          rnVoiceGateMinFrames = 30;
+    float        rnVoiceGateProbeSec = 10.0f;
+    float        rnVoiceGateQuarantineSec = 60.0f;
 
     // Scan mode
     struct ScanRange { double startHz, stopHz; };
@@ -5637,6 +7776,8 @@ private:
     // keyed by round(freqHz / 1000) — kHz-level uniqueness
     std::map<int64_t, FreqEntry> freqLog;
     std::mutex                   freqLogMtx;
+    std::map<int64_t, std::chrono::steady_clock::time_point> rnVoiceQuarantineUntil;
+    std::mutex                   rnVoiceQuarantineMtx;
 
     int64_t freqKey(double hz) { return (int64_t)std::round(hz / 1000.0); }
 
@@ -5717,6 +7858,37 @@ private:
         std::lock_guard<std::mutex> lk(freqLogMtx);
         auto it = freqLog.find(freqKey(hz));
         return it != freqLog.end() && it->second.blocked;
+    }
+
+    void quarantineRnVoice(double hz) {
+#ifndef CB_NO_RNNOISE
+        if (!rnVoiceGateEnabled || rnVoiceGateQuarantineSec <= 0.0f) return;
+        auto until = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds((int)std::round(rnVoiceGateQuarantineSec * 1000.0f));
+        {
+            std::lock_guard<std::mutex> lk(rnVoiceQuarantineMtx);
+            rnVoiceQuarantineUntil[freqKey(hz)] = until;
+        }
+        flog::info("[ChannelBank] RNNoise quarantined {0:.3f}MHz for {1:.0f}s",
+                   hz / 1e6, rnVoiceGateQuarantineSec);
+#endif
+    }
+
+    bool isRnVoiceQuarantined(double hz) {
+#ifndef CB_NO_RNNOISE
+        if (!rnVoiceGateEnabled || rnVoiceGateQuarantineSec <= 0.0f) return false;
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(rnVoiceQuarantineMtx);
+        auto it = rnVoiceQuarantineUntil.find(freqKey(hz));
+        if (it == rnVoiceQuarantineUntil.end()) return false;
+        if (now >= it->second) {
+            rnVoiceQuarantineUntil.erase(it);
+            return false;
+        }
+        return true;
+#else
+        return false;
+#endif
     }
 
     bool isInActiveSpan(double freqHz) const {
@@ -5968,6 +8140,10 @@ private:
         p["bwUsage"]          = bwUsage;
         p["noiseReduction"]   = noiseReduction;
         p["nrMix"]            = nrMix;
+        p["rnVoiceGateEnabled"] = rnVoiceGateEnabled;
+        p["rnVoiceGateVoiceFrac"] = rnVoiceGateVoiceFrac;
+        p["rnVoiceGateProbeSec"] = rnVoiceGateProbeSec;
+        p["rnVoiceGateQuarantineSec"] = rnVoiceGateQuarantineSec;
         p["nmsRadiusSlots"]   = nmsRadiusSlots;
         p["recPath"]          = folderSelect.path;
         p["staticGateEnabled"]  = staticGateEnabled;
@@ -5983,6 +8159,7 @@ private:
         p["rightTrimFrac"]      = rightTrimFrac;
         p["signalHoldMs"]       = signalHoldMs;
         p["recordingEnabled"]   = recordingEnabled;
+        p["portableRecordingGroup"] = portableRecordingGroup;
         p["transcriptionBackend"] = transcriptionBackend;
         p["m4aEnabled"]         = m4aEnabled;
         p["normalizeRecordings"]= normalizeRecordings;
@@ -6021,6 +8198,10 @@ private:
         bwUsage           = p.value("bwUsage", 0.8f);
         noiseReduction    = p.value("noiseReduction", false);
         nrMix             = p.value("nrMix", 0.7f);
+        rnVoiceGateEnabled = p.value("rnVoiceGateEnabled", false);
+        rnVoiceGateVoiceFrac = p.value("rnVoiceGateVoiceFrac", 0.20f);
+        rnVoiceGateProbeSec = p.value("rnVoiceGateProbeSec", 10.0f);
+        rnVoiceGateQuarantineSec = p.value("rnVoiceGateQuarantineSec", 60.0f);
         nmsRadiusSlots    = p.value("nmsRadiusSlots", 2);
         if (p.contains("recPath")) folderSelect.setPath(p["recPath"].get<std::string>());
         staticGateEnabled  = p.value("staticGateEnabled", true);
@@ -6036,6 +8217,7 @@ private:
         rightTrimFrac      = p.value("rightTrimFrac", 0.0f);
         signalHoldMs       = p.value("signalHoldMs", 500);
         recordingEnabled   = p.value("recordingEnabled", true);
+        portableRecordingGroup = p.value("portableRecordingGroup", false);
         transcriptionBackend = p.value("transcriptionBackend", (int)TB_OFF);
         m4aEnabled         = p.value("m4aEnabled", false);
         normalizeRecordings= p.value("normalizeRecordings", true);
