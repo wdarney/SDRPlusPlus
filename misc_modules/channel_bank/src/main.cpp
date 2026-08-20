@@ -2399,12 +2399,17 @@ function verticalWaterfallLabel(ctx, text, x, y, height, color) {
   const label = String(text || "").trim();
   if (!label) return;
   ctx.save();
-  ctx.translate(Math.min(x + 9, ctx.canvas.clientWidth - 8), Math.max(10, y + 4));
-  ctx.rotate(Math.PI / 2);
   ctx.fillStyle = color;
-  ctx.font = "10px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  ctx.font = "9px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  ctx.textAlign = "center";
   ctx.textBaseline = "top";
-  ctx.fillText(label.slice(0, 22), 0, 0, Math.max(24, height - y - 8));
+  const chars = label.slice(0, 18).split("");
+  let cy = Math.max(4, y + 5);
+  for (const ch of chars) {
+    if (cy + 9 > height - 2) break;
+    ctx.fillText(ch, x, cy);
+    cy += ch === " " ? 5 : 8;
+  }
   ctx.restore();
 }
 function collectSpanPoints(s, info) {
