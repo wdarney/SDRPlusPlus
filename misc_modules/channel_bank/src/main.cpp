@@ -2003,6 +2003,7 @@ let monitorLastStatusMs = 0;
 let monitorOutputStarted = false;
 const pendingSettingTimers = new Map();
 const pendingSettingDirty = new Set();
+const pendingSettingSeq = new Map();
 const pendingSourceTimers = new Map();
 let currentRecordingEnabled = true;
 const spanWaterfallFrames = [];
@@ -2020,7 +2021,7 @@ const sliderFormatters = {
   cbScanQuiet: v => `${v.toFixed(1)} s`,
   cbScanNoSignal: v => `${v.toFixed(1)} s`
 };
-async function post(path, body) {
+async function post(path, body, refreshAfter = true) {
   const ctl = new AbortController();
   const timeout = setTimeout(() => ctl.abort(), 5000);
   const r = await fetch(path, {
@@ -2034,7 +2035,7 @@ async function post(path, body) {
     try { msg = (await r.json()).error || msg; } catch (_) {}
     throw new Error(msg);
   }
-  await refresh();
+  if (refreshAfter) await refresh();
 }
 function setControlValue(id, value) {
   const el = document.getElementById(id);
@@ -2056,25 +2057,27 @@ function updateSliderOutput(id) {
   const formatter = sliderFormatters[id];
   out.textContent = formatter ? formatter(Number(el.value)) : el.value;
 }
-async function postAndReport(path, body) {
+async function postAndReport(path, body, refreshAfter = true) {
   try {
-    await post(path, body);
+    await post(path, body, refreshAfter);
     return true;
   } catch (e) {
     console.warn(e);
     const settingsStatus = document.getElementById("settingsStatus");
     if (settingsStatus) settingsStatus.textContent = e?.message || "Save failed";
-    await refresh();
+    if (refreshAfter) await refresh();
     return false;
   }
 }
-async function saveSettingValue(key, value, controlId) {
+async function saveSettingValue(key, value, controlId, seq) {
   const settingsStatus = document.getElementById("settingsStatus");
   if (settingsStatus) settingsStatus.textContent = "Saving settings...";
-  const ok = await postAndReport("/api/channel-bank/settings", { [key]: value });
-  if (controlId) pendingSettingDirty.delete(controlId);
-  if (ok) await refresh();
-  if (ok && settingsStatus) settingsStatus.textContent = "Settings saved";
+  const ok = await postAndReport("/api/channel-bank/settings", { [key]: value }, false);
+  const currentSeq = controlId ? (pendingSettingSeq.get(controlId) || 0) : 0;
+  const isCurrentSave = !controlId || seq === undefined || seq === currentSeq;
+  if (controlId && isCurrentSave) pendingSettingDirty.delete(controlId);
+  if (isCurrentSave) await refresh();
+  if (ok && isCurrentSave && settingsStatus) settingsStatus.textContent = "Settings saved";
 }
 async function saveSourceControls(body) {
   const status = document.getElementById("sourceSettingsStatus");
@@ -2881,12 +2884,19 @@ document.getElementById("sourceOffsetApply").onclick = saveSourceOffset;
 document.getElementById("recordingsRefresh").onclick = refreshRecordings;
 function saveSetting(id, key, read) {
   const el = document.getElementById(id);
+  const bumpSeq = () => {
+    const seq = (pendingSettingSeq.get(id) || 0) + 1;
+    pendingSettingSeq.set(id, seq);
+    return seq;
+  };
   const queueSave = () => {
+    const seq = pendingSettingSeq.get(id) || 0;
     const value = coerceSettingValue(el.value, read);
-    if (value !== undefined) saveSettingValue(key, value, id);
+    if (value !== undefined) saveSettingValue(key, value, id, seq);
   };
   if (el.tagName === "INPUT") {
     el.oninput = () => {
+      bumpSeq();
       pendingSettingDirty.add(id);
       if (el.type === "range") updateSliderOutput(id);
       clearTimeout(pendingSettingTimers.get(id));
@@ -2894,12 +2904,15 @@ function saveSetting(id, key, read) {
     };
     el.onkeydown = e => {
       if (e.key === "Enter") {
+        bumpSeq();
+        pendingSettingDirty.add(id);
         clearTimeout(pendingSettingTimers.get(id));
         queueSave();
         el.blur();
       }
     };
     el.onblur = () => {
+      if (pendingSettingDirty.has(id)) bumpSeq();
       clearTimeout(pendingSettingTimers.get(id));
       queueSave();
     };
