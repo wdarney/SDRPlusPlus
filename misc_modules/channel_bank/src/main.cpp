@@ -2477,6 +2477,7 @@ async function startMonitorAudio() {
       console.warn(e);
     }
   }
+  let mediaFallbackStarted = false;
   try {
     if (!audioReady) throw new Error("audio context not available");
     if (!monitorRunning || runId !== monitorRunId) return;
@@ -2486,11 +2487,18 @@ async function startMonitorAudio() {
     if (!r.ok || !r.body) throw new Error("monitor stream unavailable");
     setMonitorUi(true, "Monitor live");
     const reader = r.body.getReader();
+    let gotAudioBytes = false;
     while (true) {
       if (!monitorRunning || runId !== monitorRunId) break;
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        if (monitorRunning && runId === monitorRunId && !gotAudioBytes) {
+          throw new Error("monitor stream ended before audio arrived");
+        }
+        break;
+      }
       let chunk = value;
+      gotAudioBytes = gotAudioBytes || chunk.length > 0;
       if (carry.length) {
         const joined = new Uint8Array(carry.length + chunk.length);
         joined.set(carry, 0);
@@ -2506,7 +2514,19 @@ async function startMonitorAudio() {
     }
   } catch (e) {
     if (monitorRunning && runId === monitorRunId && !monitorAbort?.signal.aborted) console.warn(e);
+    if (monitorRunning && runId === monitorRunId && !monitorAbort?.signal.aborted && !shouldUseMediaElementAudio()) {
+      try {
+        stopMonitorOutput();
+        monitorAbort = null;
+        setMonitorUi(true, "Monitor trying audio fallback...");
+        await startMediaElementMonitor(runId);
+        mediaFallbackStarted = true;
+      } catch (fallbackError) {
+        console.warn(fallbackError);
+      }
+    }
   } finally {
+    if (mediaFallbackStarted) return;
     if (runId === monitorRunId) {
       monitorRunning = false;
       monitorAbort = null;
