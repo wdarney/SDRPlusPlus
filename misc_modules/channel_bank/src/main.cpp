@@ -1347,6 +1347,85 @@ private:
         return arr;
     }
 
+    json sourceOffsetStateJson() {
+        std::string selected = "None";
+        double manual = 0.0;
+        json custom = json::object();
+
+        core::configManager.acquire();
+        if (core::configManager.conf.contains("selectedOffset"))
+            selected = core::configManager.conf["selectedOffset"].get<std::string>();
+        if (core::configManager.conf.contains("manualOffset"))
+            manual = core::configManager.conf["manualOffset"].get<double>();
+        if (core::configManager.conf.contains("offsets"))
+            custom = core::configManager.conf["offsets"];
+        core::configManager.release();
+
+        json modes = json::array({"None", "Manual"});
+        double effective = 0.0;
+        if (selected == "Manual") {
+            effective = manual;
+        }
+        else if (custom.contains(selected)) {
+            effective = custom[selected].get<double>();
+        }
+        else if (selected != "None") {
+            selected = "None";
+        }
+
+        for (auto& item : custom.items()) {
+            modes.push_back(item.key());
+        }
+
+        return json({
+            {"selected", selected},
+            {"manualOffsetHz", manual},
+            {"effectiveOffsetHz", effective},
+            {"modes", modes}
+        });
+    }
+
+    bool applySourceOffsetSettings(const json& body, std::string& error) {
+        std::string selected;
+        double manual = 0.0;
+        json custom = json::object();
+
+        core::configManager.acquire();
+        selected = core::configManager.conf.contains("selectedOffset")
+            ? core::configManager.conf["selectedOffset"].get<std::string>()
+            : std::string("None");
+        manual = core::configManager.conf.contains("manualOffset")
+            ? core::configManager.conf["manualOffset"].get<double>()
+            : 0.0;
+        if (core::configManager.conf.contains("offsets"))
+            custom = core::configManager.conf["offsets"];
+        core::configManager.release();
+
+        if (body.contains("selected")) selected = body["selected"].get<std::string>();
+        if (body.contains("manualOffsetHz")) manual = body["manualOffsetHz"].get<double>();
+
+        if (!std::isfinite(manual) || std::abs(manual) > 1000000000.0) {
+            error = "manual offset must be within +/- 1 GHz";
+            return false;
+        }
+        if (selected != "None" && selected != "Manual" && !custom.contains(selected)) {
+            error = "offset mode not found";
+            return false;
+        }
+
+        double effective = 0.0;
+        if (selected == "Manual") effective = manual;
+        else if (custom.contains(selected)) effective = custom[selected].get<double>();
+
+        core::configManager.acquire();
+        core::configManager.conf["selectedOffset"] = selected;
+        core::configManager.conf["manualOffset"] = manual;
+        core::configManager.release(true);
+
+        sigpath::sourceManager.setTuningOffset(effective);
+        return true;
+    }
+
     enum ServerSourceControlCode {
         SERVER_SOURCE_CONTROL_GET = 1,
         SERVER_SOURCE_CONTROL_SET = 2,
@@ -1544,6 +1623,7 @@ private:
         j["sources"] = sourceNamesJson();
         j["sdrppServer"] = serverSourceStateJson();
         j["sourceControls"] = selectedSourceControlsJson();
+        j["sourceOffset"] = sourceOffsetStateJson();
         j["settings"] = channelBankSettingsJson();
         j["snrThresholdDb"] = snrThreshold;
         j["maxChannels"] = maxChannels;
@@ -1663,6 +1743,15 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <h2 style="margin-top:4px">Source Settings</h2>
 <div class="source-grid" id="sourceSettingsGrid"></div>
 <div class="source-actions"><button class="secondary" id="sourceRefresh" type="button">Refresh Devices</button><span class="muted" id="sourceSettingsStatus">Source settings ready</span></div>
+</div>
+<div class="source-settings" id="sourceOffsetPanel" style="display:block">
+<h2 style="margin-top:4px">Tuning Offset</h2>
+<div class="source-grid">
+<label class="control"><span class="label">Offset mode</span><select id="sourceOffsetMode"></select></label>
+<label class="control"><span class="label">Offset Hz</span><input id="sourceOffsetHz" inputmode="numeric" placeholder="0"></label>
+<button class="secondary" id="sourceOffsetApply" type="button">Apply</button>
+</div>
+<div class="muted" id="sourceOffsetStatus" style="margin-top:8px">Offset ready</div>
 </div>
 </section>
 <section>
@@ -1822,6 +1911,38 @@ async function saveSourceControls(body) {
   if (status) status.textContent = "Saving source settings...";
   const ok = await postAndReport("/api/source-controls", body);
   if (status) status.textContent = ok ? "Source settings saved" : "Source setting failed";
+}
+async function saveSourceOffset() {
+  const mode = document.getElementById("sourceOffsetMode");
+  const offset = document.getElementById("sourceOffsetHz");
+  const status = document.getElementById("sourceOffsetStatus");
+  const body = { selected: mode.value };
+  if (mode.value === "Manual") body.manualOffsetHz = Number(offset.value || 0);
+  if (status) status.textContent = "Saving offset...";
+  const ok = await postAndReport("/api/source-offset", body);
+  if (status) status.textContent = ok ? "Offset saved" : "Offset save failed";
+}
+function renderSourceOffset(s) {
+  const c = s.sourceOffset || {};
+  const mode = document.getElementById("sourceOffsetMode");
+  const offset = document.getElementById("sourceOffsetHz");
+  const status = document.getElementById("sourceOffsetStatus");
+  if (!mode || !offset) return;
+  if (document.activeElement !== mode) {
+    const selected = c.selected || "None";
+    mode.innerHTML = (c.modes || ["None", "Manual"]).map(name =>
+      `<option value="${esc(name)}" ${name === selected ? "selected" : ""}>${esc(name)}</option>`
+    ).join("");
+    mode.value = selected;
+  }
+  if (document.activeElement !== offset) {
+    const value = mode.value === "Manual" ? c.manualOffsetHz : c.effectiveOffsetHz;
+    offset.value = Number(value || 0).toFixed(0);
+  }
+  offset.disabled = mode.value !== "Manual";
+  if (status) status.textContent = mode.value === "Manual"
+    ? "Manual offset is applied in Hz."
+    : `Effective offset ${Number(c.effectiveOffsetHz || 0).toFixed(0)} Hz`;
 }
 async function blockFrequency(hz, blocked) {
   const status = document.getElementById("heatmapStatus");
@@ -2361,6 +2482,7 @@ async function refresh() {
       document.getElementById("serverConnect").disabled = !!s.radioPlaying;
     }
     renderSourceControls(s);
+    renderSourceOffset(s);
     const settings = s.settings || {};
     setControlValue("cbMode", settings.mode || s.mode || "auto");
     setSliderValue("cbSpacing", settings.spacingId);
@@ -2422,6 +2544,8 @@ document.getElementById("serverConnect").onclick = async e => {
   await postAndReport(connecting ? "/api/sdrpp-server/connect" : "/api/sdrpp-server/disconnect");
 };
 document.getElementById("sourceRefresh").onclick = () => saveSourceControls({ refresh: true });
+document.getElementById("sourceOffsetMode").onchange = saveSourceOffset;
+document.getElementById("sourceOffsetApply").onclick = saveSourceOffset;
 function saveSetting(id, key, read) {
   const el = document.getElementById(id);
   const queueSave = () => {
@@ -2695,6 +2819,10 @@ setInterval(refresh, 500);
             sendHttpResponse(fd, "200 OK", "application/json", selectedSourceControlsJson().dump());
             return;
         }
+        if (method == "GET" && path == "/api/source-offset") {
+            sendHttpResponse(fd, "200 OK", "application/json", sourceOffsetStateJson().dump());
+            return;
+        }
         if (method == "GET" && path == "/api/channel-bank/settings") {
             sendHttpResponse(fd, "200 OK", "application/json", channelBankSettingsJson().dump());
             return;
@@ -2782,6 +2910,17 @@ setInterval(refresh, 500);
                         try { error = json::parse(req.response).value("error", error); } catch (...) {}
                     }
                     return json({{"ok", false}, {"error", error}, {"_httpStatus", gui::mainWindow.isPlaying() ? "409 Conflict" : "400 Bad Request"}});
+                }
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/source-offset") {
+            json body = requestJsonBody(reqText);
+            sendUiActionResponse(fd, [this, body] {
+                std::string error;
+                if (!applySourceOffsetSettings(body, error)) {
+                    return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
                 }
                 return webStateSnapshot();
             });
