@@ -104,6 +104,9 @@ static constexpr int kM4AFsRetryAttempts = 5;
 
 class ChannelBankModule;
 
+static constexpr int CB_RF_STREAM_BUFFER_SAMPLES    = 262144;
+static constexpr int CB_AUDIO_STREAM_BUFFER_SAMPLES = 32768;
+
 #if defined(__APPLE__) || defined(_WIN32)
 struct TranscriptionJob {
     std::string path;
@@ -128,6 +131,10 @@ struct RX888SourceControlV1 {
 };
 
 struct ChannelSlot {
+    ChannelSlot() {
+        meterStream.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
+    }
+
     int    gridIdx = 0;
     double freqHz  = 0.0;   // centroid-aligned (auto mode) — for VFO placement + display
     // Grid-aligned channel freq (lastKnownCenter + gridOffset).  Stable across the
@@ -268,6 +275,7 @@ public:
     static constexpr int    SPAWN_VOTES      = 3;    // FFT frames above threshold before spawning
     static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
     static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
+    static constexpr int    MAX_CHANNELS_HARD_LIMIT = 64;
 
     ChannelBankModule(std::string name) : folderSelect("%ROOT%/channel_bank/recordings") {
         this->name = name;
@@ -427,6 +435,8 @@ public:
         webControlBindBuf[sizeof(webControlBindBuf) - 1] = '\0';
         config.release();
 
+        maxChannels = std::clamp(maxChannels, 1, MAX_CHANNELS_HARD_LIMIT);
+
         channelSpacing = SPACINGS[std::clamp(spacingId, 0, 5)];
 
         // Load FM bookmarks so displayName() can show names
@@ -571,6 +581,7 @@ public:
         // Register monitor audio output (single stream for sequential playback)
         monitorSrHandler.ctx     = this;
         monitorSrHandler.handler = [](float, void*) {};
+        monitorStream.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         monitorSinkStream = new SinkManager::Stream();
         monitorSinkStream->init(&monitorStream, &monitorSrHandler, 48000.0f);
         sigpath::sinkManager.registerStream(name + "_monitor", monitorSinkStream);
@@ -1286,7 +1297,7 @@ private:
             config.conf[name]["snrThreshold"] = snrThreshold;
         }
         if (body.contains("maxChannels")) {
-            maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, 256);
+            maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, MAX_CHANNELS_HARD_LIMIT);
             config.conf[name]["maxChannels"] = maxChannels;
         }
         if (body.contains("bwUsage")) {
@@ -1784,7 +1795,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">Channel spacing</span><span class="slider-value" id="cbSpacingValue">-</span><input id="cbSpacing" type="range" min="0" max="5" step="1"></label>
 <label class="control"><span class="label">Demod</span><select id="cbDemod"><option>AM</option><option>NFM</option><option>WFM</option><option>USB</option><option>LSB</option></select></label>
 <label class="control slider-control"><span class="label">SNR dB</span><span class="slider-value" id="cbSnrValue">-</span><input id="cbSnr" type="range" min="1" max="30" step="0.1"></label>
-<label class="control slider-control"><span class="label">Max channels</span><span class="slider-value" id="cbMaxChannelsValue">-</span><input id="cbMaxChannels" type="range" min="1" max="256" step="1"></label>
+<label class="control slider-control"><span class="label">Max channels</span><span class="slider-value" id="cbMaxChannelsValue">-</span><input id="cbMaxChannels" type="range" min="1" max="64" step="1"></label>
 <label class="control slider-control"><span class="label">Freq span</span><span class="slider-value" id="cbBwUsageValue">-</span><input id="cbBwUsage" type="range" min="50" max="100" step="1"></label>
 <label class="control slider-control"><span class="label">Min TX ms</span><span class="slider-value" id="cbMinTxValue">-</span><input id="cbMinTx" type="range" min="0" max="10000" step="50"></label>
 <label class="control slider-control"><span class="label">Signal hold ms</span><span class="slider-value" id="cbSignalHoldValue">-</span><input id="cbSignalHold" type="range" min="0" max="5000" step="50"></label>
@@ -4835,8 +4846,10 @@ setInterval(refresh, 500);
                 : peakOffsetHz;  // centroid: centers VFO on actual carrier, not grid slot
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
+        slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
         iqSplitter->bindStream(slot.iqIn);
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
+        slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
         // AM demod bandwidth = full channel width (same as VFO), matching SDR++ radio module.
         // SSB/FM use narrower audio bandwidth.
@@ -4846,6 +4859,7 @@ setInterval(refresh, 500);
             slot.amDemod->init(&slot.vfo->out,
                 dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER,
                 bw, 50.0 / audioSr, 5.0 / audioSr, 100.0 / audioSr, audioSr);
+            slot.amDemod->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         }
         else if (demodMode == DEMOD_USB || demodMode == DEMOD_LSB) {
             auto ssbMode = (demodMode == DEMOD_USB)
@@ -4853,11 +4867,13 @@ setInterval(refresh, 500);
                 : dsp::demod::SSB<dsp::stereo_t>::Mode::LSB;
             slot.ssbDemod = new dsp::demod::SSB<dsp::stereo_t>();
             slot.ssbDemod->init(&slot.vfo->out, ssbMode, ssbBw, audioSr, 0.001, 0.00001);
+            slot.ssbDemod->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         }
         else {
             double demodBw = (demodMode == DEMOD_WFM) ? 150000.0 : audioBw;
             slot.fmDemod = new dsp::demod::FM<dsp::stereo_t>();
             slot.fmDemod->init(&slot.vfo->out, audioSr, demodBw, true);
+            slot.fmDemod->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         }
         dsp::stream<dsp::stereo_t>* demodOut =
             slot.amDemod  ? &slot.amDemod->out  :
@@ -4867,6 +4883,7 @@ setInterval(refresh, 500);
         slot.splitter = new dsp::routing::Splitter<dsp::stereo_t>(demodOut);
         slot.splitter->bindStream(&slot.meterStream);
         slot.recFeedStream = new dsp::stream<dsp::stereo_t>();
+        slot.recFeedStream->setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         slot.splitter->bindStream(slot.recFeedStream);
 
         slot.meter = new dsp::bench::PeakLevelMeter<dsp::stereo_t>(&slot.meterStream);
@@ -6318,7 +6335,7 @@ setInterval(refresh, 500);
         ImGui::LeftLabel("Max Channels");
         ImGui::FillWidth();
         if (ImGui::InputInt(CONCAT("##_cb_maxch_", _this->name), &_this->maxChannels)) {
-            _this->maxChannels = std::clamp(_this->maxChannels, 1, 256);
+            _this->maxChannels = std::clamp(_this->maxChannels, 1, MAX_CHANNELS_HARD_LIMIT);
             config.acquire();
             config.conf[_this->name]["maxChannels"] = _this->maxChannels;
             config.release(true);
@@ -9032,7 +9049,7 @@ setInterval(refresh, 500);
         recGain           = p.value("recGain", 0.25f);
         minTransmissionMs = p.value("minTransmissionMs", 300);
         tailMs            = p.value("tailMs", 500);
-        maxChannels       = p.value("maxChannels", 16);
+        maxChannels       = std::clamp(p.value("maxChannels", 16), 1, MAX_CHANNELS_HARD_LIMIT);
         bwUsage           = p.value("bwUsage", 0.8f);
         noiseReduction    = p.value("noiseReduction", false);
         nrMix             = p.value("nrMix", 0.7f);
