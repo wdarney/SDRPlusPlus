@@ -243,10 +243,10 @@ struct ChannelSlot {
     DenoiseState*  nrState    = nullptr;
     float          nrInBuf[480] = {};
     int            nrInPos    = 0;
+#endif
     int            rnVadFrames = 0;
     int            rnVadVoiceFrames = 0;
     float          rnVadSum = 0.0f;
-#endif
 };
 
 class ChannelBankModule : public ModuleManager::Instance {
@@ -1842,6 +1842,7 @@ let monitorWritePos = 0;
 let monitorBufferedSamples = 0;
 let monitorLastStatusMs = 0;
 const pendingSettingTimers = new Map();
+const pendingSettingDirty = new Set();
 const pendingSourceTimers = new Map();
 let currentRecordingEnabled = true;
 const spanWaterfallFrames = [];
@@ -1882,6 +1883,7 @@ function setControlValue(id, value) {
 function setSliderValue(id, value, format) {
   const el = document.getElementById(id);
   if (!el || value === undefined || value === null) return;
+  if (pendingSettingDirty.has(id)) return;
   if (document.activeElement !== el) el.value = value;
   const out = document.getElementById(id + "Value");
   const formatter = format || sliderFormatters[id];
@@ -1906,10 +1908,12 @@ async function postAndReport(path, body) {
     return false;
   }
 }
-async function saveSettingValue(key, value) {
+async function saveSettingValue(key, value, controlId) {
   const settingsStatus = document.getElementById("settingsStatus");
   if (settingsStatus) settingsStatus.textContent = "Saving settings...";
   const ok = await postAndReport("/api/channel-bank/settings", { [key]: value });
+  if (controlId) pendingSettingDirty.delete(controlId);
+  if (ok) await refresh();
   if (ok && settingsStatus) settingsStatus.textContent = "Settings saved";
 }
 async function saveSourceControls(body) {
@@ -2411,23 +2415,37 @@ async function startMonitorAudio() {
   const runId = ++monitorRunId;
   monitorRunning = true;
   setMonitorUi(true, "Monitor connecting...");
+  const AudioCtor = window.AudioContext || window.webkitAudioContext;
+  let carry = new Uint8Array(0);
+  let audioReady = false;
+  if (AudioCtor) {
+    try {
+      if (!monitorCtx) {
+        try { monitorCtx = new AudioCtor({ sampleRate: monitorSampleRate }); }
+        catch (_) { monitorCtx = new AudioCtor(); }
+      }
+      await monitorCtx.resume();
+      audioReady = monitorCtx.state === "running";
+    } catch (e) {
+      console.warn(e);
+    }
+  }
   if (shouldUseMediaElementAudio()) {
     try {
       await startMediaElementMonitor(runId);
+      return;
     } catch (e) {
-      monitorRunning = false;
-      setMonitorUi(false, "Monitor blocked by browser");
+      console.warn(e);
+      if (!audioReady) {
+        monitorRunning = false;
+        setMonitorUi(false, "Tap Monitor Audio again");
+        return;
+      }
+      setMonitorUi(true, "Monitor using PCM fallback...");
     }
-    return;
   }
-  const AudioCtor = window.AudioContext || window.webkitAudioContext;
-  let carry = new Uint8Array(0);
   try {
-    if (!monitorCtx) {
-      try { monitorCtx = new AudioCtor({ sampleRate: monitorSampleRate }); }
-      catch (_) { monitorCtx = new AudioCtor(); }
-    }
-    await monitorCtx.resume();
+    if (!audioReady) throw new Error("audio context not available");
     if (!monitorRunning || runId !== monitorRunId) return;
     monitorAbort = new AbortController();
     startMonitorOutput();
@@ -2598,10 +2616,11 @@ function saveSetting(id, key, read) {
   const el = document.getElementById(id);
   const queueSave = () => {
     const value = coerceSettingValue(el.value, read);
-    if (value !== undefined) saveSettingValue(key, value);
+    if (value !== undefined) saveSettingValue(key, value, id);
   };
   if (el.tagName === "INPUT") {
     el.oninput = () => {
+      pendingSettingDirty.add(id);
       if (el.type === "range") updateSliderOutput(id);
       clearTimeout(pendingSettingTimers.get(id));
       pendingSettingTimers.set(id, setTimeout(queueSave, 350));
