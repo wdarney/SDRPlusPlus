@@ -1855,6 +1855,10 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 .inline-action { padding: 4px 8px; font-size: 12px; }
 .span-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 8px; }
 .span-waterfall { width: 100%; height: 180px; display: block; background: #090b0e; border: 1px solid #2b3440; border-radius: 7px; cursor: crosshair; }
+.span-status { margin-top: 8px; }
+.span-labels { position: relative; height: 76px; border-top: 1px solid #252d36; margin-bottom: 6px; overflow: hidden; }
+.span-label { position: absolute; top: 6px; transform: translateX(-50%); writing-mode: vertical-rl; text-orientation: upright; font-size: 10px; line-height: 1; white-space: nowrap; max-height: 68px; overflow: hidden; }
+.span-hint { min-height: 16px; }
 .snr-chart { width: 100%; height: 170px; display: block; background: #0b0d10; border: 1px solid #2b3440; border-radius: 7px; }
 @media (max-width: 720px) { .controls, .server-controls, .source-grid, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
 </style>
@@ -1946,7 +1950,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="muted" id="spanRange">-</div>
 </div>
 <canvas class="span-waterfall" id="spanWaterfall"></canvas>
-<div class="muted" id="spanStatus" style="margin-top:8px">Click lit activity to block or unblock it.</div>
+<div class="muted span-status" id="spanStatus"><div class="span-hint">Click lit activity to block or unblock it.</div></div>
 </section>
 <section>
 <h2>Frequency Heat Map</h2>
@@ -2190,7 +2194,7 @@ function renderSourceControls(s) {
   }
 
   grid.innerHTML = parts.join("");
-  if (status) status.textContent = running ? "Stop SDR to change device, sample rate, ADC, or mode. Gain and toggles can still be adjusted." : "RX888 source settings ready";
+  if (status) status.textContent = running ? "SDR is playing: gain and toggles are live. Stop SDR only for device, sample rate, ADC, or mode." : "RX888 source settings ready";
 
   const device = document.getElementById("srcDevice");
   if (device) device.onchange = e => saveSourceControls({ deviceId: Number(e.target.value) });
@@ -2395,23 +2399,6 @@ function spanInfo(s) {
 function spanX(freqHz, info, width) {
   return Math.round(((freqHz - info.lo) / info.span) * width);
 }
-function verticalWaterfallLabel(ctx, text, x, y, maxY, color) {
-  const label = String(text || "").trim();
-  if (!label) return;
-  ctx.save();
-  ctx.fillStyle = color;
-  ctx.font = "9px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  const chars = label.slice(0, 18).split("");
-  let cy = Math.max(4, y);
-  for (const ch of chars) {
-    if (cy + 9 > maxY) break;
-    ctx.fillText(ch, x, cy);
-    cy += ch === " " ? 5 : 8;
-  }
-  ctx.restore();
-}
 function collectSpanPoints(s, info) {
   const points = [];
   const add = (freqHz, data = {}) => {
@@ -2439,6 +2426,15 @@ function collectSpanPoints(s, info) {
     strength: ch.signalPresent ? 1 : 0.65
   }));
   return points;
+}
+function renderSpanStatus(status, info, labels, hint) {
+  if (!status) return;
+  const labelItems = Array.from(labels.values()).slice(-24).map(p => {
+    const pct = Math.max(0, Math.min(100, ((p.freqHz - info.lo) / info.span) * 100));
+    const color = p.blocked ? "#ff9b9b" : p.live ? "#d8ffe0" : "#ffd29a";
+    return `<span class="span-label" style="left:${pct.toFixed(3)}%;color:${color}">${esc(p.label).slice(0, 24)}</span>`;
+  }).join("");
+  status.innerHTML = `${labelItems ? `<div class="span-labels">${labelItems}</div>` : ""}<div class="span-hint">${esc(hint)}</div>`;
 }
 function drawSpanWaterfall(s) {
   const canvas = document.getElementById("spanWaterfall");
@@ -2485,8 +2481,7 @@ function drawSpanWaterfall(s) {
     ctx.fillStyle = h.blocked ? `rgba(210,70,70,${alpha})` : `rgba(70,130,210,${alpha})`;
     ctx.fillRect(x - 1, 0, 2, height);
   });
-  const labelBandH = 54;
-  const traceHeight = Math.max(70, height - labelBandH);
+  const traceHeight = height;
   const rowH = traceHeight / spanWaterfallMaxFrames;
   const newestLabelByFreq = new Map();
   spanWaterfallFrames.forEach((frame, i) => {
@@ -2497,12 +2492,8 @@ function drawSpanWaterfall(s) {
       ctx.fillStyle = p.blocked ? `rgba(255,74,74,${alpha})` : p.live ? `rgba(80,210,115,${alpha})` : `rgba(255,177,92,${alpha})`;
       ctx.fillRect(x - 3, y, 6, Math.max(2, rowH + 1));
       const label = p.name || fmtMHz(p.freqHz);
-      if (label) newestLabelByFreq.set(Math.round(p.freqHz), { label, x, y, blocked: p.blocked, live: p.live, recent: p.recent, alpha });
+      if (label) newestLabelByFreq.set(Math.round(p.freqHz), { label, freqHz: p.freqHz, blocked: p.blocked, live: p.live, recent: p.recent, alpha });
     });
-  });
-  Array.from(newestLabelByFreq.values()).slice(-24).forEach(p => {
-    const color = p.blocked ? "#ff9b9b" : p.live ? "#d8ffe0" : "#ffd29a";
-    verticalWaterfallLabel(ctx, p.label, p.x, traceHeight + 5, height - 2, color);
   });
   points.filter(p => p.live).slice(0, 20).forEach(p => {
     const x = spanX(p.freqHz, info, width);
@@ -2539,9 +2530,10 @@ function drawSpanWaterfall(s) {
   }
   if (status) {
     const pbActive = pb.active && Number.isFinite(Number(pb.freqHz));
-    status.textContent = pbActive
+    const hint = pbActive
       ? `Playback marker follows current audio: ${pb.name || fmtMHz(pb.freqHz)}`
       : (points.some(p => p.live || p.recent) ? "Click lit activity to block or unblock it." : "Waiting for activity.");
+    renderSpanStatus(status, info, newestLabelByFreq, hint);
   }
 }
 function nearestSpanPoint(clientX) {
