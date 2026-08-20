@@ -2399,15 +2399,19 @@ async function startMediaElementMonitor(runId) {
     monitorAudioEl = new Audio();
     monitorAudioEl.preload = "none";
     monitorAudioEl.controls = false;
-    monitorAudioEl.style.display = "none";
+    monitorAudioEl.playsInline = true;
+    monitorAudioEl.autoplay = false;
+    monitorAudioEl.style.cssText = "position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:-1;";
     document.body.appendChild(monitorAudioEl);
   }
-  monitorAudioEl.src = `/api/audio/live.wav?run=${runId}`;
+  monitorAudioEl.pause();
+  monitorAudioEl.src = `/api/audio/live.wav?run=${runId}&t=${Date.now()}`;
   monitorAudioEl.loop = false;
   monitorAudioEl.onplaying = () => setMonitorUi(true, "Monitor live");
   monitorAudioEl.onerror = () => {
     if (monitorRunning && runId === monitorRunId) setMonitorUi(true, "Monitor reconnecting...");
   };
+  monitorAudioEl.load();
   await monitorAudioEl.play();
 }
 async function startMonitorAudio() {
@@ -2436,6 +2440,12 @@ async function startMonitorAudio() {
       return;
     } catch (e) {
       console.warn(e);
+      if (monitorCtx) {
+        try {
+          await monitorCtx.resume();
+          audioReady = monitorCtx.state === "running";
+        } catch (_) {}
+      }
       if (!audioReady) {
         monitorRunning = false;
         setMonitorUi(false, "Tap Monitor Audio again");
