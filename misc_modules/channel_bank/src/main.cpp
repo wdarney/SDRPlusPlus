@@ -3135,6 +3135,26 @@ setInterval(refresh, 500);
         liveAudioCv.notify_all();
     }
 
+    bool fillLiveAudioFrame(std::vector<int16_t>& frame, uint64_t streamId) {
+        std::fill(frame.begin(), frame.end(), 0);
+        size_t copied = 0;
+        std::lock_guard<std::mutex> lk(liveAudioMtx);
+        if (!webServerRunning.load() || liveAudioStreamGeneration.load() != streamId) return false;
+        while (copied < frame.size() && !liveAudioChunks.empty()) {
+            auto& front = liveAudioChunks.front();
+            size_t take = std::min(frame.size() - copied, front.size());
+            memcpy(frame.data() + copied, front.data(), take * sizeof(int16_t));
+            copied += take;
+            liveAudioQueuedSamples -= take;
+            if (take == front.size()) {
+                liveAudioChunks.pop_front();
+            } else {
+                front.erase(front.begin(), front.begin() + (ptrdiff_t)take);
+            }
+        }
+        return true;
+    }
+
     void handleLiveAudioStream(WebSocket fd) {
         uint64_t streamId = liveAudioStreamGeneration.fetch_add(1) + 1;
         liveAudioClients.store(1);
@@ -3159,37 +3179,18 @@ setInterval(refresh, 500);
         std::string header = hdr.str();
         bool ok = sendAll(fd, header.data(), header.size());
         auto nextAudioSend = std::chrono::steady_clock::now();
+        std::vector<int16_t> frame(960);
         while (ok && webServerRunning.load() && liveAudioStreamGeneration.load() == streamId) {
-            std::vector<int16_t> chunk;
-            {
-                std::unique_lock<std::mutex> lk(liveAudioMtx);
-                liveAudioCv.wait_for(lk, std::chrono::milliseconds(100), [&] {
-                    return !liveAudioChunks.empty() || !webServerRunning.load() ||
-                        liveAudioStreamGeneration.load() != streamId;
-                });
-                if (!webServerRunning.load() || liveAudioStreamGeneration.load() != streamId) break;
-                if (!liveAudioChunks.empty()) {
-                    chunk = std::move(liveAudioChunks.front());
-                    liveAudioQueuedSamples -= chunk.size();
-                    liveAudioChunks.pop_front();
-                }
-            }
-            size_t sendSamples = chunk.empty() ? 4800 : chunk.size();
             auto now = std::chrono::steady_clock::now();
-            if (nextAudioSend < now - std::chrono::milliseconds(250)) {
+            if (nextAudioSend < now - std::chrono::milliseconds(80)) {
                 nextAudioSend = now;
             }
             if (nextAudioSend > now) {
                 std::this_thread::sleep_until(nextAudioSend);
             }
-            if (chunk.empty()) {
-                static const int16_t silence[4800] = {};
-                ok = sendAll(fd, silence, sizeof(silence));
-            } else {
-                ok = sendAll(fd, chunk.data(), chunk.size() * sizeof(int16_t));
-            }
-            nextAudioSend += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>((double)sendSamples / 48000.0));
+            if (!fillLiveAudioFrame(frame, streamId)) break;
+            ok = sendAll(fd, frame.data(), frame.size() * sizeof(int16_t));
+            nextAudioSend += std::chrono::milliseconds(20);
         }
 
         if (liveAudioStreamGeneration.load() == streamId) {
@@ -3257,38 +3258,18 @@ setInterval(refresh, 500);
         bool ok = sendAll(fd, header.data(), header.size()) &&
                   sendAll(fd, wav.data(), wav.size());
         auto nextAudioSend = std::chrono::steady_clock::now();
+        std::vector<int16_t> frame(960);
         while (ok && webServerRunning.load() && liveAudioStreamGeneration.load() == streamId) {
-            std::vector<int16_t> chunk;
-            {
-                std::unique_lock<std::mutex> lk(liveAudioMtx);
-                liveAudioCv.wait_for(lk, std::chrono::milliseconds(100), [&] {
-                    return !liveAudioChunks.empty() || !webServerRunning.load() ||
-                        liveAudioStreamGeneration.load() != streamId;
-                });
-                if (!webServerRunning.load() || liveAudioStreamGeneration.load() != streamId) break;
-                if (!liveAudioChunks.empty()) {
-                    chunk = std::move(liveAudioChunks.front());
-                    liveAudioQueuedSamples -= chunk.size();
-                    liveAudioChunks.pop_front();
-                }
-            }
-            size_t sendSamples = chunk.empty() ? 4800 : chunk.size();
             auto now = std::chrono::steady_clock::now();
-            if (nextAudioSend < now - std::chrono::milliseconds(250)) {
+            if (nextAudioSend < now - std::chrono::milliseconds(80)) {
                 nextAudioSend = now;
             }
             if (nextAudioSend > now) {
                 std::this_thread::sleep_until(nextAudioSend);
             }
-            if (chunk.empty()) {
-                static const int16_t silence[4800] = {};
-                ok = sendAll(fd, silence, sizeof(silence));
-            }
-            else {
-                ok = sendAll(fd, chunk.data(), chunk.size() * sizeof(int16_t));
-            }
-            nextAudioSend += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>((double)sendSamples / 48000.0));
+            if (!fillLiveAudioFrame(frame, streamId)) break;
+            ok = sendAll(fd, frame.data(), frame.size() * sizeof(int16_t));
+            nextAudioSend += std::chrono::milliseconds(20);
         }
 
         if (liveAudioStreamGeneration.load() == streamId) {
