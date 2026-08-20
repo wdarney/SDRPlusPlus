@@ -2997,12 +2997,9 @@ setInterval(refresh, 500);
     }
 
     void handleLiveAudioStream(WebSocket fd) {
-        int expected = 0;
-        if (!liveAudioClients.compare_exchange_strong(expected, 1)) {
-            sendHttpResponse(fd, "409 Conflict", "application/json",
-                json({{"ok", false}, {"error", "live monitor already connected"}}).dump());
-            return;
-        }
+        uint64_t streamId = liveAudioStreamGeneration.fetch_add(1) + 1;
+        liveAudioClients.store(1);
+        liveAudioCv.notify_all();
 
         {
             std::lock_guard<std::mutex> lk(liveAudioMtx);
@@ -3023,14 +3020,15 @@ setInterval(refresh, 500);
         std::string header = hdr.str();
         bool ok = sendAll(fd, header.data(), header.size());
         auto nextAudioSend = std::chrono::steady_clock::now();
-        while (ok && webServerRunning.load()) {
+        while (ok && webServerRunning.load() && liveAudioStreamGeneration.load() == streamId) {
             std::vector<int16_t> chunk;
             {
                 std::unique_lock<std::mutex> lk(liveAudioMtx);
                 liveAudioCv.wait_for(lk, std::chrono::milliseconds(100), [&] {
-                    return !liveAudioChunks.empty() || !webServerRunning.load();
+                    return !liveAudioChunks.empty() || !webServerRunning.load() ||
+                        liveAudioStreamGeneration.load() != streamId;
                 });
-                if (!webServerRunning.load()) break;
+                if (!webServerRunning.load() || liveAudioStreamGeneration.load() != streamId) break;
                 if (!liveAudioChunks.empty()) {
                     chunk = std::move(liveAudioChunks.front());
                     liveAudioQueuedSamples -= chunk.size();
@@ -3055,12 +3053,14 @@ setInterval(refresh, 500);
                 std::chrono::duration<double>((double)sendSamples / 48000.0));
         }
 
-        liveAudioClients.store(0);
-        std::lock_guard<std::mutex> lk(liveAudioMtx);
-        liveAudioChunks.clear();
-        liveAudioQueuedSamples = 0;
-        liveAudioSelectedFreqKey.store(0);
-        liveAudioSelectedMs.store(0);
+        if (liveAudioStreamGeneration.load() == streamId) {
+            liveAudioClients.store(0);
+            std::lock_guard<std::mutex> lk(liveAudioMtx);
+            liveAudioChunks.clear();
+            liveAudioQueuedSamples = 0;
+            liveAudioSelectedFreqKey.store(0);
+            liveAudioSelectedMs.store(0);
+        }
     }
 
     static void appendLe16(std::string& out, uint16_t v) {
@@ -3094,12 +3094,9 @@ setInterval(refresh, 500);
     }
 
     void handleLiveAudioWavStream(WebSocket fd) {
-        int expected = 0;
-        if (!liveAudioClients.compare_exchange_strong(expected, 1)) {
-            sendHttpResponse(fd, "409 Conflict", "application/json",
-                json({{"ok", false}, {"error", "live monitor already connected"}}).dump());
-            return;
-        }
+        uint64_t streamId = liveAudioStreamGeneration.fetch_add(1) + 1;
+        liveAudioClients.store(1);
+        liveAudioCv.notify_all();
 
         {
             std::lock_guard<std::mutex> lk(liveAudioMtx);
@@ -3121,14 +3118,15 @@ setInterval(refresh, 500);
         bool ok = sendAll(fd, header.data(), header.size()) &&
                   sendAll(fd, wav.data(), wav.size());
         auto nextAudioSend = std::chrono::steady_clock::now();
-        while (ok && webServerRunning.load()) {
+        while (ok && webServerRunning.load() && liveAudioStreamGeneration.load() == streamId) {
             std::vector<int16_t> chunk;
             {
                 std::unique_lock<std::mutex> lk(liveAudioMtx);
                 liveAudioCv.wait_for(lk, std::chrono::milliseconds(100), [&] {
-                    return !liveAudioChunks.empty() || !webServerRunning.load();
+                    return !liveAudioChunks.empty() || !webServerRunning.load() ||
+                        liveAudioStreamGeneration.load() != streamId;
                 });
-                if (!webServerRunning.load()) break;
+                if (!webServerRunning.load() || liveAudioStreamGeneration.load() != streamId) break;
                 if (!liveAudioChunks.empty()) {
                     chunk = std::move(liveAudioChunks.front());
                     liveAudioQueuedSamples -= chunk.size();
@@ -3154,12 +3152,14 @@ setInterval(refresh, 500);
                 std::chrono::duration<double>((double)sendSamples / 48000.0));
         }
 
-        liveAudioClients.store(0);
-        std::lock_guard<std::mutex> lk(liveAudioMtx);
-        liveAudioChunks.clear();
-        liveAudioQueuedSamples = 0;
-        liveAudioSelectedFreqKey.store(0);
-        liveAudioSelectedMs.store(0);
+        if (liveAudioStreamGeneration.load() == streamId) {
+            liveAudioClients.store(0);
+            std::lock_guard<std::mutex> lk(liveAudioMtx);
+            liveAudioChunks.clear();
+            liveAudioQueuedSamples = 0;
+            liveAudioSelectedFreqKey.store(0);
+            liveAudioSelectedMs.store(0);
+        }
     }
 
     json requestJsonBody(const std::string& reqText) {
@@ -8293,6 +8293,7 @@ setInterval(refresh, 500);
     std::condition_variable liveAudioCv;
     std::deque<std::vector<int16_t>> liveAudioChunks;
     size_t liveAudioQueuedSamples = 0;
+    std::atomic<uint64_t> liveAudioStreamGeneration { 0 };
     std::atomic<int64_t> liveAudioSelectedFreqKey { 0 };
     std::atomic<uint64_t> liveAudioSelectedMs { 0 };
     std::atomic<uint64_t> liveAudioDroppedChunks { 0 };
