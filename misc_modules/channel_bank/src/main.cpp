@@ -2009,6 +2009,8 @@ const pendingSettingTimers = new Map();
 const pendingSettingDirty = new Set();
 const pendingSettingSeq = new Map();
 const pendingSourceTimers = new Map();
+const pendingSourceDirty = new Set();
+const pendingSourceSeq = new Map();
 let currentRecordingEnabled = true;
 const spanWaterfallFrames = [];
 const spanWaterfallMaxFrames = 72;
@@ -2083,11 +2085,15 @@ async function saveSettingValue(key, value, controlId, seq) {
   if (isCurrentSave) await refresh();
   if (ok && isCurrentSave && settingsStatus) settingsStatus.textContent = "Settings saved";
 }
-async function saveSourceControls(body) {
+async function saveSourceControls(body, controlId, seq) {
   const status = document.getElementById("sourceSettingsStatus");
   if (status) status.textContent = "Saving source settings...";
-  const ok = await postAndReport("/api/source-controls", body);
-  if (status) status.textContent = ok ? "Source settings saved" : "Source setting failed";
+  const ok = await postAndReport("/api/source-controls", body, false);
+  const currentSeq = controlId ? (pendingSourceSeq.get(controlId) || 0) : 0;
+  const isCurrentSave = !controlId || seq === undefined || seq === currentSeq;
+  if (controlId && isCurrentSave) pendingSourceDirty.delete(controlId);
+  if (isCurrentSave) await refresh();
+  if (status && isCurrentSave) status.textContent = ok ? "Source settings saved" : "Source setting failed";
 }
 async function saveSourceOffset() {
   const mode = document.getElementById("sourceOffsetMode");
@@ -2154,7 +2160,7 @@ function renderSourceControls(s) {
     return;
   }
   panel.style.display = "block";
-  if (panel.contains(document.activeElement)) return;
+  if (panel.contains(document.activeElement) || pendingSourceDirty.size > 0) return;
 
   const running = !!(s.radioPlaying || c.running);
   const devices = c.devices || [];
@@ -2205,19 +2211,27 @@ function renderSourceControls(s) {
   const adc = document.getElementById("srcAdc");
   if (adc) {
     adc.oninput = e => {
+      const controlId = "adc";
+      const seq = (pendingSourceSeq.get(controlId) || 0) + 1;
+      pendingSourceSeq.set(controlId, seq);
+      pendingSourceDirty.add(controlId);
       document.getElementById("srcAdcValue").textContent = `${Number(e.target.value).toFixed(0)} MHz`;
-      clearTimeout(pendingSourceTimers.get("adc"));
-      pendingSourceTimers.set("adc", setTimeout(() => saveSourceControls({ adcClockMHz: Number(e.target.value) }), 400));
+      clearTimeout(pendingSourceTimers.get(controlId));
+      pendingSourceTimers.set(controlId, setTimeout(() => saveSourceControls({ adcClockMHz: Number(e.target.value) }, controlId, seq), 400));
     };
   }
   document.querySelectorAll(".src-gain").forEach(el => {
     el.oninput = e => {
       const name = e.target.dataset.gain;
+      const controlId = `gain:${name}`;
+      const seq = (pendingSourceSeq.get(controlId) || 0) + 1;
+      pendingSourceSeq.set(controlId, seq);
+      pendingSourceDirty.add(controlId);
       const value = Number(e.target.value);
       const out = document.getElementById(`srcGain_${name}Value`);
       if (out) out.textContent = `${value.toFixed(1)} dB`;
-      clearTimeout(pendingSourceTimers.get(`gain:${name}`));
-      pendingSourceTimers.set(`gain:${name}`, setTimeout(() => saveSourceControls({ gains: { [name]: value } }), 180));
+      clearTimeout(pendingSourceTimers.get(controlId));
+      pendingSourceTimers.set(controlId, setTimeout(() => saveSourceControls({ gains: { [name]: value } }, controlId, seq), 180));
     };
   });
   const biasHF = document.getElementById("srcBiasHF");
