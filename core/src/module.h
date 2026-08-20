@@ -4,20 +4,40 @@
 #include <json.hpp>
 #include <utils/event.h>
 
-// iOS fork: modules are statically linked into the main binary, no dlopen.
-// Each module's TUs get SDRPP_MODULE_TOKEN=<name>_ injected by
-// sdrpp_module.cmake, which renames the four fixed C entry-points and the
-// _INFO_ symbol so multiple modules don't collide.
-
-#define SDRPP_EXPORT extern
-
-#define MOD_EXPORT extern "C"
-#define SDRPP_MOD_EXTENTSION ".dylib"
-
-#ifndef SDRPP_MODULE_TOKEN
-// Core itself includes module.h. Tokens only matter inside module TUs.
-#define SDRPP_MODULE_TOKEN _sdrpp_unscoped_
+#ifdef _WIN32
+#ifdef SDRPP_IS_CORE
+#define SDRPP_EXPORT extern "C" __declspec(dllexport)
+#else
+#define SDRPP_EXPORT extern "C" __declspec(dllimport)
 #endif
+#else
+#define SDRPP_EXPORT extern
+#endif
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#define MOD_EXPORT           extern "C" __declspec(dllexport)
+#define SDRPP_MOD_EXTENTSION ".dll"
+#else
+#include <dlfcn.h>
+#define MOD_EXPORT extern "C"
+#ifdef __APPLE__
+#define SDRPP_MOD_EXTENTSION ".dylib"
+#else
+#define SDRPP_MOD_EXTENTSION ".so"
+#endif
+#endif
+
+// Statically linked module builds can define SDRPP_MODULE_TOKEN=<name>_ to avoid
+// entry-point collisions. Desktop dynamic modules leave the exported names
+// unscoped for dlsym/GetProcAddress compatibility.
+#ifdef SDRPP_MODULE_TOKEN
 #define _SDRPP_TOK_CAT2(a, b) a##b
 #define _SDRPP_TOK_CAT(a, b)  _SDRPP_TOK_CAT2(a, b)
 #define _INIT_                _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _INIT_)
@@ -25,6 +45,7 @@
 #define _DELETE_INSTANCE_     _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _DELETE_INSTANCE_)
 #define _END_                 _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _END_)
 #define _INFO_                _SDRPP_TOK_CAT(SDRPP_MODULE_TOKEN, _INFO_)
+#endif
 
 class ModuleManager {
 public:
@@ -48,9 +69,11 @@ public:
     };
 
     struct Module_t {
-        // No dlopen handle — kept for ABI parity with old code paths and as a
-        // stable identity (the _INFO_ pointer) for the operator== check.
+#ifdef _WIN32
+        HMODULE handle;
+#else
         void* handle;
+#endif
         ModuleManager::ModuleInfo_t* info;
         void (*init)();
         ModuleManager::Instance* (*createInstance)(std::string name);
