@@ -1692,10 +1692,43 @@ private:
 
         int playbackQueued = 0;
         int64_t playingKey = currentlyPlayingFreqKey.load();
+        double playingFreqHz = currentlyPlayingFreqHz.load();
+        int playbackMs = -1;
+#if defined(__APPLE__) || defined(_WIN32)
+        playbackMs = playbackPosMs.load();
+#endif
+        bool playbackActive = playingKey != 0;
+        json playback = {
+            {"active", playbackActive},
+            {"freqKey", playingKey},
+            {"positionMs", playbackMs},
+            {"queued", 0}
+        };
         {
             std::lock_guard<std::mutex> lk(playbackMtx);
             playbackQueued = (int)playbackQueue.size();
+            playback["queued"] = playbackQueued;
         }
+#if defined(__APPLE__) || defined(_WIN32)
+        if (playback.value("active", false)) {
+            std::string path;
+            {
+                std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
+                path = currentPlaybackPath;
+            }
+            double freqHz = playingFreqHz > 0.0 ? playingFreqHz : (double)playingKey * 1000.0;
+            playback["freqHz"] = freqHz;
+            playback["name"] = displayName(freqHz);
+            playback["file"] = path;
+            if (!path.empty()) playback["fileName"] = std::filesystem::path(path).filename().string();
+        }
+#else
+        if (playback.value("active", false)) {
+            double freqHz = playingFreqHz > 0.0 ? playingFreqHz : (double)playingKey * 1000.0;
+            playback["freqHz"] = freqHz;
+            playback["name"] = displayName(freqHz);
+        }
+#endif
 
         json history = json::array();
         {
@@ -1744,6 +1777,7 @@ private:
         j["manualDetected"] = manualDetectedCount;
         j["snrOverview"] = snrOverview;
         j["playbackQueued"] = playbackQueued;
+        j["playback"] = playback;
         j["currentlyPlayingFreqKey"] = playingKey;
         j["history"] = history;
         j["diagnostics"] = diagnosticsJson();
@@ -2454,7 +2488,36 @@ function drawSpanWaterfall(s) {
     const label = (p.name || fmtMHz(p.freqHz)).slice(0, 18);
     ctx.fillText(label, Math.min(width - 96, Math.max(4, x + 5)), 14);
   });
-  if (status && points.some(p => p.live || p.recent)) status.textContent = "Click lit activity to block or unblock it.";
+  const pb = s.playback || {};
+  if (pb.active && Number.isFinite(Number(pb.freqHz)) && pb.freqHz >= info.lo && pb.freqHz <= info.hi) {
+    const x = spanX(Number(pb.freqHz), info, width);
+    ctx.save();
+    ctx.strokeStyle = "#3bd7ff";
+    ctx.fillStyle = "#3bd7ff";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x - 7, 10);
+    ctx.lineTo(x + 7, 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    const pos = Number(pb.positionMs || 0);
+    const label = `PLAY ${pb.name || fmtMHz(pb.freqHz)} ${Math.floor(pos / 1000)}s`;
+    const labelX = Math.min(width - ctx.measureText(label).width - 6, Math.max(4, x + 8));
+    ctx.fillText(label, labelX, 30);
+    ctx.restore();
+  }
+  if (status) {
+    const pbActive = pb.active && Number.isFinite(Number(pb.freqHz));
+    status.textContent = pbActive
+      ? `Playback marker follows current audio: ${pb.name || fmtMHz(pb.freqHz)}`
+      : (points.some(p => p.live || p.recent) ? "Click lit activity to block or unblock it." : "Waiting for activity.");
+  }
 }
 function nearestSpanPoint(clientX) {
   const canvas = document.getElementById("spanWaterfall");
@@ -5873,9 +5936,11 @@ setInterval(refresh, 500);
                 playbackPosMs.store(0);
 #endif
                 normalizeRecordingIfEnabled(path);
+                currentlyPlayingFreqHz.store(playFreq);
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
                 playbackWavFile(path, playFreq);
                 currentlyPlayingFreqKey.store(0);
+                currentlyPlayingFreqHz.store(0.0);
 #if defined(__APPLE__) || defined(_WIN32)
                 playbackPosMs.store(-1);
                 // Leave playingSegments intact for a moment so the user can read
@@ -9073,6 +9138,7 @@ setInterval(refresh, 500);
     std::map<std::string, std::vector<transcription_whisper::Segment>> pendingPlaybackSegments;
 #endif
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
+    std::atomic<double>             currentlyPlayingFreqHz { 0.0 };
 #if defined(__APPLE__) || defined(_WIN32)
     std::string                     currentPlaybackPath;
     std::mutex                      currentPlaybackPathMtx;
