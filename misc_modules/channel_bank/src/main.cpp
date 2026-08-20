@@ -1957,14 +1957,16 @@ let monitorRetryTimer = null;
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
 const monitorSampleRate = 48000;
-const monitorBufferCapacity = monitorSampleRate * 2;
-const monitorTargetSamples = Math.round(monitorSampleRate * 0.16);
-const monitorMaxSamples = Math.round(monitorSampleRate * 0.42);
+const monitorBufferCapacity = monitorSampleRate * 6;
+const monitorPrebufferSamples = Math.round(monitorSampleRate * 0.60);
+const monitorTargetSamples = Math.round(monitorSampleRate * 0.85);
+const monitorMaxSamples = Math.round(monitorSampleRate * 2.20);
 const monitorRing = new Float32Array(monitorBufferCapacity);
 let monitorReadPos = 0;
 let monitorWritePos = 0;
 let monitorBufferedSamples = 0;
 let monitorLastStatusMs = 0;
+let monitorOutputStarted = false;
 const pendingSettingTimers = new Map();
 const pendingSettingDirty = new Set();
 const pendingSourceTimers = new Map();
@@ -2503,6 +2505,7 @@ function resetMonitorBuffer() {
   monitorReadPos = 0;
   monitorWritePos = 0;
   monitorBufferedSamples = 0;
+  monitorOutputStarted = false;
 }
 function dropMonitorSamples(count) {
   const drop = Math.min(count, monitorBufferedSamples);
@@ -2519,7 +2522,8 @@ function updateMonitorBufferStatus() {
   const now = performance.now();
   if (now - monitorLastStatusMs < 400) return;
   monitorLastStatusMs = now;
-  setMonitorUi(true, `Monitor live  ${Math.round(monitorBufferedSamples * 1000 / monitorSampleRate)} ms`);
+  const ms = Math.round(monitorBufferedSamples * 1000 / monitorSampleRate);
+  setMonitorUi(true, monitorOutputStarted ? `Monitor live  ${ms} ms` : `Monitor buffering  ${ms} ms`);
 }
 function enqueuePcm16(bytes) {
   if (!monitorCtx || bytes.length < 2) return;
@@ -2528,10 +2532,12 @@ function enqueuePcm16(bytes) {
   if (monitorBufferedSamples > monitorMaxSamples) dropMonitorSamples(monitorBufferedSamples - monitorTargetSamples);
   for (let i = 0; i < samples; i++) writeMonitorSample(view.getInt16(i * 2, true) / 32768);
   if (monitorBufferedSamples > monitorMaxSamples) dropMonitorSamples(monitorBufferedSamples - monitorTargetSamples);
+  if (!monitorOutputStarted && monitorBufferedSamples >= monitorPrebufferSamples) startMonitorOutput();
   updateMonitorBufferStatus();
 }
 function startMonitorOutput() {
-  resetMonitorBuffer();
+  if (monitorNode || !monitorCtx) return;
+  monitorOutputStarted = true;
   monitorNode = monitorCtx.createScriptProcessor(1024, 0, 1);
   monitorNode.onaudioprocess = e => {
     const out = e.outputBuffer.getChannelData(0);
@@ -2614,10 +2620,10 @@ async function startMonitorAudio() {
     if (!audioReady) throw new Error("audio context not available");
     if (!monitorRunning || runId !== monitorRunId) return;
     monitorAbort = new AbortController();
-    startMonitorOutput();
+    resetMonitorBuffer();
     const r = await fetch("/api/audio/live.pcm", { cache: "no-store", signal: monitorAbort.signal });
     if (!r.ok || !r.body) throw new Error("monitor stream unavailable");
-    setMonitorUi(true, "Monitor live");
+    setMonitorUi(true, "Monitor buffering...");
     const reader = r.body.getReader();
     let gotAudioBytes = false;
     while (true) {
@@ -8487,7 +8493,7 @@ setInterval(refresh, 500);
     std::vector<WebClientThread> webClientThreads;
     std::mutex webUiActionMtx;
     std::deque<std::shared_ptr<WebUiAction>> webUiActions;
-    static constexpr size_t LIVE_AUDIO_MAX_SAMPLES = 48000;
+    static constexpr size_t LIVE_AUDIO_MAX_SAMPLES = 48000 * 4;
     std::atomic<int> liveAudioClients { 0 };
     std::mutex liveAudioMtx;
     std::condition_variable liveAudioCv;
