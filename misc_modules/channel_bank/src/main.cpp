@@ -119,6 +119,12 @@ struct SDRPPServerSourceControlV1 {
     bool ok = false;
 };
 
+struct RX888SourceControlV1 {
+    char request[4096];
+    char response[32768];
+    bool ok = false;
+};
+
 struct ChannelSlot {
     int    gridIdx = 0;
     double freqHz  = 0.0;   // centroid-aligned (auto mode) — for VFO placement + display
@@ -1368,6 +1374,37 @@ private:
         return j;
     }
 
+    enum RX888SourceControlCode {
+        RX888_SOURCE_CONTROL_GET = 1,
+        RX888_SOURCE_CONTROL_SET = 2
+    };
+
+    bool callRX888SourceControl(int code, RX888SourceControlV1* inout) {
+        if (!core::modComManager.interfaceExists("rx888_source.control.v1")) return false;
+        return core::modComManager.callInterface("rx888_source.control.v1", code, inout, inout);
+    }
+
+    json rx888SourceStateJson() {
+        json j;
+        j["available"] = false;
+        RX888SourceControlV1 state{};
+        if (!callRX888SourceControl(RX888_SOURCE_CONTROL_GET, &state) || !state.response[0]) return j;
+        try {
+            j = json::parse(state.response);
+            j["available"] = state.ok && j.value("ok", false);
+        }
+        catch (...) {
+            j = json({{"available", false}});
+        }
+        return j;
+    }
+
+    json selectedSourceControlsJson() {
+        std::string selected = selectedSourceName();
+        if (selected == "RX888") return rx888SourceStateJson();
+        return json({{"available", false}, {"source", selected}});
+    }
+
     json webStateSnapshot() {
         json channels = json::array();
         json recent = json::array();
@@ -1506,6 +1543,7 @@ private:
         j["selectedSource"] = selectedSourceName();
         j["sources"] = sourceNamesJson();
         j["sdrppServer"] = serverSourceStateJson();
+        j["sourceControls"] = selectedSourceControlsJson();
         j["settings"] = channelBankSettingsJson();
         j["snrThresholdDb"] = snrThreshold;
         j["maxChannels"] = maxChannels;
@@ -1559,6 +1597,9 @@ select, input { border: 1px solid #4a4a4a; background: #101010; color: #fff; pad
 .tile, section { background: #191919; border: 1px solid #303030; border-radius: 8px; padding: 12px; }
 .controls { display: grid; grid-template-columns: 1.2fr 1fr auto auto; gap: 8px; align-items: end; }
 .server-controls { display: none; grid-template-columns: 1.3fr .7fr auto auto; gap: 8px; align-items: end; margin-top: 10px; }
+.source-settings { display: none; margin-top: 10px; }
+.source-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }
+.source-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }
 .status-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; margin-top: 10px; }
 .control { display: flex; flex-direction: column; gap: 5px; }
@@ -1590,7 +1631,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 .span-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 8px; }
 .span-waterfall { width: 100%; height: 180px; display: block; background: #090b0e; border: 1px solid #2b3440; border-radius: 7px; cursor: crosshair; }
 .snr-chart { width: 100%; height: 170px; display: block; background: #0b0d10; border: 1px solid #2b3440; border-radius: 7px; }
-@media (max-width: 720px) { .controls, .server-controls, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .controls, .server-controls, .source-grid, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -1617,6 +1658,11 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control"><span class="label">Port</span><input id="serverPort" inputmode="numeric" placeholder="8081"></label>
 <button class="secondary" id="serverApply">Apply</button>
 <button class="secondary" id="serverConnect">Connect</button>
+</div>
+<div class="source-settings" id="sourceSettings">
+<h2 style="margin-top:4px">Source Settings</h2>
+<div class="source-grid" id="sourceSettingsGrid"></div>
+<div class="source-actions"><button class="secondary" id="sourceRefresh" type="button">Refresh Devices</button><span class="muted" id="sourceSettingsStatus">Source settings ready</span></div>
 </div>
 </section>
 <section>
@@ -1704,6 +1750,7 @@ let monitorWritePos = 0;
 let monitorBufferedSamples = 0;
 let monitorLastStatusMs = 0;
 const pendingSettingTimers = new Map();
+const pendingSourceTimers = new Map();
 let currentRecordingEnabled = true;
 const spanWaterfallFrames = [];
 const spanWaterfallMaxFrames = 72;
@@ -1770,11 +1817,102 @@ async function saveSettingValue(key, value) {
   const ok = await postAndReport("/api/channel-bank/settings", { [key]: value });
   if (ok && settingsStatus) settingsStatus.textContent = "Settings saved";
 }
+async function saveSourceControls(body) {
+  const status = document.getElementById("sourceSettingsStatus");
+  if (status) status.textContent = "Saving source settings...";
+  const ok = await postAndReport("/api/source-controls", body);
+  if (status) status.textContent = ok ? "Source settings saved" : "Source setting failed";
+}
 async function blockFrequency(hz, blocked) {
   const status = document.getElementById("heatmapStatus");
   if (status) status.textContent = blocked ? "Blocking frequency..." : "Unblocking frequency...";
   const ok = await postAndReport("/api/frequency/block", { hz, blocked });
   if (status) status.textContent = ok ? (blocked ? "Frequency blocked" : "Frequency unblocked") : "Block action failed";
+}
+function renderSourceControls(s) {
+  const panel = document.getElementById("sourceSettings");
+  const grid = document.getElementById("sourceSettingsGrid");
+  const status = document.getElementById("sourceSettingsStatus");
+  const c = s.sourceControls || {};
+  if (!panel || !grid) return;
+  if (s.selectedSource !== "RX888" || !c.available) {
+    panel.style.display = "none";
+    grid.innerHTML = "";
+    return;
+  }
+  panel.style.display = "block";
+  if (panel.contains(document.activeElement)) return;
+
+  const running = !!(s.radioPlaying || c.running);
+  const devices = c.devices || [];
+  const rates = c.sampleRates || [];
+  const modes = c.modes || [];
+  const gains = (c.gains || []).filter(g => g && g.name);
+  const opt = (value, label, selected) => `<option value="${esc(value)}" ${selected ? "selected" : ""}>${esc(label)}</option>`;
+  const disabled = running ? "disabled" : "";
+  const parts = [];
+
+  parts.push(`<label class="control"><span class="label">Device</span><select id="srcDevice" ${disabled}>${
+    devices.map(d => opt(d.id, d.label, Number(d.id) === Number(c.deviceId))).join("")
+  }</select></label>`);
+  parts.push(`<label class="control"><span class="label">Sample Rate</span><select id="srcSampleRate" ${disabled}>${
+    rates.map(r => opt(r.id, r.label, !!r.selected)).join("")
+  }</select></label>`);
+  if (modes.length) {
+    parts.push(`<label class="control"><span class="label">Mode</span><select id="srcMode" ${disabled}>${
+      modes.map(m => opt(m, m, m === c.mode)).join("")
+    }</select></label>`);
+  }
+  if (c.supportsAdcFreq) {
+    const adc = Number(c.adcClockMHz || 0);
+    parts.push(`<label class="control slider-control"><span class="label">ADC Clock</span><span class="slider-value" id="srcAdcValue">${adc.toFixed(0)} MHz</span><input id="srcAdc" type="range" min="${Number(c.adcMinMHz || 16)}" max="${Number(c.adcMaxMHz || 140)}" step="1" value="${adc}" ${disabled}></label>`);
+  }
+  gains.forEach(g => {
+    const available = g.available !== false;
+    const value = Number(g.value || 0);
+    parts.push(`<label class="control slider-control"><span class="label">${esc(g.label || (g.name + " Gain"))}</span><span class="slider-value" id="srcGain_${esc(g.name)}Value">${value.toFixed(1)} dB</span><input class="src-gain" data-gain="${esc(g.name)}" id="srcGain_${esc(g.name)}" type="range" min="${Number(g.min || 0)}" max="${Number(g.max || 0)}" step="${Number(g.step || 0.1)}" value="${value}" ${available ? "" : "disabled"}></label>`);
+  });
+  if (c.supportsNewBiasTee || c.supportsBiasTee) {
+    parts.push(`<label class="control"><span class="label">HF Bias Tee</span><button class="${c.biasTeeHF ? "primary" : "secondary"}" id="srcBiasHF" type="button">${c.biasTeeHF ? "On" : "Off"}</button></label>`);
+    parts.push(`<label class="control"><span class="label">VHF Bias Tee</span><button class="${c.biasTeeVHF ? "primary" : "secondary"}" id="srcBiasVHF" type="button">${c.biasTeeVHF ? "On" : "Off"}</button></label>`);
+  }
+  if (c.supportsDithering) {
+    parts.push(`<label class="control"><span class="label">Dithering</span><button class="${c.dithering ? "primary" : "secondary"}" id="srcDithering" type="button">${c.dithering ? "On" : "Off"}</button></label>`);
+  }
+
+  grid.innerHTML = parts.join("");
+  if (status) status.textContent = running ? "Stop SDR to change device, sample rate, ADC, or mode. Gain and toggles can still be adjusted." : "RX888 source settings ready";
+
+  const device = document.getElementById("srcDevice");
+  if (device) device.onchange = e => saveSourceControls({ deviceId: Number(e.target.value) });
+  const sampleRate = document.getElementById("srcSampleRate");
+  if (sampleRate) sampleRate.onchange = e => saveSourceControls({ sampleRateId: Number(e.target.value) });
+  const mode = document.getElementById("srcMode");
+  if (mode) mode.onchange = e => saveSourceControls({ mode: e.target.value });
+  const adc = document.getElementById("srcAdc");
+  if (adc) {
+    adc.oninput = e => {
+      document.getElementById("srcAdcValue").textContent = `${Number(e.target.value).toFixed(0)} MHz`;
+      clearTimeout(pendingSourceTimers.get("adc"));
+      pendingSourceTimers.set("adc", setTimeout(() => saveSourceControls({ adcClockMHz: Number(e.target.value) }), 400));
+    };
+  }
+  document.querySelectorAll(".src-gain").forEach(el => {
+    el.oninput = e => {
+      const name = e.target.dataset.gain;
+      const value = Number(e.target.value);
+      const out = document.getElementById(`srcGain_${name}Value`);
+      if (out) out.textContent = `${value.toFixed(1)} dB`;
+      clearTimeout(pendingSourceTimers.get(`gain:${name}`));
+      pendingSourceTimers.set(`gain:${name}`, setTimeout(() => saveSourceControls({ gains: { [name]: value } }), 180));
+    };
+  });
+  const biasHF = document.getElementById("srcBiasHF");
+  if (biasHF) biasHF.onclick = () => saveSourceControls({ biasTeeHF: !c.biasTeeHF });
+  const biasVHF = document.getElementById("srcBiasVHF");
+  if (biasVHF) biasVHF.onclick = () => saveSourceControls({ biasTeeVHF: !c.biasTeeVHF });
+  const dithering = document.getElementById("srcDithering");
+  if (dithering) dithering.onclick = () => saveSourceControls({ dithering: !c.dithering });
 }
 function renderHeatMap(s) {
   const rows = new Map();
@@ -2207,6 +2345,7 @@ async function refresh() {
       document.getElementById("serverConnect").textContent = server.connected ? "Disconnect" : "Connect";
       document.getElementById("serverConnect").disabled = !!s.radioPlaying;
     }
+    renderSourceControls(s);
     const settings = s.settings || {};
     setControlValue("cbMode", settings.mode || s.mode || "auto");
     setSliderValue("cbSpacing", settings.spacingId);
@@ -2267,6 +2406,7 @@ document.getElementById("serverConnect").onclick = async e => {
   const connecting = e.target.textContent !== "Disconnect";
   await postAndReport(connecting ? "/api/sdrpp-server/connect" : "/api/sdrpp-server/disconnect");
 };
+document.getElementById("sourceRefresh").onclick = () => saveSourceControls({ refresh: true });
 function saveSetting(id, key, read) {
   const el = document.getElementById(id);
   const queueSave = () => {
@@ -2536,6 +2676,10 @@ setInterval(refresh, 500);
             sendHttpResponse(fd, "200 OK", "application/json", serverSourceStateJson().dump());
             return;
         }
+        if (method == "GET" && path == "/api/source-controls") {
+            sendHttpResponse(fd, "200 OK", "application/json", selectedSourceControlsJson().dump());
+            return;
+        }
         if (method == "GET" && path == "/api/channel-bank/settings") {
             sendHttpResponse(fd, "200 OK", "application/json", channelBankSettingsJson().dump());
             return;
@@ -2603,6 +2747,27 @@ setInterval(refresh, 500);
                 core::configManager.acquire();
                 core::configManager.conf["source"] = source;
                 core::configManager.release(true);
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/source-controls") {
+            json body = requestJsonBody(reqText);
+            sendUiActionResponse(fd, [this, body] {
+                if (selectedSourceName() != "RX888") {
+                    return json({{"ok", false}, {"error", "selected source has no web controls"}, {"_httpStatus", "404 Not Found"}});
+                }
+                RX888SourceControlV1 req{};
+                std::string text = body.dump();
+                strncpy(req.request, text.c_str(), sizeof(req.request) - 1);
+                req.request[sizeof(req.request) - 1] = '\0';
+                if (!callRX888SourceControl(RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
+                    std::string error = "RX888 source control failed";
+                    if (req.response[0]) {
+                        try { error = json::parse(req.response).value("error", error); } catch (...) {}
+                    }
+                    return json({{"ok", false}, {"error", error}, {"_httpStatus", gui::mainWindow.isPlaying() ? "409 Conflict" : "400 Bad Request"}});
+                }
                 return webStateSnapshot();
             });
             return;
