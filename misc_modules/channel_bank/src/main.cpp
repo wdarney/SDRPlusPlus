@@ -1835,9 +1835,24 @@ function renderSourceControls(s) {
   const status = document.getElementById("sourceSettingsStatus");
   const c = s.sourceControls || {};
   if (!panel || !grid) return;
-  if (s.selectedSource !== "RX888" || !c.available) {
+  const selected = s.selectedSource || c.source || "";
+  if (!selected) {
     panel.style.display = "none";
     grid.innerHTML = "";
+    return;
+  }
+  if (selected !== "RX888") {
+    panel.style.display = "block";
+    grid.innerHTML = "";
+    if (status) status.textContent = selected === "SDR++ Server"
+      ? "SDR++ Server exposes host and port here. RX888 gain and ADC controls are only visible when RX888 is selected locally."
+      : `No web controls are available for ${selected}.`;
+    return;
+  }
+  if (!c.available) {
+    panel.style.display = "block";
+    grid.innerHTML = "";
+    if (status) status.textContent = "RX888 controls are unavailable. Relaunch SDR++ Lock Build and make sure the RX888 source module is loaded.";
     return;
   }
   panel.style.display = "block";
