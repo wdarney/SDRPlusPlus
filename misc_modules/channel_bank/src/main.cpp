@@ -2422,6 +2422,15 @@ async function startMonitorAudio() {
   const AudioCtor = window.AudioContext || window.webkitAudioContext;
   let carry = new Uint8Array(0);
   let audioReady = false;
+  if (shouldUseMediaElementAudio()) {
+    try {
+      await startMediaElementMonitor(runId);
+      return;
+    } catch (e) {
+      console.warn(e);
+      setMonitorUi(true, "Monitor trying PCM fallback...");
+    }
+  }
   if (AudioCtor) {
     try {
       if (!monitorCtx) {
@@ -2432,26 +2441,6 @@ async function startMonitorAudio() {
       audioReady = monitorCtx.state === "running";
     } catch (e) {
       console.warn(e);
-    }
-  }
-  if (shouldUseMediaElementAudio()) {
-    try {
-      await startMediaElementMonitor(runId);
-      return;
-    } catch (e) {
-      console.warn(e);
-      if (monitorCtx) {
-        try {
-          await monitorCtx.resume();
-          audioReady = monitorCtx.state === "running";
-        } catch (_) {}
-      }
-      if (!audioReady) {
-        monitorRunning = false;
-        setMonitorUi(false, "Tap Monitor Audio again");
-        return;
-      }
-      setMonitorUi(true, "Monitor using PCM fallback...");
     }
   }
   try {
