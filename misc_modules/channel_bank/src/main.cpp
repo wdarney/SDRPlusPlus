@@ -2723,30 +2723,22 @@ setInterval(refresh, 500);
         }
 
         int64_t selectedKey = liveAudioSelectedFreqKey.load();
-        if (selectedKey == 0) {
-            liveAudioSelectedFreqKey.store(slotKey);
-            selectedKey = slotKey;
-        }
-
-        if (selectedKey == slotKey) {
-            liveAudioSelectedMs.store(nowMs);
-            liveAudioQueuedSamples += chunk.size();
-            liveAudioChunks.push_back(std::move(chunk));
-        }
-        else {
-            auto& pending = liveAudioPendingByFreq[slotKey];
-            if (pending.chunks.empty() && pending.queuedSamples == 0) {
-                liveAudioPendingOrder.push_back(slotKey);
-            }
-            pending.lastMs = nowMs;
-            pending.queuedSamples += chunk.size();
-            pending.chunks.push_back(std::move(chunk));
-            while (pending.queuedSamples > LIVE_AUDIO_MAX_PENDING_PER_FREQ && !pending.chunks.empty()) {
-                pending.queuedSamples -= pending.chunks.front().size();
-                pending.chunks.pop_front();
+        if (selectedKey != slotKey) {
+            uint64_t lastMs = liveAudioSelectedMs.load();
+            if (selectedKey != 0 && nowMs <= lastMs + 500) {
                 liveAudioDroppedChunks.fetch_add(1);
+                return;
+            }
+            int64_t expected = selectedKey;
+            if (!liveAudioSelectedFreqKey.compare_exchange_strong(expected, slotKey) &&
+                expected != slotKey) {
+                liveAudioDroppedChunks.fetch_add(1);
+                return;
             }
         }
+        liveAudioSelectedMs.store(nowMs);
+        liveAudioQueuedSamples += chunk.size();
+        liveAudioChunks.push_back(std::move(chunk));
 
         while (liveAudioQueuedSamples > LIVE_AUDIO_MAX_SAMPLES && !liveAudioChunks.empty()) {
             liveAudioQueuedSamples -= liveAudioChunks.front().size();
@@ -2755,36 +2747,6 @@ setInterval(refresh, 500);
         }
         lk.unlock();
         liveAudioCv.notify_one();
-    }
-
-    void promotePendingLiveAudioLocked() {
-        uint64_t nowMs = steadyMs();
-        int64_t selected = liveAudioSelectedFreqKey.load();
-        uint64_t selectedMs = liveAudioSelectedMs.load();
-        if (selected != 0 && nowMs <= selectedMs + 350 && !liveAudioChunks.empty()) return;
-
-        while (!liveAudioPendingOrder.empty()) {
-            int64_t key = liveAudioPendingOrder.front();
-            liveAudioPendingOrder.pop_front();
-            auto it = liveAudioPendingByFreq.find(key);
-            if (it == liveAudioPendingByFreq.end() || it->second.chunks.empty()) {
-                if (it != liveAudioPendingByFreq.end()) liveAudioPendingByFreq.erase(it);
-                continue;
-            }
-
-            liveAudioSelectedFreqKey.store(key);
-            liveAudioSelectedMs.store(nowMs);
-            while (!it->second.chunks.empty() && liveAudioQueuedSamples < LIVE_AUDIO_MAX_SAMPLES) {
-                liveAudioQueuedSamples += it->second.chunks.front().size();
-                liveAudioChunks.push_back(std::move(it->second.chunks.front()));
-                it->second.chunks.pop_front();
-            }
-            it->second.queuedSamples = 0;
-            for (auto& c : it->second.chunks) it->second.queuedSamples += c.size();
-            if (!it->second.chunks.empty()) liveAudioPendingOrder.push_back(key);
-            else liveAudioPendingByFreq.erase(it);
-            return;
-        }
     }
 
     void handleLiveAudioStream(WebSocket fd) {
@@ -2798,8 +2760,6 @@ setInterval(refresh, 500);
         {
             std::lock_guard<std::mutex> lk(liveAudioMtx);
             liveAudioChunks.clear();
-            liveAudioPendingByFreq.clear();
-            liveAudioPendingOrder.clear();
             liveAudioQueuedSamples = 0;
             liveAudioSelectedFreqKey.store(0);
             liveAudioSelectedMs.store(0);
@@ -2824,12 +2784,10 @@ setInterval(refresh, 500);
                     return !liveAudioChunks.empty() || !webServerRunning.load();
                 });
                 if (!webServerRunning.load()) break;
-                if (liveAudioChunks.empty()) promotePendingLiveAudioLocked();
                 if (!liveAudioChunks.empty()) {
                     chunk = std::move(liveAudioChunks.front());
                     liveAudioQueuedSamples -= chunk.size();
                     liveAudioChunks.pop_front();
-                    if (liveAudioChunks.empty()) promotePendingLiveAudioLocked();
                 }
             }
             size_t sendSamples = chunk.empty() ? 4800 : chunk.size();
@@ -2853,8 +2811,6 @@ setInterval(refresh, 500);
         liveAudioClients.store(0);
         std::lock_guard<std::mutex> lk(liveAudioMtx);
         liveAudioChunks.clear();
-        liveAudioPendingByFreq.clear();
-        liveAudioPendingOrder.clear();
         liveAudioQueuedSamples = 0;
         liveAudioSelectedFreqKey.store(0);
         liveAudioSelectedMs.store(0);
@@ -2901,8 +2857,6 @@ setInterval(refresh, 500);
         {
             std::lock_guard<std::mutex> lk(liveAudioMtx);
             liveAudioChunks.clear();
-            liveAudioPendingByFreq.clear();
-            liveAudioPendingOrder.clear();
             liveAudioQueuedSamples = 0;
             liveAudioSelectedFreqKey.store(0);
             liveAudioSelectedMs.store(0);
@@ -2928,12 +2882,10 @@ setInterval(refresh, 500);
                     return !liveAudioChunks.empty() || !webServerRunning.load();
                 });
                 if (!webServerRunning.load()) break;
-                if (liveAudioChunks.empty()) promotePendingLiveAudioLocked();
                 if (!liveAudioChunks.empty()) {
                     chunk = std::move(liveAudioChunks.front());
                     liveAudioQueuedSamples -= chunk.size();
                     liveAudioChunks.pop_front();
-                    if (liveAudioChunks.empty()) promotePendingLiveAudioLocked();
                 }
             }
             size_t sendSamples = chunk.empty() ? 4800 : chunk.size();
@@ -2958,8 +2910,6 @@ setInterval(refresh, 500);
         liveAudioClients.store(0);
         std::lock_guard<std::mutex> lk(liveAudioMtx);
         liveAudioChunks.clear();
-        liveAudioPendingByFreq.clear();
-        liveAudioPendingOrder.clear();
         liveAudioQueuedSamples = 0;
         liveAudioSelectedFreqKey.store(0);
         liveAudioSelectedMs.store(0);
@@ -8080,18 +8030,10 @@ setInterval(refresh, 500);
     std::mutex webUiActionMtx;
     std::deque<std::shared_ptr<WebUiAction>> webUiActions;
     static constexpr size_t LIVE_AUDIO_MAX_SAMPLES = 48000;
-    static constexpr size_t LIVE_AUDIO_MAX_PENDING_PER_FREQ = 48000 * 20;
-    struct LiveAudioPending {
-        std::deque<std::vector<int16_t>> chunks;
-        size_t queuedSamples = 0;
-        uint64_t lastMs = 0;
-    };
     std::atomic<int> liveAudioClients { 0 };
     std::mutex liveAudioMtx;
     std::condition_variable liveAudioCv;
     std::deque<std::vector<int16_t>> liveAudioChunks;
-    std::map<int64_t, LiveAudioPending> liveAudioPendingByFreq;
-    std::deque<int64_t> liveAudioPendingOrder;
     size_t liveAudioQueuedSamples = 0;
     std::atomic<int64_t> liveAudioSelectedFreqKey { 0 };
     std::atomic<uint64_t> liveAudioSelectedMs { 0 };
