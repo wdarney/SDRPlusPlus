@@ -2707,14 +2707,17 @@ setInterval(refresh, 500);
     void publishLiveAudio(ChannelSlot& slot, const float* mono, int count) {
         if (liveAudioClients.load() <= 0 || !mono || count <= 0) return;
 
-        int64_t slotKey = freqKey(slot.freqHz);
-        uint64_t nowMs = steadyMs();
         std::vector<int16_t> chunk;
         chunk.resize((size_t)count);
         for (int i = 0; i < count; i++) {
             float s = std::clamp(mono[i], -1.0f, 1.0f);
             chunk[(size_t)i] = (int16_t)std::lround(s * 32767.0f);
         }
+        publishLiveAudioPcm(slot.freqHz, chunk.data(), (int)chunk.size(), false);
+    }
+
+    void publishLiveAudioPcm(double freqHz, const int16_t* pcm, int count, bool forceSelect) {
+        if (liveAudioClients.load() <= 0 || !pcm || count <= 0) return;
 
         std::unique_lock<std::mutex> lk(liveAudioMtx, std::try_to_lock);
         if (!lk.owns_lock()) {
@@ -2722,8 +2725,13 @@ setInterval(refresh, 500);
             return;
         }
 
+        int64_t slotKey = freqKey(freqHz);
+        uint64_t nowMs = steadyMs();
         int64_t selectedKey = liveAudioSelectedFreqKey.load();
-        if (selectedKey != slotKey) {
+        if (forceSelect) {
+            liveAudioSelectedFreqKey.store(slotKey);
+        }
+        else if (selectedKey != slotKey) {
             uint64_t lastMs = liveAudioSelectedMs.load();
             if (selectedKey != 0 && nowMs <= lastMs + 500) {
                 liveAudioDroppedChunks.fetch_add(1);
@@ -2737,6 +2745,9 @@ setInterval(refresh, 500);
             }
         }
         liveAudioSelectedMs.store(nowMs);
+
+        std::vector<int16_t> chunk((size_t)count);
+        memcpy(chunk.data(), pcm, chunk.size() * sizeof(int16_t));
         liveAudioQueuedSamples += chunk.size();
         liveAudioChunks.push_back(std::move(chunk));
 
@@ -5089,7 +5100,6 @@ setInterval(refresh, 500);
                     }
                     slot->writer.write(nrMono, 480);
                     slot->audioSamplesWritten += 480;
-                    _this->publishLiveAudio(*slot, nrMono, 480);
                     slot->nrInPos = 0;
                 }
             }
@@ -5098,7 +5108,6 @@ setInterval(refresh, 500);
         {
             slot->writer.write(mono, count);
             slot->audioSamplesWritten += count;
-            _this->publishLiveAudio(*slot, mono, count);
         }
     }
 
@@ -5435,7 +5444,7 @@ setInterval(refresh, 500);
 #endif
                 normalizeRecordingIfEnabled(path);
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
-                playbackWavFile(path);
+                playbackWavFile(path, playFreq);
                 currentlyPlayingFreqKey.store(0);
 #if defined(__APPLE__) || defined(_WIN32)
                 playbackPosMs.store(-1);
@@ -5487,7 +5496,7 @@ setInterval(refresh, 500);
         }
     }
 
-    void playbackWavFile(const std::string& path) {
+    void playbackWavFile(const std::string& path, double playFreq) {
         // Write one silence chunk before opening the file so the file I/O
         // happens while the consumer processes audio — prevents underrun pop.
         const int PREBUF = 1024;
@@ -5531,6 +5540,7 @@ setInterval(refresh, 500);
         const int bytesPerFrame = fmtChannels * (int)sizeof(int16_t);
         const int totalSamps  = (int)(dataSize / bytesPerFrame);
         std::vector<int16_t>       pcm(CHUNK * fmtChannels);
+        std::vector<int16_t>       browserPcm(CHUNK);
         std::vector<dsp::stereo_t> buf(CHUNK);
 
         uint32_t remaining = dataSize;
@@ -5550,11 +5560,15 @@ setInterval(refresh, 500);
                 if (fmtChannels == 1) {
                     float s = (pcm[i] / 32768.0f) * gain;
                     buf[i].l = buf[i].r = s;
+                    browserPcm[i] = (int16_t)std::lround(std::clamp(s, -1.0f, 1.0f) * 32767.0f);
                 } else {
                     buf[i].l = (pcm[i * 2]     / 32768.0f) * gain;
                     buf[i].r = (pcm[i * 2 + 1] / 32768.0f) * gain;
+                    float s = (buf[i].l + buf[i].r) * 0.5f;
+                    browserPcm[i] = (int16_t)std::lround(std::clamp(s, -1.0f, 1.0f) * 32767.0f);
                 }
             }
+            publishLiveAudioPcm(playFreq, browserPcm.data(), samples, true);
             memcpy(monitorStream.writeBuf, buf.data(), samples * sizeof(dsp::stereo_t));
             if (!monitorStream.swap(samples)) { break; }
             remaining    -= bytesRead;
