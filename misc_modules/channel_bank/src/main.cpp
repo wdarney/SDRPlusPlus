@@ -51,6 +51,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdint>
+#include <cctype>
 #include <functional>
 #include <memory>
 #ifdef __APPLE__
@@ -1814,6 +1815,14 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <pre id="transcript" class="muted">No transcript yet.</pre>
 </section>
 <section>
+<div class="span-head">
+<h2>Recordings</h2>
+<button class="secondary inline-action" id="recordingsRefresh" type="button">Refresh</button>
+</div>
+<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Download</th></tr></thead><tbody id="recordings"><tr><td colspan="4" class="muted">Click Refresh to list saved recordings.</td></tr></tbody></table>
+<div class="muted" id="recordingsStatus" style="margin-top:8px">Saved WAV and M4A files in the Channel Bank recording folder.</div>
+</section>
+<section>
 <h2>History</h2>
 <table><thead><tr><th>Frequency</th><th>Name</th><th>Count</th><th>Blocked</th></tr></thead><tbody id="history"></tbody></table>
 </section>
@@ -2119,6 +2128,31 @@ function renderHeatMap(s) {
         <div class="heat-meta">${esc(meta)}</div>
       </div>`;
   }).join("");
+}
+async function refreshRecordings() {
+  const status = document.getElementById("recordingsStatus");
+  const body = document.getElementById("recordings");
+  if (status) status.textContent = "Loading recordings...";
+  try {
+    const r = await fetch("/api/recordings", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.statusText);
+    const data = await r.json();
+    const files = data.files || [];
+    if (!files.length) {
+      body.innerHTML = `<tr><td colspan="4" class="muted">No saved recordings found.</td></tr>`;
+    } else {
+      body.innerHTML = files.map(f => {
+        const mb = Number(f.size || 0) / (1024 * 1024);
+        const when = f.modifiedMs ? new Date(f.modifiedMs).toLocaleString() : "-";
+        return `<tr><td>${esc(f.name || f.path || "")}</td><td>${mb.toFixed(2)} MB</td><td>${esc(when)}</td><td><a class="secondary inline-action" href="/api/recordings/download?file=${encodeURIComponent(f.path || "")}">Download</a></td></tr>`;
+      }).join("");
+    }
+    if (status) status.textContent = `${files.length} saved recording${files.length === 1 ? "" : "s"}`;
+  } catch (e) {
+    console.warn(e);
+    if (body) body.innerHTML = `<tr><td colspan="4" class="muted">Could not load recordings.</td></tr>`;
+    if (status) status.textContent = "Recordings unavailable";
+  }
 }
 function drawSnrChart(s) {
   const canvas = document.getElementById("snrChart");
@@ -2611,6 +2645,7 @@ document.getElementById("serverConnect").onclick = async e => {
 document.getElementById("sourceRefresh").onclick = () => saveSourceControls({ refresh: true });
 document.getElementById("sourceOffsetMode").onchange = saveSourceOffset;
 document.getElementById("sourceOffsetApply").onclick = saveSourceOffset;
+document.getElementById("recordingsRefresh").onclick = refreshRecordings;
 function saveSetting(id, key, read) {
   const el = document.getElementById(id);
   const queueSave = () => {
@@ -2697,6 +2732,162 @@ setInterval(refresh, 500);
             << body;
         std::string out = oss.str();
         sendAll(fd, out.data(), out.size());
+    }
+
+    static std::string urlDecode(const std::string& in) {
+        std::string out;
+        out.reserve(in.size());
+        for (size_t i = 0; i < in.size(); i++) {
+            if (in[i] == '%' && i + 2 < in.size()) {
+                char hex[3] = { in[i + 1], in[i + 2], 0 };
+                char* end = nullptr;
+                long v = strtol(hex, &end, 16);
+                if (end && *end == '\0') {
+                    out.push_back((char)v);
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push_back(in[i] == '+' ? ' ' : in[i]);
+        }
+        return out;
+    }
+
+    static std::string queryParam(const std::string& path, const std::string& key) {
+        size_t q = path.find('?');
+        if (q == std::string::npos) return {};
+        std::string needle = key + "=";
+        size_t pos = q + 1;
+        while (pos < path.size()) {
+            size_t next = path.find('&', pos);
+            std::string part = path.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+            if (part.rfind(needle, 0) == 0) return urlDecode(part.substr(needle.size()));
+            if (next == std::string::npos) break;
+            pos = next + 1;
+        }
+        return {};
+    }
+
+    static bool pathIsInside(const std::filesystem::path& child, const std::filesystem::path& parent) {
+        auto pit = parent.begin();
+        auto cit = child.begin();
+        for (; pit != parent.end(); ++pit, ++cit) {
+            if (cit == child.end() || *cit != *pit) return false;
+        }
+        return true;
+    }
+
+    std::filesystem::path recordingsRootPath() {
+        std::error_code ec;
+        std::filesystem::path p = std::filesystem::weakly_canonical(expandString(folderSelect.path), ec);
+        return ec ? std::filesystem::path() : p;
+    }
+
+    json recordingsListJson() {
+        json out;
+        out["available"] = false;
+        out["files"] = json::array();
+        std::error_code ec;
+        std::filesystem::path rootPath = recordingsRootPath();
+        if (rootPath.empty() || !std::filesystem::exists(rootPath, ec) || ec) return out;
+        out["available"] = true;
+        out["root"] = rootPath.string();
+
+        struct RecFile {
+            std::string rel;
+            uintmax_t size = 0;
+            int64_t modifiedMs = 0;
+        };
+        std::vector<RecFile> files;
+        for (auto it = std::filesystem::recursive_directory_iterator(rootPath, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec || !it->is_regular_file(ec) || ec) continue;
+            std::filesystem::path p = it->path();
+            std::string ext = p.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (ext != ".wav" && ext != ".m4a") continue;
+
+            auto ftime = std::filesystem::last_write_time(p, ec);
+            int64_t modifiedMs = 0;
+            if (!ec) {
+                auto sysTime = std::chrono::time_point_cast<std::chrono::milliseconds>(
+                    ftime - decltype(ftime)::clock::now() + std::chrono::system_clock::now());
+                modifiedMs = sysTime.time_since_epoch().count();
+            }
+            ec.clear();
+            std::filesystem::path relPath = std::filesystem::relative(p, rootPath, ec);
+            if (ec) { ec.clear(); continue; }
+            uintmax_t size = std::filesystem::file_size(p, ec);
+            if (ec) { ec.clear(); continue; }
+            files.push_back({relPath.generic_string(), size, modifiedMs});
+            ec.clear();
+        }
+        std::sort(files.begin(), files.end(), [](const RecFile& a, const RecFile& b) {
+            return a.modifiedMs > b.modifiedMs;
+        });
+        if (files.size() > 300) files.resize(300);
+        for (auto& f : files) {
+            out["files"].push_back({
+                {"path", f.rel},
+                {"name", std::filesystem::path(f.rel).filename().string()},
+                {"size", f.size},
+                {"modifiedMs", f.modifiedMs}
+            });
+        }
+        return out;
+    }
+
+    void sendRecordingDownload(WebSocket fd, const std::string& path) {
+        std::string rel = queryParam(path, "file");
+        if (rel.empty()) {
+            sendHttpResponse(fd, "400 Bad Request", "application/json",
+                json({{"ok", false}, {"error", "file required"}}).dump());
+            return;
+        }
+        std::filesystem::path rootPath = recordingsRootPath();
+        if (rootPath.empty()) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "recordings folder not available"}}).dump());
+            return;
+        }
+        std::filesystem::path relPath(rel);
+        if (relPath.is_absolute()) {
+            sendHttpResponse(fd, "400 Bad Request", "application/json",
+                json({{"ok", false}, {"error", "absolute paths are not allowed"}}).dump());
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::path filePath = std::filesystem::weakly_canonical(rootPath / relPath, ec);
+        if (ec || !pathIsInside(filePath, rootPath) || !std::filesystem::is_regular_file(filePath, ec) || ec) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "recording not found"}}).dump());
+            return;
+        }
+
+        std::ifstream f(filePath, std::ios::binary);
+        if (!f.is_open()) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "recording not readable"}}).dump());
+            return;
+        }
+        std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::string filename = filePath.filename().string();
+        std::string ext = filePath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        std::string contentType = ext == ".m4a" ? "audio/mp4" : "audio/wav";
+
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << contentType << "\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Content-Disposition: attachment; filename=\"" << filename << "\"\r\n"
+            << "Cache-Control: no-store\r\n"
+            << "Access-Control-Allow-Origin: *\r\n"
+            << "Connection: close\r\n\r\n";
+        std::string header = oss.str();
+        sendAll(fd, header.data(), header.size());
+        sendAll(fd, body.data(), body.size());
     }
 
     static uint64_t steadyMs() {
@@ -3005,6 +3196,14 @@ setInterval(refresh, 500);
         }
         if (method == "GET" && path == "/api/channel-bank/settings") {
             sendHttpResponse(fd, "200 OK", "application/json", channelBankSettingsJson().dump());
+            return;
+        }
+        if (method == "GET" && path == "/api/recordings") {
+            sendHttpResponse(fd, "200 OK", "application/json", recordingsListJson().dump());
+            return;
+        }
+        if (method == "GET" && path.rfind("/api/recordings/download", 0) == 0) {
+            sendRecordingDownload(fd, path);
             return;
         }
         if (method == "GET" && path == "/api/audio/live.pcm") {
