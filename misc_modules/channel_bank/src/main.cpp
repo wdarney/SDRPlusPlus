@@ -43,6 +43,7 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <regex>
 #include <queue>
 #include <deque>
@@ -253,6 +254,12 @@ struct ChannelSlot {
 class ChannelBankModule : public ModuleManager::Instance {
 public:
     enum DemodMode { DEMOD_AM = 0, DEMOD_NFM = 1, DEMOD_WFM = 2, DEMOD_USB = 3, DEMOD_LSB = 4 };
+
+private:
+    struct PlaybackEntry;
+    struct WebClientThread;
+
+public:
 
     static constexpr double SPACINGS[] = {
         8333.0, 12500.0, 25000.0, 50000.0, 100000.0, 200000.0
@@ -586,10 +593,12 @@ public:
 
         // Stop playback thread — stopWriter() unblocks any pending swap() call
         playbackRunning = false;
+        playbackCv.notify_all();
         monitorStream.stopWriter();
         if (playbackThread.joinable()) { playbackThread.join(); }
         monitorStream.clearWriteStop();
-        { std::lock_guard<std::mutex> lk(playbackMtx); playbackQueue.clear(); }
+        discardPlaybackQueue();
+        clearLiveAudioQueue();
 #if defined(__APPLE__) || defined(_WIN32)
         // Drop any orphaned synced-segment entries (would otherwise leak if the
         // WAV they belonged to got discarded before playback dequeued them).
@@ -2996,6 +3005,19 @@ setInterval(refresh, 500);
         liveAudioCv.notify_one();
     }
 
+    void clearLiveAudioQueue() {
+        liveAudioStreamGeneration.fetch_add(1);
+        liveAudioClients.store(0);
+        {
+            std::lock_guard<std::mutex> lk(liveAudioMtx);
+            liveAudioChunks.clear();
+            liveAudioQueuedSamples = 0;
+            liveAudioSelectedFreqKey.store(0);
+            liveAudioSelectedMs.store(0);
+        }
+        liveAudioCv.notify_all();
+    }
+
     void handleLiveAudioStream(WebSocket fd) {
         uint64_t streamId = liveAudioStreamGeneration.fetch_add(1) + 1;
         liveAudioClients.store(1);
@@ -3458,13 +3480,28 @@ setInterval(refresh, 500);
                 break;
             }
             std::lock_guard<std::mutex> lk(webClientThreadsMtx);
-            webClientThreads.emplace_back(&ChannelBankModule::webClientThreadMain, this, clientFd);
+            pruneWebClientThreadsLocked();
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            webClientThreads.push_back({std::thread(&ChannelBankModule::webClientThreadMain, this, clientFd, done), done});
         }
     }
 
-    void webClientThreadMain(WebSocket fd) {
+    void pruneWebClientThreadsLocked() {
+        auto it = webClientThreads.begin();
+        while (it != webClientThreads.end()) {
+            if (it->done && it->done->load()) {
+                if (it->thread.joinable()) it->thread.join();
+                it = webClientThreads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void webClientThreadMain(WebSocket fd, std::shared_ptr<std::atomic<bool>> done) {
         handleWebClient(fd);
         closeFd(fd);
+        if (done) done->store(true);
     }
 
     bool parseWebBindAddress(in_addr& out) {
@@ -3565,13 +3602,13 @@ setInterval(refresh, 500);
         if (threadToJoin.joinable()) threadToJoin.join();
         liveAudioCv.notify_all();
 
-        std::vector<std::thread> clientThreads;
+        std::vector<WebClientThread> clientThreads;
         {
             std::lock_guard<std::mutex> lk(webClientThreadsMtx);
             clientThreads.swap(webClientThreads);
         }
         for (auto& t : clientThreads) {
-            if (t.joinable()) t.join();
+            if (t.thread.joinable()) t.thread.join();
         }
     }
 
@@ -5219,14 +5256,10 @@ setInterval(refresh, 500);
                         _this->logRecording(slot->gridFreqHz);
                         _this->saveFreqLog();
                         if (!slot->currentFilePath.empty()) {
-                            size_t qSize = 0;
-                            {
-                                std::lock_guard<std::mutex> lk(_this->playbackMtx);
-                                // deleteAfter=true when recording is disabled — play it back but don't keep the file
-                                _this->playbackQueue.push_back({slot->currentFilePath, slot->freqHz, slot->currentFinalM4APath, !_this->recordingEnabled});
-                                qSize = _this->playbackQueue.size();
-                                _this->playbackCv.notify_one();
-                            }
+                            // deleteAfter=true when recording is disabled — play it back but don't keep the file
+                            size_t qSize = _this->enqueuePlayback({
+                                slot->currentFilePath, slot->freqHz, slot->currentFinalM4APath, !_this->recordingEnabled
+                            });
                             // Auto-flush: if the queue is running away (live preview
                             // gets hours behind otherwise), drain the oldest entries
                             // straight to M4A so the latest few stay listenable.
@@ -5598,6 +5631,55 @@ setInterval(refresh, 500);
         }
     }
 
+    void cleanupDiscardedPlaybackEntry(const PlaybackEntry& entry) {
+        if (entry.deleteAfter) {
+            std::remove(entry.path.c_str());
+        }
+#if defined(__APPLE__) || defined(_WIN32)
+        {
+            std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+            pendingEncodes.erase(entry.path);
+        }
+        {
+            std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
+            pendingPlaybackSegments.erase(entry.path);
+        }
+#endif
+    }
+
+    size_t enqueuePlayback(PlaybackEntry entry) {
+        std::vector<PlaybackEntry> dropped;
+        size_t qSize = 0;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            playbackQueue.push_back(std::move(entry));
+            while (playbackQueue.size() > PLAYBACK_QUEUE_HARD_LIMIT) {
+                dropped.push_back(std::move(playbackQueue.front()));
+                playbackQueue.pop_front();
+            }
+            qSize = playbackQueue.size();
+        }
+        for (auto& old : dropped) cleanupDiscardedPlaybackEntry(old);
+        if (!dropped.empty()) {
+            flog::warn("[ChannelBank] Dropped {0} old playback item(s); queue hard limit is {1}",
+                       (int)dropped.size(), (int)PLAYBACK_QUEUE_HARD_LIMIT);
+        }
+        playbackCv.notify_one();
+        return qSize;
+    }
+
+    void discardPlaybackQueue() {
+        std::vector<PlaybackEntry> dropped;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            while (!playbackQueue.empty()) {
+                dropped.push_back(std::move(playbackQueue.front()));
+                playbackQueue.pop_front();
+            }
+        }
+        for (auto& entry : dropped) cleanupDiscardedPlaybackEntry(entry);
+    }
+
     void encodeThreadFunc() {
         while (true) {
             EncodeTask task;
@@ -5732,10 +5814,10 @@ setInterval(refresh, 500);
                 }
 #endif
             } else {
-                // Write silence to keep monitorStream continuously flowing.
-                // swap() naturally throttles to the consumer's 48 kHz read rate.
-                memcpy(monitorStream.writeBuf, silence.data(), CHUNK * sizeof(dsp::stereo_t));
-                if (!monitorStream.swap(CHUNK)) { return; }
+                std::unique_lock<std::mutex> lk(playbackMtx);
+                playbackCv.wait_for(lk, std::chrono::milliseconds(250), [this] {
+                    return !playbackQueue.empty() || !playbackRunning.load();
+                });
             }
         }
     }
@@ -8283,8 +8365,12 @@ setInterval(refresh, 500);
     bool         webSocketsStarted = false;
 #endif
     WebSocket    webServerFd = INVALID_WEB_SOCKET;
+    struct WebClientThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
     std::mutex   webClientThreadsMtx;
-    std::vector<std::thread> webClientThreads;
+    std::vector<WebClientThread> webClientThreads;
     std::mutex webUiActionMtx;
     std::deque<std::shared_ptr<WebUiAction>> webUiActions;
     static constexpr size_t LIVE_AUDIO_MAX_SAMPLES = 48000;
@@ -8825,6 +8911,7 @@ setInterval(refresh, 500);
         std::vector<transcription_whisper::Segment> segments;
 #endif
     };
+    static constexpr size_t PLAYBACK_QUEUE_HARD_LIMIT = 64;
     std::deque<PlaybackEntry> playbackQueue;
 #if defined(__APPLE__) || defined(_WIN32)
     std::mutex transcriptionJobsMtx;
