@@ -2395,6 +2395,18 @@ function spanInfo(s) {
 function spanX(freqHz, info, width) {
   return Math.round(((freqHz - info.lo) / info.span) * width);
 }
+function verticalWaterfallLabel(ctx, text, x, y, height, color) {
+  const label = String(text || "").trim();
+  if (!label) return;
+  ctx.save();
+  ctx.translate(Math.min(x + 9, ctx.canvas.clientWidth - 8), Math.max(10, y + 4));
+  ctx.rotate(Math.PI / 2);
+  ctx.fillStyle = color;
+  ctx.font = "10px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  ctx.textBaseline = "top";
+  ctx.fillText(label.slice(0, 22), 0, 0, Math.max(24, height - y - 8));
+  ctx.restore();
+}
 function collectSpanPoints(s, info) {
   const points = [];
   const add = (freqHz, data = {}) => {
@@ -2469,6 +2481,7 @@ function drawSpanWaterfall(s) {
     ctx.fillRect(x - 1, 0, 2, height);
   });
   const rowH = height / spanWaterfallMaxFrames;
+  const newestLabelByFreq = new Map();
   spanWaterfallFrames.forEach((frame, i) => {
     const y = height - (spanWaterfallFrames.length - i) * rowH;
     frame.forEach(p => {
@@ -2476,7 +2489,13 @@ function drawSpanWaterfall(s) {
       const alpha = p.blocked ? 0.95 : p.strength;
       ctx.fillStyle = p.blocked ? `rgba(255,74,74,${alpha})` : p.live ? `rgba(80,210,115,${alpha})` : `rgba(255,177,92,${alpha})`;
       ctx.fillRect(x - 3, y, 6, Math.max(2, rowH + 1));
+      const label = p.name || fmtMHz(p.freqHz);
+      if (label) newestLabelByFreq.set(Math.round(p.freqHz), { label, x, y, blocked: p.blocked, live: p.live, recent: p.recent, alpha });
     });
+  });
+  Array.from(newestLabelByFreq.values()).slice(-24).forEach(p => {
+    const color = p.blocked ? "#ff9b9b" : p.live ? "#d8ffe0" : "#ffd29a";
+    verticalWaterfallLabel(ctx, p.label, p.x, p.y, height, color);
   });
   points.filter(p => p.live).slice(0, 20).forEach(p => {
     const x = spanX(p.freqHz, info, width);
@@ -2486,10 +2505,6 @@ function drawSpanWaterfall(s) {
     ctx.moveTo(x, 0);
     ctx.lineTo(x, height);
     ctx.stroke();
-    ctx.fillStyle = p.blocked ? "#ff9b9b" : "#d8ffe0";
-    ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-    const label = (p.name || fmtMHz(p.freqHz)).slice(0, 18);
-    ctx.fillText(label, Math.min(width - 96, Math.max(4, x + 5)), 14);
   });
   const pb = s.playback || {};
   if (pb.active && Number.isFinite(Number(pb.freqHz)) && pb.freqHz >= info.lo && pb.freqHz <= info.hi) {
