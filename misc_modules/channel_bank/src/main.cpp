@@ -1839,6 +1839,7 @@ let monitorAbort = null;
 let monitorNode = null;
 let monitorRunning = false;
 let monitorRunId = 0;
+let monitorRetryTimer = null;
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
 const monitorSampleRate = 48000;
@@ -2368,6 +2369,22 @@ function setMonitorUi(active, text) {
   document.getElementById("monitorAudio").textContent = active ? "Stop Monitor" : "Monitor Audio";
   document.getElementById("monitorState").textContent = text;
 }
+function clearMonitorRetry() {
+  if (monitorRetryTimer) {
+    clearTimeout(monitorRetryTimer);
+    monitorRetryTimer = null;
+  }
+}
+function scheduleMonitorRetry(runId) {
+  clearMonitorRetry();
+  setMonitorUi(true, "Monitor reconnecting...");
+  monitorRetryTimer = setTimeout(() => {
+    monitorRetryTimer = null;
+    if (!monitorRunning || runId !== monitorRunId) return;
+    monitorRunning = false;
+    startMonitorAudio();
+  }, 1200);
+}
 function resetMonitorBuffer() {
   monitorReadPos = 0;
   monitorWritePos = 0;
@@ -2450,6 +2467,7 @@ async function startMediaElementMonitor(runId) {
 }
 async function startMonitorAudio() {
   if (monitorRunning) return;
+  clearMonitorRetry();
   const runId = ++monitorRunId;
   monitorRunning = true;
   setMonitorUi(true, "Monitor connecting...");
@@ -2528,14 +2546,21 @@ async function startMonitorAudio() {
   } finally {
     if (mediaFallbackStarted) return;
     if (runId === monitorRunId) {
+      const shouldRetry = monitorRunning && !(monitorAbort && monitorAbort.signal.aborted);
       monitorRunning = false;
       monitorAbort = null;
       stopMonitorOutput();
-      setMonitorUi(false, "Monitor stopped");
+      if (shouldRetry) {
+        monitorRunning = true;
+        scheduleMonitorRetry(runId);
+      } else {
+        setMonitorUi(false, "Monitor stopped");
+      }
     }
   }
 }
 function stopMonitorAudio() {
+  clearMonitorRetry();
   monitorRunning = false;
   monitorRunId++;
   if (monitorAbort) monitorAbort.abort();
