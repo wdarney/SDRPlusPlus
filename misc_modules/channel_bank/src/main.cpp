@@ -1967,9 +1967,6 @@ let monitorWritePos = 0;
 let monitorBufferedSamples = 0;
 let monitorLastStatusMs = 0;
 let monitorOutputStarted = false;
-let monitorUsingWorklet = false;
-let monitorWorkletModuleUrl = null;
-let monitorWorkletLoaded = false;
 const pendingSettingTimers = new Map();
 const pendingSettingDirty = new Set();
 const pendingSourceTimers = new Map();
@@ -2509,7 +2506,6 @@ function resetMonitorBuffer() {
   monitorWritePos = 0;
   monitorBufferedSamples = 0;
   monitorOutputStarted = false;
-  if (monitorUsingWorklet && monitorNode?.port) monitorNode.port.postMessage({ type: "reset" });
 }
 function dropMonitorSamples(count) {
   const drop = Math.min(count, monitorBufferedSamples);
@@ -2532,15 +2528,6 @@ function updateMonitorBufferStatus() {
 function enqueuePcm16(bytes) {
   if (!monitorCtx || bytes.length < 2) return;
   const samples = Math.floor(bytes.length / 2);
-  if (monitorUsingWorklet && monitorNode?.port) {
-    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + samples * 2);
-    monitorNode.port.postMessage({ type: "pcm", buffer }, [buffer]);
-    monitorBufferedSamples += samples;
-    if (monitorBufferedSamples > monitorMaxSamples) monitorBufferedSamples = monitorTargetSamples;
-    if (!monitorOutputStarted && monitorBufferedSamples >= monitorPrebufferSamples) startMonitorOutput();
-    updateMonitorBufferStatus();
-    return;
-  }
   const view = new DataView(bytes.buffer, bytes.byteOffset, samples * 2);
   if (monitorBufferedSamples > monitorMaxSamples) dropMonitorSamples(monitorBufferedSamples - monitorTargetSamples);
   for (let i = 0; i < samples; i++) writeMonitorSample(view.getInt16(i * 2, true) / 32768);
@@ -2548,106 +2535,9 @@ function enqueuePcm16(bytes) {
   if (!monitorOutputStarted && monitorBufferedSamples >= monitorPrebufferSamples) startMonitorOutput();
   updateMonitorBufferStatus();
 }
-async function prepareMonitorOutput() {
-  monitorUsingWorklet = false;
-  if (!monitorCtx) return;
-  if (monitorCtx.audioWorklet && window.AudioWorkletNode) {
-    try {
-      if (!monitorWorkletModuleUrl) {
-        const workletCode = `
-class PCMMonitorProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.capacity = 48000 * 6;
-    this.target = Math.round(48000 * 0.85);
-    this.max = Math.round(48000 * 2.20);
-    this.buffer = new Float32Array(this.capacity);
-    this.read = 0;
-    this.write = 0;
-    this.count = 0;
-    this.started = false;
-    this.lastReport = 0;
-    this.port.onmessage = e => {
-      const msg = e.data || {};
-      if (msg.type === "reset") {
-        this.read = this.write = this.count = 0;
-        this.started = false;
-        return;
-      }
-      if (msg.type === "start") {
-        this.started = true;
-        return;
-      }
-      if (msg.type === "pcm" && msg.buffer) {
-        const pcm = new Int16Array(msg.buffer);
-        for (let i = 0; i < pcm.length; i++) {
-          if (this.count >= this.capacity) this.drop(this.count - this.target);
-          this.buffer[this.write] = pcm[i] / 32768;
-          this.write = (this.write + 1) % this.capacity;
-          this.count++;
-        }
-        if (this.count > this.max) this.drop(this.count - this.target);
-      }
-    };
-  }
-  drop(n) {
-    const d = Math.max(0, Math.min(n, this.count));
-    this.read = (this.read + d) % this.capacity;
-    this.count -= d;
-  }
-  process(inputs, outputs) {
-    const out = outputs[0] && outputs[0][0];
-    if (!out) return true;
-    for (let i = 0; i < out.length; i++) {
-      if (this.started && this.count > 0) {
-        out[i] = this.buffer[this.read];
-        this.read = (this.read + 1) % this.capacity;
-        this.count--;
-      } else {
-        out[i] = 0;
-      }
-    }
-    if (currentFrame - this.lastReport > sampleRate / 4) {
-      this.lastReport = currentFrame;
-      this.port.postMessage({ type: "status", buffered: this.count });
-    }
-    return true;
-  }
-}
-registerProcessor("pcm-monitor", PCMMonitorProcessor);
-`;
-        monitorWorkletModuleUrl = URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" }));
-      }
-      if (!monitorWorkletLoaded) {
-        await monitorCtx.audioWorklet.addModule(monitorWorkletModuleUrl);
-        monitorWorkletLoaded = true;
-      }
-      monitorNode = new AudioWorkletNode(monitorCtx, "pcm-monitor", {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [1]
-      });
-      monitorUsingWorklet = true;
-      monitorNode.port.onmessage = e => {
-        if (e.data?.type === "status") monitorBufferedSamples = Math.max(0, Number(e.data.buffered || 0));
-      };
-      monitorNode.onprocessorerror = e => console.warn("monitor audio worklet failed", e);
-    } catch (e) {
-      console.warn("monitor audio worklet unavailable", e);
-      monitorNode = null;
-      monitorUsingWorklet = false;
-    }
-  }
-}
 function startMonitorOutput() {
-  if (!monitorCtx || monitorOutputStarted) return;
+  if (monitorNode || !monitorCtx) return;
   monitorOutputStarted = true;
-  if (monitorUsingWorklet && monitorNode?.port) {
-    monitorNode.port.postMessage({ type: "start" });
-    monitorNode.connect(monitorCtx.destination);
-    return;
-  }
-  if (monitorNode) return;
   monitorNode = monitorCtx.createScriptProcessor(1024, 0, 1);
   monitorNode.onaudioprocess = e => {
     const out = e.outputBuffer.getChannelData(0);
@@ -2666,10 +2556,9 @@ function startMonitorOutput() {
 function stopMonitorOutput() {
   if (monitorNode) {
     monitorNode.disconnect();
-    if (!monitorUsingWorklet) monitorNode.onaudioprocess = null;
+    monitorNode.onaudioprocess = null;
   }
   monitorNode = null;
-  monitorUsingWorklet = false;
   resetMonitorBuffer();
 }
 function shouldUseMediaElementAudio() {
@@ -2732,7 +2621,6 @@ async function startMonitorAudio() {
     if (!monitorRunning || runId !== monitorRunId) return;
     monitorAbort = new AbortController();
     resetMonitorBuffer();
-    await prepareMonitorOutput();
     const r = await fetch("/api/audio/live.pcm", { cache: "no-store", signal: monitorAbort.signal });
     if (!r.ok || !r.body) throw new Error("monitor stream unavailable");
     setMonitorUi(true, "Monitor buffering...");
