@@ -69,6 +69,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -276,6 +279,7 @@ public:
     static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
     static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
     static constexpr int    MAX_CHANNELS_HARD_LIMIT = 64;
+    static constexpr int    MAX_TRANSCRIPTION_JOBS = 1;
 
     ChannelBankModule(std::string name) : folderSelect("%ROOT%/channel_bank/recordings") {
         this->name = name;
@@ -1163,6 +1167,74 @@ private:
         return "auto";
     }
 
+    std::string transcriptionBackendName() const {
+        switch (transcriptionBackend) {
+            case TB_APPLE_SPEECH: return "Apple Speech";
+            case TB_WHISPER_ATC_LARGE: return "Whisper ATC Large";
+            case TB_WHISPER_ATC_MEDIUM: return "Whisper ATC Medium";
+            case TB_WHISPER_TURBO: return "Whisper Turbo";
+            default: return "Off";
+        }
+    }
+
+    static uint64_t processResidentBytes() {
+#ifdef __APPLE__
+        mach_task_basic_info_data_t info{};
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+            return (uint64_t)info.resident_size;
+        }
+#endif
+        return 0;
+    }
+
+    json diagnosticsJson() {
+        int activeCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(channelsMtx);
+            activeCount = (int)activeChannels.size();
+        }
+        int playbackCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            playbackCount = (int)playbackQueue.size();
+        }
+        int webClientCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(webClientThreadsMtx);
+            pruneWebClientThreadsLocked();
+            webClientCount = (int)webClientThreads.size();
+        }
+        int transcriptionCount = 0;
+        int pendingEncodeCount = 0;
+        size_t liveQueued = 0;
+#if defined(__APPLE__) || defined(_WIN32)
+        {
+            std::lock_guard<std::mutex> lk(transcriptionJobsMtx);
+            transcriptionCount = (int)transcriptionJobs.size();
+        }
+        {
+            std::lock_guard<std::mutex> lk(pendingEncodesMtx);
+            pendingEncodeCount = (int)pendingEncodes.size();
+        }
+#endif
+        {
+            std::lock_guard<std::mutex> lk(liveAudioMtx);
+            liveQueued = liveAudioQueuedSamples;
+        }
+        return {
+            {"rssBytes", processResidentBytes()},
+            {"activeChannels", activeCount},
+            {"maxChannels", maxChannels},
+            {"playbackQueued", playbackCount},
+            {"webClientThreads", webClientCount},
+            {"transcriptionJobs", transcriptionCount},
+            {"pendingEncodes", pendingEncodeCount},
+            {"liveAudioClients", liveAudioClients.load()},
+            {"liveAudioQueuedSamples", liveQueued}
+        };
+    }
+
     json channelBankSettingsJson() {
         return {
             {"mode", detectionModeName()},
@@ -1177,7 +1249,9 @@ private:
             {"signalHoldMs", signalHoldMs},
             {"tailMs", tailMs},
             {"scanQuietSec", scanQuietSec},
-            {"scanNoSignalSec", scanNoSignalSec}
+            {"scanNoSignalSec", scanNoSignalSec},
+            {"transcriptionBackend", transcriptionBackend},
+            {"transcriptionBackendName", transcriptionBackendName()}
         };
     }
 
@@ -1275,7 +1349,12 @@ private:
             error = "no-signal skip must be numeric";
             return false;
         }
+        if (body.contains("transcriptionBackend") && !body["transcriptionBackend"].is_number_integer()) {
+            error = "transcription backend must be an integer";
+            return false;
+        }
 
+        bool transcriptionTurnedOff = false;
         config.acquire();
         if (body.contains("spacingId")) {
             spacingId = std::clamp(body["spacingId"].get<int>(), 0, 5);
@@ -1328,9 +1407,19 @@ private:
             scanNoSignalSec = std::clamp(body["scanNoSignalSec"].get<float>(), 0.1f, 5.0f);
             config.conf[name]["scanNoSignalSec"] = scanNoSignalSec;
         }
+        if (body.contains("transcriptionBackend")) {
+            int next = std::clamp(body["transcriptionBackend"].get<int>(), (int)TB_OFF, (int)TB_WHISPER_TURBO);
+#ifndef __APPLE__
+            if (next == TB_APPLE_SPEECH) next = TB_OFF;
+#endif
+            transcriptionTurnedOff = transcriptionOn() && next == TB_OFF;
+            transcriptionBackend = next;
+            config.conf[name]["transcriptionBackend"] = transcriptionBackend;
+        }
         config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
         config.conf[name]["activeProfile"] = activeProfileName;
         config.release(true);
+        if (transcriptionTurnedOff) stopTranscriptionWork();
         return true;
     }
 
@@ -1657,6 +1746,7 @@ private:
         j["playbackQueued"] = playbackQueued;
         j["currentlyPlayingFreqKey"] = playingKey;
         j["history"] = history;
+        j["diagnostics"] = diagnosticsJson();
         if (scanMode) {
             j["scanStopIndex"] = scanStopIdx;
             j["scanStopCount"] = (int)scanStops.size();
@@ -1782,6 +1872,8 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="tile"><div class="label">Mode</div><div class="value" id="mode">-</div></div>
 <div class="tile"><div class="label">Center</div><div class="value" id="center">-</div></div>
 <div class="tile"><div class="label">Active</div><div class="value" id="active">-</div></div>
+<div class="tile"><div class="label">Memory</div><div class="value" id="memory">-</div></div>
+<div class="tile"><div class="label">Work</div><div class="small-value" id="workStats">-</div></div>
 </div>
 <div class="controls">
 <button class="primary" id="start">Start Channel Bank</button>
@@ -1802,6 +1894,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">TX tail ms</span><span class="slider-value" id="cbTailValue">-</span><input id="cbTail" type="range" min="100" max="2000" step="25"></label>
 <label class="control slider-control"><span class="label">Scan quiet s</span><span class="slider-value" id="cbScanQuietValue">-</span><input id="cbScanQuiet" type="range" min="1" max="30" step="0.5"></label>
 <label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
+<label class="control"><span class="label">Transcribe</span><select id="cbTranscribe"><option value="0">Off</option><option value="1">Apple Speech</option><option value="2">Whisper ATC Large</option><option value="3">Whisper ATC Medium</option><option value="4">Whisper Turbo</option></select></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
 </div>
 </section>
@@ -1851,6 +1944,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 const fmtMHz = hz => hz ? (hz / 1e6).toFixed(4) + " MHz" : "-";
 const fmtRangeMHz = (lo, hi) => lo > 0 && hi > 0 ? `${(lo / 1e6).toFixed(3)} to ${(hi / 1e6).toFixed(3)} MHz` : "-";
 const fmtRate = hz => hz > 0 ? (hz >= 1e6 ? (hz / 1e6).toFixed(3) + " MS/s" : Math.round(hz).toLocaleString() + " S/s") : "-";
+const fmtBytes = bytes => bytes > 0 ? (bytes >= 1073741824 ? (bytes / 1073741824).toFixed(2) + " GB" : (bytes / 1048576).toFixed(0) + " MB") : "-";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const spacingLabels = ["8.33 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz", "200 kHz"];
 let monitorCtx = null;
@@ -2617,6 +2711,10 @@ async function refresh() {
     document.getElementById("mode").textContent = s.mode + " / " + s.demodMode;
     document.getElementById("center").textContent = fmtMHz(s.centerHz);
     document.getElementById("active").textContent = (s.activeChannels || []).length + " / " + s.maxChannels;
+    const diag = s.diagnostics || {};
+    document.getElementById("memory").textContent = fmtBytes(Number(diag.rssBytes || 0));
+    document.getElementById("workStats").textContent =
+      `ch ${diag.activeChannels ?? 0}/${diag.maxChannels ?? s.maxChannels ?? 0} / tx ${diag.transcriptionJobs ?? 0} / play ${diag.playbackQueued ?? 0} / enc ${diag.pendingEncodes ?? 0} / web ${diag.webClientThreads ?? 0}`;
     const source = document.getElementById("source");
     const prev = source.value;
     source.innerHTML = (s.sources || []).map(name =>
@@ -2656,6 +2754,7 @@ async function refresh() {
     setSliderValue("cbTail", settings.tailMs, v => `${Math.round(v)} ms`);
     setSliderValue("cbScanQuiet", settings.scanQuietSec, v => `${v.toFixed(1)} s`);
     setSliderValue("cbScanNoSignal", settings.scanNoSignalSec, v => `${v.toFixed(1)} s`);
+    setControlValue("cbTranscribe", settings.transcriptionBackend ?? 0);
     currentRecordingEnabled = settings.recordingEnabled !== false;
     const recToggle = document.getElementById("cbRecordingToggle");
     recToggle.textContent = currentRecordingEnabled ? "On - keeping files" : "Off - monitor only";
@@ -2750,6 +2849,7 @@ saveSetting("cbSignalHold", "signalHoldMs", v => Number.parseInt(v, 10));
 saveSetting("cbTail", "tailMs", v => Number.parseInt(v, 10));
 saveSetting("cbScanQuiet", "scanQuietSec", Number);
 saveSetting("cbScanNoSignal", "scanNoSignalSec", Number);
+saveSetting("cbTranscribe", "transcriptionBackend", v => Number.parseInt(v, 10));
 document.getElementById("centerInput").onchange = e => {
   const mhz = Number(e.target.value);
   if (Number.isFinite(mhz) && mhz > 0) postAndReport("/api/center", { hz: mhz * 1e6 });
@@ -7237,10 +7337,7 @@ setInterval(refresh, 500);
                 config.conf[_this->name]["transcriptionBackend"] = cur;
                 config.release(true);
                 if (cur == TB_OFF) {
-                    std::lock_guard<std::mutex> tlk(_this->lastTranscriptMtx);
-                    _this->lastTranscriptText.clear();
-                    _this->lastTranscriptName.clear();
-                    _this->playingSegments.clear();
+                    _this->stopTranscriptionWork();
                 }
 #ifdef __APPLE__
                 if (cur == TB_APPLE_SPEECH &&
@@ -8814,6 +8911,13 @@ setInterval(refresh, 500);
         if (path.empty() || !transcriptionOn()) return false;
 
         int backend = transcriptionBackend;
+        {
+            std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+            if ((int)transcriptionJobs.size() >= MAX_TRANSCRIPTION_JOBS) {
+                flog::warn("[ChannelBank] Skipping transcription; {0} job already in flight", MAX_TRANSCRIPTION_JOBS);
+                return false;
+            }
+        }
         void* handle = txTranscribeFile(backend, path.c_str());
         if (!handle) return false;
 
@@ -8843,6 +8947,38 @@ setInterval(refresh, 500);
         }
     }
 #endif
+
+    void stopTranscriptionWork() {
+#if defined(__APPLE__) || defined(_WIN32)
+        cancelTranscriptionJobs();
+        {
+            std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
+            pendingPlaybackSegments.clear();
+        }
+        std::vector<EncodeTask> ready;
+        {
+            std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+            for (auto it = pendingEncodes.begin(); it != pendingEncodes.end();) {
+                it->second.transcriptionDone = true;
+                if (it->second.playbackDone) {
+                    ready.push_back({it->first, it->second.finalM4APath, {}, it->second.avgSnrDb, 0});
+                    it = pendingEncodes.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& task : ready) {
+            triggerEncode(task.wavPath, task.finalM4APath, task.transcript, task.avgSnrDb, task.attempt);
+        }
+        {
+            std::lock_guard<std::mutex> tlk(lastTranscriptMtx);
+            lastTranscriptText.clear();
+            lastTranscriptName.clear();
+            playingSegments.clear();
+        }
+#endif
+    }
 
     void logRecording(double hz) {
         std::lock_guard<std::mutex> lk(freqLogMtx);
