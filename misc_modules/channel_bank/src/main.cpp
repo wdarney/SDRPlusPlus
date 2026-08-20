@@ -2395,7 +2395,7 @@ function spanInfo(s) {
 function spanX(freqHz, info, width) {
   return Math.round(((freqHz - info.lo) / info.span) * width);
 }
-function verticalWaterfallLabel(ctx, text, x, y, height, color) {
+function verticalWaterfallLabel(ctx, text, x, y, maxY, color) {
   const label = String(text || "").trim();
   if (!label) return;
   ctx.save();
@@ -2404,9 +2404,9 @@ function verticalWaterfallLabel(ctx, text, x, y, height, color) {
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   const chars = label.slice(0, 18).split("");
-  let cy = Math.max(4, y + 5);
+  let cy = Math.max(4, y);
   for (const ch of chars) {
-    if (cy + 9 > height - 2) break;
+    if (cy + 9 > maxY) break;
     ctx.fillText(ch, x, cy);
     cy += ch === " " ? 5 : 8;
   }
@@ -2485,10 +2485,12 @@ function drawSpanWaterfall(s) {
     ctx.fillStyle = h.blocked ? `rgba(210,70,70,${alpha})` : `rgba(70,130,210,${alpha})`;
     ctx.fillRect(x - 1, 0, 2, height);
   });
-  const rowH = height / spanWaterfallMaxFrames;
+  const labelBandH = 54;
+  const traceHeight = Math.max(70, height - labelBandH);
+  const rowH = traceHeight / spanWaterfallMaxFrames;
   const newestLabelByFreq = new Map();
   spanWaterfallFrames.forEach((frame, i) => {
-    const y = height - (spanWaterfallFrames.length - i) * rowH;
+    const y = traceHeight - (spanWaterfallFrames.length - i) * rowH;
     frame.forEach(p => {
       const x = spanX(p.freqHz, info, width);
       const alpha = p.blocked ? 0.95 : p.strength;
@@ -2500,7 +2502,7 @@ function drawSpanWaterfall(s) {
   });
   Array.from(newestLabelByFreq.values()).slice(-24).forEach(p => {
     const color = p.blocked ? "#ff9b9b" : p.live ? "#d8ffe0" : "#ffd29a";
-    verticalWaterfallLabel(ctx, p.label, p.x, p.y, height, color);
+    verticalWaterfallLabel(ctx, p.label, p.x, traceHeight + 5, height - 2, color);
   });
   points.filter(p => p.live).slice(0, 20).forEach(p => {
     const x = spanX(p.freqHz, info, width);
