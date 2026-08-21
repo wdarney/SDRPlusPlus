@@ -1865,8 +1865,10 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 h1 { font-size: 22px; margin: 0; font-weight: 650; }
 button { border: 1px solid #4a4a4a; background: #202020; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
 button:hover { background: #2b2b2b; }
-th button { padding: 0; border: 0; background: transparent; color: #ddd; font: inherit; cursor: pointer; }
+th button { display: inline-flex; align-items: center; gap: 4px; padding: 2px 0; border: 0; background: transparent; color: #ddd; font: inherit; cursor: pointer; }
 th button:hover { background: transparent; color: #fff; }
+th button.sort-active { color: #fff; font-weight: 650; }
+th button .sort-arrow { color: #62d26f; font-size: 11px; min-width: 8px; }
 select, input { border: 1px solid #4a4a4a; background: #101010; color: #fff; padding: 8px 10px; border-radius: 6px; font-size: 14px; min-width: 0; }
 .primary { background: #0d6efd; border-color: #2b7cff; }
 .danger { background: #7c1d1d; border-color: #ad2f2f; }
@@ -2360,8 +2362,8 @@ function sortHistoryRows(rows) {
   return rows;
 }
 function sortLabel(key, label) {
-  if (historySortKey !== key) return label;
-  return `${label} ${historySortDir > 0 ? "up" : "down"}`;
+  const arrow = historySortKey === key ? (historySortDir > 0 ? "▲" : "▼") : "";
+  return `${esc(label)} <span class="sort-arrow">${arrow}</span>`;
 }
 function renderActivityHistory(s) {
   const body = document.getElementById("activityHistory");
@@ -2373,7 +2375,10 @@ function renderActivityHistory(s) {
   document.querySelectorAll("[data-history-sort]").forEach(btn => {
     const key = btn.getAttribute("data-history-sort");
     const label = key === "freq" ? "Frequency" : key === "name" ? "Name" : key === "count" ? "Count" : "Last";
-    btn.textContent = sortLabel(key, label);
+    btn.innerHTML = sortLabel(key, label);
+    btn.classList.toggle("sort-active", historySortKey === key);
+    btn.setAttribute("aria-sort", historySortKey === key ? (historySortDir > 0 ? "ascending" : "descending") : "none");
+    btn.title = `Sort by ${label}`;
   });
   const rows = sortHistoryRows([...(s.history || [])]);
   body.innerHTML = rows.map(h => {
