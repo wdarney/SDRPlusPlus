@@ -641,10 +641,8 @@ private:
                 float gain = val.get<float>();
                 gain = std::max(gmin, std::min(gain, gmax));
                 uiGains[i] = gain;
-                if (running.load() && dev) {
+                if (running.load() && dev)
                     dev->setGain(SOAPY_SDR_RX, 0, gainList[i], gain);
-                    uiGains[i] = (float)dev->getGain(SOAPY_SDR_RX, 0, gainList[i]);
-                }
             }
         }
 
