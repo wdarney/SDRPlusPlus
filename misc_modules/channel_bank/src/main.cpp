@@ -334,6 +334,8 @@ public:
             playbackAutoFlushThreshold = config.conf[name]["playbackAutoFlushThreshold"];
         if (config.conf[name].contains("playbackAutoFlushKeepLatest"))
             playbackAutoFlushKeepLatest = config.conf[name]["playbackAutoFlushKeepLatest"];
+        if (config.conf[name].contains("playbackLockFreqHz"))
+            playbackLockFreqKey.store(freqKey(config.conf[name]["playbackLockFreqHz"].get<double>()));
         if (config.conf[name].contains("bwUsage"))
             bwUsage = config.conf[name]["bwUsage"];
         if (config.conf[name].contains("noiseReduction"))
@@ -1450,6 +1452,43 @@ private:
         return true;
     }
 
+    bool setPlaybackLock(double hz, std::string& error) {
+        if (hz <= 0.0) {
+            playbackLockFreqKey.store(0);
+            config.acquire();
+            config.conf[name].erase("playbackLockFreqHz");
+            config.release(true);
+            return true;
+        }
+        if (!std::isfinite(hz)) {
+            error = "hz must be finite";
+            return false;
+        }
+        int64_t key = freqKey(hz);
+        playbackLockFreqKey.store(key);
+        config.acquire();
+        config.conf[name]["playbackLockFreqHz"] = (double)key * 1000.0;
+        config.release(true);
+        discardUnlockedPlaybackEntries();
+        return true;
+    }
+
+    json playbackLockJson() {
+        int64_t key = playbackLockFreqKey.load();
+        if (key == 0) return {{"active", false}};
+        double hz = (double)key * 1000.0;
+        return {
+            {"active", true},
+            {"freqHz", hz},
+            {"name", displayName(hz)}
+        };
+    }
+
+    bool playbackAllowed(double hz) {
+        int64_t key = playbackLockFreqKey.load();
+        return key == 0 || freqKey(hz) == key;
+    }
+
     std::string selectedSourceName() {
         std::string source;
         core::configManager.acquire();
@@ -1789,6 +1828,7 @@ private:
         j["snrOverview"] = snrOverview;
         j["playbackQueued"] = playbackQueued;
         j["playback"] = playback;
+        j["playbackLock"] = playbackLockJson();
         j["currentlyPlayingFreqKey"] = playingKey;
         j["history"] = history;
         j["diagnostics"] = diagnosticsJson();
@@ -1825,6 +1865,8 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 h1 { font-size: 22px; margin: 0; font-weight: 650; }
 button { border: 1px solid #4a4a4a; background: #202020; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
 button:hover { background: #2b2b2b; }
+th button { padding: 0; border: 0; background: transparent; color: #ddd; font: inherit; cursor: pointer; }
+th button:hover { background: transparent; color: #fff; }
 select, input { border: 1px solid #4a4a4a; background: #101010; color: #fff; padding: 8px 10px; border-radius: 6px; font-size: 14px; min-width: 0; }
 .primary { background: #0d6efd; border-color: #2b7cff; }
 .danger { background: #7c1d1d; border-color: #ad2f2f; }
@@ -1839,6 +1881,10 @@ select, input { border: 1px solid #4a4a4a; background: #101010; color: #fff; pad
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }
 .status-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; margin-top: 10px; }
 .control { display: flex; flex-direction: column; gap: 5px; }
+.center-tune { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+.center-tune .label { grid-column: 1 / 2; }
+.center-tune-readout { color: #ddd; font-size: 12px; min-width: 170px; text-align: right; font-variant-numeric: tabular-nums; }
+.center-tune input[type="range"] { grid-column: 1 / 3; }
 .slider-control { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
 .slider-control .label { grid-column: 1 / 2; }
 .slider-value { color: #ddd; font-size: 12px; min-width: 58px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -1872,6 +1918,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 .span-hint { min-height: 16px; }
 .snr-chart { width: 100%; height: 170px; display: block; background: #0b0d10; border: 1px solid #2b3440; border-radius: 7px; }
 @media (max-width: 720px) { .controls, .server-controls, .source-grid, .settings-grid, .status-strip { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .center-tune { grid-template-columns: 1fr; } .center-tune input[type="range"] { grid-column: 1; } .center-tune-readout { text-align: left; } }
 </style>
 </head>
 <body>
@@ -1886,6 +1933,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control"><span class="label">Center MHz</span><input id="centerInput" inputmode="decimal" placeholder="157.06745"></label>
 <button class="primary" id="radioPlay">Play</button>
 <button class="danger" id="radioStop">Stop</button>
+<label class="center-tune"><span class="label">Center tune</span><span class="center-tune-readout" id="centerTuneStatus">Drag left/right to tune</span><input id="centerTune" type="range" min="-100" max="100" step="1" value="0"></label>
 </div>
 <div class="status-strip">
 <div class="tile"><div class="label">SDR++</div><div class="small-value ok" id="sdrppStatus">Connected</div></div>
@@ -1964,6 +2012,13 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="muted span-status" id="spanStatus"><div class="span-hint">Click lit activity to block or unblock it.</div></div>
 </section>
 <section>
+<div class="span-head">
+<h2>Activity History</h2>
+<div class="muted"><span id="playbackLockStatus">Playback all frequencies</span> <button class="secondary inline-action" id="clearPlaybackLock" type="button">Clear Lock</button></div>
+</div>
+<table><thead><tr><th><button type="button" data-history-sort="freq">Frequency</button></th><th><button type="button" data-history-sort="name">Name</button></th><th><button type="button" data-history-sort="count">Count</button></th><th><button type="button" data-history-sort="last">Last</button></th><th>Playback</th></tr></thead><tbody id="activityHistory"></tbody></table>
+</section>
+<section>
 <h2>Frequency Heat Map</h2>
 <div class="heatmap" id="heatmap"></div>
 <div class="muted" id="heatmapStatus" style="margin-top:8px">Click a frequency to block or unblock it.</div>
@@ -1985,8 +2040,8 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="muted" id="recordingsStatus" style="margin-top:8px">Saved WAV and M4A files in the Channel Bank recording folder.</div>
 </section>
 <section>
-<h2>History</h2>
-<table><thead><tr><th>Frequency</th><th>Name</th><th>Count</th><th>Blocked</th></tr></thead><tbody id="history"></tbody></table>
+<h2>Blocked Frequencies</h2>
+<table><thead><tr><th>Frequency</th><th>Name</th><th>Count</th><th>Blocked</th></tr></thead><tbody id="blockedFreqs"></tbody></table>
 </section>
 </main>
 <script>
@@ -2027,6 +2082,14 @@ const pendingSourceDirty = new Set();
 const pendingSourceSeq = new Map();
 const sourceSaveInFlight = new Set();
 const pendingSourceBodies = new Map();
+let lastCenterHz = 0;
+let centerTuneActive = false;
+let centerTuneTimer = null;
+let centerTuneCurrentHz = 0;
+let centerTunePendingHz = null;
+let centerTuneInFlight = false;
+let historySortKey = "last";
+let historySortDir = -1;
 let currentRecordingEnabled = true;
 const spanWaterfallFrames = [];
 const spanWaterfallMaxFrames = 72;
@@ -2090,6 +2153,97 @@ async function postAndReport(path, body, refreshAfter = true) {
     if (refreshAfter) await refresh();
     return false;
   }
+}
+function setCenterTuneStatus(text) {
+  const status = document.getElementById("centerTuneStatus");
+  if (status) status.textContent = text;
+}
+function rememberCenterHz(hz) {
+  const value = Number(hz);
+  if (Number.isFinite(value) && value > 0) lastCenterHz = value;
+}
+function currentCenterHz() {
+  const input = document.getElementById("centerInput");
+  const inputMhz = Number(input?.value || 0);
+  if (Number.isFinite(inputMhz) && inputMhz > 0) return inputMhz * 1e6;
+  if (centerTuneCurrentHz > 0) return centerTuneCurrentHz;
+  if (lastCenterHz > 0) return lastCenterHz;
+  const spanCenter = Number(spanWaterfallClick?.info?.center || 0);
+  return Number.isFinite(spanCenter) && spanCenter > 0 ? spanCenter : 0;
+}
+function updateCenterTunePreview() {
+  const slider = document.getElementById("centerTune");
+  const value = Number(slider?.value || 0);
+  if (!value) {
+    const hz = currentCenterHz();
+    setCenterTuneStatus(hz > 0 ? `Center ${fmtMHz(hz)}` : "Drag left/right to tune");
+    return;
+  }
+  const sign = value > 0 ? "+" : "-";
+  const speedKhz = centerTuneStepHz(value) * 1000 / 160;
+  setCenterTuneStatus(`${sign}${Math.round(Math.abs(speedKhz) / 1000)} kHz/s`);
+}
+function centerTuneStepHz(value) {
+  const mag = Math.min(1, Math.abs(Number(value) || 0) / 100);
+  if (mag <= 0) return 0;
+  return Math.round((150 + Math.pow(mag, 1.65) * 9850) * Math.sign(value));
+}
+function queueCenterTune(hz) {
+  const value = Math.max(1, Math.round(Number(hz) || 0));
+  if (!Number.isFinite(value) || value <= 0) return;
+  centerTunePendingHz = value;
+  if (!centerTuneInFlight) flushCenterTune();
+}
+async function flushCenterTune() {
+  if (centerTuneInFlight || !centerTunePendingHz) return;
+  const hz = centerTunePendingHz;
+  centerTunePendingHz = null;
+  centerTuneInFlight = true;
+  try {
+    await post("/api/center", { hz }, false);
+    rememberCenterHz(hz);
+  } catch (e) {
+    console.warn(e);
+    setCenterTuneStatus(e?.message || "Tune failed");
+  } finally {
+    centerTuneInFlight = false;
+    if (centerTunePendingHz) setTimeout(flushCenterTune, 60);
+  }
+}
+function centerTuneTick() {
+  const slider = document.getElementById("centerTune");
+  const delta = centerTuneStepHz(slider?.value || 0);
+  if (!centerTuneActive || !delta) return;
+  const base = centerTuneCurrentHz > 0 ? centerTuneCurrentHz : currentCenterHz();
+  if (base <= 0) {
+    setCenterTuneStatus("Waiting for center");
+    return;
+  }
+  centerTuneCurrentHz = Math.max(1, base + delta);
+  rememberCenterHz(centerTuneCurrentHz);
+  const input = document.getElementById("centerInput");
+  if (input && document.activeElement !== input) input.placeholder = (centerTuneCurrentHz / 1e6).toFixed(6);
+  setCenterTuneStatus(`Center ${fmtMHz(centerTuneCurrentHz)}`);
+  queueCenterTune(centerTuneCurrentHz);
+}
+function startCenterTune() {
+  if (centerTuneActive) return;
+  centerTuneCurrentHz = currentCenterHz();
+  centerTuneActive = true;
+  if (centerTuneTimer) clearInterval(centerTuneTimer);
+  centerTuneTimer = setInterval(centerTuneTick, 160);
+  centerTuneTick();
+}
+function stopCenterTune() {
+  if (!centerTuneActive) return;
+  centerTuneActive = false;
+  if (centerTuneTimer) clearInterval(centerTuneTimer);
+  centerTuneTimer = null;
+  const slider = document.getElementById("centerTune");
+  if (slider) slider.value = 0;
+  if (centerTunePendingHz) flushCenterTune();
+  setCenterTuneStatus(centerTuneCurrentHz > 0 ? `Center ${fmtMHz(centerTuneCurrentHz)}` : "Drag left/right to tune");
+  setTimeout(refresh, 180);
 }
 async function saveSettingValue(key, value, controlId, seq) {
   const settingsStatus = document.getElementById("settingsStatus");
@@ -2172,6 +2326,68 @@ async function blockFrequency(hz, blocked) {
   if (status) status.textContent = blocked ? "Blocking frequency..." : "Unblocking frequency...";
   const ok = await postAndReport("/api/frequency/block", { hz, blocked });
   if (status) status.textContent = ok ? (blocked ? "Frequency blocked" : "Frequency unblocked") : "Block action failed";
+}
+async function setPlaybackLock(hz) {
+  const status = document.getElementById("playbackLockStatus");
+  if (status) status.textContent = hz > 0 ? "Locking playback..." : "Clearing playback lock...";
+  const ok = await postAndReport("/api/playback-lock", { hz });
+  if (status && !ok) status.textContent = "Playback lock failed";
+}
+function sameFreqKey(a, b) {
+  return Math.round(Number(a || 0) / 1000) === Math.round(Number(b || 0) / 1000);
+}
+function fmtLastSeen(seconds) {
+  const ts = Number(seconds || 0);
+  if (ts <= 0) return "-";
+  const age = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (age < 60) return `${age}s ago`;
+  if (age < 3600) return `${Math.floor(age / 60)}m ago`;
+  if (age < 86400) return `${Math.floor(age / 3600)}h ago`;
+  return `${Math.floor(age / 86400)}d ago`;
+}
+function sortHistoryRows(rows) {
+  const dir = historySortDir;
+  const cmpText = (a, b) => String(a || "").localeCompare(String(b || ""), undefined, { sensitivity: "base" });
+  rows.sort((a, b) => {
+    let cmp = 0;
+    if (historySortKey === "freq") cmp = Number(a.freqHz || 0) - Number(b.freqHz || 0);
+    else if (historySortKey === "name") cmp = cmpText(a.name, b.name);
+    else if (historySortKey === "count") cmp = Number(a.count || 0) - Number(b.count || 0);
+    else cmp = Number(a.lastSeen || 0) - Number(b.lastSeen || 0);
+    if (!cmp) cmp = Number(a.freqHz || 0) - Number(b.freqHz || 0);
+    return cmp * dir;
+  });
+  return rows;
+}
+function sortLabel(key, label) {
+  if (historySortKey !== key) return label;
+  return `${label} ${historySortDir > 0 ? "up" : "down"}`;
+}
+function renderActivityHistory(s) {
+  const body = document.getElementById("activityHistory");
+  const status = document.getElementById("playbackLockStatus");
+  if (!body) return;
+  const lock = s.playbackLock || {};
+  const lockedHz = lock.active ? Number(lock.freqHz || 0) : 0;
+  if (status) status.textContent = lockedHz > 0 ? `Playback locked to ${lock.name || fmtMHz(lockedHz)}` : "Playback all frequencies";
+  document.querySelectorAll("[data-history-sort]").forEach(btn => {
+    const key = btn.getAttribute("data-history-sort");
+    const label = key === "freq" ? "Frequency" : key === "name" ? "Name" : key === "count" ? "Count" : "Last";
+    btn.textContent = sortLabel(key, label);
+  });
+  const rows = sortHistoryRows([...(s.history || [])]);
+  body.innerHTML = rows.map(h => {
+    const isLocked = lockedHz > 0 && sameFreqKey(h.freqHz, lockedHz);
+    return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : Number(h.freqHz).toFixed(0)})">${isLocked ? "Unlock" : "Lock"}</button></td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">No history yet</td></tr>`;
+}
+function renderBlockedFrequencies(s) {
+  const body = document.getElementById("blockedFreqs");
+  if (!body) return;
+  const rows = (s.history || []).filter(h => h.blocked).sort((a, b) => Number(a.freqHz || 0) - Number(b.freqHz || 0));
+  body.innerHTML = rows.map(h =>
+    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td><button class="inline-action danger" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, false)">Unblock</button></td></tr>`
+  ).join("") || `<tr><td colspan="4" class="muted">No blocked frequencies</td></tr>`;
 }
 function renderSourceControls(s) {
   const panel = document.getElementById("sourceSettings");
@@ -2843,6 +3059,11 @@ async function refresh() {
     document.getElementById("sampleRate").textContent = fmtRate(s.sampleRate);
     const wfInfo = spanInfo(s);
     document.getElementById("freqSpan").textContent = wfInfo ? `Waterfall ${fmtRangeMHz(wfInfo.lo, wfInfo.hi)}` : "Waterfall -";
+    rememberCenterHz(s.centerHz || s.waterfallCenterHz);
+    if (!centerTuneActive) {
+      centerTuneCurrentHz = lastCenterHz;
+      setCenterTuneStatus(lastCenterHz > 0 ? `Center ${fmtMHz(lastCenterHz)}` : "Drag left/right to tune");
+    }
     document.getElementById("heartbeat").textContent = `#${s.sdrppHeartbeat || 0}  ${now}`;
     document.getElementById("state").textContent = s.running ? "Running" : "Stopped";
     document.getElementById("state").className = "value " + (s.running ? "ok" : "off");
@@ -2900,16 +3121,15 @@ async function refresh() {
     document.getElementById("cbMode").disabled = !!s.running;
     document.getElementById("cbSpacing").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
-    drawSnrChart(s);
-    drawSpanWaterfall(s);
-    renderHeatMap(s);
-    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
-      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
-    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
-    document.getElementById("history").innerHTML = (s.history || []).map(h =>
-      `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count}</td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`
-    ).join("") || `<tr><td colspan="4" class="muted">No history yet</td></tr>`;
-    const tx = (s.lastTranscriptText || "").trim();
+	    drawSnrChart(s);
+	    drawSpanWaterfall(s);
+	    renderActivityHistory(s);
+	    renderHeatMap(s);
+	    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
+	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+	    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
+	    renderBlockedFrequencies(s);
+	    const tx = (s.lastTranscriptText || "").trim();
     document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
   } catch (e) {
     document.getElementById("state").textContent = "Disconnected";
@@ -3000,8 +3220,41 @@ saveSetting("cbScanNoSignal", "scanNoSignalSec", Number);
 saveSetting("cbTranscribe", "transcriptionBackend", v => Number.parseInt(v, 10));
 document.getElementById("centerInput").onchange = e => {
   const mhz = Number(e.target.value);
-  if (Number.isFinite(mhz) && mhz > 0) postAndReport("/api/center", { hz: mhz * 1e6 });
+  if (Number.isFinite(mhz) && mhz > 0) {
+    rememberCenterHz(mhz * 1e6);
+    centerTuneCurrentHz = mhz * 1e6;
+    setCenterTuneStatus(`Center ${fmtMHz(centerTuneCurrentHz)}`);
+    postAndReport("/api/center", { hz: mhz * 1e6 });
+  }
 };
+const centerTune = document.getElementById("centerTune");
+if (centerTune) {
+  centerTune.onpointerdown = e => {
+    centerTune.setPointerCapture?.(e.pointerId);
+    startCenterTune();
+  };
+  centerTune.onpointerup = stopCenterTune;
+  centerTune.onpointercancel = stopCenterTune;
+  centerTune.oninput = () => {
+    updateCenterTunePreview();
+    if (centerTuneActive) centerTuneTick();
+  };
+  centerTune.onchange = stopCenterTune;
+  window.addEventListener("pointerup", stopCenterTune);
+  window.addEventListener("blur", stopCenterTune);
+}
+document.querySelectorAll("[data-history-sort]").forEach(btn => {
+  btn.onclick = () => {
+    const key = btn.getAttribute("data-history-sort");
+    if (historySortKey === key) historySortDir *= -1;
+    else {
+      historySortKey = key;
+      historySortDir = key === "name" || key === "freq" ? 1 : -1;
+    }
+    refresh();
+  };
+});
+document.getElementById("clearPlaybackLock").onclick = () => setPlaybackLock(0);
 document.getElementById("spanWaterfall").onclick = e => {
   const point = nearestSpanPoint(e.clientX);
   const status = document.getElementById("spanStatus");
@@ -3565,6 +3818,18 @@ setRefreshInterval(refreshIntervalMs);
             sendUiActionResponse(fd, [this, hz, blocked] {
                 std::string error;
                 if (!setFrequencyBlocked(hz, blocked, error)) {
+                    return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
+                }
+                return webStateSnapshot();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/playback-lock") {
+            json body = requestJsonBody(reqText);
+            double hz = body.value("hz", 0.0);
+            sendUiActionResponse(fd, [this, hz] {
+                std::string error;
+                if (!setPlaybackLock(hz, error)) {
                     return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
                 }
                 return webStateSnapshot();
@@ -4715,7 +4980,7 @@ setRefreshInterval(refreshIntervalMs);
         }
 
         for (auto& done : completed) {
-            if (!done.segments.empty()) {
+            if (!done.segments.empty() && isPlaybackPending(done.path)) {
                 std::lock_guard<std::mutex> sk(pendingPlaybackSegmentsMtx);
                 pendingPlaybackSegments[done.path] = done.segments;
             }
@@ -4812,6 +5077,13 @@ setRefreshInterval(refreshIntervalMs);
         if (it == playbackQueue.end()) return false;
         playbackQueue.erase(it);
         return true;
+    }
+
+    bool isPlaybackPending(const std::string& path) {
+        if (isCurrentlyPlaying(path)) return true;
+        std::lock_guard<std::mutex> lk(playbackMtx);
+        return std::any_of(playbackQueue.begin(), playbackQueue.end(),
+            [&](const auto& entry) { return entry.path == path; });
     }
 
     void clearPendingPlaybackSegments(const std::string& path) {
@@ -5509,7 +5781,7 @@ setRefreshInterval(refreshIntervalMs);
                         if (!slot->currentFilePath.empty()) {
                             // deleteAfter=true when recording is disabled — play it back but don't keep the file
                             size_t qSize = _this->enqueuePlayback({
-                                slot->currentFilePath, slot->freqHz, slot->currentFinalM4APath, !_this->recordingEnabled
+                                slot->currentFilePath, slot->gridFreqHz, slot->currentFinalM4APath, !_this->recordingEnabled
                             });
                             // Auto-flush: if the queue is running away (live preview
                             // gets hours behind otherwise), drain the oldest entries
@@ -5814,6 +6086,48 @@ setRefreshInterval(refreshIntervalMs);
     }
 #endif
 
+    void completeUnplayedPlaybackEntry(PlaybackEntry& entry) {
+        if (entry.deleteAfter) {
+            // recordingEnabled was false at record-time — discard the WAV
+            // (matches the deleteAfter contract: the user never wanted to keep it).
+            std::remove(entry.path.c_str());
+#if defined(__APPLE__) || defined(_WIN32)
+            std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+            pendingEncodes.erase(entry.path);
+#endif
+        } else {
+            normalizeRecordingIfEnabled(entry.path);
+#if defined(__APPLE__) || defined(_WIN32)
+            // Mark playbackDone in pendingEncodes; if transcription is also done,
+            // fire the M4A encode now. Otherwise pollTranscriptions will fire it.
+            if (m4aEnabled && recordingEnabled) {
+                bool        canEncode = false;
+                std::string encodeFinalM4APath = entry.finalM4APath;
+                std::string encodeTranscript;
+                float       encodeSnrDb = 0.0f;
+                {
+                    std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+                    auto it = pendingEncodes.find(entry.path);
+                    if (it != pendingEncodes.end()) {
+                        it->second.playbackDone = true;
+                        it->second.playbackDoneAt = std::chrono::steady_clock::now();
+                        if (it->second.transcriptionDone) {
+                            canEncode = true;
+                            encodeFinalM4APath = it->second.finalM4APath;
+                            encodeTranscript = it->second.transcript;
+                            encodeSnrDb = it->second.avgSnrDb;
+                            pendingEncodes.erase(it);
+                        }
+                    } else {
+                        canEncode = true;
+                    }
+                }
+                if (canEncode) triggerEncode(entry.path, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
+            }
+#endif
+        }
+    }
+
     // Drain the oldest entries from the playback queue WITHOUT playing them.
     // Each drained entry has its M4A pipeline kicked off (or its WAV deleted if
     // recordingEnabled was off at record-time).  Used by the manual "Flush" UI
@@ -5832,53 +6146,28 @@ setRefreshInterval(refreshIntervalMs);
                 playbackQueue.pop_front();
             }
         }
-        for (auto& entry : toFlush) {
-            if (entry.deleteAfter) {
-                // recordingEnabled was false at record-time — discard the WAV
-                // (matches the deleteAfter contract: the user never wanted to keep it).
-                std::remove(entry.path.c_str());
-#if defined(__APPLE__) || defined(_WIN32)
-                std::lock_guard<std::mutex> elk(pendingEncodesMtx);
-                pendingEncodes.erase(entry.path);
-#endif
-            } else {
-                normalizeRecordingIfEnabled(entry.path);
-#if defined(__APPLE__) || defined(_WIN32)
-                // Mark playbackDone in pendingEncodes; if transcription is also
-                // done, fire the M4A encode now.  Otherwise leave the entry
-                // alone — pollTranscriptions will fire the encode once Whisper
-                // finishes, with the transcript baked in.
-                if (m4aEnabled && recordingEnabled) {
-                    bool        canEncode = false;
-                    std::string encodeFinalM4APath = entry.finalM4APath;
-                    std::string encodeTranscript;
-                    float       encodeSnrDb = 0.0f;
-                    {
-                        std::lock_guard<std::mutex> elk(pendingEncodesMtx);
-                        auto it = pendingEncodes.find(entry.path);
-                        if (it != pendingEncodes.end()) {
-                            it->second.playbackDone = true;
-                            it->second.playbackDoneAt = std::chrono::steady_clock::now();
-                            if (it->second.transcriptionDone) {
-                                canEncode        = true;
-                                encodeFinalM4APath = it->second.finalM4APath;
-                                encodeTranscript = it->second.transcript;
-                                encodeSnrDb      = it->second.avgSnrDb;
-                                pendingEncodes.erase(it);
-                            }
-                        } else {
-                            canEncode = true;
-                        }
-                    }
-                    if (canEncode) triggerEncode(entry.path, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
-                }
-                // If m4a is disabled the WAV stays as-is on disk — same outcome
-                // as if playback had run to completion with m4aEnabled=false.
-#endif
-            }
-        }
+        for (auto& entry : toFlush) completeUnplayedPlaybackEntry(entry);
         if (!toFlush.empty()) {
             flog::info("[ChannelBank] Flushed {0} queued recording(s) to M4A", (int)toFlush.size());
+        }
+    }
+
+    void discardUnlockedPlaybackEntries() {
+        std::vector<PlaybackEntry> skipped;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            for (auto it = playbackQueue.begin(); it != playbackQueue.end(); ) {
+                if (playbackAllowed(it->freqHz)) {
+                    ++it;
+                } else {
+                    skipped.push_back(std::move(*it));
+                    it = playbackQueue.erase(it);
+                }
+            }
+        }
+        for (auto& entry : skipped) completeUnplayedPlaybackEntry(entry);
+        if (!skipped.empty()) {
+            flog::info("[ChannelBank] Playback lock skipped {0} queued recording(s)", (int)skipped.size());
         }
     }
 
@@ -5899,6 +6188,11 @@ setRefreshInterval(refreshIntervalMs);
     }
 
     size_t enqueuePlayback(PlaybackEntry entry) {
+        if (!playbackAllowed(entry.freqHz)) {
+            completeUnplayedPlaybackEntry(entry);
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            return playbackQueue.size();
+        }
         std::vector<PlaybackEntry> dropped;
         size_t qSize = 0;
         {
@@ -8703,6 +8997,7 @@ setRefreshInterval(refreshIntervalMs);
     bool         playbackAutoFlushEnabled    = true;
     int          playbackAutoFlushThreshold  = 30;  // queue size above which auto-flush kicks in
     int          playbackAutoFlushKeepLatest = 5;   // how many to keep playable after a flush
+    std::atomic<int64_t> playbackLockFreqKey { 0 };  // 0 = all frequencies may enter playback queue
     // Non-max-suppression radius in slots — when detecting a signal at slot N,
     // also suppress neighbors up to ±nmsRadiusSlots from joining `detected`.
     // Default 2: covers AM voice (carrier + ±5–8 kHz sidebands) at 8.33–25 kHz
