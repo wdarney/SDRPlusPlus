@@ -1958,7 +1958,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <section>
 <div class="span-head">
 <h2>Activity Span</h2>
-<div class="muted" id="spanRange">-</div>
+<div class="muted"><span id="spanRange">-</span> · <label>Update <select id="spanRate"><option value="250">250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></label></div>
 </div>
 <canvas class="span-waterfall" id="spanWaterfall"></canvas>
 <div class="muted span-status" id="spanStatus"><div class="span-hint">Click lit activity to block or unblock it.</div></div>
@@ -2005,6 +2005,9 @@ let monitorRunId = 0;
 let monitorRetryTimer = null;
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
+let refreshTimer = null;
+let refreshIntervalMs = Number(localStorage.getItem("channelBankRefreshMs") || 500);
+if (![250, 500, 1000, 2000].includes(refreshIntervalMs)) refreshIntervalMs = 500;
 const monitorSampleRate = 48000;
 const monitorBufferCapacity = monitorSampleRate * 6;
 const monitorPrebufferSamples = Math.round(monitorSampleRate * 0.60);
@@ -2478,6 +2481,12 @@ function renderSpanStatus(status, info, labels, hint) {
     return `<span class="span-label" style="left:${pct.toFixed(3)}%;color:${color}">${esc(p.label).slice(0, 24)}</span>`;
   }).join("");
   status.innerHTML = `${labelItems ? `<div class="span-labels">${labelItems}</div>` : ""}<div class="span-hint">${esc(hint)}</div>`;
+}
+function setRefreshInterval(ms) {
+  refreshIntervalMs = [250, 500, 1000, 2000].includes(Number(ms)) ? Number(ms) : 500;
+  localStorage.setItem("channelBankRefreshMs", String(refreshIntervalMs));
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refresh, refreshIntervalMs);
 }
 function drawSpanWaterfall(s) {
   const canvas = document.getElementById("spanWaterfall");
@@ -2997,13 +3006,18 @@ document.getElementById("spanWaterfall").onclick = e => {
   const point = nearestSpanPoint(e.clientX);
   const status = document.getElementById("spanStatus");
   if (!point) {
-    if (status) status.textContent = "Click closer to a lit frequency.";
+    if (status) renderSpanStatus(status, spanWaterfallClick?.info || null, new Map(), "Click closer to a lit frequency.");
     return;
   }
   blockFrequency(point.freqHz, !point.blocked);
 };
+const spanRate = document.getElementById("spanRate");
+if (spanRate) {
+  spanRate.value = String(refreshIntervalMs);
+  spanRate.onchange = e => setRefreshInterval(Number(e.target.value));
+}
 refresh();
-setInterval(refresh, 500);
+setRefreshInterval(refreshIntervalMs);
 </script>
 </body>
 </html>)HTML";
