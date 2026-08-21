@@ -525,7 +525,8 @@ private:
                 {"min", gmin},
                 {"max", gmax},
                 {"step", gainRanges[i].step() > 0.0 ? gainRanges[i].step() : 0.1},
-                {"available", gmin != gmax}
+                {"available", gmin != gmax},
+                {"liveMutable", true}
             });
         }
 
@@ -553,8 +554,10 @@ private:
             {"supportsBiasTee", supportsBiasTee},
             {"biasTeeHF", biasTeeHF},
             {"biasTeeVHF", biasTeeVHF},
+            {"biasTeeLiveMutable", true},
             {"supportsDithering", supportsDithering},
-            {"dithering", dithering}
+            {"dithering", dithering},
+            {"ditheringLiveMutable", true}
         });
     }
 
@@ -628,15 +631,20 @@ private:
         if (req.contains("gains")) {
             for (auto& [key, val] : req["gains"].items()) {
                 auto it = std::find(gainList.begin(), gainList.end(), key);
-                if (it == gainList.end()) continue;
+                if (it == gainList.end()) {
+                    error = "gain not found: " + key;
+                    return false;
+                }
                 int i = (int)std::distance(gainList.begin(), it);
                 float gmin = (float)gainRanges[i].minimum();
                 float gmax = (float)gainRanges[i].maximum();
                 float gain = val.get<float>();
                 gain = std::max(gmin, std::min(gain, gmax));
                 uiGains[i] = gain;
-                if (running.load() && dev)
+                if (running.load() && dev) {
                     dev->setGain(SOAPY_SDR_RX, 0, gainList[i], gain);
+                    uiGains[i] = (float)dev->getGain(SOAPY_SDR_RX, 0, gainList[i]);
+                }
             }
         }
 
