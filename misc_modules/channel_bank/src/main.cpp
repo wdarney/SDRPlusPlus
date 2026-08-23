@@ -9,6 +9,7 @@
 #include <imgui.h>
 #include <module.h>
 #include <frequency_manager_interface.h>
+#include "channel_identity.h"
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
@@ -271,11 +272,12 @@ struct ChannelSlot {
     // separate from center-relative DSP placement prevents a harmless center
     // refresh from looking like a different channel on the next management pass.
     double targetFreqHz = NAN;
-    // Grid-aligned channel freq (lastKnownCenter + gridOffset).  Stable across the
-    // centroid jitter, so it's the right key for blocking + freqLog history: one
-    // grid slot ⇒ one history entry, blocks persist across re-spawns of the same
-    // channel.  Same as freqHz in manual mode (no centroid).
-    double gridFreqHz = 0.0;
+    // Automatic-mode grid identity. Manual/bookmark lanes leave this unset and
+    // use their immutable exact targetFreqHz identity instead.
+    double gridFreqHz = NAN;
+    double identityFreqHz() const {
+        return channel_bank::slotIdentityHz(targetFreqHz, gridFreqHz);
+    }
     std::string streamName;
 
     ChannelBankModule* module = nullptr;
@@ -1792,9 +1794,10 @@ private:
                 channels.push_back({
                     {"slot", idx},
                     {"freqHz", slot->freqHz},
-                    {"gridFreqHz", slot->gridFreqHz},
+                    {"gridFreqHz", std::isfinite(slot->gridFreqHz) ? json(slot->gridFreqHz) : json(nullptr)},
+                    {"identityFreqHz", slot->identityFreqHz()},
                     {"name", displayName(slot->freqHz)},
-                    {"blocked", isBlocked(slot->gridFreqHz)},
+                    {"blocked", isBlocked(slot->identityFreqHz())},
                     {"recording", slot->fileOpen},
                     {"signalPresent", slot->signalPresent.load()},
                     {"rawSignalPresent", slot->rawSignalPresent.load()},
@@ -2646,7 +2649,7 @@ function renderHeatMap(s) {
       recent: false,
       lastSeen: 0
     };
-    row.freqHz = data.gridFreqHz || data.freqHz || row.freqHz;
+    row.freqHz = data.identityFreqHz || data.gridFreqHz || data.freqHz || row.freqHz;
     row.name = data.name || row.name;
     row.count = Math.max(row.count, data.count || 0);
     row.blocked = row.blocked || !!data.blocked;
@@ -2657,7 +2660,7 @@ function renderHeatMap(s) {
   };
   (s.history || []).forEach(h => put(h.freqHz, h));
   (s.recentChannels || []).forEach(ch => put(ch.freqHz, { ...ch, recent: true, count: 1 }));
-  (s.activeChannels || []).forEach(ch => put(ch.gridFreqHz || ch.freqHz, { ...ch, live: true, count: 2 }));
+  (s.activeChannels || []).forEach(ch => put(ch.identityFreqHz || ch.gridFreqHz || ch.freqHz, { ...ch, live: true, count: 2 }));
   const items = Array.from(rows.values()).sort((a, b) =>
     (Number(b.blocked) - Number(a.blocked)) ||
     (Number(b.live) - Number(a.live)) ||
@@ -2825,7 +2828,7 @@ function collectSpanPoints(s, info) {
     recent: true,
     strength: Math.max(0.18, 0.58 * (1 - Math.min(30000, ch.ageMs || 0) / 30000))
   }));
-  (s.activeChannels || []).forEach(ch => add(ch.gridFreqHz || ch.freqHz, {
+  (s.activeChannels || []).forEach(ch => add(ch.identityFreqHz || ch.gridFreqHz || ch.freqHz, {
     ...ch,
     live: true,
     strength: ch.signalPresent ? 1 : 0.65
@@ -3269,7 +3272,7 @@ async function refresh() {
 	    renderActivityHistory(s);
 	    renderHeatMap(s);
 	    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
-	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.identityFreqHz || ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
 	    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
 	    renderBlockedFrequencies(s);
 	    const tx = (s.lastTranscriptText || "").trim();
@@ -3618,7 +3621,7 @@ setRefreshInterval(refreshIntervalMs);
             float s = std::clamp(mono[i], -1.0f, 1.0f);
             chunk[(size_t)i] = (int16_t)std::lround(s * 32767.0f);
         }
-        publishLiveAudioPcm(slot.freqHz, chunk.data(), (int)chunk.size(), false);
+        publishLiveAudioPcm(slot.identityFreqHz(), chunk.data(), (int)chunk.size(), false);
     }
 
     void publishLiveAudioPcm(double freqHz, const int16_t* pcm, int count, bool forceSelect) {
@@ -5320,14 +5323,15 @@ setRefreshInterval(refreshIntervalMs);
                     auto   pit        = localPeakOffsets.find(idx);
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
+                    double identityHz = channel_bank::automaticGridIdentityHz(slotFreq, channelSpacing);
                     if (!isInActiveSpan(slotFreq)) continue;
-                    if (isBlocked(slotFreq) || isRnVoiceQuarantined(slotFreq)) { blkSkip++; continue; }
+                    if (isBlocked(identityHz) || isRnVoiceQuarantined(identityHz)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
                     slot->lastDetected      = now;
                     slot->signalPresent     = true;
                     slot->rawSignalPresent  = true;
-                    initSlot(*slot, idx, numSlots, peakOffHz);
+                    initSlot(*slot, idx, numSlots, peakOffHz, NAN, identityHz);
                     activeChannels[idx] = slot;
                 }
                 else {
@@ -5349,20 +5353,17 @@ setRefreshInterval(refreshIntervalMs);
             for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
                 auto* slot = it->second;
 
-                // Immediately tear down blocked channels.  Key on gridFreqHz so this
-                // matches the block-check at spawn (which used slotFreq = grid) — using
-                // slot->freqHz here would be the centroid key, which doesn't match what
-                // the UI's Block toggle wrote, and the slot would never get destroyed
-                // (or it would, depending on which side of the kHz boundary the centroid
-                // jittered to).  gridFreqHz makes the whole loop coherent.
-                if (isBlocked(slot->gridFreqHz)) {
+                // Spawn and teardown must use the exact same immutable identity.
+                // Automatic lanes use gridFreqHz; manual/bookmark lanes use the
+                // exact requested targetFreqHz.
+                if (isBlocked(slot->identityFreqHz())) {
                     flog::info("[ChannelBank] Destroying blocked slot {0}", it->first);
                     destroySlot(*slot);
                     delete slot;
                     it = activeChannels.erase(it);
                     continue;
                 }
-                if (isRnVoiceQuarantined(slot->gridFreqHz)) {
+                if (isRnVoiceQuarantined(slot->identityFreqHz())) {
                     flog::info("[ChannelBank] Destroying RNNoise-quarantined slot {0}", it->first);
                     destroySlot(*slot);
                     delete slot;
@@ -5398,8 +5399,9 @@ setRefreshInterval(refreshIntervalMs);
                 if (!detected) {
                     float elapsed = std::chrono::duration<float>(
                         now - slot->lastDetected).count();
-                    bool isPlaying = (currentlyPlayingFreqKey.load() == freqKey(slot->freqHz));
-                    bool isQueued  = (queuedFreqKeys.count(freqKey(slot->freqHz)) > 0);
+                    const int64_t identityKey = freqKey(slot->identityFreqHz());
+                    bool isPlaying = (currentlyPlayingFreqKey.load() == identityKey);
+                    bool isQueued  = (queuedFreqKeys.count(identityKey) > 0);
                     if (elapsed > cooldownSec && !slot->fileOpen && !isPlaying && !isQueued) {
                         flog::info("[ChannelBank] Destroying slot {0}", it->first);
                         destroySlot(*slot);
@@ -5438,7 +5440,8 @@ setRefreshInterval(refreshIntervalMs);
 
     // exactFreqHz: when not NaN, supplies the immutable absolute frequency and
     // disables spectral-centroid / BFO adjustment (used by manual modes).
-    void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactFreqHz = NAN) {
+    void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz,
+                  double exactFreqHz = NAN, double automaticIdentityHz = NAN) {
         slot.module  = this;
         slot.gridIdx = gridIdx;
 
@@ -5465,11 +5468,13 @@ setRefreshInterval(refreshIntervalMs);
             : std::clamp(peakOffsetHz, gridOffset - channelSpacing * 0.5, gridOffset + channelSpacing * 0.5);
         slot.targetFreqHz = isManual ? exactFreqHz : NAN;
         slot.freqHz       = isManual ? exactFreqHz : centerSnapshot + offset;
-        // gridFreqHz: deterministic identity for blocking + freqLog keying.
-        // Snap to nearest multiple of channelSpacing so the key is independent
-        // of the SDR center frequency — retuning won't invalidate blocks.
-        double rawGrid = isManual ? exactFreqHz : (centerSnapshot + gridOffset);
-        slot.gridFreqHz = std::round(rawGrid / channelSpacing) * channelSpacing;
+        // Only automatic lanes use a grid identity. The management thread passes
+        // the value it checked before construction, making spawn and teardown
+        // invariant even if the receiver center changes during initSlot().
+        slot.gridFreqHz = isManual ? NAN
+            : (std::isfinite(automaticIdentityHz)
+                ? automaticIdentityHz
+                : channel_bank::automaticGridIdentityHz(centerSnapshot + gridOffset, channelSpacing));
 
         char freqBuf[64];
         snprintf(freqBuf, sizeof(freqBuf), "%.3fMHz", slot.freqHz / 1e6);
@@ -5571,11 +5576,12 @@ setRefreshInterval(refreshIntervalMs);
 
     void destroySlot(ChannelSlot& slot) {
         // Register in the sticky-recent list (caller always holds channelsMtx).
-        // Push the GRID freq, not the centroid — so the recent-list block button
-        // writes the same freqLog key the spawn/destroy checks use.
+        // Push the immutable slot identity, not the display/centroid frequency,
+        // so recent-channel blocking writes the same key used at spawn/teardown.
         // Deduplicate: if this freq is already recent, just refresh its timestamp.
         {
-            int64_t k = freqKey(slot.gridFreqHz);
+            const double identityHz = slot.identityFreqHz();
+            int64_t k = freqKey(identityHz);
             bool found = false;
             for (auto& rc : recentChannels) {
                 if (freqKey(rc.freqHz) == k) {
@@ -5585,7 +5591,7 @@ setRefreshInterval(refreshIntervalMs);
                 }
             }
             if (!found)
-                recentChannels.push_back({slot.gridFreqHz, std::chrono::steady_clock::now()});
+                recentChannels.push_back({identityHz, std::chrono::steady_clock::now()});
         }
 
         // Remove the live IQ producer while the complete receiver chain is
@@ -5649,7 +5655,7 @@ setRefreshInterval(refreshIntervalMs);
                     flog::info("[ChannelBank] Discarding RNNoise non-voice recording (voice in {0}/{1} frames = {2:.0f}% < {3:.0f}%) slot {4}",
                                slot.rnVadVoiceFrames, slot.rnVadFrames, rnVoiceFrac * 100.0f,
                                slot.module->rnVoiceGateVoiceFrac * 100.0f, slot.gridIdx);
-                    slot.module->quarantineRnVoice(slot.gridFreqHz);
+                    slot.module->quarantineRnVoice(slot.identityFreqHz());
                 }
                 if (staticReject || driftReject || stuckNoiseReject || rnVoiceReject || onAirMs < (int64_t)slot.module->minTransmissionMs) {
                     std::remove(slot.currentFilePath.c_str());
@@ -5755,7 +5761,7 @@ setRefreshInterval(refreshIntervalMs);
         // heard in the recording is ~0ms even though detection takes 100ms to fire.
         // signalPresent still controls the hold/silence-countdown (unchanged).
         bool rawOpen     = (slot->rawSignalPresent.load() && slot->rawConsecutiveHits.load() >= 2);
-        bool quarantined = _this->isRnVoiceQuarantined(slot->gridFreqHz);
+        bool quarantined = _this->isRnVoiceQuarantined(slot->identityFreqHz());
         bool activeSignal = !quarantined && (slot->signalPresent.load() || rawOpen);
 
         // Hard duration cap: a recording open longer than maxRecordingSec is force-closed
@@ -5881,7 +5887,7 @@ setRefreshInterval(refreshIntervalMs);
                                    slot->rnVadVoiceFrames, slot->rnVadFrames, rnVoiceFrac * 100.0f,
                                    _this->rnVoiceGateVoiceFrac * 100.0f, slot->gridIdx,
                                    forceClose ? " [dur-cap]" : "");
-                        _this->quarantineRnVoice(slot->gridFreqHz);
+                        _this->quarantineRnVoice(slot->identityFreqHz());
                         std::remove(slot->currentFilePath.c_str());
                     } else if (onAirMs < (int64_t)_this->minTransmissionMs) {
                         flog::info("[ChannelBank] Discarding short recording (on-air {0}ms < {1}ms threshold; span was {2}ms)", onAirMs, _this->minTransmissionMs, signalMs);
@@ -5928,14 +5934,15 @@ setRefreshInterval(refreshIntervalMs);
                         }
 #endif
                         // Log the frequency and queue for playback
-                        // Log under the GRID freq — one history row per channel, no
-                        // per-recording centroid-jitter duplicates.
-                        _this->logRecording(slot->gridFreqHz);
+                        // Log under the immutable slot identity: exact target for
+                        // manual/bookmark lanes, canonical grid for automatic lanes.
+                        const double identityHz = slot->identityFreqHz();
+                        _this->logRecording(identityHz);
                         _this->saveFreqLog();
                         if (!slot->currentFilePath.empty()) {
                             // deleteAfter=true when recording is disabled — play it back but don't keep the file
                             size_t qSize = _this->enqueuePlayback({
-                                slot->currentFilePath, slot->gridFreqHz, slot->currentFinalM4APath, !_this->recordingEnabled
+                                slot->currentFilePath, identityHz, slot->currentFinalM4APath, !_this->recordingEnabled
                             });
                             // Auto-flush: if the queue is running away (live preview
                             // gets hours behind otherwise), drain the oldest entries
@@ -6636,7 +6643,7 @@ setRefreshInterval(refreshIntervalMs);
                 bool live = slot->rawSignalPresent.load();
                 bool rec  = slot->fileOpen;
                 if (live) recCount++;
-                bool play = (playingKey != 0 && _this->freqKey(slot->freqHz) == playingKey);
+                bool play = (playingKey != 0 && _this->freqKey(slot->identityFreqHz()) == playingKey);
                 if (play) playingKeyAccountedFor = true;
                 marks.push_back({ slot->freqHz, live, rec, play });
             }
@@ -8309,7 +8316,7 @@ setRefreshInterval(refreshIntervalMs);
                         ImGui::Text("%s", label.c_str());
                         if (ImGui::IsItemHovered()) _this->hoveredFreqHz = slot->freqHz;
                         ImGui::SameLine();
-                        bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
+                        bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->identityFreqHz()));
                         if (playing) {
                             ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "[PLAY]");
                         }
@@ -8323,13 +8330,14 @@ setRefreshInterval(refreshIntervalMs);
                             ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "[ ? ]");
                         }
                         ImGui::SameLine();
-                        bool blocked = _this->isBlocked(slot->gridFreqHz);
+                        const double identityHz = slot->identityFreqHz();
+                        bool blocked = _this->isBlocked(identityHz);
                         char blkId[48];
                         snprintf(blkId, sizeof(blkId), "Blk##_cb_ablk_%d", idx);
                         if (ImGui::Checkbox(blkId, &blocked)) {
                             std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                            auto& entry = _this->freqLog[_this->freqKey(slot->gridFreqHz)];
-                            if (entry.freqHz == 0.0) entry.freqHz = slot->gridFreqHz;
+                            auto& entry = _this->freqLog[_this->freqKey(identityHz)];
+                            if (entry.freqHz == 0.0) entry.freqHz = identityHz;
                             entry.blocked = blocked;
                             needSaveFreqLog = true;
                         }
@@ -8636,14 +8644,14 @@ setRefreshInterval(refreshIntervalMs);
                 continue;
             }
             // Immediately tear down blocked channels (mirrors auto-mode behaviour)
-            if (isBlocked(it->second->gridFreqHz)) {
+            if (isBlocked(it->second->identityFreqHz())) {
                 flog::info("[ChannelBank] BkScan: removing blocked slot {0}", idx);
                 destroySlot(*it->second);
                 delete it->second;
                 it = activeChannels.erase(it);
                 continue;
             }
-            if (isRnVoiceQuarantined(it->second->gridFreqHz)) {
+            if (isRnVoiceQuarantined(it->second->identityFreqHz())) {
                 flog::info("[ChannelBank] BkScan: removing RNNoise-quarantined slot {0}", idx);
                 destroySlot(*it->second);
                 delete it->second;
@@ -8974,14 +8982,14 @@ setRefreshInterval(refreshIntervalMs);
             // Immediately tear down blocked channels (mirrors auto-mode behaviour).
             // Without this, blocking a freq left the slot alive forever in manual mode,
             // so unblocking had no effect (nothing to respawn since slot never left).
-            if (isBlocked(it->second->gridFreqHz)) {
+            if (isBlocked(it->second->identityFreqHz())) {
                 flog::info("[ChannelBank] Manual: removing blocked slot {0}", idx);
                 destroySlot(*it->second);
                 delete it->second;
                 it = activeChannels.erase(it);
                 continue;
             }
-            if (isRnVoiceQuarantined(it->second->gridFreqHz)) {
+            if (isRnVoiceQuarantined(it->second->identityFreqHz())) {
                 flog::info("[ChannelBank] Manual: removing RNNoise-quarantined slot {0}", idx);
                 destroySlot(*it->second);
                 delete it->second;

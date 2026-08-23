@@ -7,6 +7,14 @@ endif ()
 
 project(channel_bank)
 
+option(CHANNEL_BANK_BUILD_IDENTITY_TEST "Build the Channel Bank identity regression test" OFF)
+if (CHANNEL_BANK_BUILD_IDENTITY_TEST)
+    enable_testing()
+    add_executable(channel_bank_identity_test tests/channel_identity_test.cpp)
+    target_compile_features(channel_bank_identity_test PRIVATE cxx_std_17)
+    add_test(NAME channel_bank_identity COMMAND channel_bank_identity_test)
+endif()
+
 file(GLOB SRC "src/*.cpp")
 list(FILTER SRC EXCLUDE REGEX "src/main_ios\\.cpp$")
 if (ANDROID)
