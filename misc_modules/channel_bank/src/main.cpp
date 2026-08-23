@@ -570,11 +570,13 @@ public:
         iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
         iqSplitter->start();
 
-        // Bind spectrum monitor stream to our splitter (not directly to the frontend)
+        // Start the spectrum consumer before exposing its stream to the live IQ
+        // splitter.  A bound stream without a running consumer can fill and
+        // back-pressure every SDR++ IQ consumer.
         specStream = new dsp::stream<dsp::complex_t>();
-        iqSplitter->bindStream(specStream);
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
+        iqSplitter->bindStream(specStream);
 
         // Start management thread
         mgmtRunning = true;
@@ -636,8 +638,10 @@ public:
         mgmtCv.notify_all();
         if (mgmtThread.joinable()) { mgmtThread.join(); }
 
-        specSink->stop();
+        // Disconnect live IQ while the spectrum sink can still drain anything
+        // already in flight, then stop and delete the consumer.
         iqSplitter->unbindStream(specStream);
+        specSink->stop();
         delete specSink;  specSink  = nullptr;
         delete specStream; specStream = nullptr;
 
@@ -5358,7 +5362,6 @@ setRefreshInterval(refreshIntervalMs);
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
         slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
-        iqSplitter->bindStream(slot.iqIn);
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
@@ -5414,13 +5417,17 @@ setRefreshInterval(refreshIntervalMs);
         }
 #endif
 
-        slot.vfo->start();
+        // Start downstream consumers first.  Bind the live IQ input only after
+        // the entire receiver chain is ready to drain it; otherwise the shared
+        // splitter can block during slot construction and freeze every VFO.
+        slot.recSink->start();
+        slot.meter->start();
+        slot.splitter->start();
         if (slot.amDemod)  slot.amDemod->start();
         if (slot.fmDemod)  slot.fmDemod->start();
         if (slot.ssbDemod) slot.ssbDemod->start();
-        slot.splitter->start();
-        slot.meter->start();
-        slot.recSink->start();
+        slot.vfo->start();
+        iqSplitter->bindStream(slot.iqIn);
 
     }
 
@@ -5443,15 +5450,18 @@ setRefreshInterval(refreshIntervalMs);
                 recentChannels.push_back({slot.gridFreqHz, std::chrono::steady_clock::now()});
         }
 
-        slot.recSink->stop();
-        slot.meter->stop();
-        slot.splitter->stop();
+        // Remove the live IQ producer while the complete receiver chain is
+        // still draining.  Stopping the VFO first leaves an undrained bound
+        // stream that can permanently block iqSplitter::unbindStream().
+        iqSplitter->unbindStream(slot.iqIn);
+
+        slot.vfo->stop();
         if (slot.amDemod)  slot.amDemod->stop();
         if (slot.fmDemod)  slot.fmDemod->stop();
         if (slot.ssbDemod) slot.ssbDemod->stop();
-        slot.vfo->stop();
-
-        iqSplitter->unbindStream(slot.iqIn);
+        slot.splitter->stop();
+        slot.meter->stop();
+        slot.recSink->stop();
 
         if (slot.fileOpen) {
             slot.writer.close();
