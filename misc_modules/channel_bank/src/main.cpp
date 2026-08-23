@@ -563,18 +563,21 @@ public:
             }
         }
 
-        // Create one shared IQ binding — all consumers fan out from this splitter
-        // so the main signal-path thread only copies one buffer.
+        // Build and start the entire local spectrum path before exposing its
+        // input to SDR++'s live frontend. The frontend splitter is synchronous:
+        // binding an undrained stream can stop IQ delivery to the waterfall,
+        // main VFO, audio, and network flow control.
         sharedIqIn = new dsp::stream<dsp::complex_t>();
-        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
         iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
-        iqSplitter->start();
-
-        // Bind spectrum monitor stream to our splitter (not directly to the frontend)
         specStream = new dsp::stream<dsp::complex_t>();
-        iqSplitter->bindStream(specStream);
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
+        iqSplitter->bindStream(specStream);
+        iqSplitter->start();
+
+        // Attach to the global frontend last, once every downstream consumer is
+        // already running and able to drain the first IQ block immediately.
+        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
 
         // Start management thread
         mgmtRunning = true;
@@ -604,6 +607,13 @@ public:
         std::lock_guard<std::mutex> lck(runMtx);
         if (!running) { return; }
         running = false;
+        mgmtRunning = false;
+        mgmtCv.notify_all();
+
+        // Detach from the synchronous global frontend first. This prevents any
+        // teardown step from leaving an undrained Channel Bank stream capable of
+        // stalling the rest of SDR++.
+        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
 
         // Restore FM waterfall visibility before tearing down
         if (manualMode) restoreWaterfallVisibility();
@@ -632,12 +642,10 @@ public:
 
         // Stop management thread and spectrum monitor so no new channels are spawned
         // or modified while we tear down.
-        mgmtRunning = false;
-        mgmtCv.notify_all();
         if (mgmtThread.joinable()) { mgmtThread.join(); }
 
-        specSink->stop();
         iqSplitter->unbindStream(specStream);
+        specSink->stop();
         delete specSink;  specSink  = nullptr;
         delete specStream; specStream = nullptr;
 
@@ -664,9 +672,9 @@ public:
         { std::lock_guard<std::mutex> lk(encodeQueueMtx);   encodeQueue.clear(); }
         { std::lock_guard<std::mutex> lk(pendingEncodesMtx); pendingEncodes.clear(); }
 
-        // Tear down shared IQ splitter — all slot streams have been unbound by destroySlot above.
+        // Tear down the now-isolated local IQ splitter. All slot streams have
+        // already been unbound by destroySlot().
         iqSplitter->stop();
-        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
         delete iqSplitter; iqSplitter = nullptr;
         delete sharedIqIn; sharedIqIn = nullptr;
     }
@@ -5358,7 +5366,6 @@ setRefreshInterval(refreshIntervalMs);
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
         slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
-        iqSplitter->bindStream(slot.iqIn);
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
@@ -5414,13 +5421,18 @@ setRefreshInterval(refreshIntervalMs);
         }
 #endif
 
-        slot.vfo->start();
+        // Start downstream-to-upstream so every producer has a live consumer
+        // before it can publish its first block.
+        slot.recSink->start();
+        slot.meter->start();
+        slot.splitter->start();
         if (slot.amDemod)  slot.amDemod->start();
         if (slot.fmDemod)  slot.fmDemod->start();
         if (slot.ssbDemod) slot.ssbDemod->start();
-        slot.splitter->start();
-        slot.meter->start();
-        slot.recSink->start();
+        slot.vfo->start();
+
+        // Expose the completed receiver chain to the live local IQ splitter last.
+        iqSplitter->bindStream(slot.iqIn);
 
     }
 
@@ -5443,15 +5455,17 @@ setRefreshInterval(refreshIntervalMs);
                 recentChannels.push_back({slot.gridFreqHz, std::chrono::steady_clock::now()});
         }
 
-        slot.recSink->stop();
-        slot.meter->stop();
-        slot.splitter->stop();
+        // Remove the live producer first, then stop upstream-to-downstream. No
+        // stopped consumer remains attached to a synchronous splitter.
+        iqSplitter->unbindStream(slot.iqIn);
+
+        slot.vfo->stop();
         if (slot.amDemod)  slot.amDemod->stop();
         if (slot.fmDemod)  slot.fmDemod->stop();
         if (slot.ssbDemod) slot.ssbDemod->stop();
-        slot.vfo->stop();
-
-        iqSplitter->unbindStream(slot.iqIn);
+        slot.splitter->stop();
+        slot.meter->stop();
+        slot.recSink->stop();
 
         if (slot.fileOpen) {
             slot.writer.close();
