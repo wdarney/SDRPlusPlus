@@ -189,7 +189,11 @@ private:
         parameters.nChannels = 2;
         unsigned int bufferFrames = sampleRate / 60;
         RtAudio::StreamOptions opts;
-        opts.flags = RTAUDIO_MINIMIZE_LATENCY;
+        // On CoreAudio, RTAUDIO_MINIMIZE_LATENCY replaces bufferFrames with
+        // the device's absolute minimum.  That leaves too little scheduling
+        // headroom when SDR++ is backgrounded and produces audible underruns.
+        // Keep RtAudio's robust default while retaining our ~16.7 ms request.
+        opts.flags = 0;
         opts.streamName = _streamName;
 
         try {
