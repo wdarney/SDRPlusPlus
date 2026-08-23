@@ -484,6 +484,7 @@ public:
                           - 0.01168f * cosf(3.0f * phi);
         }
         fftAccum.resize(FFT_SIZE);
+        pendingSpectrum.resize(FFT_SIZE);
         fftBufPos = 0;
 
         retuneHandler.ctx     = this;
@@ -580,7 +581,16 @@ public:
         iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
         iqSplitter->start();
 
-        // Bind spectrum monitor stream to our splitter (not directly to the frontend)
+        // Bind spectrum monitor stream to our splitter (not directly to the frontend).
+        // The Handler only copies a bounded snapshot into pendingSpectrum. All FFT
+        // and detector work runs on spectrumWorkerThread so this branch cannot hold
+        // the shared IQ splitter while analysis is in progress.
+        {
+            std::lock_guard<std::mutex> lk(spectrumWorkMtx);
+            spectrumWorkPending = false;
+        }
+        spectrumWorkerRunning.store(true);
+        spectrumWorkerThread = std::thread(&ChannelBankModule::spectrumWorkerFunc, this);
         specStream = new dsp::stream<dsp::complex_t>();
         iqSplitter->bindStream(specStream);
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
@@ -650,6 +660,16 @@ public:
         iqSplitter->unbindStream(specStream);
         delete specSink;  specSink  = nullptr;
         delete specStream; specStream = nullptr;
+
+        // No new snapshots can arrive after the sink is stopped. Stop the analysis
+        // worker before destroying detector state or the shared IQ objects.
+        spectrumWorkerRunning.store(false);
+        {
+            std::lock_guard<std::mutex> lk(spectrumWorkMtx);
+            spectrumWorkPending = false;
+        }
+        spectrumWorkCv.notify_all();
+        if (spectrumWorkerThread.joinable()) spectrumWorkerThread.join();
 
         // Teardown all active channels BEFORE stopping the encode thread.
         // destroySlot() may queue open recordings for direct M4A encoding; the
@@ -4219,8 +4239,8 @@ setRefreshInterval(refreshIntervalMs);
         // At 64 MHz SR the naive approach (FFT every 8192 samples) runs ~7,800 FFTs/sec,
         // saturates a CPU core, and creates backpressure on the DSP Splitter chain that
         // starves the waterfall's own FFT thread — causing visual choppiness.
-        // Returning early here still lets the Handler sink flush the buffer immediately,
-        // so the Splitter never blocks.
+        // Returning early here lets the Handler sink flush immediately. Due frames
+        // are also limited to one FFT-sized copy below; analysis never runs inline.
         _this->specSamplesUntilFFT -= count;
         if (_this->specSamplesUntilFFT > 0) return;
 
@@ -4229,16 +4249,46 @@ setRefreshInterval(refreshIntervalMs);
             ? (int64_t)(sr / SPEC_ANALYSIS_HZ)
             : (int64_t)(FFT_SIZE);
 
-        // Fill fftAccum from this block; zero-pad if the block is smaller than FFT_SIZE
-        // (only possible at very low sample rates — typical HF/SDR blocks are much larger).
+        // Never wait behind spectrum analysis here. This Handler is fed by a
+        // blocking SDR++ splitter, so work done before it flushes propagates back to
+        // the waterfall and every VFO. A try-lock plus one pending frame makes this
+        // a bounded latest-frame mailbox: if analysis is busy, intentionally drop
+        // this frame and keep the shared radio path moving.
+        if (!_this->spectrumWorkerRunning.load(std::memory_order_relaxed)) return;
+        std::unique_lock<std::mutex> lk(_this->spectrumWorkMtx, std::try_to_lock);
+        if (!lk.owns_lock() || _this->spectrumWorkPending) return;
+
         int fill = std::min(count, FFT_SIZE);
-        std::copy(data, data + fill, _this->fftAccum.data());
+        std::copy(data, data + fill, _this->pendingSpectrum.data());
         if (fill < FFT_SIZE) {
-            std::fill(_this->fftAccum.begin() + fill, _this->fftAccum.end(),
+            std::fill(_this->pendingSpectrum.begin() + fill, _this->pendingSpectrum.end(),
                       dsp::complex_t{0.0f, 0.0f});
         }
-        _this->fftBufPos = 0;
-        _this->analyzeSpectrum();
+        _this->spectrumWorkPending = true;
+        lk.unlock();
+        _this->spectrumWorkCv.notify_one();
+    }
+
+    void spectrumWorkerFunc() {
+        std::vector<dsp::complex_t> localSpectrum(FFT_SIZE);
+        while (spectrumWorkerRunning.load(std::memory_order_relaxed)) {
+            {
+                std::unique_lock<std::mutex> lk(spectrumWorkMtx);
+                spectrumWorkCv.wait(lk, [this] {
+                    return spectrumWorkPending ||
+                           !spectrumWorkerRunning.load(std::memory_order_relaxed);
+                });
+                if (!spectrumWorkerRunning.load(std::memory_order_relaxed)) break;
+                localSpectrum.swap(pendingSpectrum);
+                spectrumWorkPending = false;
+            }
+
+            // Both vectors remain FFT_SIZE elements after each swap. The worker
+            // exclusively owns fftAccum and all detector history.
+            fftAccum.swap(localSpectrum);
+            fftBufPos = 0;
+            analyzeSpectrum();
+        }
     }
 
     void analyzeSpectrum() {
@@ -9414,6 +9464,12 @@ setRefreshInterval(refreshIntervalMs);
     std::vector<float>                      fftWindow;     // active window (length FFT_SIZE, correct for current SR)
     int                                     fftWindowFill  = 0; // fill length fftWindow was built for
     std::vector<dsp::complex_t>             fftAccum;
+    std::vector<dsp::complex_t>             pendingSpectrum;
+    std::mutex                              spectrumWorkMtx;
+    std::condition_variable                 spectrumWorkCv;
+    bool                                    spectrumWorkPending = false;
+    std::atomic<bool>                       spectrumWorkerRunning { false };
+    std::thread                             spectrumWorkerThread;
     int                                     fftBufPos      = 0;
     int64_t                                 specSamplesUntilFFT = 0;  // countdown; analysis fires when ≤ 0
     std::atomic<int>                        debugDetectedCount { 0 };
