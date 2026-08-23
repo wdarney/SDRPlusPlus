@@ -75,6 +75,11 @@ namespace dsp {
             return (readerStop ? -1 : dataSize);
         }
 
+        inline bool isDataReady() {
+            std::lock_guard<std::mutex> lck(rdyMtx);
+            return dataReady;
+        }
+
         virtual inline void flush() {
             // Clear data ready
             {

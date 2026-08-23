@@ -221,10 +221,20 @@ private:
 
     static int callback(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames, double streamTime, RtAudioStreamStatus status, void* userData) {
         AudioSink* _this = (AudioSink*)userData;
+        memset(outputBuffer, 0, nBufferFrames * sizeof(dsp::stereo_t));
+
+        // RtAudio can invoke the callback synchronously while startStream() is
+        // still bringing up a newly selected sink. Never block that startup on
+        // the DSP packer, which may not have produced its first buffer yet.
+        if (!_this->stereoPacker.out.isDataReady()) {
+            return 0;
+        }
+
         int count = _this->stereoPacker.out.read();
         if (count < 0) { return 0; }
 
-        memcpy(outputBuffer, _this->stereoPacker.out.readBuf, nBufferFrames * sizeof(dsp::stereo_t));
+        int toCopy = std::min<int>(count, nBufferFrames);
+        memcpy(outputBuffer, _this->stereoPacker.out.readBuf, toCopy * sizeof(dsp::stereo_t));
         _this->stereoPacker.out.flush();
         return 0;
     }
