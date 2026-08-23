@@ -9070,6 +9070,12 @@ setRefreshInterval(refreshIntervalMs);
         std::vector<double> localFreqs = getActiveManualFreqs();
 
         auto now = std::chrono::steady_clock::now();
+        std::set<int64_t> queuedFreqKeys;
+        {
+            std::lock_guard<std::mutex> plk(playbackMtx);
+            for (auto& entry : playbackQueue)
+                queuedFreqKeys.insert(freqKey(entry.freqHz));
+        }
         std::lock_guard<std::mutex> clck(channelsMtx);
 
         // Build desired set (indices currently within SDR bandwidth and active span)
@@ -9153,11 +9159,33 @@ setRefreshInterval(refreshIntervalMs);
                 if (watchedFreqs.count(k) > 0) watchAlert.store(k);
             }
             it->second->prevSignalPresent = present;
+
+            // Manual detection comes from the shared spectrum monitor, so a quiet
+            // configured frequency does not need to keep a VFO/demodulator chain
+            // alive. Retire it using the same cooldown and playback protections as
+            // Auto mode. This prevents a large bookmark list from backpressuring the
+            // shared IQ splitter and pausing the waterfall/main VFO.
+            if (!present && !rawPresent) {
+                float elapsed = std::chrono::duration<float>(
+                    now - it->second->lastDetected).count();
+                bool isPlaying = (currentlyPlayingFreqKey.load() == freqKey(it->second->freqHz));
+                bool isQueued  = (queuedFreqKeys.count(freqKey(it->second->freqHz)) > 0);
+                if (elapsed > cooldownSec && !it->second->fileOpen && !isPlaying && !isQueued) {
+                    flog::info("[ChannelBank] Manual: retiring quiet slot {0}", idx);
+                    destroySlot(*it->second);
+                    delete it->second;
+                    it = activeChannels.erase(it);
+                    continue;
+                }
+            }
             ++it;
         }
 
-        // Spawn a slot for each desired freq not yet active
+        // Spawn only after the shared-spectrum detector has accumulated enough
+        // votes. The detector does not depend on a ChannelSlot, so pre-creating a
+        // lane for every quiet bookmark only adds splitter backpressure and threads.
         for (int i : desired) {
+            if (localDetected.count(i) == 0) continue;
             if (activeChannels.find(i) != activeChannels.end()) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
             if (isBlocked(localFreqs[i]) || isRnVoiceQuarantined(localFreqs[i])) continue;
