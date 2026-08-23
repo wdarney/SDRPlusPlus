@@ -567,20 +567,13 @@ public:
             }
         }
 
-        // Create one shared IQ binding — all consumers fan out from this splitter
-        // so the main signal-path thread only copies one buffer.
-        sharedIqIn = new dsp::stream<dsp::complex_t>();
-        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
-        iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
-        iqSplitter->start();
-
-        // Start the spectrum consumer before exposing its stream to the live IQ
-        // splitter.  A bound stream without a running consumer can fill and
-        // back-pressure every SDR++ IQ consumer.
+        // Start the spectrum consumer before exposing its stream to live IQ.
+        // Keep this as a direct frontend tap: the former private shared splitter
+        // could stop the entire source graph when any Channel Bank lane stalled.
         specStream = new dsp::stream<dsp::complex_t>();
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
-        iqSplitter->bindStream(specStream);
+        sigpath::iqFrontEnd.bindIQStream(specStream);
 
         // Start management thread
         mgmtRunning = true;
@@ -644,7 +637,7 @@ public:
 
         // Disconnect live IQ while the spectrum sink can still drain anything
         // already in flight, then stop and delete the consumer.
-        iqSplitter->unbindStream(specStream);
+        sigpath::iqFrontEnd.unbindIQStream(specStream);
         specSink->stop();
         delete specSink;  specSink  = nullptr;
         delete specStream; specStream = nullptr;
@@ -672,11 +665,6 @@ public:
         { std::lock_guard<std::mutex> lk(encodeQueueMtx);   encodeQueue.clear(); }
         { std::lock_guard<std::mutex> lk(pendingEncodesMtx); pendingEncodes.clear(); }
 
-        // Tear down shared IQ splitter — all slot streams have been unbound by destroySlot above.
-        iqSplitter->stop();
-        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
-        delete iqSplitter; iqSplitter = nullptr;
-        delete sharedIqIn; sharedIqIn = nullptr;
     }
 
     // Normalize a closed INT16 mono WAV to -3 dBFS in-place.
@@ -5434,7 +5422,7 @@ setRefreshInterval(refreshIntervalMs);
         if (slot.fmDemod)  slot.fmDemod->start();
         if (slot.ssbDemod) slot.ssbDemod->start();
         slot.vfo->start();
-        iqSplitter->bindStream(slot.iqIn);
+        sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
 
     }
 
@@ -5459,8 +5447,8 @@ setRefreshInterval(refreshIntervalMs);
 
         // Remove the live IQ producer while the complete receiver chain is
         // still draining.  Stopping the VFO first leaves an undrained bound
-        // stream that can permanently block iqSplitter::unbindStream().
-        iqSplitter->unbindStream(slot.iqIn);
+        // stream that can permanently block the frontend splitter.
+        sigpath::iqFrontEnd.unbindIQStream(slot.iqIn);
 
         slot.vfo->stop();
         if (slot.amDemod)  slot.amDemod->stop();
@@ -9103,11 +9091,6 @@ setRefreshInterval(refreshIntervalMs);
     std::mutex bookmarkNamesMtx;
     struct BookmarkEntry { std::string name; std::string listName; };
     std::map<int64_t, BookmarkEntry> bookmarkNames;  // freqKey -> {name, listName}
-
-    // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
-    // keeping the main signal-path thread's memcpy cost at O(1) regardless of slot count.
-    dsp::stream<dsp::complex_t>*            sharedIqIn  = nullptr;
-    dsp::routing::Splitter<dsp::complex_t>* iqSplitter  = nullptr;
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
