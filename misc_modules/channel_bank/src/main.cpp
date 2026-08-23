@@ -140,6 +140,10 @@ struct ChannelSlot {
 
     int    gridIdx = 0;
     double freqHz  = 0.0;   // centroid-aligned (auto mode) — for VFO placement + display
+    // Immutable requested frequency for manual/bookmark lanes.  Keeping this
+    // separate from center-relative DSP placement prevents a harmless center
+    // refresh from looking like a different channel on the next management pass.
+    double targetFreqHz = NAN;
     // Grid-aligned channel freq (lastKnownCenter + gridOffset).  Stable across the
     // centroid jitter, so it's the right key for blocking + freqLog history: one
     // grid slot ⇒ one history entry, blocks persist across re-spawns of the same
@@ -5302,13 +5306,13 @@ setRefreshInterval(refreshIntervalMs);
         }
     }
 
-    // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
-    // disables spectral-centroid / BFO adjustment (used by manual mode).
-    void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
+    // exactFreqHz: when not NaN, supplies the immutable absolute frequency and
+    // disables spectral-centroid / BFO adjustment (used by manual modes).
+    void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactFreqHz = NAN) {
         slot.module  = this;
         slot.gridIdx = gridIdx;
 
-        bool isManual = !std::isnan(exactOffsetHz);
+        bool isManual = !std::isnan(exactFreqHz);
         // Auto mode: use the spectral centroid (peakOffsetHz) as the channel frequency.
         // The centroid tracks the actual carrier position, which is typically NOT exactly
         // at the grid slot center — the SDR tuning offset, transmitter frequency error, or
@@ -5322,16 +5326,19 @@ setRefreshInterval(refreshIntervalMs);
         //
         // Clamp to ±channelSpacing/2 of the grid center so a noisy centroid (e.g. during
         // a very brief burst) cannot drift the channel into an adjacent slot's territory.
-        // In manual mode, use the caller-supplied exact offset.
+        // In manual mode, derive placement from one center snapshot but preserve
+        // the caller's absolute target as the slot identity.
+        const double centerSnapshot = lastKnownCenter;
         const double gridOffset = ((double)gridIdx - (double)(numSlots - 1) / 2.0) * channelSpacing;
         double offset = isManual
-            ? exactOffsetHz
+            ? exactFreqHz - centerSnapshot
             : std::clamp(peakOffsetHz, gridOffset - channelSpacing * 0.5, gridOffset + channelSpacing * 0.5);
-        slot.freqHz     = lastKnownCenter + offset;
+        slot.targetFreqHz = isManual ? exactFreqHz : NAN;
+        slot.freqHz       = isManual ? exactFreqHz : centerSnapshot + offset;
         // gridFreqHz: deterministic identity for blocking + freqLog keying.
         // Snap to nearest multiple of channelSpacing so the key is independent
         // of the SDR center frequency — retuning won't invalidate blocks.
-        double rawGrid = isManual ? slot.freqHz : (lastKnownCenter + gridOffset);
+        double rawGrid = isManual ? exactFreqHz : (centerSnapshot + gridOffset);
         slot.gridFreqHz = std::round(rawGrid / channelSpacing) * channelSpacing;
 
         char freqBuf[64];
@@ -5349,7 +5356,7 @@ setRefreshInterval(refreshIntervalMs);
         // placed at carrier ∓ ssbBw/2 so after the xlator the carrier lands at DC.
         const double ssbBw  = 2800.0;  // standard SSB voice bandwidth
         // VFO placement (consistent with slot.freqHz above — both centroid-based in auto mode):
-        //   Manual mode: caller supplies the exact offset (already correct for SSB sideband shift).
+        //   Manual mode: derive the offset from the caller's exact absolute frequency.
         //   Auto, SSB: centroid with user BFO trim applied.
         //   Auto, AM/NFM/WFM: centroid directly (symmetric energy → centroid ≈ carrier).
         const double vfoOff = isManual
@@ -8488,7 +8495,8 @@ setRefreshInterval(refreshIntervalMs);
         for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
             int idx = it->first;
             bool freqMismatch = desired.count(idx) > 0 && idx < (int)stop.freqsHz.size() &&
-                                std::abs(it->second->freqHz - stop.freqsHz[idx]) > 500.0;
+                                (std::isnan(it->second->targetFreqHz) ||
+                                 std::abs(it->second->targetFreqHz - stop.freqsHz[idx]) > 100.0);
             if (desired.count(idx) == 0 || freqMismatch) {
                 destroySlot(*it->second);
                 delete it->second;
@@ -8554,13 +8562,12 @@ setRefreshInterval(refreshIntervalMs);
             if (activeChannels.find(i) != activeChannels.end()) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
             if (isBlocked(stop.freqsHz[i]) || isRnVoiceQuarantined(stop.freqsHz[i])) continue;
-            double offset = stop.freqsHz[i] - lastKnownCenter;
             flog::info("[ChannelBank] BkScan: spawning slot {0} at {1:.3f}MHz", i, stop.freqsHz[i] / 1e6);
             auto* slot = new ChannelSlot();
             slot->lastDetected     = now;
             slot->signalPresent    = localDetected.count(i) > 0;
             slot->rawSignalPresent = localRawDetected.count(i) > 0;
-            initSlot(*slot, i, 1, 0.0, offset);
+            initSlot(*slot, i, 1, 0.0, stop.freqsHz[i]);
             activeChannels[i] = slot;
         }
 
@@ -8656,6 +8663,13 @@ setRefreshInterval(refreshIntervalMs);
             }
             if (!dup) out.push_back(bf);
         }
+        // Detection and management communicate by vector index.  Give that
+        // index a deterministic meaning even when Frequency Manager refreshes
+        // or rewrites its JSON in a different order.
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end(), [](double a, double b) {
+            return std::abs(a - b) < 100.0;
+        }), out.end());
         return out;
     }
 
@@ -8816,7 +8830,8 @@ setRefreshInterval(refreshIntervalMs);
         for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
             int idx = it->first;
             bool freqMismatch = desired.count(idx) > 0 && idx < (int)localFreqs.size() &&
-                                std::abs(it->second->freqHz - localFreqs[idx]) > 500.0;
+                                (std::isnan(it->second->targetFreqHz) ||
+                                 std::abs(it->second->targetFreqHz - localFreqs[idx]) > 100.0);
             if (desired.count(idx) == 0 || freqMismatch) {
                 flog::info("[ChannelBank] Manual: removing slot {0}", idx);
                 destroySlot(*it->second);
@@ -8892,13 +8907,12 @@ setRefreshInterval(refreshIntervalMs);
             if (activeChannels.find(i) != activeChannels.end()) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
             if (isBlocked(localFreqs[i]) || isRnVoiceQuarantined(localFreqs[i])) continue;
-            double offset = localFreqs[i] - lastKnownCenter;
             flog::info("[ChannelBank] Manual: spawning slot {0} at {1:.3f}MHz", i, localFreqs[i] / 1e6);
             auto* slot = new ChannelSlot();
             slot->lastDetected     = now;
             slot->signalPresent    = localDetected.count(i) > 0;
             slot->rawSignalPresent = localRawDetected.count(i) > 0;
-            initSlot(*slot, i, 1, 0.0, offset);
+            initSlot(*slot, i, 1, 0.0, localFreqs[i]);
             activeChannels[i] = slot;
         }
     }
