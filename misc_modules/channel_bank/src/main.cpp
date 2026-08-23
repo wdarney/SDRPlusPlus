@@ -106,8 +106,87 @@ static constexpr int kM4AFsRetryAttempts = 5;
 
 class ChannelBankModule;
 
-static constexpr int CB_RF_STREAM_BUFFER_SAMPLES    = 262144;
 static constexpr int CB_AUDIO_STREAM_BUFFER_SAMPLES = 32768;
+
+// A two-buffer stream for best-effort RF taps. Unlike dsp::stream, swap() never
+// waits for the reader: when the previous block is still in use, the new block
+// is dropped. This guarantees Channel Bank cannot backpressure SDR++'s frontend.
+template <class T>
+class CBBestEffortStream : public dsp::stream<T> {
+public:
+    bool swap(int size) override {
+        {
+            std::lock_guard<std::mutex> lck(swapMtx);
+            if (writerStop) return false;
+            if (!canSwap) return true;
+
+            dataSize = size;
+            T* tmp = this->writeBuf;
+            this->writeBuf = this->readBuf;
+            this->readBuf = tmp;
+            canSwap = false;
+        }
+        {
+            std::lock_guard<std::mutex> lck(readyMtx);
+            dataReady = true;
+        }
+        readyCv.notify_all();
+        return true;
+    }
+
+    int read() override {
+        std::unique_lock<std::mutex> lck(readyMtx);
+        readyCv.wait(lck, [this]() { return dataReady || readerStop; });
+        return readerStop ? -1 : dataSize;
+    }
+
+    void flush() override {
+        {
+            std::lock_guard<std::mutex> lck(readyMtx);
+            dataReady = false;
+        }
+        {
+            std::lock_guard<std::mutex> lck(swapMtx);
+            canSwap = true;
+        }
+    }
+
+    void stopWriter() override {
+        {
+            std::lock_guard<std::mutex> lck(swapMtx);
+            writerStop = true;
+        }
+    }
+
+    void clearWriteStop() override {
+        std::lock_guard<std::mutex> lck(swapMtx);
+        writerStop = false;
+    }
+
+    void stopReader() override {
+        {
+            std::lock_guard<std::mutex> lck(readyMtx);
+            readerStop = true;
+        }
+        readyCv.notify_all();
+    }
+
+    void clearReadStop() override {
+        std::lock_guard<std::mutex> lck(readyMtx);
+        readerStop = false;
+    }
+
+private:
+    std::mutex swapMtx;
+    bool canSwap = true;
+    bool writerStop = false;
+
+    std::mutex readyMtx;
+    std::condition_variable readyCv;
+    bool dataReady = false;
+    bool readerStop = false;
+    int dataSize = 0;
+};
 
 #if defined(__APPLE__) || defined(_WIN32)
 struct TranscriptionJob {
@@ -643,7 +722,7 @@ public:
         { std::lock_guard<std::mutex> lk(encodeQueueMtx);   encodeQueue.clear(); }
         { std::lock_guard<std::mutex> lk(pendingEncodesMtx); pendingEncodes.clear(); }
 
-        // Tear down the lazily-created IQ splitter, if a detected signal created one.
+        // All slot streams are unbound by destroySlot above.
         teardownSharedIqBus();
     }
 
@@ -5435,10 +5514,11 @@ setRefreshInterval(refreshIntervalMs);
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
-        // Do not touch the frontend IQ path merely because Channel Bank is running.
-        // Create the shared lane bus only after the detector has confirmed a signal.
+        // Bind only one best-effort tap to the frontend, regardless of lane count.
+        // Both splitter boundaries drop when busy, so no Channel Bank wait can
+        // propagate back into the main VFO or waterfall.
         if (!iqSplitter) {
-            sharedIqIn = new dsp::stream<dsp::complex_t>();
+            sharedIqIn = new CBBestEffortStream<dsp::complex_t>();
             sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
             iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
             iqSplitter->start();
@@ -5499,9 +5579,9 @@ setRefreshInterval(refreshIntervalMs);
                 ? peakOffsetHz - (double)ssbBfoHz
                 : peakOffsetHz;  // centroid: centers VFO on actual carrier, not grid slot
 
-        slot.iqIn = new dsp::stream<dsp::complex_t>();
-        slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
-        iqSplitter->bindStream(slot.iqIn);
+        slot.iqIn = new CBBestEffortStream<dsp::complex_t>();
+        // Keep the default full-size buffers so any valid frontend block fits.
+        // A slow lane drops its own next RF block rather than stalling its peers.
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
@@ -5557,13 +5637,16 @@ setRefreshInterval(refreshIntervalMs);
         }
 #endif
 
-        slot.vfo->start();
+        // Start downstream-to-upstream so every consumer is waiting before RF
+        // delivery begins, then attach this non-blocking lane to the frontend.
+        slot.recSink->start();
+        slot.meter->start();
+        slot.splitter->start();
         if (slot.amDemod)  slot.amDemod->start();
         if (slot.fmDemod)  slot.fmDemod->start();
         if (slot.ssbDemod) slot.ssbDemod->start();
-        slot.splitter->start();
-        slot.meter->start();
-        slot.recSink->start();
+        slot.vfo->start();
+        iqSplitter->bindStream(slot.iqIn);
 
     }
 
@@ -9379,10 +9462,10 @@ setRefreshInterval(refreshIntervalMs);
     struct BookmarkEntry { std::string name; std::string listName; };
     std::map<int64_t, BookmarkEntry> bookmarkNames;  // freqKey -> {name, listName}
 
-    // Shared IQ bus for active demodulator lanes. It is created lazily on the
-    // first confirmed detection; the spectrum detector never uses this path.
-    dsp::stream<dsp::complex_t>*            sharedIqIn  = nullptr;
-    dsp::routing::Splitter<dsp::complex_t>* iqSplitter  = nullptr;
+    // One best-effort frontend tap fans out to active lanes. Both this input and
+    // each lane output use drop-when-busy streams, eliminating DSP backpressure.
+    dsp::stream<dsp::complex_t>*            sharedIqIn = nullptr;
+    dsp::routing::Splitter<dsp::complex_t>* iqSplitter = nullptr;
 
     // Non-blocking waterfall FFT snapshot worker.
     std::thread                             spectrumPollThread;
