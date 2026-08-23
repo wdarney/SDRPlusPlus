@@ -155,12 +155,6 @@ namespace ImGui {
         float* acquireLatestFFT(int& width);
         void releaseLatestFFT();
 
-        // Copy the latest full-resolution FFT without waiting for the producer.
-        // Returns false when the buffer is busy or unavailable. If capacity is
-        // too small, size receives the required number of bins.
-        bool tryCopyLatestRawFFT(float* dest, int capacity, int& size,
-                                 double& centerFrequency, double& bandwidth);
-
         bool centerFreqMoved = false;
         bool vfoFreqChanged = false;
         bool bandplanEnabled = false;
