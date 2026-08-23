@@ -107,8 +107,86 @@ static constexpr int kM4AFsRetryAttempts = 5;
 
 class ChannelBankModule;
 
-static constexpr int CB_RF_STREAM_BUFFER_SAMPLES    = 262144;
 static constexpr int CB_AUDIO_STREAM_BUFFER_SAMPLES = 32768;
+
+// Best-effort frontend tap.  The core IQ splitter calls swap() on every bound
+// output serially; the stock dsp::stream waits until its reader flushes, so one
+// slow module can stop the waterfall, main VFO, and server flow-control ACKs.
+// This stream drops a new RF block when its previous block is still in use.
+template <class T>
+class CBBestEffortStream : public dsp::stream<T> {
+public:
+    bool swap(int size) override {
+        {
+            std::lock_guard<std::mutex> lck(swapMtx);
+            if (writerStop) return false;
+            if (!canSwap) return true;
+
+            dataSize = size;
+            T* tmp = this->writeBuf;
+            this->writeBuf = this->readBuf;
+            this->readBuf = tmp;
+            canSwap = false;
+        }
+        {
+            std::lock_guard<std::mutex> lck(readyMtx);
+            dataReady = true;
+        }
+        readyCv.notify_all();
+        return true;
+    }
+
+    int read() override {
+        std::unique_lock<std::mutex> lck(readyMtx);
+        readyCv.wait(lck, [this] { return dataReady || readerStop; });
+        return readerStop ? -1 : dataSize;
+    }
+
+    void flush() override {
+        {
+            std::lock_guard<std::mutex> lck(readyMtx);
+            dataReady = false;
+        }
+        {
+            std::lock_guard<std::mutex> lck(swapMtx);
+            canSwap = true;
+        }
+    }
+
+    void stopWriter() override {
+        std::lock_guard<std::mutex> lck(swapMtx);
+        writerStop = true;
+    }
+
+    void clearWriteStop() override {
+        std::lock_guard<std::mutex> lck(swapMtx);
+        writerStop = false;
+    }
+
+    void stopReader() override {
+        {
+            std::lock_guard<std::mutex> lck(readyMtx);
+            readerStop = true;
+        }
+        readyCv.notify_all();
+    }
+
+    void clearReadStop() override {
+        std::lock_guard<std::mutex> lck(readyMtx);
+        readerStop = false;
+    }
+
+private:
+    std::mutex swapMtx;
+    bool canSwap = true;
+    bool writerStop = false;
+
+    std::mutex readyMtx;
+    std::condition_variable readyCv;
+    bool dataReady = false;
+    bool readerStop = false;
+    int dataSize = 0;
+};
 
 #if defined(__APPLE__) || defined(_WIN32)
 struct TranscriptionJob {
@@ -570,7 +648,7 @@ public:
         // Start the spectrum consumer before exposing its stream to live IQ.
         // Keep this as a direct frontend tap: the former private shared splitter
         // could stop the entire source graph when any Channel Bank lane stalled.
-        specStream = new dsp::stream<dsp::complex_t>();
+        specStream = new CBBestEffortStream<dsp::complex_t>();
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
         sigpath::iqFrontEnd.bindIQStream(specStream);
@@ -5355,8 +5433,9 @@ setRefreshInterval(refreshIntervalMs);
                 ? peakOffsetHz - (double)ssbBfoHz
                 : peakOffsetHz;  // centroid: centers VFO on actual carrier, not grid slot
 
-        slot.iqIn = new dsp::stream<dsp::complex_t>();
-        slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
+        // Use the default one-million-sample buffers so every valid frontend
+        // block fits before the best-effort swap/drop decision is made.
+        slot.iqIn = new CBBestEffortStream<dsp::complex_t>();
         slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
         slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
