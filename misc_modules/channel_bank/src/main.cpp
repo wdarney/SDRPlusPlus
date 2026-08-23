@@ -188,6 +188,55 @@ private:
     int dataSize = 0;
 };
 
+// Module-local fanout with a live-mutable output list.  Unlike the core
+// dsp::routing::Splitter, bind/unbind never tempStop(), join, or restart the
+// worker.  The one frontend binding therefore remains untouched as channels
+// appear and disappear.
+template <class T>
+class CBLiveFanout : public dsp::Sink<T> {
+    using base_type = dsp::Sink<T>;
+public:
+    explicit CBLiveFanout(dsp::stream<T>* in) { base_type::init(in); }
+
+    void bindStream(dsp::stream<T>* stream) {
+        std::lock_guard<std::recursive_mutex> ctrl(base_type::ctrlMtx);
+        std::lock_guard<std::mutex> outputs(outputsMtx);
+        if (std::find(streams.begin(), streams.end(), stream) != streams.end()) return;
+        streams.push_back(stream);
+        base_type::registerOutput(stream);
+    }
+
+    void unbindStream(dsp::stream<T>* stream) {
+        std::lock_guard<std::recursive_mutex> ctrl(base_type::ctrlMtx);
+        std::lock_guard<std::mutex> outputs(outputsMtx);
+        auto it = std::find(streams.begin(), streams.end(), stream);
+        if (it == streams.end()) return;
+        streams.erase(it);
+        base_type::unregisterOutput(stream);
+    }
+
+    int run() override {
+        int count = base_type::_in->read();
+        if (count < 0) return -1;
+
+        {
+            std::lock_guard<std::mutex> outputs(outputsMtx);
+            for (auto* stream : streams) {
+                memcpy(stream->writeBuf, base_type::_in->readBuf, count * sizeof(T));
+                // Channel Bank lane streams are best-effort.  A stopped lane is
+                // simply skipped; it must never terminate or block the fanout.
+                stream->swap(count);
+            }
+        }
+        base_type::_in->flush();
+        return count;
+    }
+
+private:
+    std::mutex outputsMtx;
+    std::vector<dsp::stream<T>*> streams;
+};
+
 #if defined(__APPLE__) || defined(_WIN32)
 struct TranscriptionJob {
     std::string path;
@@ -653,6 +702,14 @@ public:
         specSink->start();
         sigpath::iqFrontEnd.bindIQStream(specStream);
 
+        // One permanent best-effort frontend tap feeds all receiver lanes.
+        // Lane changes happen inside CBLiveFanout without restarting SDR++'s
+        // frontend splitter.
+        sharedIqIn = new CBBestEffortStream<dsp::complex_t>();
+        laneFanout = new CBLiveFanout<dsp::complex_t>(sharedIqIn);
+        laneFanout->start();
+        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
+
         // Start management thread
         mgmtRunning = true;
         mgmtThread = std::thread(&ChannelBankModule::managementThreadFunc, this);
@@ -731,6 +788,13 @@ public:
             }
             activeChannels.clear();
         }
+
+        // All lane outputs are gone. Disconnect the one permanent frontend tap
+        // while its fanout is still draining, then stop the fanout worker.
+        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
+        laneFanout->stop();
+        delete laneFanout; laneFanout = nullptr;
+        delete sharedIqIn; sharedIqIn = nullptr;
 
 #if defined(__APPLE__) || defined(_WIN32)
         cancelTranscriptionJobs();
@@ -5501,7 +5565,7 @@ setRefreshInterval(refreshIntervalMs);
         if (slot.fmDemod)  slot.fmDemod->start();
         if (slot.ssbDemod) slot.ssbDemod->start();
         slot.vfo->start();
-        sigpath::iqFrontEnd.bindIQStream(slot.iqIn);
+        laneFanout->bindStream(slot.iqIn);
 
     }
 
@@ -5526,8 +5590,9 @@ setRefreshInterval(refreshIntervalMs);
 
         // Remove the live IQ producer while the complete receiver chain is
         // still draining.  Stopping the VFO first leaves an undrained bound
-        // stream that can permanently block the frontend splitter.
-        sigpath::iqFrontEnd.unbindIQStream(slot.iqIn);
+        // stream that can permanently block a splitter. CBLiveFanout removes
+        // this output without stopping or restarting its worker.
+        laneFanout->unbindStream(slot.iqIn);
 
         slot.vfo->stop();
         if (slot.amDemod)  slot.amDemod->stop();
@@ -9170,6 +9235,11 @@ setRefreshInterval(refreshIntervalMs);
     std::mutex bookmarkNamesMtx;
     struct BookmarkEntry { std::string name; std::string listName; };
     std::map<int64_t, BookmarkEntry> bookmarkNames;  // freqKey -> {name, listName}
+
+    // One fixed frontend tap and a live-mutable module-local fanout for receiver
+    // lanes. Runtime channel churn never touches IQFrontEnd's blocking splitter.
+    dsp::stream<dsp::complex_t>* sharedIqIn = nullptr;
+    CBLiveFanout<dsp::complex_t>* laneFanout = nullptr;
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
