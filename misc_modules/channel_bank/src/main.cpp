@@ -27,7 +27,6 @@
 #include <config.h>
 #include <core.h>
 #include <utils/wav.h>
-#include <fftw3.h>
 #ifndef CB_NO_RNNOISE
 #include <rnnoise.h>
 #endif
@@ -186,7 +185,7 @@ struct ChannelSlot {
     std::atomic<bool>                          sustainSnrValid { false };
     bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
 
-    // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
+    // Fade-out state driven by rawSignalPresent (slot DSP thread only — no locking needed)
     int fadeOutRemaining   = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
     int audioHoldRemaining = 0;    // independent post-detection hold before fade starts;
                                    // AM bypasses it to suppress carrier-AGC release noise
@@ -382,6 +381,16 @@ public:
             bookmarkScanMode = config.conf[name]["bookmarkScanMode"];
         if (config.conf[name].contains("manualPassbandLimit"))
             manualPassbandLimit = config.conf[name]["manualPassbandLimit"];
+        if (config.conf[name].contains("manualLocalSnrEnabled"))
+            manualLocalSnrEnabled = config.conf[name]["manualLocalSnrEnabled"];
+        if (config.conf[name].contains("manualStormGuardEnabled"))
+            manualStormGuardEnabled = config.conf[name]["manualStormGuardEnabled"];
+        if (config.conf[name].contains("manualSnrOverrides") &&
+            config.conf[name]["manualSnrOverrides"].is_object()) {
+            for (auto& [key, value] : config.conf[name]["manualSnrOverrides"].items())
+                if (value.is_number())
+                    manualSnrOverrides[key] = std::clamp(value.get<float>(), 1.0f, 30.0f);
+        }
         if (config.conf[name].contains("manualFrequencies"))
             for (auto& j : config.conf[name]["manualFrequencies"])
                 manualFrequencies.push_back(j.get<double>());
@@ -454,28 +463,6 @@ public:
         // Populate cached freqs from all bound lists
         rebuildBoundFreqs();
 
-        // Allocate FFTW buffers
-        fftIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
-        fftOut = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
-        fftPlan = fftwf_plan_dft_1d(FFT_SIZE, fftIn, fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
-
-        // Precompute 4-term Blackman-Harris window.
-        // Sidelobes: -92 dB vs Hann's -31.5 dB.  For a 40 dB strong signal,
-        // Hann sidelobes sit at 8.5 dB above noise (above any detection threshold);
-        // Blackman-Harris sidelobes sit at -52 dB — completely invisible.
-        // This prevents strong SELCAL / HFDL carriers from leaking into adjacent
-        // bookmark detection windows and showing wide spikes in the mini-spectrum.
-        hannWindow.resize(FFT_SIZE);
-        for (int i = 0; i < FFT_SIZE; i++) {
-            float phi = 2.0f * M_PI * i / (float)(FFT_SIZE - 1);
-            hannWindow[i] = 0.35875f
-                          - 0.48829f * cosf(phi)
-                          + 0.14128f * cosf(2.0f * phi)
-                          - 0.01168f * cosf(3.0f * phi);
-        }
-        fftAccum.resize(FFT_SIZE);
-        fftBufPos = 0;
-
         retuneHandler.ctx     = this;
         retuneHandler.handler = retuneHandlerFunc;
         sigpath::sourceManager.onRetune.bindHandler(&retuneHandler);
@@ -500,9 +487,6 @@ public:
         // Calling shutdown() here gives whisper.cpp a clean teardown window.
         transcription_whisper::shutdown();
 #endif
-        fftwf_destroy_plan(fftPlan);
-        fftwf_free(fftIn);
-        fftwf_free(fftOut);
     }
 
     void postInit() {
@@ -532,13 +516,16 @@ public:
 
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
-        fftBufPos = 0;
-        specSamplesUntilFFT = 0;    // trigger first spectrum analysis immediately
         avgPower.clear();           // reset spectrum averaging on start
         instPower.clear();
         rawSlotMisses.clear();
         rawManualMisses.clear();
+        manualLocalNoiseFloors.clear();
+        slotVotes.clear();
+        manualVotes.clear();
+        floorHistory.clear();
         globalNoiseFloor = 0.0f;
+        displayNoiseFloor = 0.0f;
         { std::lock_guard<std::mutex> lck(channelsMtx); recentChannels.clear(); }
 
         if (scanMode) {
@@ -563,18 +550,10 @@ public:
             }
         }
 
-        // Create one shared IQ binding — all consumers fan out from this splitter
-        // so the main signal-path thread only copies one buffer.
-        sharedIqIn = new dsp::stream<dsp::complex_t>();
-        sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
-        iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
-        iqSplitter->start();
-
-        // Bind spectrum monitor stream to our splitter (not directly to the frontend)
-        specStream = new dsp::stream<dsp::complex_t>();
-        iqSplitter->bindStream(specStream);
-        specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
-        specSink->start();
+        // Detection reads non-blocking copies of the waterfall's existing FFT.
+        // It never adds a consumer to the frontend IQ path.
+        spectrumPollRunning = true;
+        spectrumPollThread = std::thread(&ChannelBankModule::spectrumPollThreadFunc, this);
 
         // Start management thread
         mgmtRunning = true;
@@ -605,6 +584,12 @@ public:
         if (!running) { return; }
         running = false;
 
+        // Stop waterfall snapshot analysis first so detection state is frozen
+        // before the management thread tears down active lanes.
+        spectrumPollRunning = false;
+        spectrumPollCv.notify_all();
+        if (spectrumPollThread.joinable()) { spectrumPollThread.join(); }
+
         // Restore FM waterfall visibility before tearing down
         if (manualMode) restoreWaterfallVisibility();
 
@@ -630,16 +615,10 @@ public:
         delete monitorSinkStream;
         monitorSinkStream = nullptr;
 
-        // Stop management thread and spectrum monitor so no new channels are spawned
-        // or modified while we tear down.
+        // Stop management so no new channels are spawned or modified while we tear down.
         mgmtRunning = false;
         mgmtCv.notify_all();
         if (mgmtThread.joinable()) { mgmtThread.join(); }
-
-        specSink->stop();
-        iqSplitter->unbindStream(specStream);
-        delete specSink;  specSink  = nullptr;
-        delete specStream; specStream = nullptr;
 
         // Teardown all active channels BEFORE stopping the encode thread.
         // destroySlot() may queue open recordings for direct M4A encoding; the
@@ -664,11 +643,8 @@ public:
         { std::lock_guard<std::mutex> lk(encodeQueueMtx);   encodeQueue.clear(); }
         { std::lock_guard<std::mutex> lk(pendingEncodesMtx); pendingEncodes.clear(); }
 
-        // Tear down shared IQ splitter — all slot streams have been unbound by destroySlot above.
-        iqSplitter->stop();
-        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
-        delete iqSplitter; iqSplitter = nullptr;
-        delete sharedIqIn; sharedIqIn = nullptr;
+        // Tear down the lazily-created IQ splitter, if a detected signal created one.
+        teardownSharedIqBus();
     }
 
     // Normalize a closed INT16 mono WAV to -3 dBFS in-place.
@@ -1255,6 +1231,8 @@ private:
             {"channelSpacingHz", channelSpacing},
             {"demodMode", demodModeName(demodMode)},
             {"snrThresholdDb", snrThreshold},
+            {"manualLocalSnrEnabled", manualLocalSnrEnabled},
+            {"manualStormGuardEnabled", manualStormGuardEnabled},
             {"maxChannels", maxChannels},
             {"bwUsage", bwUsage},
             {"recordingEnabled", recordingEnabled},
@@ -1330,6 +1308,14 @@ private:
             error = "snr threshold must be numeric";
             return false;
         }
+        if (body.contains("manualLocalSnrEnabled") && !body["manualLocalSnrEnabled"].is_boolean()) {
+            error = "local SNR floors must be true or false";
+            return false;
+        }
+        if (body.contains("manualStormGuardEnabled") && !body["manualStormGuardEnabled"].is_boolean()) {
+            error = "storm guard must be true or false";
+            return false;
+        }
         if (body.contains("maxChannels") && !body["maxChannels"].is_number_integer()) {
             error = "max channels must be an integer";
             return false;
@@ -1388,6 +1374,14 @@ private:
             snrThreshold = std::clamp(body["snrThresholdDb"].get<float>(), 1.0f, 30.0f);
             config.conf[name]["snrThreshold"] = snrThreshold;
         }
+        if (body.contains("manualLocalSnrEnabled")) {
+            manualLocalSnrEnabled = body["manualLocalSnrEnabled"].get<bool>();
+            config.conf[name]["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
+        }
+        if (body.contains("manualStormGuardEnabled")) {
+            manualStormGuardEnabled = body["manualStormGuardEnabled"].get<bool>();
+            config.conf[name]["manualStormGuardEnabled"] = manualStormGuardEnabled;
+        }
         if (body.contains("maxChannels")) {
             maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, MAX_CHANNELS_HARD_LIMIT);
             config.conf[name]["maxChannels"] = maxChannels;
@@ -1432,6 +1426,9 @@ private:
         config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
         config.conf[name]["activeProfile"] = activeProfileName;
         config.release(true);
+        if (body.contains("snrThresholdDb") || body.contains("demodMode") ||
+            body.contains("manualLocalSnrEnabled") || body.contains("manualStormGuardEnabled"))
+            resetDetectorFloor();
         if (transcriptionTurnedOff) stopTranscriptionWork();
         return true;
     }
@@ -1695,11 +1692,13 @@ private:
                 std::set<int> localDetected;
                 std::set<int> localRawDetected;
                 std::map<int, float> localSnr;
+                std::map<int, float> localThresholds;
                 {
                     std::lock_guard<std::mutex> lk(manualDetectedMtx);
                     localDetected = manualDetected;
                     localRawDetected = rawManualDetected;
                     localSnr = manualSnrDb;
+                    localThresholds = manualThresholdDb;
                 }
                 std::vector<double> localFreqs = getActiveManualFreqs();
                 for (auto& [idx, snrDb] : localSnr) {
@@ -1709,6 +1708,7 @@ private:
                     snrOverview.push_back({
                         {"freqHz", freqHz},
                         {"snrDb", snrDb},
+                        {"thresholdDb", localThresholds.count(idx) ? localThresholds[idx] : snrThreshold},
                         {"detected", localDetected.count(idx) > 0},
                         {"rawDetected", localRawDetected.count(idx) > 0},
                         {"blocked", isBlocked(freqHz)}
@@ -1995,6 +1995,8 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
 <label class="control"><span class="label">Transcribe</span><select id="cbTranscribe"><option value="0">Off</option><option value="1">Apple Speech</option><option value="2">Whisper ATC Large</option><option value="3">Whisper ATC Medium</option><option value="4">Whisper Turbo</option></select></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
+<label class="control"><span class="label">Local SNR floors</span><button class="secondary" id="cbLocalSnrToggle" type="button">-</button></label>
+<label class="control"><span class="label">Storm guard</span><button class="secondary" id="cbStormGuardToggle" type="button">-</button></label>
 </div>
 </section>
 <section>
@@ -2093,6 +2095,8 @@ let centerTuneInFlight = false;
 let historySortKey = "last";
 let historySortDir = -1;
 let currentRecordingEnabled = true;
+let currentLocalSnrEnabled = true;
+let currentStormGuardEnabled = true;
 const spanWaterfallFrames = [];
 const spanWaterfallMaxFrames = 72;
 let spanWaterfallKey = "";
@@ -2603,12 +2607,14 @@ function drawSnrChart(s) {
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
   const threshold = Number(s.snrThresholdDb || s.settings?.snrThresholdDb || 0);
+  const pointThreshold = p => Number.isFinite(Number(p.thresholdDb)) ? Number(p.thresholdDb) : threshold;
   const peak = points.length ? Math.max(...points.map(p => Number(p.snrDb))) : 0;
-  const maxDb = Math.max(30, threshold + 5, Math.ceil(peak + 2));
+  const thresholdPeak = points.length ? Math.max(...points.map(pointThreshold)) : threshold;
+  const maxDb = Math.max(30, thresholdPeak + 5, Math.ceil(peak + 2));
   const minDb = -5;
   const yFor = db => padT + (1 - ((db - minDb) / (maxDb - minDb))) * plotH;
   const xFor = hz => padL + ((hz - info.lo) / info.span) * plotW;
-  const above = points.filter(p => Number(p.snrDb) >= threshold).length;
+  const above = points.filter(p => Number(p.snrDb) >= pointThreshold(p)).length;
   const detected = points.filter(p => p.detected).length;
   if (summary) {
     summary.textContent = points.length
@@ -2642,8 +2648,13 @@ function drawSnrChart(s) {
     const x = xFor(Number(p.freqHz));
     const y = yFor(Math.max(0, db));
     const h = Math.max(1, Math.abs(baseY - y));
-    ctx.fillStyle = p.blocked ? "#bc3d3d" : p.detected ? "#62d26f" : p.rawDetected ? "#ffb15c" : (db >= threshold ? "#7aa7ff" : "#36516d");
+    ctx.fillStyle = p.blocked ? "#bc3d3d" : p.detected ? "#62d26f" : p.rawDetected ? "#ffb15c" : (db >= pointThreshold(p) ? "#7aa7ff" : "#36516d");
     ctx.fillRect(x - barW / 2, Math.min(baseY, y), barW, h);
+    if (Math.abs(pointThreshold(p) - threshold) > 0.05) {
+      const py = yFor(pointThreshold(p));
+      ctx.fillStyle = "#f4d35e";
+      ctx.fillRect(x - 5, py - 1, 10, 2);
+    }
   });
 
   const thresholdY = yFor(threshold);
@@ -3123,6 +3134,14 @@ async function refresh() {
     const recToggle = document.getElementById("cbRecordingToggle");
     recToggle.textContent = currentRecordingEnabled ? "On - keeping files" : "Off - monitor only";
     recToggle.className = currentRecordingEnabled ? "primary" : "danger";
+    currentLocalSnrEnabled = settings.manualLocalSnrEnabled !== false;
+    const localSnrToggle = document.getElementById("cbLocalSnrToggle");
+    localSnrToggle.textContent = currentLocalSnrEnabled ? "On - per frequency" : "Off - shared floor";
+    localSnrToggle.className = currentLocalSnrEnabled ? "primary" : "danger";
+    currentStormGuardEnabled = settings.manualStormGuardEnabled !== false;
+    const stormToggle = document.getElementById("cbStormGuardToggle");
+    stormToggle.textContent = currentStormGuardEnabled ? "On - freeze impulses" : "Off";
+    stormToggle.className = currentStormGuardEnabled ? "primary" : "danger";
     document.getElementById("cbMode").disabled = !!s.running;
     document.getElementById("cbSpacing").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
@@ -3159,6 +3178,12 @@ document.getElementById("monitorAudio").onclick = () => {
 };
 document.getElementById("cbRecordingToggle").onclick = () => {
   saveSettingValue("recordingEnabled", !currentRecordingEnabled);
+};
+document.getElementById("cbLocalSnrToggle").onclick = () => {
+  saveSettingValue("manualLocalSnrEnabled", !currentLocalSnrEnabled);
+};
+document.getElementById("cbStormGuardToggle").onclick = () => {
+  saveSettingValue("manualStormGuardEnabled", !currentStormGuardEnabled);
 };
 document.getElementById("serverApply").onclick = () => {
   const host = document.getElementById("serverHost").value.trim();
@@ -4153,49 +4178,48 @@ setRefreshInterval(refreshIntervalMs);
 
     // ── Spectrum analysis ────────────────────────────────────────────────────
 
-    static void spectrumHandler(dsp::complex_t* data, int count, void* ctx) {
-        ChannelBankModule* _this = (ChannelBankModule*)ctx;
+    void spectrumPollThreadFunc() {
+        std::vector<float> snapshot(FFT_SIZE);
+        const auto interval = std::chrono::milliseconds(
+            std::max(1, (int)std::round(1000.0 / SPEC_ANALYSIS_HZ)));
 
-        // Rate-limit spectrum analysis to SPEC_ANALYSIS_HZ regardless of sample rate.
-        // At 64 MHz SR the naive approach (FFT every 8192 samples) runs ~7,800 FFTs/sec,
-        // saturates a CPU core, and creates backpressure on the DSP Splitter chain that
-        // starves the waterfall's own FFT thread — causing visual choppiness.
-        // Returning early here still lets the Handler sink flush the buffer immediately,
-        // so the Splitter never blocks.
-        _this->specSamplesUntilFFT -= count;
-        if (_this->specSamplesUntilFFT > 0) return;
+        while (spectrumPollRunning) {
+            int bins = 0;
+            double center = 0.0;
+            double bandwidth = 0.0;
+            bool copied = gui::waterfall.tryCopyLatestRawFFT(
+                snapshot.data(), (int)snapshot.size(), bins, center, bandwidth);
 
-        double sr = _this->lastKnownSr;
-        _this->specSamplesUntilFFT = (sr > 0.0)
-            ? (int64_t)(sr / SPEC_ANALYSIS_HZ)
-            : (int64_t)(FFT_SIZE);
+            if (!copied && bins > (int)snapshot.size()) {
+                // Resize outside the waterfall lock and try again next cycle.
+                snapshot.resize(bins);
+            }
+            else if (copied) {
+                analyzeSpectrum(snapshot.data(), bins, center, bandwidth);
+            }
 
-        // Fill fftAccum from this block; zero-pad if the block is smaller than FFT_SIZE
-        // (only possible at very low sample rates — typical HF/SDR blocks are much larger).
-        int fill = std::min(count, FFT_SIZE);
-        std::copy(data, data + fill, _this->fftAccum.data());
-        if (fill < FFT_SIZE) {
-            std::fill(_this->fftAccum.begin() + fill, _this->fftAccum.end(),
-                      dsp::complex_t{0.0f, 0.0f});
+            std::unique_lock<std::mutex> lck(spectrumPollWaitMtx);
+            spectrumPollCv.wait_for(lck, interval,
+                [&]() { return !spectrumPollRunning.load(); });
         }
-        _this->fftBufPos = 0;
-        _this->analyzeSpectrum();
     }
 
-    void analyzeSpectrum() {
-        // Refresh center frequency every frame — free (single double load) and ensures
-        // PPM changes or other mid-session corrections are picked up without a full retune.
-        lastKnownCenter = gui::waterfall.getCenterFrequency();
+    void analyzeSpectrum(const float* spectrumDb, int spectrumSize,
+                         double spectrumCenter, double spectrumBandwidth) {
+        if (spectrumDb == nullptr || spectrumSize <= 1 || spectrumBandwidth <= 0.0) return;
 
-        // Check for deferred retune — safely reset DSP-owned state on the DSP thread
+        lastKnownCenter = spectrumCenter;
+        lastKnownSr = spectrumBandwidth;
+
+        // Check for deferred retune — safely reset detector-owned state on its worker.
         if (retuneFlag.load()) {
             lastKnownSr     = pendingRetuneSr;
             lastKnownCenter = pendingRetuneCenter;
-            fftBufPos        = 0;
             avgPower.clear();
             instPower.clear();
             rawSlotMisses.clear();
             rawManualMisses.clear();
+            manualLocalNoiseFloors.clear();
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
             floorHistory.clear();
@@ -4215,6 +4239,7 @@ setRefreshInterval(refreshIntervalMs);
             manualVotes.clear();
             rawSlotMisses.clear();
             rawManualMisses.clear();
+            manualLocalNoiseFloors.clear();
             {
                 std::lock_guard<std::mutex> lk(detectedMtx);
                 detectedSlots.clear();
@@ -4225,6 +4250,7 @@ setRefreshInterval(refreshIntervalMs);
                 manualDetected.clear();
                 rawManualDetected.clear();
                 manualSnrDb.clear();
+                manualThresholdDb.clear();
             }
 #ifndef CB_NO_RNNOISE
             {
@@ -4233,41 +4259,6 @@ setRefreshInterval(refreshIntervalMs);
             }
 #endif
         }
-
-        // Determine how many real samples are in fftAccum this frame.
-        // At low sample rates (< FFT_SIZE * SPEC_ANALYSIS_HZ ≈ 164 kHz) the DSP block
-        // is shorter than FFT_SIZE, so the remainder was zero-padded in the DSP callback.
-        // Applying the full FFT_SIZE BH window to this truncated data leaves it at ~0.14
-        // at the cut point — far from zero — which reintroduces sidelobes almost as bad
-        // as Hann.  The fix: build a BH window sized to the actual fill, zero-padded to
-        // FFT_SIZE, and cache it so we only recompute on sample-rate changes.
-        int fill = (lastKnownSr > 0.0)
-            ? std::min((int)(lastKnownSr / SPEC_ANALYSIS_HZ), FFT_SIZE)
-            : FFT_SIZE;
-        if (fill != fftWindowFill) {
-            fftWindow.resize(FFT_SIZE, 0.0f);
-            int n = fill > 1 ? fill : 1;
-            for (int i = 0; i < fill; i++) {
-                float phi = 2.0f * M_PI * i / (float)(n - 1);
-                fftWindow[i] = 0.35875f
-                             - 0.48829f * cosf(phi)
-                             + 0.14128f * cosf(2.0f * phi)
-                             - 0.01168f * cosf(3.0f * phi);
-            }
-            for (int i = fill; i < FFT_SIZE; i++) fftWindow[i] = 0.0f;
-            fftWindowFill = fill;
-        }
-
-        // Apply window and copy to FFTW input
-        for (int i = 0; i < FFT_SIZE; i++) {
-            fftIn[i][0] = fftAccum[i].re * fftWindow[i];
-            fftIn[i][1] = fftAccum[i].im * fftWindow[i];
-        }
-
-        fftwf_execute(fftPlan);
-
-        // Compute linear power per bin (FFT-shifted, normalised)
-        float scale = 1.0f / (float)(FFT_SIZE * FFT_SIZE);
 
         // Two power arrays:
         //   avgPower  (alpha=0.15) — slow EMA: voting/spawning/NMS/noise floor
@@ -4286,10 +4277,32 @@ setRefreshInterval(refreshIntervalMs);
             avgPower.resize(FFT_SIZE);
             instPower.resize(FFT_SIZE);
         }
+
+        // The waterfall publishes dB power with DC already centered. Convert it
+        // back to linear power for the existing SNR detector. Keep the detector's
+        // established 8192-bin geometry: interpolate when the waterfall has fewer
+        // bins, and take the strongest source bin when reducing a larger FFT so a
+        // weak narrow USB component is not averaged away.
         for (int i = 0; i < FFT_SIZE; i++) {
-            int k = (i + FFT_SIZE / 2) % FFT_SIZE;
-            float re = fftOut[k][0], im = fftOut[k][1];
-            float inst = (re * re + im * im) * scale;
+            float db = -300.0f;
+            if (spectrumSize >= FFT_SIZE) {
+                int lo = (int)(((int64_t)i * spectrumSize) / FFT_SIZE);
+                int hi = (int)((((int64_t)(i + 1) * spectrumSize) + FFT_SIZE - 1) / FFT_SIZE) - 1;
+                lo = std::clamp(lo, 0, spectrumSize - 1);
+                hi = std::clamp(hi, lo, spectrumSize - 1);
+                db = spectrumDb[lo];
+                for (int b = lo + 1; b <= hi; b++) db = std::max(db, spectrumDb[b]);
+            }
+            else {
+                double pos = ((double)i * (double)(spectrumSize - 1)) /
+                             (double)(FFT_SIZE - 1);
+                int lo = std::clamp((int)std::floor(pos), 0, spectrumSize - 1);
+                int hi = std::min(lo + 1, spectrumSize - 1);
+                float frac = (float)(pos - (double)lo);
+                db = spectrumDb[lo] + (spectrumDb[hi] - spectrumDb[lo]) * frac;
+            }
+            if (!std::isfinite(db)) db = -300.0f;
+            float inst = powf(10.0f, std::clamp(db, -300.0f, 100.0f) / 10.0f);
             avgPower[i]  = firstFrame ? inst : (alpha * inst + (1.0f - alpha) * avgPower[i]);
             instPower[i] = inst;  // no smoothing — raw per-frame power for fade trigger
         }
@@ -4298,7 +4311,7 @@ setRefreshInterval(refreshIntervalMs);
 
         double binHz  = lastKnownSr / FFT_SIZE;
         std::vector<double> manualPassbandFreqs;
-        if (manualMode && manualPassbandLimit)
+        if (manualMode && manualPassbandLimit && !manualLocalSnrEnabled)
             manualPassbandFreqs = getActiveManualFreqs();
 
         std::vector<uint8_t> manualPassbandMask;
@@ -4418,10 +4431,9 @@ setRefreshInterval(refreshIntervalMs);
             // unless they last for more than half the buffer. EMA smoothers
             // partially track every pulse, raising the threshold momentarily and
             // making detection vulnerable to brief whole-band noise events.
-            // ~30 frames is ~100ms at 2.4MHz SR (FFT_SIZE=8192, ~290 Hz frame
-            // rate); short enough to track real band-condition changes within
-            // half a second, long enough that 50/60/100/120 Hz mains-related
-            // RFI pulses are completely ignored.
+            // At the 20 Hz snapshot rate, 30 frames is about 1.5 seconds: fast
+            // enough to follow changing band conditions while rejecting brief
+            // whole-band impulses.
             constexpr size_t FLOOR_HISTORY_LEN = 30;
             floorHistory.push_back(rawFloor);
             if (floorHistory.size() > FLOOR_HISTORY_LEN) floorHistory.pop_front();
@@ -4486,12 +4498,141 @@ setRefreshInterval(refreshIntervalMs);
             std::map<int,float> newManualInstantSnr;
             std::map<int,float> newManualCentroidHz;
             std::map<int,float> newManualWidthHz;
+            std::map<int,float> newManualThresholdDb;
+
+            struct ManualWindow {
+                bool  valid = false;
+                int   centerBin = 0;
+                int   lo = 0, hi = -1;
+                int   guard1Lo = -1, guard1Hi = -1;
+                int   guard2Lo = -1, guard2Hi = -1;
+                float noiseFloor = 0.0f;
+                float instantNoiseFloor = 0.0f;
+                float thresholdDb = 0.0f;
+            };
+            std::vector<ManualWindow> manualWindows(localFreqs.size());
+            std::vector<uint8_t> manualSignalMask(FFT_SIZE, 0);
+
+            std::map<std::string, float> localOverrides;
+            {
+                std::lock_guard<std::mutex> lk(manualFreqMtx);
+                localOverrides = manualSnrOverrides;
+            }
+
+            // First build every modulation-aware signal window. The combined mask
+            // keeps another configured channel from contaminating a frequency's
+            // local noise shoulders when bookmarks are closely spaced.
             for (int i = 0; i < (int)localFreqs.size(); i++) {
                 double freqOffset = localFreqs[i] - lastKnownCenter;
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
-                int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
-                int halfBins2 = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
-                int lo, hi;
+                auto& w = manualWindows[i];
+                w.valid = true;
+                w.centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+                int halfBins2 = std::max(1, (int)std::round(
+                    std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
+                if (demodMode == DEMOD_USB) {
+                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
+                    w.lo = w.centerBin;
+                    w.hi = std::clamp(w.centerBin + ssbBins, 0, FFT_SIZE - 1);
+                    w.guard1Lo = w.hi + 1;
+                    w.guard1Hi = std::clamp(w.hi + ssbBins, 0, FFT_SIZE - 1);
+                    w.guard2Lo = std::clamp(w.centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    w.guard2Hi = std::max(0, w.centerBin - 1);
+                } else if (demodMode == DEMOD_LSB) {
+                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
+                    w.lo = std::clamp(w.centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    w.hi = w.centerBin;
+                    w.guard1Lo = std::clamp(w.lo - ssbBins, 0, FFT_SIZE - 1);
+                    w.guard1Hi = w.lo - 1;
+                    w.guard2Lo = w.hi + 1;
+                    w.guard2Hi = std::clamp(w.hi + ssbBins, 0, FFT_SIZE - 1);
+                } else {
+                    w.lo = std::clamp(w.centerBin - halfBins2, 0, FFT_SIZE - 1);
+                    w.hi = std::clamp(w.centerBin + halfBins2, 0, FFT_SIZE - 1);
+                }
+                for (int b = w.lo; b <= w.hi; b++) manualSignalMask[b] = 1;
+                auto overrideIt = localOverrides.find(manualSnrOverrideKey(localFreqs[i], demodMode));
+                w.thresholdDb = overrideIt == localOverrides.end() ? snrThreshold : overrideIt->second;
+                newManualThresholdDb[i] = w.thresholdDb;
+            }
+
+            auto noisePercentile = [&](const std::vector<float>& source, int lo, int hi) -> float {
+                std::vector<float> samples;
+                lo = std::clamp(lo, 0, FFT_SIZE - 1);
+                hi = std::clamp(hi, 0, FFT_SIZE - 1);
+                if (lo > hi) return 0.0f;
+                samples.reserve(hi - lo + 1);
+                for (int b = lo; b <= hi; b++)
+                    if (!manualSignalMask[b]) samples.push_back(source[b]);
+                if (samples.empty()) return 0.0f;
+                std::sort(samples.begin(), samples.end());
+                size_t idx = std::min(samples.size() - 1,
+                                      (size_t)std::floor(samples.size() * 0.20));
+                return std::max(samples[idx], 1e-30f);
+            };
+
+            int stormEligible = 0;
+            int stormRaised = 0;
+            constexpr float MANUAL_STORM_RISE_DB = 4.0f;
+            const float stormRiseLinear = powf(10.0f, MANUAL_STORM_RISE_DB / 10.0f);
+            const float maxFloorRisePerFrame = powf(10.0f, 0.5f / 10.0f);
+            for (int i = 0; i < (int)manualWindows.size(); i++) {
+                auto& w = manualWindows[i];
+                if (!w.valid) continue;
+                // Use at least 8 kHz of noise bins on each side. At a 5 MHz
+                // span a 2.8 kHz USB window is only a handful of FFT bins; the
+                // wider shoulders make the percentile stable without becoming
+                // a span-wide measurement again.
+                int width = std::max(w.hi - w.lo + 1,
+                                     std::max(2, (int)std::round(8000.0 / binHz)));
+                int gap = std::max(1, (int)std::round(300.0 / binHz));
+                float leftFloor  = noisePercentile(power,     w.lo - gap - width, w.lo - gap - 1);
+                float rightFloor = noisePercentile(power,     w.hi + gap + 1, w.hi + gap + width);
+                float leftInst   = noisePercentile(instPower, w.lo - gap - width, w.lo - gap - 1);
+                float rightInst  = noisePercentile(instPower, w.hi + gap + 1, w.hi + gap + width);
+
+                auto lowerValid = [](float a, float b) {
+                    if (a <= 0.0f) return b;
+                    if (b <= 0.0f) return a;
+                    return std::min(a, b);
+                };
+                float rawLocal = lowerValid(leftFloor, rightFloor);
+                float instLocal = lowerValid(leftInst, rightInst);
+                if (rawLocal <= 0.0f) rawLocal = globalNoiseFloor;
+                if (instLocal <= 0.0f) instLocal = rawLocal;
+
+                std::string floorKey = manualSnrOverrideKey(localFreqs[i], demodMode);
+                float& tracked = manualLocalNoiseFloors[floorKey];
+                if (tracked > 0.0f) {
+                    stormEligible++;
+                    if (instLocal > tracked * stormRiseLinear) stormRaised++;
+                    // Track sustained atmospheric changes, but cap upward motion at
+                    // 0.5 dB/frame so a single large crash cannot poison sensitivity
+                    // for the following weak transmission. Release slowly to avoid
+                    // threshold pumping between closely spaced crashes.
+                    float a = rawLocal > tracked ? 0.30f : 0.04f;
+                    float next = a * rawLocal + (1.0f - a) * tracked;
+                    tracked = std::min(next, tracked * maxFloorRisePerFrame);
+                } else {
+                    tracked = rawLocal;
+                }
+                w.noiseFloor = manualLocalSnrEnabled ? tracked : globalNoiseFloor;
+                w.instantNoiseFloor = manualLocalSnrEnabled ? instLocal : globalNoiseFloor;
+            }
+
+            // A common-mode jump in the local noise shoulders around at least two
+            // frequencies is a storm/broadband event. Preserve accumulated votes and
+            // active-channel state for the frame instead of treating the crash as a
+            // signal or a dropout.
+            bool manualStormEvent = manualLocalSnrEnabled && manualStormGuardEnabled &&
+                                    stormEligible >= 2 && stormRaised * 5 >= stormEligible * 3;
+            widebandEvent = widebandEvent || manualStormEvent;
+
+            for (int i = 0; i < (int)localFreqs.size(); i++) {
+                auto& w = manualWindows[i];
+                if (!w.valid) continue;
+                int centerBin = w.centerBin;
+                int lo = w.lo, hi = w.hi;
                 // Two guard bands per SSB mode (-1 = unused):
                 //   guard1: outer guard, same side as the voice passband
                 //           (above carrier for USB, below for LSB) — catches interferers
@@ -4501,39 +4642,8 @@ setRefreshInterval(refreshIntervalMs);
                 //           whose upper/lower sideband leaks across the carrier
                 // USB voice has zero energy below the carrier; LSB has zero above.
                 // Any elevation there means an adjacent signal is leaking through.
-                int guard1Lo = -1, guard1Hi = -1;
-                int guard2Lo = -1, guard2Hi = -1;
-                if (demodMode == DEMOD_USB) {
-                    // USB energy lives in 300-2800 Hz above the carrier only.
-                    // Using halfBins2*2 (≈6.6 kHz for 8.33 kHz channel spacing)
-                    // is far too wide and catches adjacent HFDL signals 6 kHz up.
-                    // Clamp the window to the actual SSB passband width (2800 Hz).
-                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
-                    lo = centerBin;
-                    hi = std::clamp(centerBin + ssbBins, 0, FFT_SIZE - 1);
-                    // guard1: above the voice passband (catches HFDL above the bookmark)
-                    guard1Lo = hi + 1;
-                    guard1Hi = std::clamp(hi + ssbBins, 0, FFT_SIZE - 1);
-                    // guard2: below the carrier (catches HFDL below the bookmark)
-                    // USB voice never has energy here, so any elevation is interference.
-                    guard2Lo = std::clamp(centerBin - ssbBins, 0, FFT_SIZE - 1);
-                    guard2Hi = std::max(0, centerBin - 1);
-                } else if (demodMode == DEMOD_LSB) {
-                    // Mirror: LSB energy lives in 300-2800 Hz below the carrier.
-                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
-                    lo = std::clamp(centerBin - ssbBins, 0, FFT_SIZE - 1);
-                    hi = centerBin;
-                    // guard1: below the voice passband (catches HFDL below the bookmark)
-                    guard1Lo = std::clamp(lo - ssbBins, 0, FFT_SIZE - 1);
-                    guard1Hi = lo - 1;
-                    // guard2: above the carrier (catches HFDL above the bookmark)
-                    guard2Lo = hi + 1;
-                    guard2Hi = std::clamp(hi + ssbBins, 0, FFT_SIZE - 1);
-                } else {
-                    // AM / NFM / WFM: symmetric window around carrier
-                    lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
-                    hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
-                }
+                int guard1Lo = w.guard1Lo, guard1Hi = w.guard1Hi;
+                int guard2Lo = w.guard2Lo, guard2Hi = w.guard2Hi;
                 float sum = 0.0f, instSum = 0.0f;
                 for (int b = lo; b <= hi; b++) {
                     sum     += power[b];
@@ -4542,8 +4652,8 @@ setRefreshInterval(refreshIntervalMs);
                 int nBins2 = hi - lo + 1;
                 float mean     = sum     / (float)nBins2;
                 float instMean = instSum / (float)nBins2;
-                if (globalNoiseFloor > 0.0f && instMean > 1e-30f)
-                    newManualInstantSnr[i] = 10.0f * log10f(instMean / globalNoiseFloor);
+                if (w.noiseFloor > 0.0f && instMean > 1e-30f)
+                    newManualInstantSnr[i] = 10.0f * log10f(instMean / w.noiseFloor);
                 double centroidWeighted = 0.0;
                 double centroidPower = 0.0;
                 for (int b = lo; b <= hi; b++) {
@@ -4569,11 +4679,14 @@ setRefreshInterval(refreshIntervalMs);
                 // Using instMean for voting caused strong-signal modulation spikes to
                 // accumulate votes on adjacent channels, triggering false detections.
                 //
-                // Hysteresis: once a file is open on this index, use holdSnrLinear
-                // (= snrThreshold - holdHysteresisDb) so brief fades don't drain votes.
-                float effSnr   = openSlotIndices.count(i) ? holdSnrLinear : snrLinear;
-                bool aboveVote = (mean     > globalNoiseFloor * effSnr);
-                bool aboveRaw  = (instMean > globalNoiseFloor * effSnr);
+                // Hysteresis and per-frequency calibration are applied in dB so
+                // overrides retain the same hold margin as the global threshold.
+                float effectiveThresholdDb = w.thresholdDb -
+                    (openSlotIndices.count(i) ? holdHysteresisDb : 0.0f);
+                float startSnrLinear = powf(10.0f, w.thresholdDb / 10.0f);
+                float effSnr = powf(10.0f, effectiveThresholdDb / 10.0f);
+                bool aboveVote = (mean     > w.noiseFloor * effSnr);
+                bool aboveRaw  = (instMean > w.noiseFloor * effSnr);
 
                 // Guard-band suppression for USB/LSB.
                 //
@@ -4605,7 +4718,7 @@ setRefreshInterval(refreshIntervalMs);
                     float gMean     = gSum     / (float)nGuard;
                     float gInstMean = gInstSum / (float)nGuard;
                     // Activation gate: slow EMA (stable, ignores single-frame noise spikes).
-                    if (gMean > globalNoiseFloor * (snrLinear * 0.5f)) {
+                    if (gMean > w.noiseFloor * (startSnrLinear * 0.5f)) {
                         // Ratio uses instantaneous power for both numerator and denominator.
                         // This eliminates EMA charge-up lag at transmission start:
                         //   • New voice tx: instMean jumps immediately → ratio is high → passes.
@@ -4675,8 +4788,8 @@ setRefreshInterval(refreshIntervalMs);
 
                 if (aboveRaw && !widebandEvent) newRawDetected.insert(i);  // raw, un-voted
                 // Store per-freq SNR for M4A metadata
-                if (globalNoiseFloor > 0.0f)
-                    newManualSnr[i] = 10.0f * log10f(mean / globalNoiseFloor);
+                if (w.noiseFloor > 0.0f)
+                    newManualSnr[i] = 10.0f * log10f(mean / w.noiseFloor);
                 // Votes frozen during wideband events (lightning protection)
                 if (!widebandEvent) {
                     int& v = manualVotes[i];
@@ -4689,6 +4802,7 @@ setRefreshInterval(refreshIntervalMs);
                 manualDetected    = newDetected;
                 rawManualDetected = newRawDetected;   // copy — keep newRawDetected usable below
                 manualSnrDb       = std::move(newManualSnr);
+                manualThresholdDb = newManualThresholdDb;
             }
             {
                 std::lock_guard<std::mutex> dlck(displayMtx);
@@ -4701,12 +4815,18 @@ setRefreshInterval(refreshIntervalMs);
                 displaySnap.numSlots  = 0;
                 displaySnap.manualCenterBins.clear();
                 displaySnap.manualActiveFlags.clear();
+                displaySnap.manualThresholdDb.clear();
                 for (int i = 0; i < (int)localFreqs.size(); i++) {
                     double freqOffset = localFreqs[i] - lastKnownCenter;
                     if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
                     int bin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
                     displaySnap.manualCenterBins.push_back(bin);
                     displaySnap.manualActiveFlags.push_back(newDetected.count(i) > 0);
+                    auto wit = manualWindows.begin() + i;
+                    float absoluteThreshold = wit->noiseFloor *
+                        powf(10.0f, wit->thresholdDb / 10.0f);
+                    displaySnap.manualThresholdDb.push_back(
+                        10.0f * log10f(absoluteThreshold + 1e-30f));
                 }
                 std::vector<float> sorted = displaySnap.power;
                 int lo5  = (int)(FFT_SIZE * 0.05f);
@@ -4928,6 +5048,9 @@ setRefreshInterval(refreshIntervalMs);
             displaySnap.threshDb  = 10.0f * log10f(displayNoiseFloor * snrLinear + 1e-30f);
             displaySnap.detected  = detected;
             displaySnap.numSlots  = numSlots;
+            displaySnap.manualCenterBins.clear();
+            displaySnap.manualActiveFlags.clear();
+            displaySnap.manualThresholdDb.clear();
             // Auto-range: 5th/95th percentile for a clean y-axis.
             // nth_element is O(n) vs std::sort's O(n log n) — saves ~50% of
             // this block's CPU on 8192-element arrays at 20 Hz.
@@ -5128,6 +5251,7 @@ setRefreshInterval(refreshIntervalMs);
                                     delete slot;
                                 }
                                 activeChannels.clear();
+                                teardownSharedIqBus();
                             }
                             bookmarkScanStopIdx = (bookmarkScanStopIdx + 1) % (int)bookmarkScanStops.size();
                             bookmarkScanHadSignal = false;
@@ -5195,7 +5319,7 @@ setRefreshInterval(refreshIntervalMs);
                 else {
                     it->second->lastDetected  = now;
                     it->second->signalPresent = true;
-                    // rawSignalPresent is maintained exclusively by the DSP thread
+                    // rawSignalPresent is maintained exclusively by the spectrum worker
                     // (analyzeSpectrum NMS pass) with mode-aware miss debounce.
                     // Accumulate SNR while the slot is actively recording
                     if (it->second->fileOpen && idx < (int)localSnrDb.size()) {
@@ -5256,7 +5380,7 @@ setRefreshInterval(refreshIntervalMs);
                         ? std::max(signalHoldMs, 2000) : signalHoldMs;
                     slot->signalPresent = detected || rawPresent || (holdElapsed * 1000.0f < (float)effectiveHoldMs);
                 }
-                // rawSignalPresent maintained exclusively by the DSP thread (NMS pass).
+                // rawSignalPresent is maintained exclusively by the spectrum worker (NMS pass).
                 if (!detected) {
                     float elapsed = std::chrono::duration<float>(
                         now - slot->lastDetected).count();
@@ -5272,6 +5396,8 @@ setRefreshInterval(refreshIntervalMs);
                 }
                 ++it;
             }
+
+            if (activeChannels.empty()) teardownSharedIqBus();
 
             // Scan mode: advance to next stop once the band has been quiet long enough
             if (scanMode && !scanStops.empty()) {
@@ -5298,9 +5424,26 @@ setRefreshInterval(refreshIntervalMs);
         }
     }
 
+    void teardownSharedIqBus() {
+        if (!iqSplitter) return;
+        iqSplitter->stop();
+        sigpath::iqFrontEnd.unbindIQStream(sharedIqIn);
+        delete iqSplitter; iqSplitter = nullptr;
+        delete sharedIqIn; sharedIqIn = nullptr;
+    }
+
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
+        // Do not touch the frontend IQ path merely because Channel Bank is running.
+        // Create the shared lane bus only after the detector has confirmed a signal.
+        if (!iqSplitter) {
+            sharedIqIn = new dsp::stream<dsp::complex_t>();
+            sigpath::iqFrontEnd.bindIQStream(sharedIqIn);
+            iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
+            iqSplitter->start();
+        }
+
         slot.module  = this;
         slot.gridIdx = gridIdx;
 
@@ -5581,7 +5724,7 @@ setRefreshInterval(refreshIntervalMs);
         // detection is unreliable — the FFT already knows if a signal is there.
         //
         // Two flags drive this:
-        //   rawSignalPresent – updated in the DSP thread every FFT frame (50 ms).
+        //   rawSignalPresent – updated by the spectrum worker every snapshot (~50 ms).
         //                      Goes TRUE on the very first frame above the SNR
         //                      threshold; goes FALSE after 2 consecutive misses in
         //                      AM, or 4 for other open recording modes.
@@ -6723,6 +6866,7 @@ setRefreshInterval(refreshIntervalMs);
                 delete slot;
             }
             _this->activeChannels.clear();
+            _this->teardownSharedIqBus();
         }
         {
             std::lock_guard<std::mutex> lck(_this->detectedMtx);
@@ -6733,9 +6877,8 @@ setRefreshInterval(refreshIntervalMs);
             _this->manualDetected.clear();
         }
 
-        // Store new params but DON'T touch DSP-thread-owned state (slotVotes,
-        // avgPower, fftBufPos, etc.) — set a flag so the DSP thread resets
-        // them safely at the start of its next frame.
+        // Store new params but don't touch detector-worker-owned state directly.
+        // The worker resets it safely at the start of its next snapshot.
         _this->pendingRetuneSr     = newSr;
         _this->pendingRetuneCenter = newCenter;
         _this->retuneFlag.store(true);
@@ -7047,23 +7190,44 @@ setRefreshInterval(refreshIntervalMs);
 
         if (_this->running) { style::endDisabled(); }
 
-        bool canLimitPassbands = _this->manualMode;
-        if (!canLimitPassbands) style::beginDisabled();
-        if (ImGui::Checkbox(CONCAT("Limit to manual passbands##_cb_manpb_", _this->name),
-                            &_this->manualPassbandLimit)) {
-            config.acquire();
-            config.conf[_this->name]["manualPassbandLimit"] = _this->manualPassbandLimit;
-            config.release(true);
+        bool canTuneManualDetector = _this->manualMode;
+        if (!canTuneManualDetector) style::beginDisabled();
+        if (ImGui::Checkbox(CONCAT("Local SNR floors##_cb_local_snr_", _this->name),
+                            &_this->manualLocalSnrEnabled)) {
+            _this->saveManualConfig();
             _this->resetDetectorFloor();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Manual mode only.\n"
-                              "USB watches bookmark to +channel spacing.\n"
-                              "LSB watches -channel spacing to bookmark.\n"
-                              "AM/NFM/WFM watch a centered channel-width passband.\n"
-                              "When off, manual detection uses the current full-span floor.");
+            ImGui::SetTooltip("Manual mode only. Measures each configured frequency\n"
+                              "against nearby modulation-aware noise shoulders.\n"
+                              "USB/LSB use one-sided voice windows; AM/NFM/WFM\n"
+                              "use symmetric windows. Disable to restore the legacy\n"
+                              "shared noise floor.");
         }
-        if (!canLimitPassbands) style::endDisabled();
+        if (ImGui::Checkbox(CONCAT("Storm guard##_cb_storm_guard_", _this->name),
+                            &_this->manualStormGuardEnabled)) {
+            _this->saveManualConfig();
+            _this->resetDetectorFloor();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Freeze detection votes for a frame when the nearby\n"
+                              "noise around most manual frequencies jumps together.\n"
+                              "Votes and active-channel state are preserved, not reset.");
+        }
+        if (!canTuneManualDetector) style::endDisabled();
+
+        // Keep the old shared-floor mask available strictly as an A/B fallback.
+        // It has no effect while local floors are enabled.
+        if (_this->manualMode && !_this->manualLocalSnrEnabled) {
+            if (ImGui::Checkbox(CONCAT("Limit shared floor to passbands##_cb_manpb_", _this->name),
+                                &_this->manualPassbandLimit)) {
+                _this->saveManualConfig();
+                _this->resetDetectorFloor();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Legacy detector only. Restricts the single shared\n"
+                                  "noise-floor estimate to the combined manual passbands.");
+        }
 
         // Manual frequency list — editable while running
         if (_this->manualMode) {
@@ -7191,7 +7355,7 @@ setRefreshInterval(refreshIntervalMs);
 
                 int toRemove = -1;
                 ImGui::BeginChild(CONCAT("##_cb_manlist_", _this->name),
-                                  ImVec2(menuWidth, 120), true);
+                                  ImVec2(menuWidth, 190), true);
 
                 // Helper lambda: draw a watch toggle button.
                 // Orange [W] = watched, default [ ] = not watched.
@@ -7218,6 +7382,65 @@ setRefreshInterval(refreshIntervalMs);
                         ImGui::SetTooltip(watched ? "Watching — click to stop" : "Click to watch");
                 };
 
+                // Optional modulation-specific SNR override. Unchecked rows inherit
+                // the global threshold; enabling starts at the current global value.
+                auto thresholdControl = [&](const char* idSuffix, double hz, int activeIndex) {
+                    std::string key = _this->manualSnrOverrideKey(hz, _this->demodMode);
+                    bool enabled = false;
+                    float value = _this->snrThreshold;
+                    {
+                        std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                        auto it = _this->manualSnrOverrides.find(key);
+                        if (it != _this->manualSnrOverrides.end()) {
+                            enabled = true;
+                            value = it->second;
+                        }
+                    }
+
+                    ImGui::Indent(24.0f);
+                    char enableId[64];
+                    snprintf(enableId, sizeof(enableId), "SNR override##%s_enable", idSuffix);
+                    if (ImGui::Checkbox(enableId, &enabled)) {
+                        {
+                            std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                            if (enabled) _this->manualSnrOverrides[key] = _this->snrThreshold;
+                            else _this->manualSnrOverrides.erase(key);
+                        }
+                        _this->saveManualConfig();
+                        _this->resetDetectorFloor();
+                        value = _this->snrThreshold;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Override the global start threshold for this\n"
+                                          "frequency in the current modulation mode only.");
+                    ImGui::SameLine();
+                    if (!enabled) style::beginDisabled();
+                    ImGui::SetNextItemWidth(78.0f);
+                    char valueId[48];
+                    snprintf(valueId, sizeof(valueId), "##%s_value", idSuffix);
+                    if (ImGui::DragFloat(valueId, &value, 0.1f, 1.0f, 30.0f, "%.1f dB")) {
+                        value = std::clamp(value, 1.0f, 30.0f);
+                        {
+                            std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                            _this->manualSnrOverrides[key] = value;
+                        }
+                        _this->saveManualConfig();
+                        _this->resetDetectorFloor();
+                    }
+                    if (!enabled) style::endDisabled();
+                    float currentSnr = NAN;
+                    {
+                        std::lock_guard<std::mutex> lk(_this->manualDetectedMtx);
+                        auto it = _this->manualSnrDb.find(activeIndex);
+                        if (it != _this->manualSnrDb.end()) currentSnr = it->second;
+                    }
+                    if (std::isfinite(currentSnr)) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("%.1f now", currentSnr);
+                    }
+                    ImGui::Unindent(24.0f);
+                };
+
                 // — Custom entries —
                 for (int i = 0; i < (int)customFreqs.size(); i++) {
                     double hz = customFreqs[i];
@@ -7229,6 +7452,7 @@ setRefreshInterval(refreshIntervalMs);
                     ImGui::SameLine(menuWidth - 38);
                     char rmBtn[32]; snprintf(rmBtn, sizeof(rmBtn), "X##_cb_rm_%d", i);
                     if (ImGui::SmallButton(rmBtn)) toRemove = i;
+                    thresholdControl(idBuf, hz, i);
                 }
 
                 // — Bound bookmark list entries (read-only; can watch, cannot remove) —
@@ -7239,6 +7463,7 @@ setRefreshInterval(refreshIntervalMs);
                     ImGui::SameLine();
                     std::string dname = _this->displayName(hz);
                     ImGui::TextDisabled("%s", dname.c_str());
+                    thresholdControl(idBuf, hz, (int)customFreqs.size() + i);
                 }
 
                 ImGui::EndChild();
@@ -7471,14 +7696,28 @@ setRefreshInterval(refreshIntervalMs);
                     dl->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(0, 210, 0, 200));
                 }
 
-                // Global threshold line (orange horizontal line across full width)
-                float ty = dBtoY(snap.threshDb);
-                dl->AddLine(ImVec2(pos.x, ty), ImVec2(pos.x + W, ty),
-                            IM_COL32(255, 120, 0, 200), 1.5f);
+                // Manual/local mode has a different absolute threshold at each
+                // frequency, so draw short orange ticks instead of a misleading
+                // full-span line. Auto and legacy Manual mode keep the global line.
+                bool localThresholds = !snap.manualThresholdDb.empty() &&
+                    snap.manualThresholdDb.size() == snap.manualCenterBins.size();
+                if (localThresholds) {
+                    for (int m = 0; m < (int)snap.manualCenterBins.size(); m++) {
+                        float x = binToX(snap.manualCenterBins[m]);
+                        float y = dBtoY(snap.manualThresholdDb[m]);
+                        dl->AddLine(ImVec2(x - 5.0f, y), ImVec2(x + 5.0f, y),
+                                    IM_COL32(255, 120, 0, 220), 2.0f);
+                    }
+                } else {
+                    float ty = dBtoY(snap.threshDb);
+                    dl->AddLine(ImVec2(pos.x, ty), ImVec2(pos.x + W, ty),
+                                IM_COL32(255, 120, 0, 200), 1.5f);
+                }
 
                 // Legend
                 dl->AddText(ImVec2(pos.x + 4, pos.y + 2),  IM_COL32(0, 210, 0, 200),   "Power");
-                dl->AddText(ImVec2(pos.x + 4, pos.y + 14), IM_COL32(255, 120, 0, 200),  "Threshold");
+                dl->AddText(ImVec2(pos.x + 4, pos.y + 14), IM_COL32(255, 120, 0, 200),
+                            localThresholds ? "Local thresholds" : "Threshold");
                 dl->AddText(ImVec2(pos.x + 4, pos.y + 26), IM_COL32(255, 200, 0, 200),  "Detected");
 
                 // dB range labels
@@ -8463,6 +8702,12 @@ setRefreshInterval(refreshIntervalMs);
         }
 
         auto now = std::chrono::steady_clock::now();
+        std::set<int64_t> queuedFreqKeys;
+        {
+            std::lock_guard<std::mutex> plk(playbackMtx);
+            for (auto& entry : playbackQueue)
+                queuedFreqKeys.insert(freqKey(entry.freqHz));
+        }
         std::lock_guard<std::mutex> clck(channelsMtx);
 
         // All freqs in the current stop are within SDR bandwidth by construction;
@@ -8515,7 +8760,7 @@ setRefreshInterval(refreshIntervalMs);
             // means lastDetected can be up to 250ms stale when a signal starts to
             // dip — the hold timer effectively begins 250ms early, causing the file
             // to close prematurely and then immediately reopen on signal recovery.
-            // rawSignalPresent is updated in the DSP thread every FFT frame (50ms),
+            // rawSignalPresent is updated by the spectrum worker every snapshot (~50ms),
             // so pinning lastDetected to it keeps the hold countdown accurate to
             // within ~100ms of actual signal loss.
             if (present || rawPresent) it->second->lastDetected = now;
@@ -8527,7 +8772,7 @@ setRefreshInterval(refreshIntervalMs);
                     ? std::max(signalHoldMs, 2000) : signalHoldMs;
                 it->second->signalPresent = present || rawPresent || (holdElapsed * 1000.0f < (float)effectiveHoldMs);
             }
-            // rawSignalPresent maintained exclusively by the DSP thread (analyzeSpectrum).
+            // rawSignalPresent is maintained exclusively by the spectrum worker.
             // Accumulate SNR while signal present and recording
             if (present && it->second->fileOpen) {
                 auto sit = localSnrDb.find(idx);
@@ -8536,12 +8781,27 @@ setRefreshInterval(refreshIntervalMs);
                     it->second->snrCount += 1;
                 }
             }
+            if (!present && !rawPresent) {
+                float elapsed = std::chrono::duration<float>(
+                    now - it->second->lastDetected).count();
+                bool isPlaying = currentlyPlayingFreqKey.load() == freqKey(it->second->freqHz);
+                bool isQueued = queuedFreqKeys.count(freqKey(it->second->freqHz)) > 0;
+                if (elapsed > cooldownSec && !it->second->fileOpen && !isPlaying && !isQueued) {
+                    flog::info("[ChannelBank] BkScan: retiring quiet slot {0}", idx);
+                    destroySlot(*it->second);
+                    delete it->second;
+                    it = activeChannels.erase(it);
+                    continue;
+                }
+            }
             ++it;
         }
 
-        // Spawn slots for all desired freqs not yet active
+        // Spawn only after voted detection. Merely enabling Manual/BkScan must not
+        // create a bank of IQ consumers for every listed frequency.
         for (int i : desired) {
             if (activeChannels.find(i) != activeChannels.end()) continue;
+            if (localDetected.count(i) == 0) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
             if (isBlocked(stop.freqsHz[i]) || isRnVoiceQuarantined(stop.freqsHz[i])) continue;
             double offset = stop.freqsHz[i] - lastKnownCenter;
@@ -8558,6 +8818,7 @@ setRefreshInterval(refreshIntervalMs);
         bool anyActive = false;
         for (auto& [idx, slot] : activeChannels)
             if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
+        if (activeChannels.empty()) teardownSharedIqBus();
         return anyActive;
     }
 
@@ -8580,6 +8841,11 @@ setRefreshInterval(refreshIntervalMs);
         config.conf[name]["manualMode"]       = manualMode;
         config.conf[name]["bookmarkScanMode"] = bookmarkScanMode;
         config.conf[name]["manualPassbandLimit"] = manualPassbandLimit;
+        config.conf[name]["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
+        config.conf[name]["manualStormGuardEnabled"] = manualStormGuardEnabled;
+        auto& snrOverrides = config.conf[name]["manualSnrOverrides"];
+        snrOverrides = nlohmann::json::object();
+        for (auto& [key, value] : manualSnrOverrides) snrOverrides[key] = value;
         auto& arr = config.conf[name]["manualFrequencies"];
         arr = nlohmann::json::array();
         for (double f : manualFrequencies) arr.push_back(f);
@@ -8633,7 +8899,7 @@ setRefreshInterval(refreshIntervalMs);
 
     // Build the manual-mode frequency list as the union of user-entered
     // frequencies and the bound bookmark lists (deduped within ±100 Hz).
-    // BOTH the DSP thread (analyzeSpectrum) and the mgmt thread
+    // BOTH the spectrum worker (analyzeSpectrum) and the mgmt thread
     // (manageManualChannels) must use this same view, otherwise the indices
     // in `manualDetected` don't map to anything and channels never spawn.
     std::vector<double> getActiveManualFreqs() {
@@ -8647,6 +8913,11 @@ setRefreshInterval(refreshIntervalMs);
             if (!dup) out.push_back(bf);
         }
         return out;
+    }
+
+    std::string manualSnrOverrideKey(double freqHz, int mode) const {
+        return std::to_string(mode) + ":" +
+               std::to_string((int64_t)std::llround(freqHz / 1000.0));
     }
 
     bool manualPassbandBinsForFreq(double freqHz, double binHz, int& lo, int& hi) const {
@@ -8791,6 +9062,12 @@ setRefreshInterval(refreshIntervalMs);
         std::vector<double> localFreqs = getActiveManualFreqs();
 
         auto now = std::chrono::steady_clock::now();
+        std::set<int64_t> queuedFreqKeys;
+        {
+            std::lock_guard<std::mutex> plk(playbackMtx);
+            for (auto& entry : playbackQueue)
+                queuedFreqKeys.insert(freqKey(entry.freqHz));
+        }
         std::lock_guard<std::mutex> clck(channelsMtx);
 
         // Build desired set (indices currently within SDR bandwidth and active span)
@@ -8846,7 +9123,7 @@ setRefreshInterval(refreshIntervalMs);
             // means lastDetected can be up to 250ms stale when a signal starts to
             // dip — the hold timer effectively begins 250ms early, causing the file
             // to close prematurely and then immediately reopen on signal recovery.
-            // rawSignalPresent is updated in the DSP thread every FFT frame (50ms),
+            // rawSignalPresent is updated by the spectrum worker every snapshot (~50ms),
             // so pinning lastDetected to it keeps the hold countdown accurate to
             // within ~100ms of actual signal loss.
             if (present || rawPresent) it->second->lastDetected = now;
@@ -8858,7 +9135,7 @@ setRefreshInterval(refreshIntervalMs);
                     ? std::max(signalHoldMs, 2000) : signalHoldMs;
                 it->second->signalPresent = present || rawPresent || (holdElapsed * 1000.0f < (float)effectiveHoldMs);
             }
-            // rawSignalPresent maintained exclusively by the DSP thread (analyzeSpectrum).
+            // rawSignalPresent is maintained exclusively by the spectrum worker.
             // Accumulate SNR while signal present and recording
             if (present && it->second->fileOpen) {
                 auto sit = localSnrDb.find(idx);
@@ -8874,12 +9151,27 @@ setRefreshInterval(refreshIntervalMs);
                 if (watchedFreqs.count(k) > 0) watchAlert.store(k);
             }
             it->second->prevSignalPresent = present;
+            if (!present && !rawPresent) {
+                float elapsed = std::chrono::duration<float>(
+                    now - it->second->lastDetected).count();
+                bool isPlaying = currentlyPlayingFreqKey.load() == freqKey(it->second->freqHz);
+                bool isQueued = queuedFreqKeys.count(freqKey(it->second->freqHz)) > 0;
+                if (elapsed > cooldownSec && !it->second->fileOpen && !isPlaying && !isQueued) {
+                    flog::info("[ChannelBank] Manual: retiring quiet slot {0}", idx);
+                    destroySlot(*it->second);
+                    delete it->second;
+                    it = activeChannels.erase(it);
+                    continue;
+                }
+            }
             ++it;
         }
 
-        // Spawn a slot for each desired freq not yet active
+        // Spawn only after voted detection. A quiet manual list should add no IQ
+        // consumers at all, regardless of how many frequencies it contains.
         for (int i : desired) {
             if (activeChannels.find(i) != activeChannels.end()) continue;
+            if (localDetected.count(i) == 0) continue;
             if ((int)activeChannels.size() >= maxChannels) continue;
             if (isBlocked(localFreqs[i]) || isRnVoiceQuarantined(localFreqs[i])) continue;
             double offset = localFreqs[i] - lastKnownCenter;
@@ -8891,6 +9183,7 @@ setRefreshInterval(refreshIntervalMs);
             initSlot(*slot, i, 1, 0.0, offset);
             activeChannels[i] = slot;
         }
+        if (activeChannels.empty()) teardownSharedIqBus();
     }
 
     // ── Members ──────────────────────────────────────────────────────────────
@@ -9048,6 +9341,8 @@ setRefreshInterval(refreshIntervalMs);
     // Manual mode
     bool manualMode = false;
     bool manualPassbandLimit = false;
+    bool manualLocalSnrEnabled = true;
+    bool manualStormGuardEnabled = true;
     std::mutex manualFreqMtx;
     std::vector<double>   manualFrequencies;    // user-entered frequencies (custom additions)
     std::set<std::string> boundBookmarkLists;   // names of bound FM bookmark lists
@@ -9057,12 +9352,16 @@ setRefreshInterval(refreshIntervalMs);
     bool                        waterfallStateSaved = false;
     std::chrono::steady_clock::time_point lastFmConfigRefresh{};
     char manualFreqInputBuf[64] = {};
-    std::map<int, int> manualVotes;       // list-index → vote count (DSP thread only)
-    std::set<int>       manualDetected;      // written by DSP, read by mgmt thread
+    std::map<int, int> manualVotes;       // list-index → vote count (spectrum worker only)
+    std::set<int>       manualDetected;      // written by spectrum worker, read by mgmt thread
     std::set<int>       rawManualDetected;   // un-voted; instant fade-out (under manualDetectedMtx)
     std::map<int,float> manualSnrDb;         // per-freq SNR dB; manual/bookmark scan mode
+    std::map<int,float> manualThresholdDb;   // effective start threshold per manual frequency
     std::mutex          manualDetectedMtx;
     std::set<int64_t> watchedFreqs;       // watched freq keys; protected by manualFreqMtx
+    // Optional start thresholds are keyed by "demod-mode:rounded-kHz" so the
+    // same bookmark can retain different calibration in USB, LSB, AM, etc.
+    std::map<std::string, float> manualSnrOverrides; // protected by manualFreqMtx
     std::atomic<int64_t> watchAlert{0};   // non-zero = freqKey of watched freq that just fired
 
     // Description editor (UI thread only)
@@ -9080,49 +9379,37 @@ setRefreshInterval(refreshIntervalMs);
     struct BookmarkEntry { std::string name; std::string listName; };
     std::map<int64_t, BookmarkEntry> bookmarkNames;  // freqKey -> {name, listName}
 
-    // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
-    // keeping the main signal-path thread's memcpy cost at O(1) regardless of slot count.
+    // Shared IQ bus for active demodulator lanes. It is created lazily on the
+    // first confirmed detection; the spectrum detector never uses this path.
     dsp::stream<dsp::complex_t>*            sharedIqIn  = nullptr;
     dsp::routing::Splitter<dsp::complex_t>* iqSplitter  = nullptr;
 
-    // FFT spectrum monitor
-    dsp::stream<dsp::complex_t>*            specStream     = nullptr;
-    dsp::sink::Handler<dsp::complex_t>*     specSink       = nullptr;
-    fftwf_complex*                          fftIn          = nullptr;
-    fftwf_complex*                          fftOut         = nullptr;
-    fftwf_plan                              fftPlan;
-    std::vector<float>                      hannWindow;
-    // At very low sample rates (< FFT_SIZE * SPEC_ANALYSIS_HZ ≈ 164 kHz) the
-    // DSP block has fewer than FFT_SIZE samples, so fftAccum is zero-padded.
-    // Applying the full-size BH window to truncated data leaves it non-zero at
-    // the cut point, causing sidelobes nearly as bad as Hann.  We cache a BH
-    // window sized to the actual fill length (zero-padded to FFT_SIZE) and
-    // recompute only when the sample rate changes.
-    std::vector<float>                      fftWindow;     // active window (length FFT_SIZE, correct for current SR)
-    int                                     fftWindowFill  = 0; // fill length fftWindow was built for
-    std::vector<dsp::complex_t>             fftAccum;
-    int                                     fftBufPos      = 0;
-    int64_t                                 specSamplesUntilFFT = 0;  // countdown; analysis fires when ≤ 0
+    // Non-blocking waterfall FFT snapshot worker.
+    std::thread                             spectrumPollThread;
+    std::atomic<bool>                       spectrumPollRunning { false };
+    std::condition_variable                 spectrumPollCv;
+    std::mutex                              spectrumPollWaitMtx;
     std::atomic<int>                        debugDetectedCount { 0 };
     std::atomic<int>                        debugBlockedSkips  { 0 };
     std::atomic<int>                        debugCapSkips      { 0 };
     std::vector<float>                      avgPower;           // slow EMA power spectrum (alpha=0.15) — voting
     std::vector<float>                      instPower;          // instantaneous per-frame power (no EMA) — fade trigger
-    std::map<int, int>                      rawSlotMisses;      // DSP-thread-only: consecutive below-threshold frames (auto mode)
-    std::map<int, int>                      rawManualMisses;    // DSP-thread-only: consecutive below-threshold frames (manual mode)
-    bool                                    widebandEvent = false; // DSP-thread-only: >40% of slots above threshold this frame
+    std::map<int, int>                      rawSlotMisses;      // spectrum-worker-only: consecutive misses (auto)
+    std::map<int, int>                      rawManualMisses;    // spectrum-worker-only: consecutive misses (manual)
+    std::map<std::string, float>             manualLocalNoiseFloors; // spectrum-worker-only, mode/frequency keyed
+    bool                                    widebandEvent = false; // spectrum-worker-only: broadband event this frame
     float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
     float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
     std::deque<float>                       floorHistory;             // ring buffer of recent rawFloor values for median filter
     std::atomic<bool>                       detectorFloorResetRequested { false };
     std::map<int, int>                      slotVotes;
 
-    // Deferred retune — set by waterfall thread, consumed by DSP thread
+    // Deferred retune — set by waterfall thread, consumed by spectrum worker.
     std::atomic<bool>                       retuneFlag { false };
     double                                  pendingRetuneSr     = 0.0;
     double                                  pendingRetuneCenter = 0.0;
 
-    // Detected signals (written by DSP thread, read by mgmt thread)
+    // Detected signals (written by spectrum worker, read by management thread).
     std::mutex              detectedMtx;
     std::set<int>           detectedSlots;
     std::map<int, double>   slotPeakOffsets;  // Hz from SDR center of peak energy bin per slot
@@ -9446,7 +9733,7 @@ setRefreshInterval(refreshIntervalMs);
         config.release(true);
     }
 
-    // Display snapshot (written by DSP thread, read by UI thread)
+    // Display snapshot (written by spectrum worker, read by UI thread)
     struct DisplaySnapshot {
         std::vector<float>  power;          // per-bin dB  (FFT_SIZE)
         float               threshDb = -120.0f; // global threshold line in dB
@@ -9458,6 +9745,7 @@ setRefreshInterval(refreshIntervalMs);
         // Manual mode display
         std::vector<int>    manualCenterBins;
         std::vector<bool>   manualActiveFlags;
+        std::vector<float>  manualThresholdDb; // absolute per-frequency threshold for display
     };
     std::mutex       displayMtx;
     DisplaySnapshot  displaySnap;
@@ -9594,6 +9882,8 @@ setRefreshInterval(refreshIntervalMs);
         p["manualMode"]         = manualMode;
         p["bookmarkScanMode"]   = bookmarkScanMode;
         p["manualPassbandLimit"]= manualPassbandLimit;
+        p["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
+        p["manualStormGuardEnabled"] = manualStormGuardEnabled;
         p["scanMode"]           = scanMode;
         p["scanQuietSec"]       = scanQuietSec;
         p["scanNoSignalSec"]    = scanNoSignalSec;
@@ -9606,6 +9896,9 @@ setRefreshInterval(refreshIntervalMs);
         for (auto& s : boundBookmarkLists) p["boundBookmarkLists"].push_back(s);
         p["watchedFreqs"]       = json::array();
         for (auto k : watchedFreqs) p["watchedFreqs"].push_back(k);
+        p["manualSnrOverrides"] = json::object();
+        for (auto& [key, value] : manualSnrOverrides)
+            p["manualSnrOverrides"][key] = value;
         p["scanRanges"]         = json::array();
         for (auto& r : scanRanges) p["scanRanges"].push_back({{"start", r.startHz}, {"stop", r.stopHz}});
         return p;
@@ -9652,6 +9945,8 @@ setRefreshInterval(refreshIntervalMs);
         manualMode         = p.value("manualMode", false);
         bookmarkScanMode   = p.value("bookmarkScanMode", false);
         manualPassbandLimit= p.value("manualPassbandLimit", false);
+        manualLocalSnrEnabled = p.value("manualLocalSnrEnabled", true);
+        manualStormGuardEnabled = p.value("manualStormGuardEnabled", true);
         scanMode           = p.value("scanMode", false);
         scanQuietSec       = p.value("scanQuietSec", 3.0f);
         scanNoSignalSec    = p.value("scanNoSignalSec", 1.0f);
@@ -9668,6 +9963,11 @@ setRefreshInterval(refreshIntervalMs);
         watchedFreqs.clear();
         if (p.contains("watchedFreqs"))
             for (auto& j : p["watchedFreqs"]) watchedFreqs.insert(j.get<int64_t>());
+        manualSnrOverrides.clear();
+        if (p.contains("manualSnrOverrides") && p["manualSnrOverrides"].is_object())
+            for (auto& [key, value] : p["manualSnrOverrides"].items())
+                if (value.is_number())
+                    manualSnrOverrides[key] = std::clamp(value.get<float>(), 1.0f, 30.0f);
         scanRanges.clear();
         if (p.contains("scanRanges"))
             for (auto& j : p["scanRanges"]) scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });

@@ -1248,6 +1248,28 @@ namespace ImGui {
         latestFFTMtx.unlock();
     }
 
+    bool WaterFall::tryCopyLatestRawFFT(float* dest, int capacity, int& size,
+                                         double& centerFrequency, double& bandwidth) {
+        size = 0;
+        std::unique_lock<std::recursive_mutex> lck(buf_mtx, std::try_to_lock);
+        if (!lck.owns_lock() || rawFFTs == NULL || rawFFTSize <= 0 || fftLines <= 0) {
+            return false;
+        }
+
+        size = rawFFTSize;
+        if (dest == NULL || capacity < rawFFTSize) {
+            return false;
+        }
+
+        const float* src = waterfallVisible
+            ? &rawFFTs[currentFFTLine * rawFFTSize]
+            : rawFFTs;
+        memcpy(dest, src, rawFFTSize * sizeof(float));
+        centerFrequency = centerFreq;
+        bandwidth = wholeBandwidth;
+        return true;
+    }
+
     void WaterfallVFO::setOffset(double offset) {
         generalOffset = offset;
         if (reference == REF_CENTER) {
