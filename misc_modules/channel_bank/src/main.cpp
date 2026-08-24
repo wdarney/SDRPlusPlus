@@ -2109,7 +2109,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <h2>Activity History</h2>
 <div class="muted"><span id="playbackLockStatus">Playback all frequencies</span> <button class="secondary inline-action" id="clearPlaybackLock" type="button">Clear Lock</button></div>
 </div>
-<table><thead><tr><th><button type="button" data-history-sort="freq">Frequency</button></th><th><button type="button" data-history-sort="name">Name</button></th><th><button type="button" data-history-sort="count">Count</button></th><th><button type="button" data-history-sort="last">Last</button></th><th>Playback</th></tr></thead><tbody id="activityHistory"></tbody></table>
+<table><thead><tr><th><button type="button" data-history-sort="freq">Frequency</button></th><th><button type="button" data-history-sort="name">Name</button></th><th><button type="button" data-history-sort="count">Count</button></th><th><button type="button" data-history-sort="last">Last</button></th><th>Playback</th><th>Block</th></tr></thead><tbody id="activityHistory"></tbody></table>
 </section>
 <section>
 <h2>Frequency Heat Map</h2>
@@ -2134,7 +2134,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 </section>
 <section>
 <h2>Blocked Frequencies</h2>
-<table><thead><tr><th>Frequency</th><th>Name</th><th>Count</th><th>Blocked</th></tr></thead><tbody id="blockedFreqs"></tbody></table>
+<table><thead><tr><th><button type="button" data-blocked-sort="freq">Frequency</button></th><th><button type="button" data-blocked-sort="name">Name</button></th><th><button type="button" data-blocked-sort="count">Count</button></th><th><button type="button" data-blocked-sort="last">Last</button></th><th>Blocked</th></tr></thead><tbody id="blockedFreqs"></tbody></table>
 </section>
 </main>
 <script>
@@ -2154,6 +2154,8 @@ let monitorRunId = 0;
 let monitorRetryTimer = null;
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
+let refreshAbort = null;
+let refreshSeq = 0;
 let refreshTimer = null;
 let refreshIntervalMs = Number(localStorage.getItem("channelBankRefreshMs") || 500);
 if (![250, 500, 1000, 2000].includes(refreshIntervalMs)) refreshIntervalMs = 500;
@@ -2184,6 +2186,8 @@ let centerTunePendingHz = null;
 let centerTuneInFlight = false;
 let historySortKey = "last";
 let historySortDir = -1;
+let blockedSortKey = "freq";
+let blockedSortDir = 1;
 let currentRecordingEnabled = true;
 let currentLocalSnrEnabled = true;
 let currentStormGuardEnabled = true;
@@ -2216,7 +2220,7 @@ async function post(path, body, refreshAfter = true) {
     try { msg = (await r.json()).error || msg; } catch (_) {}
     throw new Error(msg);
   }
-  if (refreshAfter) await refresh();
+  if (refreshAfter) await refresh(true);
 }
 function setControlValue(id, value) {
   const el = document.getElementById(id);
@@ -2246,7 +2250,7 @@ async function postAndReport(path, body, refreshAfter = true) {
     console.warn(e);
     const settingsStatus = document.getElementById("settingsStatus");
     if (settingsStatus) settingsStatus.textContent = e?.message || "Save failed";
-    if (refreshAfter) await refresh();
+    if (refreshAfter) await refresh(true);
     return false;
   }
 }
@@ -2442,13 +2446,15 @@ function fmtLastSeen(seconds) {
   return `${Math.floor(age / 86400)}d ago`;
 }
 function sortHistoryRows(rows) {
-  const dir = historySortDir;
+  return sortRows(rows, historySortKey, historySortDir);
+}
+function sortRows(rows, key, dir) {
   const cmpText = (a, b) => String(a || "").localeCompare(String(b || ""), undefined, { sensitivity: "base" });
   rows.sort((a, b) => {
     let cmp = 0;
-    if (historySortKey === "freq") cmp = Number(a.freqHz || 0) - Number(b.freqHz || 0);
-    else if (historySortKey === "name") cmp = cmpText(a.name, b.name);
-    else if (historySortKey === "count") cmp = Number(a.count || 0) - Number(b.count || 0);
+    if (key === "freq") cmp = Number(a.freqHz || 0) - Number(b.freqHz || 0);
+    else if (key === "name") cmp = cmpText(a.name, b.name);
+    else if (key === "count") cmp = Number(a.count || 0) - Number(b.count || 0);
     else cmp = Number(a.lastSeen || 0) - Number(b.lastSeen || 0);
     if (!cmp) cmp = Number(a.freqHz || 0) - Number(b.freqHz || 0);
     return cmp * dir;
@@ -2457,6 +2463,10 @@ function sortHistoryRows(rows) {
 }
 function sortLabel(key, label) {
   const arrow = historySortKey === key ? (historySortDir > 0 ? "▲" : "▼") : "";
+  return `${esc(label)} <span class="sort-arrow">${arrow}</span>`;
+}
+function sortHeaderLabel(activeKey, activeDir, key, label) {
+  const arrow = activeKey === key ? (activeDir > 0 ? "▲" : "▼") : "";
   return `${esc(label)} <span class="sort-arrow">${arrow}</span>`;
 }
 function renderActivityHistory(s) {
@@ -2477,16 +2487,25 @@ function renderActivityHistory(s) {
   const rows = sortHistoryRows([...(s.history || [])]);
   body.innerHTML = rows.map(h => {
     const isLocked = lockedHz > 0 && sameFreqKey(h.freqHz, lockedHz);
-    return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : Number(h.freqHz).toFixed(0)})">${isLocked ? "Unlock" : "Lock"}</button></td></tr>`;
-  }).join("") || `<tr><td colspan="5" class="muted">No history yet</td></tr>`;
+    const hz = Number(h.freqHz).toFixed(0);
+    return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : hz})">${isLocked ? "Unlock" : "Lock"}</button></td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${hz}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">No history yet</td></tr>`;
 }
 function renderBlockedFrequencies(s) {
   const body = document.getElementById("blockedFreqs");
   if (!body) return;
-  const rows = (s.history || []).filter(h => h.blocked).sort((a, b) => Number(a.freqHz || 0) - Number(b.freqHz || 0));
+  document.querySelectorAll("[data-blocked-sort]").forEach(btn => {
+    const key = btn.getAttribute("data-blocked-sort");
+    const label = key === "freq" ? "Frequency" : key === "name" ? "Name" : key === "count" ? "Count" : "Last";
+    btn.innerHTML = sortHeaderLabel(blockedSortKey, blockedSortDir, key, label);
+    btn.classList.toggle("sort-active", blockedSortKey === key);
+    btn.setAttribute("aria-sort", blockedSortKey === key ? (blockedSortDir > 0 ? "ascending" : "descending") : "none");
+    btn.title = `Sort by ${label}`;
+  });
+  const rows = sortRows((s.history || []).filter(h => h.blocked), blockedSortKey, blockedSortDir);
   body.innerHTML = rows.map(h =>
-    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td><button class="inline-action danger" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, false)">Unblock</button></td></tr>`
-  ).join("") || `<tr><td colspan="4" class="muted">No blocked frequencies</td></tr>`;
+    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action danger" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, false)">Unblock</button></td></tr>`
+  ).join("") || `<tr><td colspan="5" class="muted">No blocked frequencies</td></tr>`;
 }
 function renderSourceControls(s) {
   const panel = document.getElementById("sourceSettings");
@@ -2658,8 +2677,10 @@ async function refreshRecordings() {
   const status = document.getElementById("recordingsStatus");
   const body = document.getElementById("recordings");
   if (status) status.textContent = "Loading recordings...";
+  const ctl = new AbortController();
+  const timeout = setTimeout(() => ctl.abort(), 8000);
   try {
-    const r = await fetch("/api/recordings", { cache: "no-store" });
+    const r = await fetch("/api/recordings", { cache: "no-store", signal: ctl.signal });
     if (!r.ok) throw new Error(r.statusText);
     const data = await r.json();
     const files = data.files || [];
@@ -2677,6 +2698,8 @@ async function refreshRecordings() {
     console.warn(e);
     if (body) body.innerHTML = `<tr><td colspan="4" class="muted">Could not load recordings.</td></tr>`;
     if (status) status.textContent = "Recordings unavailable";
+  } finally {
+    clearTimeout(timeout);
   }
 }
 function drawSnrChart(s) {
@@ -2814,7 +2837,7 @@ function setRefreshInterval(ms) {
   refreshIntervalMs = [250, 500, 1000, 2000].includes(Number(ms)) ? Number(ms) : 500;
   localStorage.setItem("channelBankRefreshMs", String(refreshIntervalMs));
   if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(refresh, refreshIntervalMs);
+  refreshTimer = setInterval(() => refresh(false), refreshIntervalMs);
 }
 function drawSpanWaterfall(s) {
   const canvas = document.getElementById("spanWaterfall");
@@ -3154,11 +3177,18 @@ function stopMonitorAudio() {
   if (monitorCtx && monitorCtx.state === "running") monitorCtx.suspend().catch(() => {});
   setMonitorUi(false, "Monitor stopped");
 }
-async function refresh() {
-  if (refreshInFlight && performance.now() - lastRefreshStarted < 4500) return;
+async function refresh(force = false) {
+  const nowMs = performance.now();
+  if (!force && document.hidden) return;
+  if (refreshInFlight) {
+    if (!force && nowMs - lastRefreshStarted < 4500) return;
+    if (refreshAbort) refreshAbort.abort();
+  }
   refreshInFlight = true;
-  lastRefreshStarted = performance.now();
+  lastRefreshStarted = nowMs;
+  const seq = ++refreshSeq;
   const ctl = new AbortController();
+  refreshAbort = ctl;
   const timeout = setTimeout(() => ctl.abort(), 4000);
   try {
     const r = await fetch("/api/state", { cache: "no-store", signal: ctl.signal });
@@ -3261,7 +3291,10 @@ async function refresh() {
     document.getElementById("radioState").className = "small-value off";
   } finally {
     clearTimeout(timeout);
-    refreshInFlight = false;
+    if (refreshSeq === seq) {
+      refreshInFlight = false;
+      refreshAbort = null;
+    }
   }
 }
 document.getElementById("start").onclick = () => postAndReport("/api/start");
@@ -3381,7 +3414,18 @@ document.querySelectorAll("[data-history-sort]").forEach(btn => {
       historySortKey = key;
       historySortDir = key === "name" || key === "freq" ? 1 : -1;
     }
-    refresh();
+    refresh(true);
+  };
+});
+document.querySelectorAll("[data-blocked-sort]").forEach(btn => {
+  btn.onclick = () => {
+    const key = btn.getAttribute("data-blocked-sort");
+    if (blockedSortKey === key) blockedSortDir *= -1;
+    else {
+      blockedSortKey = key;
+      blockedSortDir = key === "name" || key === "freq" ? 1 : -1;
+    }
+    refresh(true);
   };
 });
 document.getElementById("clearPlaybackLock").onclick = () => setPlaybackLock(0);
@@ -3399,7 +3443,10 @@ if (spanRate) {
   spanRate.value = String(refreshIntervalMs);
   spanRate.onchange = e => setRefreshInterval(Number(e.target.value));
 }
-refresh();
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refresh(true);
+});
+refresh(true);
 setRefreshInterval(refreshIntervalMs);
 </script>
 </body>
