@@ -11,6 +11,7 @@
 #include "PScope_uti.h"
 #include "../Interface.h"
 
+#include <algorithm>
 #include <chrono>
 
 using namespace std::chrono;
@@ -102,6 +103,7 @@ bool RadioHandlerClass::Init(fx3class* Fx3, void (*callback)(void*context, const
 
 	radio = (RadioModel)rdata[0];
 	firmware = (rdata[1] << 8) + rdata[2];
+	modeRF = NOMODE;
 
 	delete hardware; // delete dummy instance
 	switch (radio)
@@ -219,6 +221,7 @@ bool RadioHandlerClass::Close()
 {
 	delete hardware;
 	hardware = nullptr;
+	modeRF = NOMODE;
 
 	return true;
 }
@@ -235,6 +238,11 @@ bool RadioHandlerClass::UpdateSampleRate(uint32_t samplefreq)
 // attenuator RF used in HF
 int RadioHandlerClass::UpdateattRF(int att)
 {
+	const float* steps = nullptr;
+	int count = GetRFAttSteps(&steps);
+	if (count > 0) {
+		att = std::clamp(att, 0, count - 1);
+	}
 	if (hardware->UpdateattRF(att))
 	{
 		return att;
@@ -245,6 +253,11 @@ int RadioHandlerClass::UpdateattRF(int att)
 // attenuator RF used in HF
 int RadioHandlerClass::UpdateIFGain(int idx)
 {
+	const float* steps = nullptr;
+	int count = GetIFGainSteps(&steps);
+	if (count > 0) {
+		idx = std::clamp(idx, 0, count - 1);
+	}
 	if (hardware->UpdateGainIF(idx))
 	{
 		return idx;

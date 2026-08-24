@@ -233,10 +233,16 @@ private:
         updateGainRanges();
         int rfStep = nearestGainStep(true, rfGain);
         int ifStep = nearestGainStep(false, ifGain);
-        flog::info("RX888: applying gains RF {:.1f} dB step {}, IF {:.1f} dB step {}",
+        rfStep = radio.UpdateattRF(rfStep);
+        ifStep = radio.UpdateIFGain(ifStep);
+        const float* rfSteps = nullptr;
+        const float* ifSteps = nullptr;
+        int rfCount = radio.GetRFAttSteps(&rfSteps);
+        int ifCount = radio.GetIFGainSteps(&ifSteps);
+        if (rfSteps && rfCount > 0) { rfGain = rfSteps[std::clamp(rfStep, 0, rfCount - 1)]; }
+        if (ifSteps && ifCount > 0) { ifGain = ifSteps[std::clamp(ifStep, 0, ifCount - 1)]; }
+        flog::info("RX888: applied gains RF {:.1f} dB step {}, IF {:.1f} dB step {}",
                    rfGain, rfStep, ifGain, ifStep);
-        radio.UpdateattRF(rfStep);
-        radio.UpdateIFGain(ifStep);
         radio.UpdBiasT_HF(biasTeeHF);
         radio.UpdBiasT_VHF(biasTeeVHF);
         radio.UptDither(dithering);
