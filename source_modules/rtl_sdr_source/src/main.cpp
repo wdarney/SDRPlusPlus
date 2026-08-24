@@ -24,6 +24,12 @@ SDRPP_MOD_INFO{
 
 ConfigManager config;
 
+struct RTLSDRSourceControlV1 {
+    char request[4096];
+    char response[32768];
+    bool ok = false;
+};
+
 const double sampleRates[] = {
     250000,
     1024000,
@@ -93,10 +99,13 @@ public:
         selectByName(selectedDevName);
 
         sigpath::sourceManager.registerSource("RTL-SDR", &handler);
+        core::modComManager.registerInterface(
+            "rtl_sdr_source", "rtl_sdr_source.control.v1", controlHandler, this);
     }
 
     ~RTLSDRSourceModule() {
         stop(this);
+        core::modComManager.unregisterInterface("rtl_sdr_source.control.v1");
         sigpath::sourceManager.unregisterSource("RTL-SDR");
     }
 
@@ -270,6 +279,212 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    static void writeControlResponse(RTLSDRSourceControlV1* msg, const json& body, bool ok = true) {
+        if (!msg) return;
+        std::string text = body.dump();
+        strncpy(msg->response, text.c_str(), sizeof(msg->response) - 1);
+        msg->response[sizeof(msg->response) - 1] = '\0';
+        msg->ok = ok;
+    }
+
+    void saveDeviceConfig(const char* key, const json& value) {
+        if (selectedDevName == "") return;
+        config.acquire();
+        config.conf["devices"][selectedDevName][key] = value;
+        config.release(true);
+    }
+
+    json controlStateJson() {
+        json devices = json::array();
+        for (int i = 0; i < devCount; i++) {
+            devices.push_back({{"id", i}, {"label", devNames[i]}});
+        }
+
+        json rates = json::array();
+        for (int i = 0; i < 11; i++) {
+            rates.push_back({{"id", i}, {"value", sampleRates[i]}, {"label", sampleRatesTxt[i]}, {"selected", i == srId}});
+        }
+
+        json gains = json::array();
+        if (!gainList.empty()) {
+            gains.push_back({
+                {"name", "tuner"}, {"label", "Tuner Gain"},
+                {"value", (float)gainList[gainId] / 10.0f},
+                {"min", (float)gainList.front() / 10.0f},
+                {"max", (float)gainList.back() / 10.0f},
+                {"step", 0.1}, {"available", !tunerAgc}, {"liveMutable", true}
+            });
+        }
+        gains.push_back({
+            {"name", "ppm"}, {"label", "PPM Correction"}, {"value", ppm},
+            {"min", -1000}, {"max", 1000}, {"step", 1}, {"available", true}, {"liveMutable", true}
+        });
+
+        json modes = json::array({"Disabled", "I branch", "Q branch"});
+        int modeId = std::clamp(directSamplingMode, 0, 2);
+        json toggles = json::array({
+            {{"key", "biasT"}, {"label", "Bias-T"}, {"value", biasT}, {"liveMutable", true}},
+            {{"key", "offsetTuning"}, {"label", "Offset Tuning"}, {"value", offsetTuning}, {"liveMutable", true}},
+            {{"key", "rtlAgc"}, {"label", "RTL AGC"}, {"value", rtlAgc}, {"liveMutable", true}},
+            {{"key", "tunerAgc"}, {"label", "Tuner AGC"}, {"value", tunerAgc}, {"liveMutable", true}}
+        });
+
+        return json({
+            {"available", true}, {"source", "RTL-SDR"}, {"running", running},
+            {"deviceId", devId}, {"devices", devices},
+            {"sampleRate", sampleRate}, {"sampleRates", rates},
+            {"mode", modes[modeId]}, {"modes", modes},
+            {"gains", gains}, {"toggles", toggles}
+        });
+    }
+
+    bool applyControlJson(const json& req, std::string& error) {
+        bool stoppedOnlyChanged = req.contains("deviceId") || req.contains("sampleRateId") || req.value("refresh", false);
+        if (running && stoppedOnlyChanged) {
+            error = "stop SDR before changing device, sample rate, or refresh";
+            return false;
+        }
+
+        if (req.value("refresh", false)) {
+            refresh();
+            selectByName(selectedDevName);
+            core::setInputSampleRate(sampleRate);
+        }
+
+        if (req.contains("deviceId")) {
+            int id = req["deviceId"].get<int>();
+            if (id < 0 || id >= devCount) {
+                error = "device not found";
+                return false;
+            }
+            selectById(id);
+            core::setInputSampleRate(sampleRate);
+            config.acquire();
+            config.conf["device"] = selectedDevName;
+            config.release(true);
+        }
+
+        if (req.contains("sampleRateId")) {
+            int id = req["sampleRateId"].get<int>();
+            if (id < 0 || id >= 11) {
+                error = "sample rate not found";
+                return false;
+            }
+            srId = id;
+            sampleRate = sampleRates[srId];
+            core::setInputSampleRate(sampleRate);
+            saveDeviceConfig("sampleRate", sampleRate);
+        }
+
+        if (req.contains("mode")) {
+            std::string mode = req["mode"].get<std::string>();
+            int next = -1;
+            if (mode == "Disabled") next = 0;
+            else if (mode == "I branch") next = 1;
+            else if (mode == "Q branch") next = 2;
+            if (next < 0) {
+                error = "direct sampling mode not found";
+                return false;
+            }
+            directSamplingMode = next;
+            if (running) rtlsdr_set_direct_sampling(openDev, directSamplingMode);
+            saveDeviceConfig("directSampling", directSamplingMode);
+        }
+
+        if (req.contains("gains")) {
+            for (auto& [key, val] : req["gains"].items()) {
+                if (key == "tuner") {
+                    if (gainList.empty()) continue;
+                    float db = val.get<float>();
+                    int best = 0;
+                    float bestDist = std::abs(((float)gainList[0] / 10.0f) - db);
+                    for (int i = 1; i < (int)gainList.size(); i++) {
+                        float dist = std::abs(((float)gainList[i] / 10.0f) - db);
+                        if (dist < bestDist) {
+                            best = i;
+                            bestDist = dist;
+                        }
+                    }
+                    gainId = best;
+                    updateGainTxt();
+                    if (running && !tunerAgc) rtlsdr_set_tuner_gain(openDev, gainList[gainId]);
+                    saveDeviceConfig("gain", gainId);
+                }
+                else if (key == "ppm") {
+                    ppm = std::clamp<int>(val.get<int>(), -1000000, 1000000);
+                    if (running) rtlsdr_set_freq_correction(openDev, ppm);
+                    saveDeviceConfig("ppm", ppm);
+                }
+            }
+        }
+
+        if (req.contains("toggles")) {
+            json toggles = req["toggles"];
+            if (toggles.contains("biasT")) {
+                biasT = toggles["biasT"].get<bool>();
+                if (running) rtlsdr_set_bias_tee(openDev, biasT);
+                saveDeviceConfig("biasT", biasT);
+            }
+            if (toggles.contains("offsetTuning")) {
+                offsetTuning = toggles["offsetTuning"].get<bool>();
+                if (running) rtlsdr_set_offset_tuning(openDev, offsetTuning);
+                saveDeviceConfig("offsetTuning", offsetTuning);
+            }
+            if (toggles.contains("rtlAgc")) {
+                rtlAgc = toggles["rtlAgc"].get<bool>();
+                if (running) rtlsdr_set_agc_mode(openDev, rtlAgc);
+                saveDeviceConfig("rtlAgc", rtlAgc);
+            }
+            if (toggles.contains("tunerAgc")) {
+                tunerAgc = toggles["tunerAgc"].get<bool>();
+                if (running) {
+                    if (tunerAgc) {
+                        rtlsdr_set_tuner_gain_mode(openDev, 0);
+                    }
+                    else {
+                        rtlsdr_set_tuner_gain_mode(openDev, 1);
+                        if (!gainList.empty()) rtlsdr_set_tuner_gain(openDev, gainList[gainId]);
+                    }
+                }
+                saveDeviceConfig("tunerAgc", tunerAgc);
+            }
+        }
+
+        return true;
+    }
+
+    enum ControlCode {
+        CONTROL_GET = 1,
+        CONTROL_SET = 2
+    };
+
+    static void controlHandler(int code, void* in, void* out, void* ctx) {
+        RTLSDRSourceModule* _this = (RTLSDRSourceModule*)ctx;
+        RTLSDRSourceControlV1* inMsg = (RTLSDRSourceControlV1*)in;
+        RTLSDRSourceControlV1* outMsg = (RTLSDRSourceControlV1*)(out ? out : in);
+        if (!_this || !outMsg) return;
+        try {
+            if (code == CONTROL_SET) {
+                json req = json::object();
+                if (inMsg && inMsg->request[0]) req = json::parse(inMsg->request);
+                std::string error;
+                if (!_this->applyControlJson(req, error)) {
+                    writeControlResponse(outMsg, json({{"ok", false}, {"error", error}}), false);
+                    return;
+                }
+            }
+            json state = _this->controlStateJson();
+            state["ok"] = true;
+            writeControlResponse(outMsg, state, true);
+        }
+        catch (const std::exception& e) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", e.what()}}), false);
+        }
+        catch (...) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", "RTL-SDR control failed"}}), false);
+        }
     }
 
     static void menuSelected(void* ctx) {
