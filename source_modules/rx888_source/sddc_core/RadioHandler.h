@@ -62,6 +62,12 @@ public:
 
     float getBps() const { return mBps; }
     float getSpsIF() const {return mSpsIF; }
+    int getInputFullCount() const { return inputbuffer.getFullCount(); }
+    int getInputEmptyCount() const { return inputbuffer.getEmptyCount(); }
+    int getInputWriteCount() const { return inputbuffer.getWriteCount(); }
+    int getOutputFullCount() const { return outputbuffer.getFullCount(); }
+    int getOutputEmptyCount() const { return outputbuffer.getEmptyCount(); }
+    int getOutputWriteCount() const { return outputbuffer.getWriteCount(); }
 
     const char* getName() const;
     RadioModel getModel() { return radio; }
@@ -109,8 +115,13 @@ private:
     RadioModel radio;
 
     // transfer variables
+#if defined(__ANDROID__)
+    ringbuffer<int16_t> inputbuffer { 256 };
+    ringbuffer<float> outputbuffer { 128 };
+#else
     ringbuffer<int16_t> inputbuffer;
     ringbuffer<float> outputbuffer;
+#endif
 
     // threads
     std::thread show_stats_thread;

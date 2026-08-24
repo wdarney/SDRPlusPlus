@@ -17,7 +17,7 @@ static std::atomic<uint64_t> g_usb_errors{0};
 static constexpr uint8_t FX3_BOOT_VENDOR_REQUEST = 0xA0;
 static constexpr uint16_t FX3_BOOT_MAX_BLOCK_SIZE = 0x1000;
 static constexpr unsigned int FX3_BOOT_TIMEOUT_MS = 1000;
-static constexpr int RX888_ANDROID_ASYNC_TRANSFERS = 8;
+static constexpr int RX888_ANDROID_ASYNC_TRANSFERS = 16;
 
 struct android_fx3handler::AsyncTransferSlot {
     android_fx3handler* owner = nullptr;

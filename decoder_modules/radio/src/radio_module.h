@@ -235,6 +235,18 @@ private:
             }
         }
 
+        if (_this->vfo) {
+            bool frequencyLocked = _this->vfo->getFrequencyLock();
+            if (ImGui::Checkbox(("Lock##_radio_vfo_lock_" + _this->name).c_str(), &frequencyLocked)) {
+                _this->vfo->setFrequencyLock(frequencyLocked, gui::waterfall.getCenterFrequency());
+                core::configManager.acquire();
+                core::configManager.conf["vfoLocks"][_this->name]["enabled"] = frequencyLocked;
+                core::configManager.conf["vfoLocks"][_this->name]["frequency"] = _this->vfo->getLockedFrequency();
+                core::configManager.conf["vfoOffsets"][_this->name] = _this->vfo->getOffset();
+                core::configManager.release(true);
+            }
+        }
+
         // VFO snap interval
         ImGui::LeftLabel("Snap Interval");
         ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());

@@ -151,6 +151,7 @@ elseif (MSVC)
     target_link_libraries(channel_bank PRIVATE
         whisper
         shell32
+        ws2_32
     )
     target_include_directories(channel_bank PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp/include

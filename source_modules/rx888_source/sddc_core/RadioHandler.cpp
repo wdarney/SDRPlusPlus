@@ -178,9 +178,11 @@ bool RadioHandlerClass::Start(int srate_idx)
 			this->OnDataPacket();
 		});
 
+#if !defined(__ANDROID__)
 	show_stats_thread = std::thread([this](void*) {
 		this->CaculateStats();
 	}, nullptr);
+#endif
 
 	return true;
 }
@@ -199,8 +201,10 @@ bool RadioHandlerClass::Stop()
 
 		run = false; // now waits for threads
 
-		show_stats_thread.join(); //first to be joined
-		DbgPrintf("show_stats_thread join2\n");
+		if (show_stats_thread.joinable()) {
+			show_stats_thread.join(); //first to be joined
+			DbgPrintf("show_stats_thread join2\n");
+		}
 
 		submit_thread.join();
 		DbgPrintf("submit_thread join1\n");

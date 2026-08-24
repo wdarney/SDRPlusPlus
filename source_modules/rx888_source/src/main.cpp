@@ -10,7 +10,11 @@
 #include <signal_path/signal_path.h>
 #include <core.h>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +33,12 @@ SDRPP_MOD_INFO{
 };
 
 ConfigManager config;
+
+struct RX888SourceControlV1 {
+    char request[4096];
+    char response[32768];
+    bool ok = false;
+};
 
 class RX888SourceModule : public ModuleManager::Instance {
 public:
@@ -53,10 +63,13 @@ public:
         selectDevice(devLabel);
 
         sigpath::sourceManager.registerSource("RX888", &handler);
+        core::modComManager.registerInterface(
+            "rx888_source", "rx888_source.control.v1", controlHandler, this);
     }
 
     ~RX888SourceModule() {
         stop(this);
+        core::modComManager.unregisterInterface("rx888_source.control.v1");
         sigpath::sourceManager.unregisterSource("RX888");
     }
 
@@ -95,9 +108,17 @@ private:
             std::filesystem::path(modulePath.data()).parent_path().parent_path() /
             "SoapySDR" / "modules0.8" / "SDDCSupport.dll";
 
+        if (!std::filesystem::exists(sddc)) {
+            flog::warn("RX888: Expected SoapySDDC module is missing at {}", sddc.string());
+            flog::warn("RX888: Windows RX888 enumeration requires SDDCSupport.dll and its runtime dependencies");
+            return;
+        }
+
         std::string err = SoapySDR::loadModule(sddc.string());
-        if (!err.empty())
+        if (!err.empty()) {
             flog::warn("RX888: SoapySDDC load: {}", err);
+            flog::warn("RX888: Windows RX888 refresh will stay empty if SDDCSupport.dll, SoapySDR, or libusb runtime pieces are missing");
+        }
         else
             flog::info("RX888: Loaded SoapySDDC from {}", sddc.string());
 #elif defined(__APPLE__)
@@ -167,7 +188,7 @@ private:
         gainRanges.clear();
         uiGains.clear();
         for (const auto& g : gainList) {
-            gainRanges.push_back(dev->getGainRange(SOAPY_SDR_RX, 0, g));
+            gainRanges.push_back(defaultGainRange(g, queryMode));
             // Default to 0 dB clamped to the valid range, not minimum (which is too low)
             double def = std::max(gainRanges.back().minimum(),
                          std::min(0.0, gainRanges.back().maximum()));
@@ -194,9 +215,88 @@ private:
         refreshSampleRates(dev);
     }
 
+    void setDefaultCapabilities() {
+        hasHF  = true;
+        hasVHF = true;
+
+        gainList = { "RF", "IF" };
+        gainRanges.clear();
+        uiGains.clear();
+        for (const auto& g : gainList) {
+            gainRanges.push_back(defaultGainRange(g, mode));
+            double def = std::max(gainRanges.back().minimum(),
+                         std::min(0.0, gainRanges.back().maximum()));
+            uiGains.push_back((float)def);
+        }
+
+        supportsNewBiasTee = true;
+        supportsAdcFreq    = true;
+        supportsBiasTee    = false;
+        supportsDithering  = false;
+        refreshDefaultSampleRates();
+    }
+
+    static SoapySDR::Range defaultGainRange(const std::string& name, const std::string& rangeMode) {
+        if (name == "RF")
+            return rangeMode == "VHF" ? SoapySDR::Range(0.0, 49.6) : SoapySDR::Range(-31.5, 0.0);
+        if (name == "IF")
+            return rangeMode == "VHF" ? SoapySDR::Range(-4.7, 40.8) : SoapySDR::Range(-24.6, 33.1);
+        return SoapySDR::Range();
+    }
+
     void refreshSampleRates(SoapySDR::Device* dev) {
         sampleRates = dev->listSampleRates(SOAPY_SDR_RX, 0);
         buildSrText();
+    }
+
+    void refreshDefaultSampleRates() {
+        sampleRates.clear();
+
+        int numRates = adcFreq > 80000000.0 ? 6 : 5;
+        double bwmin = adcFreq / 64.0;
+        if (adcFreq > 80000000.0) bwmin /= 2.0;
+
+        for (int idx = 0; idx < numRates; idx++) {
+            double rate = bwmin * (double)(1 << idx) * 2.0;
+            if ((rate / adcFreq) * 2.0 <= 1.1)
+                sampleRates.push_back(rate);
+        }
+
+        buildSrText();
+    }
+
+    bool clampAdcToDriverRange(SoapySDR::Device* dev) {
+        if (!supportsAdcFreq || !dev) return false;
+
+        try {
+            auto settingInfo = dev->getSettingInfo();
+            for (const auto& s : settingInfo) {
+                if (s.key != "adc_frequency") continue;
+
+                double minFreq = s.range.minimum();
+                double maxFreq = s.range.maximum();
+                if (maxFreq <= minFreq) return false;
+
+                double clamped = std::max(minFreq, std::min(adcFreq, maxFreq));
+                if (clamped == adcFreq) return false;
+
+                flog::warn("RX888: Saved ADC clock {} MHz is outside driver range {}-{} MHz; using {} MHz",
+                    adcFreq / 1e6, minFreq / 1e6, maxFreq / 1e6, clamped / 1e6);
+                adcFreq = clamped;
+                refreshDefaultSampleRates();
+                selectSampleRate(sampleRate);
+                saveConfig();
+                return true;
+            }
+        }
+        catch (const std::exception& e) {
+            flog::warn("RX888: Could not read driver ADC range: {}", e.what());
+        }
+        catch (...) {
+            flog::warn("RX888: Could not read driver ADC range");
+        }
+
+        return false;
     }
 
     // Max useful sample rate for VHF mode — R820T2 IF bandwidth is ~8-10 MHz
@@ -240,10 +340,10 @@ private:
     // Called in start() after setAntenna() — re-queries gain ranges for the active mode
     // and clamps existing slider values into the new valid range.
     void updateGainRanges() {
-        auto newList   = dev->listGains(SOAPY_SDR_RX, 0);
+        auto newList   = gainList.empty() ? std::vector<std::string>{ "RF", "IF" } : gainList;
         std::vector<SoapySDR::Range> newRanges;
         for (const auto& g : newList)
-            newRanges.push_back(dev->getGainRange(SOAPY_SDR_RX, 0, g));
+            newRanges.push_back(defaultGainRange(g, mode));
 
         if (newList.size() != gainList.size()) {
             gainList   = newList;
@@ -263,42 +363,31 @@ private:
     // Called when mode radio button changes while device is stopped —
     // spawns a background thread so the firmware-upload open doesn't block the UI.
     void reQueryGainsForMode() {
-        if (devList.empty() || devId < 0 || running) return;
-        auto args = devList[devId];
+        if (devList.empty() || devId < 0 || running.load()) return;
         auto m    = mode;
-        std::thread([this, args, m]() {
-            SoapySDR::Device* d = nullptr;
-            try { d = SoapySDR::Device::make(args); }
-            catch (const std::exception& e) {
-                flog::warn("RX888: reQueryGainsForMode open failed: {}", e.what());
-                return;
-            }
-            try { d->setAntenna(SOAPY_SDR_RX, 0, m); } catch (...) {}
-            auto newList = d->listGains(SOAPY_SDR_RX, 0);
-            std::vector<SoapySDR::Range> newRanges;
-            for (const auto& g : newList)
-                newRanges.push_back(d->getGainRange(SOAPY_SDR_RX, 0, g));
-            SoapySDR::Device::unmake(d);
-            // Only update if mode hasn't changed since we started
-            if (m == mode) {
-                gainList   = newList;
-                gainRanges = newRanges;
-                uiGains.resize(gainList.size(), 0.0f);
-                for (int i = 0; i < (int)gainList.size(); i++) {
-                    uiGains[i] = std::max((float)gainRanges[i].minimum(),
-                                 std::min(uiGains[i], (float)gainRanges[i].maximum()));
-                }
-            }
-        }).detach();
+        auto newList = std::vector<std::string>{ "RF", "IF" };
+        std::vector<SoapySDR::Range> newRanges;
+        for (const auto& g : newList)
+            newRanges.push_back(defaultGainRange(g, m));
+
+        gainList   = newList;
+        gainRanges = newRanges;
+        uiGains.resize(gainList.size(), 0.0f);
+        for (int i = 0; i < (int)gainList.size(); i++) {
+            uiGains[i] = std::max((float)gainRanges[i].minimum(),
+                         std::min(uiGains[i], (float)gainRanges[i].maximum()));
+        }
     }
 
     void applyModeRateCap() {
+        bool changed = false;
         if (mode == "VHF" && sampleRate > VHF_MAX_SR) {
             selectSampleRate(VHF_MAX_SR);
-            saveConfig();
+            changed = true;
         }
         buildSrText();
         srVisibleId = realToVisibleIdx(srId);
+        if (changed) saveConfig();
     }
 
     void selectDevice(const std::string& label) {
@@ -309,36 +398,35 @@ private:
             if (deviceLabel(devList[i]) == label) { found = i; break; }
         }
         devId = found;
+        std::string selectedLabel = deviceLabel(devList[devId]);
 
-        SoapySDR::Device* dev = nullptr;
-        try {
-            dev = SoapySDR::Device::make(devList[devId]);
-        }
-        catch (const std::exception& e) {
-            flog::error("RX888: open failed during select: {}", e.what());
-            devId = -1;
-            return;
-        }
-
-        queryCapabilities(dev, mode);
-        SoapySDR::Device::unmake(dev);
-
-        // Load saved config for this device
+        json savedDevice;
+        bool hasSavedDevice = false;
         config.acquire();
         auto& dc = config.conf["devices"];
-        if (dc.contains(label)) {
-            auto& c = dc[label];
-            if (c.contains("mode"))       mode       = c["mode"].get<std::string>();
-            if (c.contains("adcFreq"))    adcFreq    = c["adcFreq"].get<double>();
-            if (c.contains("biasTeeHF"))  biasTeeHF  = c["biasTeeHF"].get<bool>();
-            if (c.contains("biasTeeVHF")) biasTeeVHF = c["biasTeeVHF"].get<bool>();
-            if (c.contains("dithering"))  dithering  = c["dithering"].get<bool>();
+        if (dc.contains(selectedLabel) || dc.contains(label)) {
+            savedDevice = dc.contains(selectedLabel) ? dc[selectedLabel] : dc[label];
+            hasSavedDevice = true;
+            if (savedDevice.contains("mode"))       mode       = savedDevice["mode"].get<std::string>();
+            if (savedDevice.contains("adcFreq"))    adcFreq    = savedDevice["adcFreq"].get<double>();
+            if (savedDevice.contains("biasTeeHF"))  biasTeeHF  = savedDevice["biasTeeHF"].get<bool>();
+            if (savedDevice.contains("biasTeeVHF")) biasTeeVHF = savedDevice["biasTeeVHF"].get<bool>();
+            if (savedDevice.contains("dithering"))  dithering  = savedDevice["dithering"].get<bool>();
+        }
+        config.release();
+
+        setDefaultCapabilities();
+
+        // Load saved config for this device
+        if (hasSavedDevice) {
             for (int i = 0; i < (int)gainList.size(); i++) {
-                if (c.contains("gains") && c["gains"].contains(gainList[i]))
-                    uiGains[i] = c["gains"][gainList[i]].get<float>();
+                if (savedDevice.contains("gains") && savedDevice["gains"].contains(gainList[i]))
+                    uiGains[i] = savedDevice["gains"][gainList[i]].get<float>();
             }
-            double savedSr = c.contains("sampleRate") ? c["sampleRate"].get<double>() : sampleRates[0];
-            selectSampleRate(savedSr);
+            if (!sampleRates.empty()) {
+                double savedSr = savedDevice.contains("sampleRate") ? savedDevice["sampleRate"].get<double>() : sampleRates[0];
+                selectSampleRate(savedSr);
+            }
         }
         else {
             // Defaults
@@ -349,7 +437,6 @@ private:
             dithering  = true;
             if (!sampleRates.empty()) selectSampleRate(sampleRates[0]);
         }
-        config.release();
 
         // Sync visible combo index after mode and rate are set
         applyModeRateCap();
@@ -394,6 +481,226 @@ private:
         }
     }
 
+    static void writeControlResponse(RX888SourceControlV1* msg, const json& body, bool ok = true) {
+        if (!msg) return;
+        std::string text = body.dump();
+        strncpy(msg->response, text.c_str(), sizeof(msg->response) - 1);
+        msg->response[sizeof(msg->response) - 1] = '\0';
+        msg->ok = ok;
+    }
+
+    json controlStateJson() {
+        json devices = json::array();
+        for (int i = 0; i < (int)devList.size(); i++) {
+            devices.push_back({
+                {"id", i},
+                {"label", deviceLabel(devList[i])}
+            });
+        }
+
+        json rates = json::array();
+        int visible = 0;
+        for (int i = 0; i < (int)sampleRates.size(); i++) {
+            double sr = sampleRates[i];
+            if (mode == "VHF" && sr > VHF_MAX_SR) continue;
+            char label[32];
+            if (sr >= 1e6) snprintf(label, sizeof(label), "%.0f MHz", sr / 1e6);
+            else snprintf(label, sizeof(label), "%.0f kHz", sr / 1e3);
+            rates.push_back({
+                {"id", visible++},
+                {"value", sr},
+                {"label", label},
+                {"selected", i == srId}
+            });
+        }
+
+        json gains = json::array();
+        for (int i = 0; i < (int)gainList.size(); i++) {
+            double gmin = gainRanges[i].minimum();
+            double gmax = gainRanges[i].maximum();
+            gains.push_back({
+                {"name", gainList[i]},
+                {"label", gainList[i] + " Gain"},
+                {"value", uiGains[i]},
+                {"min", gmin},
+                {"max", gmax},
+                {"step", gainRanges[i].step() > 0.0 ? gainRanges[i].step() : 0.1},
+                {"available", gmin != gmax},
+                {"liveMutable", true}
+            });
+        }
+
+        json modes = json::array();
+        if (hasHF) modes.push_back("HF");
+        if (hasVHF) modes.push_back("VHF");
+
+        return json({
+            {"available", true},
+            {"source", "RX888"},
+            {"running", running.load()},
+            {"cleanupBusy", driverCleanupBusy->load()},
+            {"deviceId", devId},
+            {"devices", devices},
+            {"sampleRate", sampleRate},
+            {"sampleRates", rates},
+            {"supportsAdcFreq", supportsAdcFreq},
+            {"adcClockMHz", adcFreq / 1e6},
+            {"adcMinMHz", 16.0},
+            {"adcMaxMHz", 140.0},
+            {"mode", mode},
+            {"modes", modes},
+            {"gains", gains},
+            {"supportsNewBiasTee", supportsNewBiasTee},
+            {"supportsBiasTee", supportsBiasTee},
+            {"biasTeeHF", biasTeeHF},
+            {"biasTeeVHF", biasTeeVHF},
+            {"biasTeeLiveMutable", true},
+            {"supportsDithering", supportsDithering},
+            {"dithering", dithering},
+            {"ditheringLiveMutable", true}
+        });
+    }
+
+    bool applyControlJson(const json& req, std::string& error) {
+        bool stoppedOnlyChanged = req.contains("deviceLabel") || req.contains("deviceId") ||
+                                  req.contains("sampleRate") || req.contains("sampleRateId") ||
+                                  req.contains("adcClockMHz") || req.contains("mode") ||
+                                  req.value("refresh", false);
+        if (running.load() && stoppedOnlyChanged) {
+            error = "stop SDR before changing device, sample rate, ADC clock, mode, or refresh";
+            return false;
+        }
+
+        if (req.value("refresh", false)) {
+            refresh();
+            if (devId >= 0 && devId < (int)devList.size()) selectDevice(deviceLabel(devList[devId]));
+            else selectDevice("");
+        }
+
+        if (req.contains("deviceLabel")) {
+            selectDevice(req["deviceLabel"].get<std::string>());
+        }
+        else if (req.contains("deviceId")) {
+            int id = req["deviceId"].get<int>();
+            if (id < 0 || id >= (int)devList.size()) {
+                error = "device not found";
+                return false;
+            }
+            selectDevice(deviceLabel(devList[id]));
+        }
+
+        if (req.contains("mode")) {
+            std::string newMode = req["mode"].get<std::string>();
+            if ((newMode == "HF" && hasHF) || (newMode == "VHF" && hasVHF)) {
+                mode = newMode;
+                reQueryGainsForMode();
+                applyModeRateCap();
+            }
+            else {
+                error = "mode not available";
+                return false;
+            }
+        }
+
+        if (req.contains("adcClockMHz")) {
+            double mhz = req["adcClockMHz"].get<double>();
+            if (!std::isfinite(mhz) || mhz < 16.0 || mhz > 140.0) {
+                error = "ADC clock out of range";
+                return false;
+            }
+            adcFreq = mhz * 1e6;
+            applyModeRateCap();
+        }
+
+        if (req.contains("sampleRateId")) {
+            int visibleId = req["sampleRateId"].get<int>();
+            int realId = visibleToRealIdx(visibleId);
+            if (realId < 0 || realId >= (int)sampleRates.size()) {
+                error = "sample rate not found";
+                return false;
+            }
+            srVisibleId = visibleId;
+            srId = realId;
+            sampleRate = sampleRates[srId];
+            core::setInputSampleRate(sampleRate);
+        }
+        else if (req.contains("sampleRate")) {
+            selectSampleRate(req["sampleRate"].get<double>());
+        }
+
+        if (req.contains("gains")) {
+            for (auto& [key, val] : req["gains"].items()) {
+                auto it = std::find(gainList.begin(), gainList.end(), key);
+                if (it == gainList.end()) {
+                    error = "gain not found: " + key;
+                    return false;
+                }
+                int i = (int)std::distance(gainList.begin(), it);
+                float gmin = (float)gainRanges[i].minimum();
+                float gmax = (float)gainRanges[i].maximum();
+                float gain = val.get<float>();
+                gain = std::max(gmin, std::min(gain, gmax));
+                uiGains[i] = gain;
+                if (running.load() && dev)
+                    dev->setGain(SOAPY_SDR_RX, 0, gainList[i], gain);
+            }
+        }
+
+        if (req.contains("biasTeeHF")) {
+            biasTeeHF = req["biasTeeHF"].get<bool>();
+            if (supportsNewBiasTee) applySetting("UpdBiasT_HF", biasTeeHF ? "true" : "false");
+            else if (supportsBiasTee && mode == "HF") applySetting("biastee", biasTeeHF ? "true" : "false");
+        }
+        if (req.contains("biasTeeVHF")) {
+            biasTeeVHF = req["biasTeeVHF"].get<bool>();
+            if (supportsNewBiasTee) applySetting("UpdBiasT_VHF", biasTeeVHF ? "true" : "false");
+            else if (supportsBiasTee && mode == "VHF") applySetting("biastee", biasTeeVHF ? "true" : "false");
+        }
+        if (req.contains("dithering")) {
+            dithering = req["dithering"].get<bool>();
+            if (supportsDithering) {
+                applySetting("dithering", dithering ? "true" : "false");
+                applySetting("randomization", dithering ? "true" : "false");
+            }
+        }
+
+        saveConfig();
+        return true;
+    }
+
+    enum ControlCode {
+        CONTROL_GET = 1,
+        CONTROL_SET = 2
+    };
+
+    static void controlHandler(int code, void* in, void* out, void* ctx) {
+        RX888SourceModule* _this = (RX888SourceModule*)ctx;
+        RX888SourceControlV1* inMsg = (RX888SourceControlV1*)in;
+        RX888SourceControlV1* outMsg = (RX888SourceControlV1*)(out ? out : in);
+        if (!_this || !outMsg) return;
+
+        try {
+            if (code == CONTROL_SET) {
+                json req = json::object();
+                if (inMsg && inMsg->request[0]) req = json::parse(inMsg->request);
+                std::string error;
+                if (!_this->applyControlJson(req, error)) {
+                    writeControlResponse(outMsg, json({{"ok", false}, {"error", error}}), false);
+                    return;
+                }
+            }
+            json state = _this->controlStateJson();
+            state["ok"] = true;
+            writeControlResponse(outMsg, state, true);
+        }
+        catch (const std::exception& e) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", e.what()}}), false);
+        }
+        catch (...) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", "RX888 control failed"}}), false);
+        }
+    }
+
     static void menuSelected(void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
         core::setInputSampleRate(_this->sampleRate);
@@ -403,7 +710,12 @@ private:
 
     static void start(void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
-        if (_this->running) return;
+        if (_this->running.load()) return;
+        if (_this->driverCleanupBusy->load()) {
+            _this->restartAfterCleanup.store(true);
+            flog::warn("RX888: Previous driver shutdown is still in progress; start queued");
+            return;
+        }
         if (_this->devId < 0) { flog::error("RX888: No device selected"); return; }
 
         try {
@@ -415,11 +727,12 @@ private:
         }
 
         // ADC frequency — set first as it determines valid sample rates
+        _this->clampAdcToDriverRange(_this->dev);
         if (_this->supportsAdcFreq)
             _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
 
         // Re-query sample rates (they depend on ADC freq) and reselect
-        _this->refreshSampleRates(_this->dev);
+        _this->refreshDefaultSampleRates();
         _this->selectSampleRate(_this->sampleRate);
 
         // Antenna / mode — re-query gains after switching so ranges are correct for this mode
@@ -451,7 +764,8 @@ private:
         _this->devStream = _this->dev->setupStream(SOAPY_SDR_RX, "CF32");
         _this->dev->activateStream(_this->devStream);
 
-        _this->running = true;
+        _this->stream.clearWriteStop();
+        _this->running.store(true);
         _this->workerThread = std::thread(_worker, _this);
         flog::info("RX888: Started ({}, {} MHz, ADC {} MHz)", _this->mode,
                    _this->sampleRate / 1e6, _this->adcFreq / 1e6);
@@ -459,26 +773,79 @@ private:
 
     static void stop(void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
-        if (!_this->running) return;
-        _this->running = false;
+        if (!_this->running.exchange(false)) return;
 
-        // Deactivate stream first — unblocks readStream in worker
-        _this->dev->deactivateStream(_this->devStream);
-        // Unblock any pending stream.swap()
-        _this->stream.stopWriter();
-        _this->workerThread.join();
-        _this->stream.clearWriteStop();
+        auto* dev = _this->dev;
+        auto* devStream = _this->devStream;
+        std::thread worker;
+        if (_this->workerThread.joinable()) {
+            worker = std::move(_this->workerThread);
+        }
 
-        _this->dev->closeStream(_this->devStream);
-        SoapySDR::Device::unmake(_this->dev);
         _this->dev = nullptr;
-        flog::info("RX888: Stopped");
+        _this->devStream = nullptr;
+
+        auto cleanupBusy = _this->driverCleanupBusy;
+        cleanupBusy->store(true);
+
+        // Unblock any pending stream.swap() immediately, then let the slow
+        // driver/USB shutdown continue off the SDR++ UI thread.
+        _this->stream.stopWriter();
+
+        std::thread([_this, dev, devStream, cleanupBusy, worker = std::move(worker)]() mutable {
+            // Tell the hardware stream to stop before joining the worker.  The RX888
+            // driver can otherwise keep readStream() alive long enough to leave the
+            // FX3/USB side in a half-stopped state, which makes the next Start fail
+            // until the app or device is power-cycled.
+            try {
+                if (dev && devStream) { dev->deactivateStream(devStream); }
+            }
+            catch (const std::exception& e) {
+                flog::warn("RX888: Driver deactivate failed during stop: {}", e.what());
+            }
+            catch (...) {
+                flog::warn("RX888: Driver deactivate failed during stop");
+            }
+
+            if (worker.joinable()) {
+                worker.join();
+            }
+            _this->stream.clearWriteStop();
+
+            try {
+                if (dev && devStream) { dev->closeStream(devStream); }
+            }
+            catch (const std::exception& e) {
+                flog::warn("RX888: Driver closeStream failed during stop: {}", e.what());
+            }
+            catch (...) {
+                flog::warn("RX888: Driver closeStream failed during stop");
+            }
+
+            try {
+                if (dev) { SoapySDR::Device::unmake(dev); }
+            }
+            catch (const std::exception& e) {
+                flog::warn("RX888: Driver unmake failed during stop: {}", e.what());
+            }
+            catch (...) {
+                flog::warn("RX888: Driver unmake failed during stop");
+            }
+
+            cleanupBusy->store(false);
+            flog::info("RX888: Driver cleanup finished");
+            if (_this->restartAfterCleanup.exchange(false)) {
+                flog::info("RX888: Running queued start after driver cleanup");
+                start(_this);
+            }
+        }).detach();
+        flog::info("RX888: Stop requested; driver cleanup is running in background");
     }
 
     static void tune(double freq, void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
         _this->freq = freq;
-        if (_this->running)
+        if (_this->running.load())
             _this->dev->setFrequency(SOAPY_SDR_RX, 0, freq);
     }
 
@@ -494,11 +861,12 @@ private:
                 std::string label = config.conf["device"];
                 config.release();
                 _this->selectDevice(label);
+                _this->saveConfig();
             }
             return;
         }
 
-        if (_this->running) SmGui::BeginDisabled();
+        if (_this->running.load()) SmGui::BeginDisabled();
 
         // Device selector
         SmGui::FillWidth();
@@ -508,16 +876,6 @@ private:
             _this->saveConfig();
         }
 
-        // Sample rate + Refresh on same line
-        SmGui::FillWidth();
-        SmGui::ForceSync();
-        if (SmGui::Combo(CONCAT("##rx888_sr_", _this->name), &_this->srVisibleId, _this->txtSrList.c_str())) {
-            _this->srId = _this->visibleToRealIdx(_this->srVisibleId);
-            _this->sampleRate = _this->sampleRates[_this->srId];
-            core::setInputSampleRate(_this->sampleRate);
-            _this->saveConfig();
-        }
-        SmGui::SameLine();
         SmGui::FillWidth();
         SmGui::ForceSync();
         if (SmGui::Button(CONCAT("Refresh##rx888_refr_", _this->name))) {
@@ -526,6 +884,17 @@ private:
             std::string label = config.conf["device"];
             config.release();
             _this->selectDevice(label);
+            _this->saveConfig();
+        }
+
+        // Sample rate
+        SmGui::FillWidth();
+        SmGui::ForceSync();
+        if (SmGui::Combo(CONCAT("##rx888_sr_", _this->name), &_this->srVisibleId, _this->txtSrList.c_str())) {
+            _this->srId = _this->visibleToRealIdx(_this->srVisibleId);
+            _this->sampleRate = _this->sampleRates[_this->srId];
+            core::setInputSampleRate(_this->sampleRate);
+            _this->saveConfig();
         }
 
         // ADC frequency (only shown if driver supports it)
@@ -535,6 +904,7 @@ private:
             float adcMHz = (float)(_this->adcFreq / 1e6);
             if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz, 16.0f, 140.0f, SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
                 _this->adcFreq = adcMHz * 1e6;
+                _this->applyModeRateCap();
                 _this->saveConfig();
             }
         }
@@ -562,7 +932,7 @@ private:
             }
         }
 
-        if (_this->running) SmGui::EndDisabled();
+        if (_this->running.load()) SmGui::EndDisabled();
 
         // --- Controls that work live ---
 
@@ -586,7 +956,7 @@ private:
                 changed = SmGui::SliderFloat(id.c_str(), &_this->uiGains[i], gmin, gmax);
             }
             if (changed) {
-                if (_this->running)
+                if (_this->running.load())
                     _this->dev->setGain(SOAPY_SDR_RX, 0, _this->gainList[i], _this->uiGains[i]);
                 _this->saveConfig();
             }
@@ -634,7 +1004,7 @@ private:
         int flags     = 0;
         long long timeNs = 0;
 
-        while (_this->running) {
+        while (_this->running.load()) {
             int ret = _this->dev->readStream(_this->devStream,
                 (void**)&_this->stream.writeBuf, blockSize, flags, timeNs, 100000 /*us*/);
             if (ret < 0) {
@@ -651,7 +1021,8 @@ private:
     bool enabled = true;
 
     // State
-    bool running = false;
+    std::atomic<bool> running{false};
+    std::atomic<bool> restartAfterCleanup{false};
     double freq  = 100e6;
 
     // Device list
@@ -687,6 +1058,7 @@ private:
     // SoapySDR handles
     SoapySDR::Device* dev       = nullptr;
     SoapySDR::Stream* devStream = nullptr;
+    std::shared_ptr<std::atomic<bool>> driverCleanupBusy = std::make_shared<std::atomic<bool>>(false);
 
     // DSP
     dsp::stream<dsp::complex_t> stream;

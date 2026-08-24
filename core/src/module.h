@@ -34,10 +34,9 @@
 #endif
 #endif
 
-// iOS modules are statically linked into the main binary. Their C entry
-// points receive a per-module token from sdrpp_module_ios.cmake so multiple
-// modules can coexist in one image. Desktop modules leave the names unscoped
-// for dlsym/GetProcAddress compatibility.
+// Statically linked module builds can define SDRPP_MODULE_TOKEN=<name>_ to avoid
+// entry-point collisions. Desktop dynamic modules leave the exported names
+// unscoped for dlsym/GetProcAddress compatibility.
 #ifdef SDRPP_MODULE_TOKEN
 #define _SDRPP_TOK_CAT2(a, b) a##b
 #define _SDRPP_TOK_CAT(a, b)  _SDRPP_TOK_CAT2(a, b)

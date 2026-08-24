@@ -264,6 +264,7 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["windowSize"]["w"] = 1280;
 
     defConfig["vfoOffsets"] = json::object();
+    defConfig["vfoLocks"] = json::object();
 
     defConfig["vfoColors"]["Radio"] = "#FFFFFF";
 
