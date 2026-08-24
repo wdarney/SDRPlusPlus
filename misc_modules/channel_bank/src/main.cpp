@@ -3148,7 +3148,6 @@ function stopMonitorAudio() {
 }
 async function refresh(force = false) {
   const nowMs = performance.now();
-  if (!force && document.hidden) return;
   if (refreshInFlight) {
     if (!force && nowMs - lastRefreshStarted < 4500) return;
     if (refreshAbort) refreshAbort.abort();
