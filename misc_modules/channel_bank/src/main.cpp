@@ -1230,6 +1230,27 @@ private:
         return 0;
     }
 
+    double processCpuPercent() {
+        auto now = std::chrono::steady_clock::now();
+        std::clock_t procNow = std::clock();
+        if (procNow == (std::clock_t)-1) return -1.0;
+
+        std::lock_guard<std::mutex> lk(cpuSampleMtx);
+        if (!cpuSampleValid) {
+            lastCpuWall = now;
+            lastCpuClock = procNow;
+            cpuSampleValid = true;
+            return -1.0;
+        }
+
+        double wallSec = std::chrono::duration<double>(now - lastCpuWall).count();
+        double cpuSec = (double)(procNow - lastCpuClock) / (double)CLOCKS_PER_SEC;
+        lastCpuWall = now;
+        lastCpuClock = procNow;
+        if (wallSec <= 0.0 || cpuSec < 0.0) return -1.0;
+        return (cpuSec / wallSec) * 100.0;
+    }
+
     json diagnosticsJson() {
         int activeCount = 0;
         {
@@ -1266,6 +1287,7 @@ private:
         }
         return {
             {"rssBytes", processResidentBytes()},
+            {"cpuPercent", processCpuPercent()},
             {"activeChannels", activeCount},
             {"maxChannels", maxChannels},
             {"playbackQueued", playbackCount},
@@ -2017,6 +2039,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="tile"><div class="label">Mode</div><div class="value" id="mode">-</div></div>
 <div class="tile"><div class="label">Center</div><div class="value" id="center">-</div></div>
 <div class="tile"><div class="label">Active</div><div class="value" id="active">-</div></div>
+<div class="tile"><div class="label">CPU</div><div class="value" id="cpu">-</div></div>
 <div class="tile"><div class="label">Memory</div><div class="value" id="memory">-</div></div>
 <div class="tile"><div class="label">Work</div><div class="small-value" id="workStats">-</div></div>
 </div>
@@ -2097,6 +2120,7 @@ const fmtMHz = hz => hz ? (hz / 1e6).toFixed(4) + " MHz" : "-";
 const fmtRangeMHz = (lo, hi) => lo > 0 && hi > 0 ? `${(lo / 1e6).toFixed(3)} to ${(hi / 1e6).toFixed(3)} MHz` : "-";
 const fmtRate = hz => hz > 0 ? (hz >= 1e6 ? (hz / 1e6).toFixed(3) + " MS/s" : Math.round(hz).toLocaleString() + " S/s") : "-";
 const fmtBytes = bytes => bytes > 0 ? (bytes >= 1073741824 ? (bytes / 1073741824).toFixed(2) + " GB" : (bytes / 1048576).toFixed(0) + " MB") : "-";
+const fmtCpu = pct => Number.isFinite(pct) && pct >= 0 ? `${pct.toFixed(pct < 100 ? 1 : 0)}%` : "-";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const spacingLabels = ["8.33 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz", "200 kHz"];
 let monitorCtx = null;
@@ -3128,6 +3152,7 @@ async function refresh() {
     document.getElementById("center").textContent = fmtMHz(s.centerHz);
     document.getElementById("active").textContent = (s.activeChannels || []).length + " / " + s.maxChannels;
     const diag = s.diagnostics || {};
+    document.getElementById("cpu").textContent = fmtCpu(Number(diag.cpuPercent));
     document.getElementById("memory").textContent = fmtBytes(Number(diag.rssBytes || 0));
     document.getElementById("workStats").textContent =
       `ch ${diag.activeChannels ?? 0}/${diag.maxChannels ?? s.maxChannels ?? 0} / tx ${diag.transcriptionJobs ?? 0} / play ${diag.playbackQueued ?? 0} / enc ${diag.pendingEncodes ?? 0} / web ${diag.webClientThreads ?? 0}`;
@@ -9016,6 +9041,10 @@ setRefreshInterval(refreshIntervalMs);
     std::string  webControlBind    = "127.0.0.1";
     char         webControlBindBuf[64] = "127.0.0.1";
     std::atomic<uint64_t> webHeartbeat { 0 };
+    std::mutex   cpuSampleMtx;
+    bool         cpuSampleValid = false;
+    std::chrono::steady_clock::time_point lastCpuWall;
+    std::clock_t lastCpuClock = 0;
     std::atomic<bool> webServerRunning { false };
     std::thread  webServerThread;
     std::mutex   webServerMtx;
