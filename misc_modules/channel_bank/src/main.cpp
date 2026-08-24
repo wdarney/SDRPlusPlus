@@ -1652,11 +1652,28 @@ private:
         return core::modComManager.callInterface("rx888_source.control.v1", code, inout, inout);
     }
 
-    json rx888SourceStateJson() {
+    const char* selectedSourceControlInterface(const std::string& selected) {
+        if (selected == "RX888") return "rx888_source.control.v1";
+        if (selected == "RTL-SDR") return "rtl_sdr_source.control.v1";
+        if (selected == "Airspy") return "airspy_source.control.v1";
+        if (selected == "Airspy HF+") return "airspyhf_source.control.v1";
+        return nullptr;
+    }
+
+    bool callJsonSourceControl(const char* iface, int code, RX888SourceControlV1* inout) {
+        if (!iface || !core::modComManager.interfaceExists(iface)) return false;
+        return core::modComManager.callInterface(iface, code, inout, inout);
+    }
+
+    json jsonSourceStateJson(const std::string& selected) {
         json j;
         j["available"] = false;
         RX888SourceControlV1 state{};
-        if (!callRX888SourceControl(RX888_SOURCE_CONTROL_GET, &state) || !state.response[0]) return j;
+        const char* iface = selectedSourceControlInterface(selected);
+        if (!callJsonSourceControl(iface, RX888_SOURCE_CONTROL_GET, &state) || !state.response[0]) {
+            j["source"] = selected;
+            return j;
+        }
         try {
             j = json::parse(state.response);
             j["available"] = state.ok && j.value("ok", false);
@@ -1669,7 +1686,7 @@ private:
 
     json selectedSourceControlsJson() {
         std::string selected = selectedSourceName();
-        if (selected == "RX888") return rx888SourceStateJson();
+        if (selectedSourceControlInterface(selected)) return jsonSourceStateJson(selected);
         return json({{"available", false}, {"source", selected}});
     }
 
@@ -2435,18 +2452,12 @@ function renderSourceControls(s) {
     grid.innerHTML = "";
     return;
   }
-  if (selected !== "RX888") {
-    panel.style.display = "block";
-    grid.innerHTML = "";
-    if (status) status.textContent = selected === "SDR++ Server"
-      ? "SDR++ Server exposes host and port here. RX888 gain and ADC controls are only visible when RX888 is selected locally."
-      : `No web controls are available for ${selected}.`;
-    return;
-  }
   if (!c.available) {
     panel.style.display = "block";
     grid.innerHTML = "";
-    if (status) status.textContent = "RX888 controls are unavailable. Relaunch SDR++ Lock Build and make sure the RX888 source module is loaded.";
+    if (status) status.textContent = selected === "SDR++ Server"
+      ? "SDR++ Server exposes host and port above."
+      : `No web controls are available for ${selected}.`;
     return;
   }
   panel.style.display = "block";
@@ -2488,9 +2499,14 @@ function renderSourceControls(s) {
   if (c.supportsDithering) {
     parts.push(`<label class="control"><span class="label">Dithering</span><button class="${c.dithering ? "primary" : "secondary"}" id="srcDithering" type="button">${c.dithering ? "On" : "Off"}</button></label>`);
   }
+  (c.toggles || []).filter(t => t && t.key).forEach(t => {
+    const available = t.available !== false;
+    const cls = t.value ? "primary" : "secondary";
+    parts.push(`<label class="control"><span class="label">${esc(t.label || t.key)}</span><button class="${cls}" data-toggle="${esc(t.key)}" type="button" ${available ? "" : "disabled"}>${t.value ? "On" : "Off"}</button></label>`);
+  });
 
   grid.innerHTML = parts.join("");
-  if (status) status.textContent = running ? "SDR is playing: gain and toggles are live. Stop SDR only for device, sample rate, ADC, or mode." : "RX888 source settings ready";
+  if (status) status.textContent = running ? "SDR is playing: live controls remain available. Stop SDR for device, sample rate, ADC, mode, or refresh." : `${c.source || selected} source settings ready`;
 
   const device = document.getElementById("srcDevice");
   if (device) device.onchange = e => saveSourceControls({ deviceId: Number(e.target.value) });
@@ -2522,6 +2538,13 @@ function renderSourceControls(s) {
   if (biasVHF) biasVHF.onclick = () => saveSourceControls({ biasTeeVHF: !c.biasTeeVHF });
   const dithering = document.getElementById("srcDithering");
   if (dithering) dithering.onclick = () => saveSourceControls({ dithering: !c.dithering });
+  document.querySelectorAll("[data-toggle]").forEach(el => {
+    el.onclick = e => {
+      const key = e.target.dataset.toggle;
+      const current = (c.toggles || []).find(t => t && t.key === key);
+      saveSourceControls({ toggles: { [key]: !(current && current.value) } });
+    };
+  });
 }
 function renderHeatMap(s) {
   const rows = new Map();
@@ -3191,8 +3214,11 @@ document.getElementById("cbRecordingToggle").onclick = () => {
 };
 document.getElementById("serverApply").onclick = () => {
   const host = document.getElementById("serverHost").value.trim();
-  const port = Number(document.getElementById("serverPort").value);
-  if (host && Number.isInteger(port)) postAndReport("/api/sdrpp-server", { host, port });
+  const portText = document.getElementById("serverPort").value.trim();
+  const port = Number(portText);
+  if (host && /^[0-9]+$/.test(portText) && Number.isInteger(port) && port > 0 && port <= 65535) {
+    postAndReport("/api/sdrpp-server", { host, port });
+  }
 };
 document.getElementById("serverConnect").onclick = async e => {
   const connecting = e.target.textContent !== "Disconnect";
@@ -3891,15 +3917,17 @@ setRefreshInterval(refreshIntervalMs);
         if (method == "POST" && path == "/api/source-controls") {
             json body = requestJsonBody(reqText);
             sendUiActionResponse(fd, [this, body] {
-                if (selectedSourceName() != "RX888") {
+                std::string selected = selectedSourceName();
+                const char* iface = selectedSourceControlInterface(selected);
+                if (!iface) {
                     return json({{"ok", false}, {"error", "selected source has no web controls"}, {"_httpStatus", "404 Not Found"}});
                 }
                 RX888SourceControlV1 req{};
                 std::string text = body.dump();
                 strncpy(req.request, text.c_str(), sizeof(req.request) - 1);
                 req.request[sizeof(req.request) - 1] = '\0';
-                if (!callRX888SourceControl(RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
-                    std::string error = "RX888 source control failed";
+                if (!callJsonSourceControl(iface, RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
+                    std::string error = selected + " source control failed";
                     if (req.response[0]) {
                         try { error = json::parse(req.response).value("error", error); } catch (...) {}
                     }
@@ -3941,7 +3969,13 @@ setRefreshInterval(refreshIntervalMs);
                 if (!callServerSourceControl(SERVER_SOURCE_CONTROL_SET, &req) || !req.ok) {
                     return json({{"ok", false}, {"error", "server target is busy or invalid"}, {"_httpStatus", "409 Conflict"}});
                 }
-                return webStateSnapshot();
+                json snapshot = webStateSnapshot();
+                snapshot["sdrppServer"]["available"] = true;
+                snapshot["sdrppServer"]["host"] = req.host;
+                snapshot["sdrppServer"]["port"] = req.port;
+                snapshot["sdrppServer"]["connected"] = req.connected;
+                snapshot["sdrppServer"]["sourceRunning"] = req.running;
+                return snapshot;
             });
             return;
         }

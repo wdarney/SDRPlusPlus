@@ -8,6 +8,7 @@
 #include <config.h>
 #include <gui/smgui.h>
 #include <airspy.h>
+#include <algorithm>
 
 #ifdef __ANDROID__
 #include <android_backend.h>
@@ -24,6 +25,12 @@ SDRPP_MOD_INFO{
 };
 
 ConfigManager config;
+
+struct AirspySourceControlV1 {
+    char request[4096];
+    char response[32768];
+    bool ok = false;
+};
 
 class AirspySourceModule : public ModuleManager::Instance {
 public:
@@ -55,10 +62,13 @@ public:
         selectByString(devSerial);
 
         sigpath::sourceManager.registerSource("Airspy", &handler);
+        core::modComManager.registerInterface(
+            "airspy_source", "airspy_source.control.v1", controlHandler, this);
     }
 
     ~AirspySourceModule() {
         stop(this);
+        core::modComManager.unregisterInterface("airspy_source.control.v1");
         sigpath::sourceManager.unregisterSource("Airspy");
         airspy_exit();
     }
@@ -244,6 +254,217 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    static void writeControlResponse(AirspySourceControlV1* msg, const json& body, bool ok = true) {
+        if (!msg) return;
+        std::string text = body.dump();
+        strncpy(msg->response, text.c_str(), sizeof(msg->response) - 1);
+        msg->response[sizeof(msg->response) - 1] = '\0';
+        msg->ok = ok;
+    }
+
+    void saveDeviceConfig(const char* key, const json& value) {
+        if (selectedSerStr == "") return;
+        config.acquire();
+        config.conf["devices"][selectedSerStr][key] = value;
+        config.release(true);
+    }
+
+    json controlStateJson() {
+        json devices = json::array();
+        char buf[1024];
+        for (int i = 0; i < (int)devList.size(); i++) {
+            sprintf(buf, "%016" PRIX64, devList[i]);
+            devices.push_back({{"id", i}, {"label", buf}});
+        }
+
+        json rates = json::array();
+        for (int i = 0; i < (int)sampleRateList.size(); i++) {
+            rates.push_back({
+                {"id", i},
+                {"value", sampleRateList[i]},
+                {"label", getBandwdithScaled(sampleRateList[i])},
+                {"selected", i == srId}
+            });
+        }
+
+        json gains = json::array({
+            {{"name", "sensitive"}, {"label", "Sensitive Gain"}, {"value", sensitiveGain}, {"min", 0}, {"max", 21}, {"step", 1}, {"available", gainMode == 0}, {"liveMutable", true}},
+            {{"name", "linear"}, {"label", "Linear Gain"}, {"value", linearGain}, {"min", 0}, {"max", 21}, {"step", 1}, {"available", gainMode == 1}, {"liveMutable", true}},
+            {{"name", "lna"}, {"label", "LNA Gain"}, {"value", lnaGain}, {"min", 0}, {"max", 15}, {"step", 1}, {"available", gainMode == 2 && !lnaAgc}, {"liveMutable", true}},
+            {{"name", "mixer"}, {"label", "Mixer Gain"}, {"value", mixerGain}, {"min", 0}, {"max", 15}, {"step", 1}, {"available", gainMode == 2 && !mixerAgc}, {"liveMutable", true}},
+            {{"name", "vga"}, {"label", "VGA Gain"}, {"value", vgaGain}, {"min", 0}, {"max", 15}, {"step", 1}, {"available", gainMode == 2}, {"liveMutable", true}}
+        });
+        json modes = json::array({"Sensitive", "Linear", "Free"});
+        int modeId = std::clamp(gainMode, 0, 2);
+        json toggles = json::array({
+            {{"key", "lnaAgc"}, {"label", "LNA AGC"}, {"value", lnaAgc}, {"liveMutable", true}, {"available", gainMode == 2}},
+            {{"key", "mixerAgc"}, {"label", "Mixer AGC"}, {"value", mixerAgc}, {"liveMutable", true}, {"available", gainMode == 2}},
+            {{"key", "biasT"}, {"label", "Bias-T"}, {"value", biasT}, {"liveMutable", true}}
+        });
+
+        return json({
+            {"available", true}, {"source", "Airspy"}, {"running", running},
+            {"deviceId", devId}, {"devices", devices},
+            {"sampleRate", sampleRate}, {"sampleRates", rates},
+            {"mode", modes[modeId]}, {"modes", modes},
+            {"gains", gains}, {"toggles", toggles}
+        });
+    }
+
+    bool applyControlJson(const json& req, std::string& error) {
+        bool stoppedOnlyChanged = req.contains("deviceId") || req.contains("sampleRateId") || req.value("refresh", false);
+        if (running && stoppedOnlyChanged) {
+            error = "stop SDR before changing device, sample rate, or refresh";
+            return false;
+        }
+
+        if (req.value("refresh", false)) {
+            refresh();
+            selectByString(selectedSerStr);
+            core::setInputSampleRate(sampleRate);
+        }
+
+        if (req.contains("deviceId")) {
+            int id = req["deviceId"].get<int>();
+            if (id < 0 || id >= (int)devList.size()) {
+                error = "device not found";
+                return false;
+            }
+            selectBySerial(devList[id]);
+            core::setInputSampleRate(sampleRate);
+            config.acquire();
+            config.conf["device"] = selectedSerStr;
+            config.release(true);
+        }
+
+        if (req.contains("sampleRateId")) {
+            int id = req["sampleRateId"].get<int>();
+            if (id < 0 || id >= (int)sampleRateList.size()) {
+                error = "sample rate not found";
+                return false;
+            }
+            srId = id;
+            sampleRate = sampleRateList[srId];
+            core::setInputSampleRate(sampleRate);
+            saveDeviceConfig("sampleRate", sampleRate);
+        }
+
+        if (req.contains("mode")) {
+            std::string mode = req["mode"].get<std::string>();
+            if (mode == "Sensitive") gainMode = 0;
+            else if (mode == "Linear") gainMode = 1;
+            else if (mode == "Free") gainMode = 2;
+            else {
+                error = "gain mode not found";
+                return false;
+            }
+            if (running) {
+                airspy_set_lna_agc(openDev, 0);
+                airspy_set_mixer_agc(openDev, 0);
+                if (gainMode == 0) airspy_set_sensitivity_gain(openDev, sensitiveGain);
+                else if (gainMode == 1) airspy_set_linearity_gain(openDev, linearGain);
+                else {
+                    airspy_set_lna_agc(openDev, lnaAgc ? 1 : 0);
+                    if (!lnaAgc) airspy_set_lna_gain(openDev, lnaGain);
+                    airspy_set_mixer_agc(openDev, mixerAgc ? 1 : 0);
+                    if (!mixerAgc) airspy_set_mixer_gain(openDev, mixerGain);
+                    airspy_set_vga_gain(openDev, vgaGain);
+                }
+            }
+            saveDeviceConfig("gainMode", gainMode);
+        }
+
+        if (req.contains("gains")) {
+            for (auto& [key, val] : req["gains"].items()) {
+                int v = val.get<int>();
+                if (key == "sensitive") {
+                    sensitiveGain = std::clamp(v, 0, 21);
+                    if (running && gainMode == 0) airspy_set_sensitivity_gain(openDev, sensitiveGain);
+                    saveDeviceConfig("sensitiveGain", sensitiveGain);
+                }
+                else if (key == "linear") {
+                    linearGain = std::clamp(v, 0, 21);
+                    if (running && gainMode == 1) airspy_set_linearity_gain(openDev, linearGain);
+                    saveDeviceConfig("linearGain", linearGain);
+                }
+                else if (key == "lna") {
+                    lnaGain = std::clamp(v, 0, 15);
+                    if (running && gainMode == 2 && !lnaAgc) airspy_set_lna_gain(openDev, lnaGain);
+                    saveDeviceConfig("lnaGain", lnaGain);
+                }
+                else if (key == "mixer") {
+                    mixerGain = std::clamp(v, 0, 15);
+                    if (running && gainMode == 2 && !mixerAgc) airspy_set_mixer_gain(openDev, mixerGain);
+                    saveDeviceConfig("mixerGain", mixerGain);
+                }
+                else if (key == "vga") {
+                    vgaGain = std::clamp(v, 0, 15);
+                    if (running && gainMode == 2) airspy_set_vga_gain(openDev, vgaGain);
+                    saveDeviceConfig("vgaGain", vgaGain);
+                }
+            }
+        }
+
+        if (req.contains("toggles")) {
+            json toggles = req["toggles"];
+            if (toggles.contains("lnaAgc")) {
+                lnaAgc = toggles["lnaAgc"].get<bool>();
+                if (running && gainMode == 2) {
+                    airspy_set_lna_agc(openDev, lnaAgc ? 1 : 0);
+                    if (!lnaAgc) airspy_set_lna_gain(openDev, lnaGain);
+                }
+                saveDeviceConfig("lnaAgc", lnaAgc);
+            }
+            if (toggles.contains("mixerAgc")) {
+                mixerAgc = toggles["mixerAgc"].get<bool>();
+                if (running && gainMode == 2) {
+                    airspy_set_mixer_agc(openDev, mixerAgc ? 1 : 0);
+                    if (!mixerAgc) airspy_set_mixer_gain(openDev, mixerGain);
+                }
+                saveDeviceConfig("mixerAgc", mixerAgc);
+            }
+            if (toggles.contains("biasT")) {
+                biasT = toggles["biasT"].get<bool>();
+                if (running) airspy_set_rf_bias(openDev, biasT);
+                saveDeviceConfig("biasT", biasT);
+            }
+        }
+
+        return true;
+    }
+
+    enum ControlCode {
+        CONTROL_GET = 1,
+        CONTROL_SET = 2
+    };
+
+    static void controlHandler(int code, void* in, void* out, void* ctx) {
+        AirspySourceModule* _this = (AirspySourceModule*)ctx;
+        AirspySourceControlV1* inMsg = (AirspySourceControlV1*)in;
+        AirspySourceControlV1* outMsg = (AirspySourceControlV1*)(out ? out : in);
+        if (!_this || !outMsg) return;
+        try {
+            if (code == CONTROL_SET) {
+                json req = json::object();
+                if (inMsg && inMsg->request[0]) req = json::parse(inMsg->request);
+                std::string error;
+                if (!_this->applyControlJson(req, error)) {
+                    writeControlResponse(outMsg, json({{"ok", false}, {"error", error}}), false);
+                    return;
+                }
+            }
+            json state = _this->controlStateJson();
+            state["ok"] = true;
+            writeControlResponse(outMsg, state, true);
+        }
+        catch (const std::exception& e) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", e.what()}}), false);
+        }
+        catch (...) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", "Airspy control failed"}}), false);
+        }
     }
 
     static void menuSelected(void* ctx) {
