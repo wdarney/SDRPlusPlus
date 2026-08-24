@@ -16,4 +16,5 @@ namespace backend {
     extern const std::vector<DevVIDPID> SDDC_VIDPIDS;
 
     int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids);
+    void setKeepaliveActive(bool active);
 }

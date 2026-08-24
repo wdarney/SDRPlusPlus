@@ -28,6 +28,8 @@ namespace backend {
     bool initialized = false;
     bool pauseRendering = false;
     bool exited = false;
+    EventHandler<bool> playStateHandler;
+    bool playStateHandlerBound = false;
 
     bool getJniEnv(JavaVM* java_vm, JNIEnv** java_env, bool& didAttach) {
         didAttach = false;
@@ -52,6 +54,18 @@ namespace backend {
     // Forward declaration
     int ShowSoftKeyboardInput();
     int PollUnicodeChars();
+
+    void playStateChangeHandler(bool playing, void*) {
+        setKeepaliveActive(playing);
+    }
+
+    void bindPlayStateHandler() {
+        if (playStateHandlerBound) { return; }
+        playStateHandler.handler = playStateChangeHandler;
+        playStateHandler.ctx = nullptr;
+        gui::mainWindow.onPlayStateChange.bindHandler(&playStateHandler);
+        playStateHandlerBound = true;
+    }
 
     void doPartialInit() {
         std::string root = (std::string)core::args["root"];
@@ -298,6 +312,38 @@ namespace backend {
         return 0;
     }
 
+    void setKeepaliveActive(bool active) {
+        if (!app || !app->activity || !app->activity->vm || !app->activity->clazz) { return; }
+
+        JavaVM* java_vm = app->activity->vm;
+        JNIEnv* java_env = NULL;
+        bool did_attach = false;
+
+        if (!getJniEnv(java_vm, &java_env, did_attach)) {
+            return;
+        }
+
+        jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
+        if (native_activity_clazz == NULL) {
+            detachJniEnv(java_vm, did_attach);
+            return;
+        }
+
+        jmethodID method_id = java_env->GetMethodID(native_activity_clazz, "setKeepaliveActive", "(Z)V");
+        if (method_id == NULL) {
+            detachJniEnv(java_vm, did_attach);
+            return;
+        }
+
+        java_env->CallVoidMethod(app->activity->clazz, method_id, active ? JNI_TRUE : JNI_FALSE);
+        if (java_env->ExceptionCheck()) {
+            java_env->ExceptionDescribe();
+            java_env->ExceptionClear();
+        }
+
+        detachJniEnv(java_vm, did_attach);
+    }
+
     int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids) {
         JavaVM* java_vm = app->activity->vm;
         JNIEnv* java_env = NULL;
@@ -487,6 +533,7 @@ extern "C" {
 
         // Grab files dir
         std::string appdir = backend::getAppFilesDir();
+        backend::bindPlayStateHandler();
 
         // Call main
         char* rootpath = new char[appdir.size() + 1];

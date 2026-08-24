@@ -12,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.hardware.usb.*;
 import android.Manifest;
 import android.os.Bundle;
+import android.os.Build;
 import android.view.View;
 import android.view.KeyEvent;
 import android.view.inputmethod.InputMethodManager;
@@ -110,6 +111,11 @@ class MainActivity : NativeActivity() {
         super.onCreate(savedInstanceState)
     }
 
+    public override fun onDestroy() {
+        setKeepaliveActive(false);
+        super.onDestroy();
+    }
+
     public override fun onResume() {
         // Hide bars again
         hideSystemBars();
@@ -125,6 +131,21 @@ class MainActivity : NativeActivity() {
         val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager;
         inputMethodManager.hideSoftInputFromWindow(window.decorView.windowToken, 0);
         hideSystemBars();
+    }
+
+    fun setKeepaliveActive(active: Boolean) {
+        val intent = Intent(this, SdrKeepaliveService::class.java);
+        if (active) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            }
+            else {
+                startService(intent);
+            }
+        }
+        else {
+            stopService(intent);
+        }
     }
 
     // Queue for the Unicode characters to be polled from native code (via pollUnicodeChar())
