@@ -352,6 +352,8 @@ public:
             rnVoiceGateQuarantineSec = config.conf[name]["rnVoiceGateQuarantineSec"];
         if (config.conf[name].contains("recPath"))
             folderSelect.setPath(config.conf[name]["recPath"]);
+        if (config.conf[name].contains("activeRecordingSession"))
+            activeRecordingSession = sanitizeForFilename(config.conf[name]["activeRecordingSession"].get<std::string>(), 48);
         if (config.conf[name].contains("freqLog")) {
             double sp = SPACINGS[std::clamp(spacingId, 0, 5)];
             for (auto& j : config.conf[name]["freqLog"]) {
@@ -1014,7 +1016,15 @@ public:
                 name.c_str(), slot.freqHz / 1e6,
                 ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
                 ltm->tm_mday, ltm->tm_mon + 1, ltm->tm_year + 1900);
-        std::filesystem::path requestedWav = expandString(folderSelect.path + "/" + buf);
+        std::filesystem::path recordingBase = expandString(folderSelect.path);
+        if (!activeRecordingSession.empty()) recordingBase /= activeRecordingSession;
+        std::error_code dirEc;
+        std::filesystem::create_directories(recordingBase, dirEc);
+        if (dirEc) {
+            flog::warn("[ChannelBank] Could not create recording session directory {0}: {1}",
+                       recordingBase.string(), dirEc.message());
+        }
+        std::filesystem::path requestedWav = recordingBase / buf;
         std::string path = requestedWav.string();
         slot.currentFinalM4APath.clear();
 
@@ -2106,7 +2116,15 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <section>
 <div class="span-head">
 <h2>Recordings</h2>
+<div>
 <button class="secondary inline-action" id="recordingsRefresh" type="button">Refresh</button>
+<button class="danger inline-action" id="recordingsClearWavs" type="button">Clear WAVs</button>
+</div>
+</div>
+<div class="controls">
+<input id="recordingSessionName" type="text" placeholder="Session name">
+<button class="secondary" id="recordingSessionStart" type="button">Start Session</button>
+<div class="muted" id="recordingSessionStatus">Session: default folder</div>
 </div>
 <table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Download</th></tr></thead><tbody id="recordings"><tr><td colspan="4" class="muted">Click Refresh to list saved recordings.</td></tr></tbody></table>
 <div class="muted" id="recordingsStatus" style="margin-top:8px">Saved WAV and M4A files in the Channel Bank recording folder.</div>
@@ -2658,6 +2676,7 @@ function renderHeatMap(s) {
 }
 async function refreshRecordings() {
   const status = document.getElementById("recordingsStatus");
+  const sessionStatus = document.getElementById("recordingSessionStatus");
   const body = document.getElementById("recordings");
   if (status) status.textContent = "Loading recordings...";
   const ctl = new AbortController();
@@ -2667,13 +2686,24 @@ async function refreshRecordings() {
     if (!r.ok) throw new Error(r.statusText);
     const data = await r.json();
     const files = data.files || [];
+    if (sessionStatus) sessionStatus.textContent = data.activeSession ? `Session: ${data.activeSession}` : "Session: default folder";
     if (!files.length) {
       body.innerHTML = `<tr><td colspan="4" class="muted">No saved recordings found.</td></tr>`;
     } else {
-      body.innerHTML = files.map(f => {
-        const mb = Number(f.size || 0) / (1024 * 1024);
-        const when = f.modifiedMs ? new Date(f.modifiedMs).toLocaleString() : "-";
-        return `<tr><td>${esc(f.name || f.path || "")}</td><td>${mb.toFixed(2)} MB</td><td>${esc(when)}</td><td><a class="secondary inline-action" href="/api/recordings/download?file=${encodeURIComponent(f.path || "")}">Download</a></td></tr>`;
+      const groups = new Map();
+      files.forEach(f => {
+        const key = f.session || "Default";
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(f);
+      });
+      body.innerHTML = Array.from(groups.entries()).map(([session, items]) => {
+        const bytes = items.reduce((sum, f) => sum + Number(f.size || 0), 0);
+        const sessionRows = items.map(f => {
+          const mb = Number(f.size || 0) / (1024 * 1024);
+          const when = f.modifiedMs ? new Date(f.modifiedMs).toLocaleString() : "-";
+          return `<tr><td>${esc(f.name || f.path || "")}</td><td>${mb.toFixed(2)} MB</td><td>${esc(when)}</td><td><a class="secondary inline-action" href="/api/recordings/download?file=${encodeURIComponent(f.path || "")}">Download</a></td></tr>`;
+        }).join("");
+        return `<tr><td colspan="4"><details ${session === (data.activeSession || "Default") ? "open" : ""}><summary>${esc(session)} / ${items.length} file${items.length === 1 ? "" : "s"} / ${(bytes / (1024 * 1024)).toFixed(2)} MB</summary><table><tbody>${sessionRows}</tbody></table></details></td></tr>`;
       }).join("");
     }
     if (status) status.textContent = `${files.length} saved recording${files.length === 1 ? "" : "s"}`;
@@ -2683,6 +2713,36 @@ async function refreshRecordings() {
     if (status) status.textContent = "Recordings unavailable";
   } finally {
     clearTimeout(timeout);
+  }
+}
+async function startRecordingSession() {
+  const input = document.getElementById("recordingSessionName");
+  const status = document.getElementById("recordingsStatus");
+  const name = (input?.value || "").trim();
+  if (!name) {
+    if (status) status.textContent = "Session name required";
+    return;
+  }
+  if (status) status.textContent = "Starting session...";
+  const ok = await postAndReport("/api/recordings/session", { name }, false);
+  if (ok) {
+    if (input) input.value = "";
+    await refreshRecordings();
+  } else if (status) {
+    status.textContent = "Session start failed";
+  }
+}
+async function clearRecordedWavs() {
+  const status = document.getElementById("recordingsStatus");
+  if (!confirm("Delete all saved WAV files in the Channel Bank recording folder? M4A files are kept.")) return;
+  if (status) status.textContent = "Clearing WAV files...";
+  try {
+    const data = await post("/api/recordings/clear-wavs", null, false);
+    if (status) status.textContent = `Deleted ${data?.deleted || 0} WAV file${data?.deleted === 1 ? "" : "s"}${data?.skipped ? ` / skipped ${data.skipped}` : ""}`;
+    await refreshRecordings();
+  } catch (e) {
+    console.warn(e);
+    if (status) status.textContent = e?.message || "Clear WAVs failed";
   }
 }
 function drawSnrChart(s) {
@@ -3377,6 +3437,11 @@ document.getElementById("sourceRefresh").onclick = () => saveSourceControls({ re
 document.getElementById("sourceOffsetMode").onchange = saveSourceOffset;
 document.getElementById("sourceOffsetApply").onclick = saveSourceOffset;
 document.getElementById("recordingsRefresh").onclick = refreshRecordings;
+document.getElementById("recordingSessionStart").onclick = startRecordingSession;
+document.getElementById("recordingSessionName").onkeydown = e => {
+  if (e.key === "Enter") startRecordingSession();
+};
+document.getElementById("recordingsClearWavs").onclick = clearRecordedWavs;
 function saveSetting(id, key, read) {
   const el = document.getElementById(id);
   const bumpSeq = () => {
@@ -3655,6 +3720,7 @@ self.addEventListener("fetch", event => {
         json out;
         out["available"] = false;
         out["files"] = json::array();
+        out["activeSession"] = activeRecordingSession;
         std::error_code ec;
         std::filesystem::path rootPath = recordingsRootPath();
         if (rootPath.empty() || !std::filesystem::exists(rootPath, ec) || ec) return out;
@@ -3663,6 +3729,7 @@ self.addEventListener("fetch", event => {
 
         struct RecFile {
             std::string rel;
+            std::string session;
             uintmax_t size = 0;
             int64_t modifiedMs = 0;
         };
@@ -3685,9 +3752,16 @@ self.addEventListener("fetch", event => {
             ec.clear();
             std::filesystem::path relPath = std::filesystem::relative(p, rootPath, ec);
             if (ec) { ec.clear(); continue; }
+            std::string session;
+            auto relIt = relPath.begin();
+            if (relIt != relPath.end()) {
+                auto next = relIt;
+                ++next;
+                if (next != relPath.end()) session = relIt->string();
+            }
             uintmax_t size = std::filesystem::file_size(p, ec);
             if (ec) { ec.clear(); continue; }
-            files.push_back({relPath.generic_string(), size, modifiedMs});
+            files.push_back({relPath.generic_string(), session, size, modifiedMs});
             ec.clear();
         }
         std::sort(files.begin(), files.end(), [](const RecFile& a, const RecFile& b) {
@@ -3698,10 +3772,96 @@ self.addEventListener("fetch", event => {
             out["files"].push_back({
                 {"path", f.rel},
                 {"name", std::filesystem::path(f.rel).filename().string()},
+                {"session", f.session},
                 {"size", f.size},
                 {"modifiedMs", f.modifiedMs}
             });
         }
+        return out;
+    }
+
+    bool setRecordingSession(const std::string& requested, std::string& error) {
+        std::string session = sanitizeForFilename(requested, 48);
+        if (session.empty()) {
+            error = "session name is required";
+            return false;
+        }
+        std::filesystem::path rootPath = recordingsRootPath();
+        if (rootPath.empty()) {
+            error = "recordings folder not available";
+            return false;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(rootPath / session, ec);
+        if (ec) {
+            error = "could not create session folder";
+            return false;
+        }
+        activeRecordingSession = session;
+        config.acquire();
+        config.conf[name]["activeRecordingSession"] = activeRecordingSession;
+        config.release(true);
+        return true;
+    }
+
+    json clearRecordedWavsJson() {
+        json out = {{"ok", true}, {"deleted", 0}, {"skipped", 0}};
+        std::filesystem::path rootPath = recordingsRootPath();
+        if (rootPath.empty()) {
+            out["ok"] = false;
+            out["error"] = "recordings folder not available";
+            out["_httpStatus"] = "404 Not Found";
+            return out;
+        }
+
+        std::set<std::filesystem::path> protectedPaths;
+        {
+            std::lock_guard<std::mutex> lk(channelsMtx);
+            for (auto& [idx, slot] : activeChannels) {
+                if (slot && !slot->currentFilePath.empty()) {
+                    std::error_code ec;
+                    auto p = std::filesystem::weakly_canonical(slot->currentFilePath, ec);
+                    if (!ec) protectedPaths.insert(p);
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
+            if (!currentPlaybackPath.empty()) {
+                std::error_code ec;
+                auto p = std::filesystem::weakly_canonical(currentPlaybackPath, ec);
+                if (!ec) protectedPaths.insert(p);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            for (auto& entry : playbackQueue) {
+                if (entry.path.empty()) continue;
+                std::error_code ec;
+                auto p = std::filesystem::weakly_canonical(entry.path, ec);
+                if (!ec) protectedPaths.insert(p);
+            }
+        }
+
+        std::error_code ec;
+        int deleted = 0;
+        int skipped = 0;
+        for (auto it = std::filesystem::recursive_directory_iterator(rootPath, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec || !it->is_regular_file(ec) || ec) continue;
+            std::filesystem::path p = it->path();
+            std::string ext = p.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (ext != ".wav") continue;
+            auto canon = std::filesystem::weakly_canonical(p, ec);
+            if (ec) { ec.clear(); skipped++; continue; }
+            if (protectedPaths.count(canon)) { skipped++; continue; }
+            std::filesystem::remove(canon, ec);
+            if (ec) { ec.clear(); skipped++; }
+            else deleted++;
+        }
+        out["deleted"] = deleted;
+        out["skipped"] = skipped;
         return out;
     }
 
@@ -4127,6 +4287,25 @@ self.addEventListener("fetch", event => {
         }
         if (method == "GET" && path.rfind("/api/recordings/download", 0) == 0) {
             sendRecordingDownload(fd, path);
+            return;
+        }
+        if (method == "POST" && path == "/api/recordings/session") {
+            json body = requestJsonBody(reqText);
+            std::string session = body.value("name", std::string());
+            sendUiActionResponse(fd, [this, session] {
+                std::string error;
+                if (!setRecordingSession(session, error)) {
+                    return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
+                }
+                return recordingsListJson();
+            });
+            return;
+        }
+        if (method == "POST" && path == "/api/recordings/clear-wavs") {
+            json result = clearRecordedWavsJson();
+            std::string status = result.value("_httpStatus", std::string("200 OK"));
+            result.erase("_httpStatus");
+            sendHttpResponse(fd, status, "application/json", result.dump());
             return;
         }
         if (method == "GET" && path == "/api/audio/live.pcm") {
@@ -9383,6 +9562,7 @@ self.addEventListener("fetch", event => {
     bool         draggingRight  = false;
     int          signalHoldMs          = 500;    // hold signalPresent true N ms after last detection (dropout hysteresis)
     bool         recordingEnabled      = true;   // global recording on/off toggle
+    std::string  activeRecordingSession;
     bool         portableRecordingGroup = false; // save new recordings under the Portable group name
     // Transcription backend selector.  ChannelSlot::transcribeBackend stores the
     // raw int form of this enum so it can live in the slot struct (which is
