@@ -2168,7 +2168,9 @@ let monitorNode = null;
 let monitorRunning = false;
 let monitorRunId = 0;
 let monitorRetryTimer = null;
+let monitorRetryDelayMs = 1200;
 let monitorMode = "idle";
+let webConnected = false;
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
 let refreshAbort = null;
@@ -3005,15 +3007,20 @@ function clearMonitorRetry() {
     monitorRetryTimer = null;
   }
 }
+function resetMonitorRetryDelay() {
+  monitorRetryDelayMs = 1200;
+}
 function scheduleMonitorRetry(runId) {
   clearMonitorRetry();
-  setMonitorUi(true, "Monitor reconnecting...");
+  const delay = webConnected ? monitorRetryDelayMs : Math.max(monitorRetryDelayMs, 5000);
+  setMonitorUi(true, webConnected ? "Monitor reconnecting..." : "Waiting for SDR++...");
   monitorRetryTimer = setTimeout(() => {
     monitorRetryTimer = null;
     if (!monitorRunning || runId !== monitorRunId) return;
     monitorRunning = false;
     startMonitorAudio();
-  }, 1200);
+  }, delay);
+  monitorRetryDelayMs = Math.min(delay * 2, 30000);
 }
 function resetMonitorBuffer() {
   monitorReadPos = 0;
@@ -3117,7 +3124,10 @@ async function startMediaElementMonitor(runId) {
   monitorAudioEl.pause();
   monitorAudioEl.src = `/api/audio/live.wav?run=${runId}&t=${Date.now()}`;
   monitorAudioEl.loop = false;
-  monitorAudioEl.onplaying = () => setMonitorUi(true, "Monitor live");
+  monitorAudioEl.onplaying = () => {
+    resetMonitorRetryDelay();
+    setMonitorUi(true, "Monitor live");
+  };
   monitorAudioEl.onwaiting = () => setMonitorUi(true, "Monitor buffering...");
   monitorAudioEl.onstalled = () => setMonitorUi(true, "Monitor buffering...");
   monitorAudioEl.onended = () => reconnectMediaElementMonitor(runId, "media monitor ended");
@@ -3128,6 +3138,7 @@ async function startMediaElementMonitor(runId) {
 async function startMonitorAudio() {
   if (monitorRunning) return;
   clearMonitorRetry();
+  resetMonitorRetryDelay();
   const runId = ++monitorRunId;
   monitorRunning = true;
   monitorMode = "pcm";
@@ -3222,6 +3233,7 @@ async function startMonitorAudio() {
 }
 function stopMonitorAudio() {
   clearMonitorRetry();
+  resetMonitorRetryDelay();
   monitorRunning = false;
   monitorMode = "idle";
   monitorRunId++;
@@ -3257,6 +3269,7 @@ async function refresh(force = false) {
   try {
     const r = await fetch("/api/state", { cache: "no-store", signal: ctl.signal });
     const s = await r.json();
+    webConnected = true;
     const now = s.serverTimeMs ? new Date(s.serverTimeMs).toLocaleTimeString() : new Date().toLocaleTimeString();
     document.getElementById("sdrppStatus").textContent = "Connected";
     document.getElementById("sdrppStatus").className = "small-value ok";
@@ -3347,6 +3360,7 @@ async function refresh(force = false) {
 	    const tx = (s.lastTranscriptText || "").trim();
     document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
   } catch (e) {
+    webConnected = false;
     document.getElementById("state").textContent = "Disconnected";
     document.getElementById("state").className = "value off";
     document.getElementById("sdrppStatus").textContent = "Disconnected";
