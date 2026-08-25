@@ -1952,6 +1952,14 @@ private:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101820">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Channel Bank">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
 <title>Channel Bank Control</title>
 <style>
 :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111; color: #f3f3f3; }
@@ -2160,6 +2168,7 @@ let monitorNode = null;
 let monitorRunning = false;
 let monitorRunId = 0;
 let monitorRetryTimer = null;
+let monitorMode = "idle";
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
 let refreshAbort = null;
@@ -2988,6 +2997,7 @@ function coerceSettingValue(raw, read) {
 function setMonitorUi(active, text) {
   document.getElementById("monitorAudio").textContent = active ? "Stop Monitor" : "Monitor Audio";
   document.getElementById("monitorState").textContent = text;
+  if ("mediaSession" in navigator) navigator.mediaSession.playbackState = active ? "playing" : "none";
 }
 function clearMonitorRetry() {
   if (monitorRetryTimer) {
@@ -3067,9 +3077,34 @@ function stopMonitorOutput() {
 }
 function shouldUseMediaElementAudio() {
   const ua = navigator.userAgent || "";
-  return /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/i.test(ua);
+  const isSafari = /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/i.test(ua);
+  const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone;
+  return isSafari || !!standalone;
+}
+function setupMonitorMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  if ("MediaMetadata" in window) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: "Channel Bank Monitor",
+      artist: "SDR++",
+      album: "Live audio"
+    });
+  }
+  if (navigator.mediaSession.setActionHandler) navigator.mediaSession.setActionHandler("play", () => {
+    if (!monitorRunning) startMonitorAudio();
+    else if (monitorAudioEl) monitorAudioEl.play().catch(() => {});
+  });
+  if (navigator.mediaSession.setActionHandler) navigator.mediaSession.setActionHandler("pause", () => stopMonitorAudio());
+  if (navigator.mediaSession.setActionHandler) navigator.mediaSession.setActionHandler("stop", () => stopMonitorAudio());
+}
+function reconnectMediaElementMonitor(runId, reason) {
+  if (!monitorRunning || runId !== monitorRunId) return;
+  console.warn(reason || "media monitor reconnect");
+  scheduleMonitorRetry(runId);
 }
 async function startMediaElementMonitor(runId) {
+  monitorMode = "media";
+  setupMonitorMediaSession();
   if (!monitorAudioEl) {
     monitorAudioEl = new Audio();
     monitorAudioEl.preload = "none";
@@ -3083,9 +3118,10 @@ async function startMediaElementMonitor(runId) {
   monitorAudioEl.src = `/api/audio/live.wav?run=${runId}&t=${Date.now()}`;
   monitorAudioEl.loop = false;
   monitorAudioEl.onplaying = () => setMonitorUi(true, "Monitor live");
-  monitorAudioEl.onerror = () => {
-    if (monitorRunning && runId === monitorRunId) setMonitorUi(true, "Monitor reconnecting...");
-  };
+  monitorAudioEl.onwaiting = () => setMonitorUi(true, "Monitor buffering...");
+  monitorAudioEl.onstalled = () => reconnectMediaElementMonitor(runId, "media monitor stalled");
+  monitorAudioEl.onended = () => reconnectMediaElementMonitor(runId, "media monitor ended");
+  monitorAudioEl.onerror = () => reconnectMediaElementMonitor(runId, "media monitor error");
   monitorAudioEl.load();
   await monitorAudioEl.play();
 }
@@ -3094,6 +3130,7 @@ async function startMonitorAudio() {
   clearMonitorRetry();
   const runId = ++monitorRunId;
   monitorRunning = true;
+  monitorMode = "pcm";
   setMonitorUi(true, "Monitor connecting...");
   const AudioCtor = window.AudioContext || window.webkitAudioContext;
   let carry = new Uint8Array(0);
@@ -3186,10 +3223,16 @@ async function startMonitorAudio() {
 function stopMonitorAudio() {
   clearMonitorRetry();
   monitorRunning = false;
+  monitorMode = "idle";
   monitorRunId++;
   if (monitorAbort) monitorAbort.abort();
   monitorAbort = null;
   if (monitorAudioEl) {
+    monitorAudioEl.onplaying = null;
+    monitorAudioEl.onwaiting = null;
+    monitorAudioEl.onstalled = null;
+    monitorAudioEl.onended = null;
+    monitorAudioEl.onerror = null;
     monitorAudioEl.pause();
     monitorAudioEl.removeAttribute("src");
     monitorAudioEl.load();
@@ -3464,6 +3507,11 @@ if (spanRate) {
   spanRate.value = String(refreshIntervalMs);
   spanRate.onchange = e => setRefreshInterval(Number(e.target.value));
 }
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(e => console.warn("service worker registration failed", e));
+  });
+}
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh(true);
 });
@@ -3472,6 +3520,75 @@ setRefreshInterval(refreshIntervalMs);
 </script>
 </body>
 </html>)HTML";
+    }
+
+    std::string webManifestJson() const {
+        return json({
+            {"name", "SDR++ Channel Bank"},
+            {"short_name", "Channel Bank"},
+            {"description", "Realtime control surface for the SDR++ Channel Bank module."},
+            {"start_url", "/"},
+            {"scope", "/"},
+            {"display", "standalone"},
+            {"background_color", "#101820"},
+            {"theme_color", "#101820"},
+            {"orientation", "any"},
+            {"icons", json::array({
+                {
+                    {"src", "/icon.svg"},
+                    {"sizes", "any"},
+                    {"type", "image/svg+xml"},
+                    {"purpose", "any maskable"}
+                }
+            })}
+        }).dump();
+    }
+
+    std::string webIconSvg() const {
+        return R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<rect width="512" height="512" rx="96" fill="#101820"/>
+<path d="M84 322c56-92 116-138 180-138s120 46 164 138" fill="none" stroke="#62d26f" stroke-width="34" stroke-linecap="round"/>
+<path d="M128 322c42-58 86-88 132-88s86 30 124 88" fill="none" stroke="#4da3ff" stroke-width="24" stroke-linecap="round"/>
+<circle cx="256" cy="322" r="38" fill="#f4d35e"/>
+<path d="M118 384h276" stroke="#dfe8f2" stroke-width="28" stroke-linecap="round"/>
+<path d="M176 130h160" stroke="#dfe8f2" stroke-width="30" stroke-linecap="round"/>
+</svg>)SVG";
+    }
+
+    std::string webServiceWorkerJs() const {
+        return R"JS(const CACHE_NAME = "channel-bank-pwa-v1";
+const SHELL_URLS = ["/", "/manifest.webmanifest", "/icon.svg"];
+
+self.addEventListener("install", event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(SHELL_URLS))
+      .then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener("activate", event => {
+  event.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", event => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET" || url.origin !== location.origin) return;
+  if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/audio/")) return;
+  event.respondWith(
+    fetch(event.request)
+      .then(response => {
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
+        return response;
+      })
+      .catch(() => caches.match(event.request).then(cached => cached || caches.match("/")))
+  );
+});)JS";
     }
 
     bool sendAll(WebSocket fd, const void* data, size_t size) {
@@ -3932,6 +4049,18 @@ setRefreshInterval(refreshIntervalMs);
         }
         if (method == "GET" && (path == "/" || path == "/index.html")) {
             sendHttpResponse(fd, "200 OK", "text/html; charset=utf-8", webIndexHtml());
+            return;
+        }
+        if (method == "GET" && path == "/manifest.webmanifest") {
+            sendHttpResponse(fd, "200 OK", "application/manifest+json", webManifestJson());
+            return;
+        }
+        if (method == "GET" && path == "/sw.js") {
+            sendHttpResponse(fd, "200 OK", "application/javascript; charset=utf-8", webServiceWorkerJs());
+            return;
+        }
+        if (method == "GET" && path == "/icon.svg") {
+            sendHttpResponse(fd, "200 OK", "image/svg+xml", webIconSvg());
             return;
         }
         if (method == "GET" && (path == "/api/state" || path == "/state")) {
