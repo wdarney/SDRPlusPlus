@@ -3107,7 +3107,7 @@ async function startMediaElementMonitor(runId) {
   setupMonitorMediaSession();
   if (!monitorAudioEl) {
     monitorAudioEl = new Audio();
-    monitorAudioEl.preload = "none";
+    monitorAudioEl.preload = "auto";
     monitorAudioEl.controls = false;
     monitorAudioEl.playsInline = true;
     monitorAudioEl.autoplay = false;
@@ -3119,7 +3119,7 @@ async function startMediaElementMonitor(runId) {
   monitorAudioEl.loop = false;
   monitorAudioEl.onplaying = () => setMonitorUi(true, "Monitor live");
   monitorAudioEl.onwaiting = () => setMonitorUi(true, "Monitor buffering...");
-  monitorAudioEl.onstalled = () => reconnectMediaElementMonitor(runId, "media monitor stalled");
+  monitorAudioEl.onstalled = () => setMonitorUi(true, "Monitor buffering...");
   monitorAudioEl.onended = () => reconnectMediaElementMonitor(runId, "media monitor ended");
   monitorAudioEl.onerror = () => reconnectMediaElementMonitor(runId, "media monitor error");
   monitorAudioEl.load();
