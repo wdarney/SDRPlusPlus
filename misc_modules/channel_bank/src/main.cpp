@@ -1509,10 +1509,12 @@ private:
             error = "hz must be positive";
             return false;
         }
+        int64_t key = freqKey(hz);
+        double keyHz = (double)key * 1000.0;
         {
             std::lock_guard<std::mutex> lk(freqLogMtx);
-            auto& entry = freqLog[freqKey(hz)];
-            if (entry.freqHz == 0.0) entry.freqHz = hz;
+            auto& entry = freqLog[key];
+            entry.freqHz = keyHz;
             entry.blocked = blocked;
         }
         saveFreqLog();
@@ -1740,6 +1742,8 @@ private:
                     {"slot", idx},
                     {"freqHz", slot->freqHz},
                     {"gridFreqHz", slot->gridFreqHz},
+                    {"freqKey", freqKey(slot->gridFreqHz)},
+                    {"blockHz", (double)freqKey(slot->gridFreqHz) * 1000.0},
                     {"name", displayName(slot->freqHz)},
                     {"blocked", isBlocked(slot->gridFreqHz)},
                     {"recording", slot->fileOpen},
@@ -1753,6 +1757,8 @@ private:
                 auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - ch.destroyedAt).count();
                 recent.push_back({
                     {"freqHz", ch.freqHz},
+                    {"freqKey", freqKey(ch.freqHz)},
+                    {"blockHz", (double)freqKey(ch.freqHz) * 1000.0},
                     {"name", displayName(ch.freqHz)},
                     {"blocked", isBlocked(ch.freqHz)},
                     {"ageMs", ageMs}
@@ -1876,6 +1882,8 @@ private:
                 const auto& e = it->second;
                 history.push_back({
                     {"freqHz", e.freqHz},
+                    {"freqKey", it->first},
+                    {"blockHz", (double)it->first * 1000.0},
                     {"name", displayName(e.freqHz)},
                     {"count", e.count},
                     {"blocked", e.blocked},
@@ -2220,7 +2228,10 @@ async function post(path, body, refreshAfter = true) {
     try { msg = (await r.json()).error || msg; } catch (_) {}
     throw new Error(msg);
   }
+  let data = null;
+  try { data = await r.json(); } catch (_) {}
   if (refreshAfter) await refresh(true);
+  return data;
 }
 function setControlValue(id, value) {
   const el = document.getElementById(id);
@@ -2424,7 +2435,8 @@ function renderSourceOffset(s) {
 async function blockFrequency(hz, blocked) {
   const status = document.getElementById("heatmapStatus");
   if (status) status.textContent = blocked ? "Blocking frequency..." : "Unblocking frequency...";
-  const ok = await postAndReport("/api/frequency/block", { hz, blocked });
+  const ok = await postAndReport("/api/frequency/block", { hz, blocked }, false);
+  if (ok) await refresh(true);
   if (status) status.textContent = ok ? (blocked ? "Frequency blocked" : "Frequency unblocked") : "Block action failed";
 }
 async function setPlaybackLock(hz) {
@@ -2435,6 +2447,14 @@ async function setPlaybackLock(hz) {
 }
 function sameFreqKey(a, b) {
   return Math.round(Number(a || 0) / 1000) === Math.round(Number(b || 0) / 1000);
+}
+function blockHzFor(item) {
+  item = item || {};
+  const hz = Number(item.blockHz || 0);
+  if (Number.isFinite(hz) && hz > 0) return hz.toFixed(0);
+  const key = Number(item.freqKey || 0);
+  if (Number.isFinite(key) && key > 0) return (key * 1000).toFixed(0);
+  return Number(item.gridFreqHz || item.freqHz || 0).toFixed(0);
 }
 function fmtLastSeen(seconds) {
   const ts = Number(seconds || 0);
@@ -2487,7 +2507,7 @@ function renderActivityHistory(s) {
   const rows = sortHistoryRows([...(s.history || [])]);
   body.innerHTML = rows.map(h => {
     const isLocked = lockedHz > 0 && sameFreqKey(h.freqHz, lockedHz);
-    const hz = Number(h.freqHz).toFixed(0);
+    const hz = blockHzFor(h);
     return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : hz})">${isLocked ? "Unlock" : "Lock"}</button></td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${hz}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`;
   }).join("") || `<tr><td colspan="6" class="muted">No history yet</td></tr>`;
 }
@@ -2504,7 +2524,7 @@ function renderBlockedFrequencies(s) {
   });
   const rows = sortRows((s.history || []).filter(h => h.blocked), blockedSortKey, blockedSortDir);
   body.innerHTML = rows.map(h =>
-    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action danger" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, false)">Unblock</button></td></tr>`
+    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action danger" onclick="blockFrequency(${blockHzFor(h)}, false)">Unblock</button></td></tr>`
   ).join("") || `<tr><td colspan="5" class="muted">No blocked frequencies</td></tr>`;
 }
 function renderSourceControls(s) {
@@ -2628,6 +2648,7 @@ function renderHeatMap(s) {
       lastSeen: 0
     };
     row.freqHz = data.gridFreqHz || data.freqHz || row.freqHz;
+    row.blockHz = data.blockHz || (data.freqKey ? Number(data.freqKey) * 1000 : row.blockHz);
     row.name = data.name || row.name;
     row.count = Math.max(row.count, data.count || 0);
     row.blocked = row.blocked || !!data.blocked;
@@ -2665,7 +2686,7 @@ function renderHeatMap(s) {
     ].filter(Boolean).join(" / ");
     return `<div class="heat-cell ${item.blocked ? "blocked" : ""} ${item.live ? "live" : ""}"
         style="background:${bg}"
-        onclick="blockFrequency(${Number(item.freqHz).toFixed(0)}, ${item.blocked ? "false" : "true"})"
+        onclick="blockFrequency(${blockHzFor(item)}, ${item.blocked ? "false" : "true"})"
         title="${item.blocked ? "Unblock" : "Block"} ${esc(fmtMHz(item.freqHz))}">
         <div class="heat-freq">${esc(fmtMHz(item.freqHz))}</div>
         <div class="heat-name">${esc(item.name || "")}</div>
@@ -3277,7 +3298,7 @@ async function refresh(force = false) {
 	    renderActivityHistory(s);
 	    renderHeatMap(s);
 	    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
-	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${blockHzFor(ch)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
 	    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
 	    renderBlockedFrequencies(s);
 	    const tx = (s.lastTranscriptText || "").trim();
@@ -3997,7 +4018,13 @@ setRefreshInterval(refreshIntervalMs);
                 if (!setFrequencyBlocked(hz, blocked, error)) {
                     return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
                 }
-                return webStateSnapshot();
+                int64_t key = freqKey(hz);
+                return json({
+                    {"ok", true},
+                    {"freqKey", key},
+                    {"blockHz", (double)key * 1000.0},
+                    {"blocked", blocked}
+                });
             });
             return;
         }
