@@ -1853,7 +1853,6 @@ private:
             playbackQueued = (int)playbackQueue.size();
             playback["queued"] = playbackQueued;
         }
-#if defined(__APPLE__) || defined(_WIN32)
         if (playback.value("active", false)) {
             std::string path;
             {
@@ -1866,13 +1865,6 @@ private:
             playback["file"] = path;
             if (!path.empty()) playback["fileName"] = std::filesystem::path(path).filename().string();
         }
-#else
-        if (playback.value("active", false)) {
-            double freqHz = playingFreqHz > 0.0 ? playingFreqHz : (double)playingKey * 1000.0;
-            playback["freqHz"] = freqHz;
-            playback["name"] = displayName(freqHz);
-        }
-#endif
 
         json history = json::array();
         {
@@ -2083,6 +2075,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <button class="primary" id="start">Start Channel Bank</button>
 <button class="danger" id="stop">Stop Channel Bank</button>
 <button class="secondary" id="monitorAudio">Monitor Audio</button>
+<select id="monitorAudioMode" title="Monitor audio path"><option value="auto">Audio Auto</option><option value="pcm">Low Latency</option><option value="media">Background</option></select>
 <div class="muted" id="monitorState">Monitor stopped</div>
 </div>
 <div class="muted" id="settingsStatus" style="margin-top:8px">Settings ready</div>
@@ -2170,6 +2163,9 @@ let monitorRunId = 0;
 let monitorRetryTimer = null;
 let monitorRetryDelayMs = 1200;
 let monitorMode = "idle";
+let monitorAudioMode = localStorage.getItem("channelBankMonitorAudioMode") || "auto";
+if (!["auto", "pcm", "media"].includes(monitorAudioMode)) monitorAudioMode = "auto";
+let monitorMediaFile = "";
 let webConnected = false;
 let refreshInFlight = false;
 let lastRefreshStarted = 0;
@@ -3083,10 +3079,12 @@ function stopMonitorOutput() {
   resetMonitorBuffer();
 }
 function shouldUseMediaElementAudio() {
+  if (monitorAudioMode === "media") return true;
+  if (monitorAudioMode === "pcm") return false;
   const ua = navigator.userAgent || "";
-  const isSafari = /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/i.test(ua);
-  const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone;
-  return isSafari || !!standalone;
+  const isSafari = /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox|Android/i.test(ua);
+  const isiOS = /iPad|iPhone|iPod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  return isSafari || isiOS;
 }
 function setupMonitorMediaSession() {
   if (!("mediaSession" in navigator)) return;
@@ -3122,7 +3120,7 @@ async function startMediaElementMonitor(runId) {
     document.body.appendChild(monitorAudioEl);
   }
   monitorAudioEl.pause();
-  monitorAudioEl.src = `/api/audio/live.wav?run=${runId}&t=${Date.now()}`;
+  monitorAudioEl.removeAttribute("src");
   monitorAudioEl.loop = false;
   monitorAudioEl.onplaying = () => {
     resetMonitorRetryDelay();
@@ -3130,10 +3128,33 @@ async function startMediaElementMonitor(runId) {
   };
   monitorAudioEl.onwaiting = () => setMonitorUi(true, "Monitor buffering...");
   monitorAudioEl.onstalled = () => setMonitorUi(true, "Monitor buffering...");
-  monitorAudioEl.onended = () => reconnectMediaElementMonitor(runId, "media monitor ended");
-  monitorAudioEl.onerror = () => reconnectMediaElementMonitor(runId, "media monitor error");
+  monitorAudioEl.onended = () => setMonitorUi(true, "Waiting for playback...");
+  monitorAudioEl.onerror = () => setMonitorUi(true, "Waiting for playback...");
   monitorAudioEl.load();
-  await monitorAudioEl.play();
+  monitorMediaFile = "";
+  setMonitorUi(true, "Waiting for playback...");
+}
+function syncMediaElementPlayback(s) {
+  if (!monitorRunning || monitorMode !== "media" || !monitorAudioEl) return;
+  const playback = s.playback || {};
+  const file = playback.active && playback.file ? String(playback.file) : "";
+  if (!file) {
+    if (!monitorAudioEl.paused) monitorAudioEl.pause();
+    monitorMediaFile = "";
+    setMonitorUi(true, "Waiting for playback...");
+    return;
+  }
+  if (file !== monitorMediaFile) {
+    monitorMediaFile = file;
+    monitorAudioEl.pause();
+    monitorAudioEl.src = `/api/audio/current-playback?run=${monitorRunId}&t=${Date.now()}`;
+    monitorAudioEl.load();
+    monitorAudioEl.play().catch(e => {
+      console.warn(e);
+      if (monitorRunning && monitorMode === "media") setMonitorUi(true, "Waiting for playback...");
+    });
+    setMonitorUi(true, playback.name ? `Playing ${playback.name}` : "Playing transmission...");
+  }
 }
 async function startMonitorAudio() {
   if (monitorRunning) return;
@@ -3143,6 +3164,7 @@ async function startMonitorAudio() {
   monitorRunning = true;
   monitorMode = "pcm";
   setMonitorUi(true, "Monitor connecting...");
+  setupMonitorMediaSession();
   const AudioCtor = window.AudioContext || window.webkitAudioContext;
   let carry = new Uint8Array(0);
   let audioReady = false;
@@ -3357,8 +3379,9 @@ async function refresh(force = false) {
 	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${blockHzFor(ch)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
 	    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
 	    renderBlockedFrequencies(s);
-	    const tx = (s.lastTranscriptText || "").trim();
+    const tx = (s.lastTranscriptText || "").trim();
     document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
+    syncMediaElementPlayback(s);
   } catch (e) {
     webConnected = false;
     document.getElementById("state").textContent = "Disconnected";
@@ -3384,6 +3407,18 @@ document.getElementById("monitorAudio").onclick = () => {
   if (monitorRunning) stopMonitorAudio();
   else startMonitorAudio();
 };
+const monitorAudioModeEl = document.getElementById("monitorAudioMode");
+if (monitorAudioModeEl) {
+  monitorAudioModeEl.value = monitorAudioMode;
+  monitorAudioModeEl.onchange = e => {
+    monitorAudioMode = ["auto", "pcm", "media"].includes(e.target.value) ? e.target.value : "auto";
+    localStorage.setItem("channelBankMonitorAudioMode", monitorAudioMode);
+    if (monitorRunning) {
+      stopMonitorAudio();
+      setTimeout(startMonitorAudio, 80);
+    }
+  };
+}
 document.getElementById("cbRecordingToggle").onclick = () => {
   saveSettingValue("recordingEnabled", !currentRecordingEnabled);
 };
@@ -3790,6 +3825,55 @@ self.addEventListener("fetch", event => {
         sendAll(fd, body.data(), body.size());
     }
 
+    void sendCurrentPlaybackAudio(WebSocket fd) {
+        if (currentlyPlayingFreqKey.load() == 0) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "no active playback"}}).dump());
+            return;
+        }
+
+        std::string path;
+        {
+            std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
+            path = currentPlaybackPath;
+        }
+        if (path.empty()) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "playback file unavailable"}}).dump());
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::path filePath = std::filesystem::weakly_canonical(path, ec);
+        if (ec || !std::filesystem::is_regular_file(filePath, ec) || ec) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "playback file not found"}}).dump());
+            return;
+        }
+
+        std::ifstream f(filePath, std::ios::binary);
+        if (!f.is_open()) {
+            sendHttpResponse(fd, "404 Not Found", "application/json",
+                json({{"ok", false}, {"error", "playback file not readable"}}).dump());
+            return;
+        }
+        std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::string ext = filePath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        std::string contentType = ext == ".m4a" ? "audio/mp4" : "audio/wav";
+
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << contentType << "\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Cache-Control: no-store\r\n"
+            << "Access-Control-Allow-Origin: *\r\n"
+            << "Connection: close\r\n\r\n";
+        std::string header = oss.str();
+        sendAll(fd, header.data(), header.size());
+        sendAll(fd, body.data(), body.size());
+    }
+
     static uint64_t steadyMs() {
         return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -4114,6 +4198,10 @@ self.addEventListener("fetch", event => {
         }
         if (method == "GET" && path == "/api/audio/live.pcm") {
             handleLiveAudioStream(fd);
+            return;
+        }
+        if (method == "GET" && path.rfind("/api/audio/current-playback", 0) == 0) {
+            sendCurrentPlaybackAudio(fd);
             return;
         }
         if (method == "GET" && path.rfind("/api/audio/live.wav", 0) == 0) {
@@ -6756,12 +6844,10 @@ self.addEventListener("fetch", event => {
                     finalM4APath = playbackQueue.front().finalM4APath;
                     deleteAfter = playbackQueue.front().deleteAfter;
                     playbackQueue.pop_front();
-#if defined(__APPLE__) || defined(_WIN32)
                     {
                         std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
                         currentPlaybackPath = path;
                     }
-#endif
                 }
             }
 
@@ -6829,12 +6915,10 @@ self.addEventListener("fetch", event => {
                     if (canEncode) triggerEncode(path, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
                 }
 #endif
-#if defined(__APPLE__) || defined(_WIN32)
                 {
                     std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
                     if (currentPlaybackPath == path) currentPlaybackPath.clear();
                 }
-#endif
             } else {
                 std::unique_lock<std::mutex> lk(playbackMtx);
                 playbackCv.wait_for(lk, std::chrono::milliseconds(250), [this] {
