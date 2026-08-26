@@ -9,11 +9,11 @@
 #include <math.h>
 #include <stdint.h>
 #include "FX3Class.h"
+#include "r2iq.h"
 
 #include "dsp/ringbuffer.h"
 
 class RadioHardware;
-class r2iqControlClass;
 
 enum {
     RESULT_OK,
@@ -63,6 +63,14 @@ public:
 
     float getBps() const { return mBps; }
     float getSpsIF() const {return mSpsIF; }
+    int getInputFullCount() const { return inputbuffer.getFullCount(); }
+    int getInputEmptyCount() const { return inputbuffer.getEmptyCount(); }
+    int getInputWriteCount() const { return inputbuffer.getWriteCount(); }
+    int getOutputFullCount() const { return outputbuffer.getFullCount(); }
+    int getOutputEmptyCount() const { return outputbuffer.getEmptyCount(); }
+    int getOutputWriteCount() const { return outputbuffer.getWriteCount(); }
+    R2iqTimingSnapshot getR2iqTimingSnapshot() const { return r2iqCntrl ? r2iqCntrl->getTimingSnapshot() : R2iqTimingSnapshot{}; }
+    void resetR2iqTiming() { if (r2iqCntrl) { r2iqCntrl->resetTiming(); } }
 
     const char* getName() const;
     RadioModel getModel() { return radio; }
@@ -111,8 +119,13 @@ private:
     int requestedR2iqWorkers;
 
     // transfer variables
+#if defined(__ANDROID__)
+    ringbuffer<int16_t> inputbuffer { 256 };
+    ringbuffer<float> outputbuffer { 128 };
+#else
     ringbuffer<int16_t> inputbuffer;
     ringbuffer<float> outputbuffer;
+#endif
 
     // threads
     std::thread show_stats_thread;

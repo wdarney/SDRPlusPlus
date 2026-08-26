@@ -21,6 +21,7 @@ The name r2iq as Real 2 I+Q stream
 #include "fir.h"
 
 #include <assert.h>
+#include <chrono>
 #include <cstdio>
 #include <utility>
 
@@ -64,7 +65,13 @@ fft_mt_r2iq::fft_mt_r2iq() :
 	android_decimate(0),
 	android_filter(nullptr),
 	android_filter2(nullptr),
-	android_lsb(false)
+	android_lsb(false),
+	timing_chunks(0),
+	timing_forward_ns(0),
+	timing_shift_ns(0),
+	timing_inverse_ns(0),
+	timing_copy_ns(0),
+	timing_sync_ns(0)
 #endif
 {
 	mtunebin = halfFft / 4;
@@ -187,7 +194,9 @@ void fft_mt_r2iq::setWorkerCount(int workers)
 #if defined(__ANDROID__)
 void fft_mt_r2iq::processFftChunk(r2iqThreadArg* th, const float* adcInTime, int k, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, fftwf_complex* pout, int decimate)
 {
+	auto t0 = std::chrono::steady_clock::now();
 	fftwf_execute_dft_r2c(th->plan_t2f_r2c, const_cast<float*>(adcInTime) + (3 * halfFft / 2) * k, th->ADCinFreq);
+	auto t1 = std::chrono::steady_clock::now();
 
 	const auto count = std::min(mfft / 2, halfFft - mtunebin);
 	const auto source = &th->ADCinFreq[mtunebin];
@@ -202,8 +211,10 @@ void fft_mt_r2iq::processFftChunk(r2iqThreadArg* th, const float* adcInTime, int
 	shift_freq(dest, source2, filter2, start, mfft / 2);
 	if (start != 0)
 		memset(th->inFreqTmp[mfft / 2], 0, sizeof(float) * 2 * start);
+	auto t2 = std::chrono::steady_clock::now();
 
 	fftwf_execute_dft(th->plans_f2t_c2c[decimate], th->inFreqTmp, th->inFreqTmp);
+	auto t3 = std::chrono::steady_clock::now();
 
 	if (lsb)
 	{
@@ -219,6 +230,12 @@ void fft_mt_r2iq::processFftChunk(r2iqThreadArg* th, const float* adcInTime, int
 		else
 			copy<false>(pout + mfft / 2 + (3 * mfft / 4) * (k - 1), &th->inFreqTmp[0], (3 * mfft / 4));
 	}
+	auto t4 = std::chrono::steady_clock::now();
+	timing_forward_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(), std::memory_order_relaxed);
+	timing_shift_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count(), std::memory_order_relaxed);
+	timing_inverse_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count(), std::memory_order_relaxed);
+	timing_copy_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count(), std::memory_order_relaxed);
+	timing_chunks.fetch_add(1, std::memory_order_relaxed);
 }
 
 void fft_mt_r2iq::androidWorkerLoop(unsigned workerIdx)
@@ -289,10 +306,35 @@ void fft_mt_r2iq::androidRunBlock(fftwf_complex* pout, int mfft, int mtunebin, c
 		processFftChunk(threadArgs[0], threadArgs[0]->ADCinTime, k, mfft, mtunebin, filter, filter2, lsb, pout, decimate);
 	}
 
+	auto waitStart = std::chrono::steady_clock::now();
 	std::unique_lock<std::mutex> lk(android_work_mutex);
 	android_done_cv.wait(lk, [this] {
 		return android_completed_seq >= android_worker_count - 1;
 	});
+	auto waitEnd = std::chrono::steady_clock::now();
+	timing_sync_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(waitEnd - waitStart).count(), std::memory_order_relaxed);
+}
+
+R2iqTimingSnapshot fft_mt_r2iq::getTimingSnapshot() const
+{
+	return {
+		timing_chunks.load(std::memory_order_relaxed),
+		timing_forward_ns.load(std::memory_order_relaxed),
+		timing_shift_ns.load(std::memory_order_relaxed),
+		timing_inverse_ns.load(std::memory_order_relaxed),
+		timing_copy_ns.load(std::memory_order_relaxed),
+		timing_sync_ns.load(std::memory_order_relaxed)
+	};
+}
+
+void fft_mt_r2iq::resetTiming()
+{
+	timing_chunks.store(0, std::memory_order_relaxed);
+	timing_forward_ns.store(0, std::memory_order_relaxed);
+	timing_shift_ns.store(0, std::memory_order_relaxed);
+	timing_inverse_ns.store(0, std::memory_order_relaxed);
+	timing_copy_ns.store(0, std::memory_order_relaxed);
+	timing_sync_ns.store(0, std::memory_order_relaxed);
 }
 
 void* fft_mt_r2iq::r2iqThreadf_android(r2iqThreadArg* th)
