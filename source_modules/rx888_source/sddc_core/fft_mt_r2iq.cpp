@@ -157,8 +157,15 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 	if (processor_count > N_MAX_R2IQ_THREADS)
 		processor_count = N_MAX_R2IQ_THREADS;
 #if defined(__ANDROID__)
-	if (processor_count > 2)
-		processor_count = 2;
+	unsigned androidMaxWorkers = std::thread::hardware_concurrency();
+	if (androidMaxWorkers > 2)
+		androidMaxWorkers -= 2;
+	else
+		androidMaxWorkers = 1;
+	if (androidMaxWorkers > 3)
+		androidMaxWorkers = 3;
+	if (processor_count > androidMaxWorkers)
+		processor_count = androidMaxWorkers;
 #endif
 
 	{
