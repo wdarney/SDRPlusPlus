@@ -46,7 +46,25 @@ r2iqControlClass::r2iqControlClass()
 
 fft_mt_r2iq::fft_mt_r2iq() :
 	r2iqControlClass(),
-	filterHw(nullptr)
+	filterHw(nullptr),
+	processor_count(0),
+	allocated_thread_count(0)
+#if defined(__ANDROID__)
+	,
+	android_worker_count(1),
+	android_next_k(0),
+	android_work_seq(0),
+	android_completed_seq(0),
+	android_stop_workers(false),
+	android_adc_in_time(nullptr),
+	android_pout(nullptr),
+	android_mfft(0),
+	android_mtunebin(0),
+	android_decimate(0),
+	android_filter(nullptr),
+	android_filter2(nullptr),
+	android_lsb(false)
+#endif
 {
 	mtunebin = halfFft / 4;
 	mfftdim[0] = halfFft;
@@ -95,8 +113,13 @@ fft_mt_r2iq::~fft_mt_r2iq()
 		fftwf_destroy_plan(plans_f2t_c2c[d]);
 	}
 
-	for (unsigned t = 0; t < processor_count; t++) {
+	for (unsigned t = 0; t < allocated_thread_count; t++) {
 		auto th = threadArgs[t];
+		fftwf_destroy_plan(th->plan_t2f_r2c);
+		for (int d = 0; d < NDECIDX; d++)
+		{
+			fftwf_destroy_plan(th->plans_f2t_c2c[d]);
+		}
 		fftwf_free(th->ADCinTime);
 		fftwf_free(th->ADCinFreq);
 		fftwf_free(th->inFreqTmp);
@@ -147,6 +170,195 @@ void fft_mt_r2iq::TurnOff(void) {
 
 bool fft_mt_r2iq::IsOn(void) { return(this->r2iqOn); }
 
+#if defined(__ANDROID__)
+void fft_mt_r2iq::processFftChunk(r2iqThreadArg* th, const float* adcInTime, int k, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, fftwf_complex* pout, int decimate)
+{
+	fftwf_execute_dft_r2c(th->plan_t2f_r2c, const_cast<float*>(adcInTime) + (3 * halfFft / 2) * k, th->ADCinFreq);
+
+	const auto count = std::min(mfft / 2, halfFft - mtunebin);
+	const auto source = &th->ADCinFreq[mtunebin];
+	const auto start = std::max(0, mfft / 2 - mtunebin);
+	const auto source2 = &th->ADCinFreq[mtunebin - mfft / 2];
+	const auto dest = &th->inFreqTmp[mfft / 2];
+
+	shift_freq(th->inFreqTmp, source, filter, 0, count);
+	if (mfft / 2 != count)
+		memset(th->inFreqTmp[count], 0, sizeof(float) * 2 * (mfft / 2 - count));
+
+	shift_freq(dest, source2, filter2, start, mfft / 2);
+	if (start != 0)
+		memset(th->inFreqTmp[mfft / 2], 0, sizeof(float) * 2 * start);
+
+	fftwf_execute_dft(th->plans_f2t_c2c[decimate], th->inFreqTmp, th->inFreqTmp);
+
+	if (lsb)
+	{
+		if (k == 0)
+			copy<true>(pout, &th->inFreqTmp[mfft / 4], mfft / 2);
+		else
+			copy<true>(pout + mfft / 2 + (3 * mfft / 4) * (k - 1), &th->inFreqTmp[0], (3 * mfft / 4));
+	}
+	else
+	{
+		if (k == 0)
+			copy<false>(pout, &th->inFreqTmp[mfft / 4], mfft / 2);
+		else
+			copy<false>(pout + mfft / 2 + (3 * mfft / 4) * (k - 1), &th->inFreqTmp[0], (3 * mfft / 4));
+	}
+}
+
+void fft_mt_r2iq::androidWorkerLoop(unsigned workerIdx)
+{
+	char name[16];
+	std::snprintf(name, sizeof(name), "rx888-r2iq-%u", workerIdx);
+	rx888_set_thread_name(name);
+
+	uint64_t seenSeq = 0;
+	while (true)
+	{
+		{
+			std::unique_lock<std::mutex> lk(android_work_mutex);
+			android_work_cv.wait(lk, [this, seenSeq] {
+				return android_stop_workers || android_work_seq != seenSeq;
+			});
+			if (android_stop_workers)
+				return;
+			seenSeq = android_work_seq;
+		}
+
+		while (true)
+		{
+			int k = android_next_k.fetch_add(1);
+			if (k >= fftPerBuf)
+				break;
+			processFftChunk(threadArgs[workerIdx], android_adc_in_time, k, android_mfft, android_mtunebin, android_filter, android_filter2, android_lsb, android_pout, android_decimate);
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(android_work_mutex);
+			android_completed_seq++;
+			android_done_cv.notify_one();
+		}
+	}
+}
+
+void fft_mt_r2iq::androidRunBlock(fftwf_complex* pout, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, int decimate)
+{
+	if (android_worker_count <= 1)
+	{
+		for (int k = 0; k < fftPerBuf; k++)
+			processFftChunk(threadArgs[0], threadArgs[0]->ADCinTime, k, mfft, mtunebin, filter, filter2, lsb, pout, decimate);
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(android_work_mutex);
+		android_adc_in_time = threadArgs[0]->ADCinTime;
+		android_pout = pout;
+		android_mfft = mfft;
+		android_mtunebin = mtunebin;
+		android_filter = filter;
+		android_filter2 = filter2;
+		android_lsb = lsb;
+		android_decimate = decimate;
+		android_next_k = 0;
+		android_completed_seq = 0;
+		android_work_seq++;
+	}
+	android_work_cv.notify_all();
+
+	while (true)
+	{
+		int k = android_next_k.fetch_add(1);
+		if (k >= fftPerBuf)
+			break;
+		processFftChunk(threadArgs[0], threadArgs[0]->ADCinTime, k, mfft, mtunebin, filter, filter2, lsb, pout, decimate);
+	}
+
+	std::unique_lock<std::mutex> lk(android_work_mutex);
+	android_done_cv.wait(lk, [this] {
+		return android_completed_seq >= android_worker_count - 1;
+	});
+}
+
+void* fft_mt_r2iq::r2iqThreadf_android(r2iqThreadArg* th)
+{
+	rx888_set_thread_name("rx888-r2iq-0");
+
+	android_stop_workers = false;
+	android_workers.clear();
+	for (unsigned t = 1; t < android_worker_count; t++)
+	{
+		android_workers.emplace_back([this, t] {
+			androidWorkerLoop(t);
+		});
+	}
+
+	const int decimate = this->mdecimation;
+	const int mfft = this->mfftdim[decimate];
+	const fftwf_complex* filter = filterHw[decimate];
+	const bool lsb = this->getSideband();
+	const auto filter2 = &filter[halfFft - mfft / 2];
+
+	fftwf_complex* pout = nullptr;
+	int decimate_count = 0;
+
+	while (r2iqOn)
+	{
+		const int16_t* dataADC = inputbuffer->getReadPtr();
+		if (!r2iqOn)
+			break;
+
+		this->bufIdx = (this->bufIdx + 1) % QUEUE_SIZE;
+		const int16_t* endloop = inputbuffer->peekReadPtr(-1) + transferSamples - halfFft;
+		const int mtunebin = this->mtunebin;
+
+		auto inloop = th->ADCinTime;
+		if (!this->getRand())
+		{
+			convert_float<false>(endloop, inloop, halfFft);
+			convert_float<false>(dataADC, inloop + halfFft, transferSamples);
+		}
+		else
+		{
+			convert_float<true>(endloop, inloop, halfFft);
+			convert_float<true>(dataADC, inloop + halfFft, transferSamples);
+		}
+		inputbuffer->ReadDone();
+
+		if (decimate_count == 0)
+			pout = (fftwf_complex*)outputbuffer->getWritePtr();
+
+		decimate_count = (decimate_count + 1) & ((1 << decimate) - 1);
+		androidRunBlock(pout, mfft, mtunebin, filter, filter2, lsb, decimate);
+
+		if (decimate_count == 0)
+		{
+			outputbuffer->WriteDone();
+			pout = nullptr;
+		}
+		else
+		{
+			pout += mfft / 2 + (3 * mfft / 4) * (fftPerBuf - 1);
+		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(android_work_mutex);
+		android_stop_workers = true;
+		android_work_seq++;
+	}
+	android_work_cv.notify_all();
+	for (auto& worker : android_workers)
+	{
+		if (worker.joinable())
+			worker.join();
+	}
+	android_workers.clear();
+	return 0;
+}
+#endif
+
 void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>* obuffers)
 {
 	this->inputbuffer = input;    // set to the global exported by main_loop
@@ -162,6 +374,7 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 		processor_count = 1;
 	if (processor_count > N_MAX_R2IQ_THREADS)
 		processor_count = N_MAX_R2IQ_THREADS;
+	allocated_thread_count = processor_count;
 #if defined(__ANDROID__)
 	unsigned androidMaxWorkers = std::thread::hardware_concurrency();
 	if (androidMaxWorkers > 2)
@@ -170,8 +383,11 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 		androidMaxWorkers = 1;
 	if (androidMaxWorkers > 3)
 		androidMaxWorkers = 3;
-	if (processor_count > androidMaxWorkers)
-		processor_count = androidMaxWorkers;
+	android_worker_count = androidMaxWorkers;
+	if (android_worker_count < 1)
+		android_worker_count = 1;
+	processor_count = 1;
+	allocated_thread_count = android_worker_count;
 #endif
 
 	{
@@ -222,7 +438,7 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 		fftwf_destroy_plan(filterplan_t2f_c2c);
 		fftwf_free(pfilterht);
 
-		for (unsigned t = 0; t < processor_count; t++) {
+		for (unsigned t = 0; t < allocated_thread_count; t++) {
 			r2iqThreadArg *th = new r2iqThreadArg();
 			threadArgs[t] = th;
 
@@ -230,6 +446,11 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 
 			th->ADCinFreq = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*(halfFft + 1)); // 1024+1
 			th->inFreqTmp = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*(halfFft));    // 1024
+			th->plan_t2f_r2c = fftwf_plan_dft_r2c_1d(2 * halfFft, th->ADCinTime, th->ADCinFreq, RX888_FFTW_PLAN_FLAGS);
+			for (int d = 0; d < NDECIDX; d++)
+			{
+				th->plans_f2t_c2c[d] = fftwf_plan_dft_1d(mfftdim[d], th->inFreqTmp, th->inFreqTmp, FFTW_BACKWARD, RX888_FFTW_PLAN_FLAGS);
+			}
 		}
 
 		plan_t2f_r2c = fftwf_plan_dft_r2c_1d(2 * halfFft, threadArgs[0]->ADCinTime, threadArgs[0]->ADCinFreq, RX888_FFTW_PLAN_FLAGS);
@@ -282,6 +503,9 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 
 void * fft_mt_r2iq::r2iqThreadf(r2iqThreadArg *th)
 {
+#if defined(__ANDROID__)
+	return r2iqThreadf_android(th);
+#endif
 #ifdef NO_SIMD_OPTIM
 	DbgPrintf("Hardware Capability: all SIMD features (AVX, AVX2, AVX512) deactivated\n");
 	return r2iqThreadf_def(th);
