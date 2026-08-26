@@ -34,6 +34,7 @@ public:
     virtual bool IsOn(void) { return this->r2iqOn; }
     virtual void DataReady(void) {}
     virtual float setFreqOffset(float offset) { return 0; };
+    virtual void setWorkerCount(int workers) {}
 
 protected:
     int mdecimation ;   // selected decimation ratio

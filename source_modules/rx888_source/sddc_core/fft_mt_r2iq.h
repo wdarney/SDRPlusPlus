@@ -35,6 +35,7 @@ public:
     void TurnOn();
     void TurnOff(void);
     bool IsOn(void);
+    void setWorkerCount(int workers) override;
 
 protected:
 
@@ -118,6 +119,7 @@ private:
     uint32_t processor_count;
     uint32_t allocated_thread_count;
 #if defined(__ANDROID__)
+    uint32_t requested_android_worker_count;
     uint32_t android_worker_count;
     std::vector<std::thread> android_workers;
     std::mutex android_work_mutex;

@@ -75,6 +75,7 @@ RadioHandlerClass::RadioHandlerClass() :
 	biasT_VHF(false),
 	firmware(0),
 	modeRF(NOMODE),
+	requestedR2iqWorkers(3),
 	adcrate(DEFAULT_ADC_FREQ),
 	fc(0.0f),
 	hardware(new DummyRadio(nullptr))
@@ -101,6 +102,7 @@ bool RadioHandlerClass::Init(fx3class* Fx3, void (*callback)(void*context, const
 
 	if (r2iqCntrl == nullptr)
 		r2iqCntrl = new fft_mt_r2iq();
+	r2iqCntrl->setWorkerCount(requestedR2iqWorkers);
 
 	Fx3->GetHardwareInfo((uint32_t*)rdata);
 
@@ -151,6 +153,15 @@ bool RadioHandlerClass::Init(fx3class* Fx3, void (*callback)(void*context, const
 	r2iqCntrl->Init(hardware->getGain(), &inputbuffer, &outputbuffer);
 
 	return true;
+}
+
+void RadioHandlerClass::SetR2iqWorkerCount(int workers)
+{
+	if (workers < 1)
+		workers = 1;
+	if (workers > 4)
+		workers = 4;
+	requestedR2iqWorkers = workers;
 }
 
 bool RadioHandlerClass::Start(int srate_idx)
