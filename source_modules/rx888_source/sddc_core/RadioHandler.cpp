@@ -9,6 +9,7 @@
 #include "fft_mt_r2iq.h"
 #include "config.h"
 #include "PScope_uti.h"
+#include "thread_names.h"
 #include "../Interface.h"
 
 #include <algorithm>
@@ -22,6 +23,8 @@ unsigned long Failures = 0;
 
 void RadioHandlerClass::OnDataPacket()
 {
+	rx888_set_thread_name("rx888-submit");
+
 	auto len = outputbuffer.getBlockSize() / 2 / sizeof(float);
 
 	while(run)

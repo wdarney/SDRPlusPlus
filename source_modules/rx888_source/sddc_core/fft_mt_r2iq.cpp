@@ -16,10 +16,12 @@ The name r2iq as Real 2 I+Q stream
 #include "config.h"
 #include "fftw3.h"
 #include "RadioHandler.h"
+#include "thread_names.h"
 
 #include "fir.h"
 
 #include <assert.h>
+#include <cstdio>
 #include <utility>
 
 #if defined(__ANDROID__)
@@ -124,8 +126,12 @@ void fft_mt_r2iq::TurnOn() {
 
 	for (unsigned t = 0; t < processor_count; t++) {
 		r2iq_thread[t] = std::thread(
-			[this] (void* arg)
-				{ return this->r2iqThreadf((r2iqThreadArg*)arg); }, (void*)threadArgs[t]);
+			[this, t] (void* arg) {
+				char name[16];
+				std::snprintf(name, sizeof(name), "rx888-r2iq-%u", t);
+				rx888_set_thread_name(name);
+				return this->r2iqThreadf((r2iqThreadArg*)arg);
+			}, (void*)threadArgs[t]);
 	}
 }
 
