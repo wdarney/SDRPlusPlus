@@ -9,11 +9,11 @@
 #include <math.h>
 #include <stdint.h>
 #include "FX3Class.h"
+#include "r2iq.h"
 
 #include "dsp/ringbuffer.h"
 
 class RadioHardware;
-class r2iqControlClass;
 
 enum {
     RESULT_OK,
@@ -69,6 +69,8 @@ public:
     int getOutputFullCount() const { return outputbuffer.getFullCount(); }
     int getOutputEmptyCount() const { return outputbuffer.getEmptyCount(); }
     int getOutputWriteCount() const { return outputbuffer.getWriteCount(); }
+    R2iqTimingSnapshot getR2iqTimingSnapshot() const { return r2iqCntrl ? r2iqCntrl->getTimingSnapshot() : R2iqTimingSnapshot{}; }
+    void resetR2iqTiming() { if (r2iqCntrl) { r2iqCntrl->resetTiming(); } }
 
     const char* getName() const;
     RadioModel getModel() { return radio; }

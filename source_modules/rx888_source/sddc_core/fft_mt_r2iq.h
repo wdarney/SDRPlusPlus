@@ -36,6 +36,8 @@ public:
     void TurnOff(void);
     bool IsOn(void);
     void setWorkerCount(int workers) override;
+    R2iqTimingSnapshot getTimingSnapshot() const override;
+    void resetTiming() override;
 
 protected:
 
@@ -137,6 +139,12 @@ private:
     const fftwf_complex* android_filter;
     const fftwf_complex* android_filter2;
     bool android_lsb;
+    std::atomic<uint64_t> timing_chunks;
+    std::atomic<uint64_t> timing_forward_ns;
+    std::atomic<uint64_t> timing_shift_ns;
+    std::atomic<uint64_t> timing_inverse_ns;
+    std::atomic<uint64_t> timing_copy_ns;
+    std::atomic<uint64_t> timing_sync_ns;
 #endif
     r2iqThreadArg* threadArgs[N_MAX_R2IQ_THREADS];
     std::mutex mutexR2iqControl;                   // r2iq control lock

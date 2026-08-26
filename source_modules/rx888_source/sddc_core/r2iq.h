@@ -8,10 +8,20 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <cstdint>
 
 #include "dsp/ringbuffer.h"
 
 struct r2iqThreadArg;
+
+struct R2iqTimingSnapshot {
+    uint64_t chunks = 0;
+    uint64_t forwardNs = 0;
+    uint64_t shiftNs = 0;
+    uint64_t inverseNs = 0;
+    uint64_t copyNs = 0;
+    uint64_t syncNs = 0;
+};
 
 class r2iqControlClass {
 public:
@@ -35,6 +45,8 @@ public:
     virtual void DataReady(void) {}
     virtual float setFreqOffset(float offset) { return 0; };
     virtual void setWorkerCount(int workers) {}
+    virtual R2iqTimingSnapshot getTimingSnapshot() const { return {}; }
+    virtual void resetTiming() {}
 
 protected:
     int mdecimation ;   // selected decimation ratio

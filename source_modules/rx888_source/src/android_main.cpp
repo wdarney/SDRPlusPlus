@@ -551,6 +551,7 @@ private:
         int lastInputEmpty = radio.getInputEmptyCount();
         int lastOutputFull = radio.getOutputFullCount();
         int lastOutputEmpty = radio.getOutputEmptyCount();
+        R2iqTimingSnapshot lastTiming = radio.getR2iqTimingSnapshot();
 
         while (running) {
             std::this_thread::sleep_for(1s);
@@ -566,10 +567,24 @@ private:
             int inputEmpty = radio.getInputEmptyCount();
             int outputFull = radio.getOutputFullCount();
             int outputEmpty = radio.getOutputEmptyCount();
+            R2iqTimingSnapshot timing = radio.getR2iqTimingSnapshot();
 
             double usbMBps = (double)(usbBytes - lastUsbBytes) / (1024.0 * 1024.0);
             double dspMSps = (double)(samples - lastSamples) / 1000000.0;
             double swapWaitMs = (double)(swapWaitNs - lastSwapWaitNs) / 1000000.0;
+            uint64_t timingChunks = timing.chunks - lastTiming.chunks;
+            uint64_t forwardNs = timing.forwardNs - lastTiming.forwardNs;
+            uint64_t shiftNs = timing.shiftNs - lastTiming.shiftNs;
+            uint64_t inverseNs = timing.inverseNs - lastTiming.inverseNs;
+            uint64_t copyNs = timing.copyNs - lastTiming.copyNs;
+            uint64_t syncNs = timing.syncNs - lastTiming.syncNs;
+            uint64_t totalNs = forwardNs + shiftNs + inverseNs + copyNs + syncNs;
+            auto pct = [totalNs](uint64_t ns) -> double {
+                return totalNs ? (double)ns * 100.0 / (double)totalNs : 0.0;
+            };
+            auto ms = [](uint64_t ns) -> double {
+                return (double)ns / 1000000.0;
+            };
 
             uint64_t deltaUsbTransfers = usbTransfers - lastUsbTransfers;
             uint64_t deltaBlocks = blocks - lastBlocks;
@@ -579,13 +594,19 @@ private:
             int deltaOutputFull = outputFull - lastOutputFull;
             int deltaOutputEmpty = outputEmpty - lastOutputEmpty;
             {
-                char buf[320];
+                char buf[512];
                 snprintf(buf, sizeof(buf),
-                         "Diag USB %.1f MiB/s  DSP %.2f MS/s\nXfer/s %llu  blocks/s %llu  swap %.0f ms/s\nUSB err %llu (+%llu)  oversize %llu\nIn full %d (+%d)  empty %d (+%d)\nOut full %d (+%d)  empty %d (+%d)  stops %llu",
+                         "Diag USB %.1f MiB/s  DSP %.2f MS/s\nXfer/s %llu  blocks/s %llu  swap %.0f ms/s\nR2IQ chunks/s %llu  fwd %.0fms %.0f%%  inv %.0fms %.0f%%\nshift %.0fms %.0f%%  copy %.0fms %.0f%%  sync %.0fms %.0f%%\nUSB err %llu (+%llu)  oversize %llu\nIn full %d (+%d)  empty %d (+%d)\nOut full %d (+%d)  empty %d (+%d)  stops %llu",
                          usbMBps, dspMSps,
                          (unsigned long long)deltaUsbTransfers,
                          (unsigned long long)deltaBlocks,
                          swapWaitMs,
+                         (unsigned long long)timingChunks,
+                         ms(forwardNs), pct(forwardNs),
+                         ms(inverseNs), pct(inverseNs),
+                         ms(shiftNs), pct(shiftNs),
+                         ms(copyNs), pct(copyNs),
+                         ms(syncNs), pct(syncNs),
                          (unsigned long long)usbErrors,
                          (unsigned long long)deltaUsbErrors,
                          (unsigned long long)oversizedDrops.load(),
@@ -597,13 +618,19 @@ private:
                 std::lock_guard<std::mutex> lck(diagTextMtx);
                 diagText = buf;
             }
-            char logBuf[384];
+            char logBuf[640];
             snprintf(logBuf, sizeof(logBuf),
-                     "usb=%.1fMiB/s dsp=%.2fMS/s xfers/s=%llu blocks/s=%llu swap=%.0fms/s usbErr=%llu (+%llu) oversize=%llu inFull=%d (+%d) inEmpty=%d (+%d) outFull=%d (+%d) outEmpty=%d (+%d) stops=%llu",
+                     "usb=%.1fMiB/s dsp=%.2fMS/s xfers/s=%llu blocks/s=%llu swap=%.0fms/s r2iqChunks/s=%llu fwd=%.0fms %.0f%% inv=%.0fms %.0f%% shift=%.0fms %.0f%% copy=%.0fms %.0f%% sync=%.0fms %.0f%% usbErr=%llu (+%llu) oversize=%llu inFull=%d (+%d) inEmpty=%d (+%d) outFull=%d (+%d) outEmpty=%d (+%d) stops=%llu",
                      usbMBps, dspMSps,
                      (unsigned long long)deltaUsbTransfers,
                      (unsigned long long)deltaBlocks,
                      swapWaitMs,
+                     (unsigned long long)timingChunks,
+                     ms(forwardNs), pct(forwardNs),
+                     ms(inverseNs), pct(inverseNs),
+                     ms(shiftNs), pct(shiftNs),
+                     ms(copyNs), pct(copyNs),
+                     ms(syncNs), pct(syncNs),
                      (unsigned long long)usbErrors,
                      (unsigned long long)deltaUsbErrors,
                      (unsigned long long)oversizedDrops.load(),
@@ -624,6 +651,7 @@ private:
             lastInputEmpty = inputEmpty;
             lastOutputFull = outputFull;
             lastOutputEmpty = outputEmpty;
+            lastTiming = timing;
         }
     }
 
@@ -690,6 +718,7 @@ private:
         _this->oversizedDrops = 0;
         _this->streamSwapStops = 0;
         _this->streamSwapWaitNs = 0;
+        _this->radio.resetR2iqTiming();
         _this->activeSampleRate = _this->sampleRate;
         _this->activeSelector = _this->sampleRateIndex();
         _this->activeDecimation = _this->decimationIndex();
