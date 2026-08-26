@@ -51,6 +51,7 @@ fft_mt_r2iq::fft_mt_r2iq() :
 	allocated_thread_count(0)
 #if defined(__ANDROID__)
 	,
+	requested_android_worker_count(3),
 	android_worker_count(1),
 	android_next_k(0),
 	android_work_seq(0),
@@ -169,6 +170,19 @@ void fft_mt_r2iq::TurnOff(void) {
 }
 
 bool fft_mt_r2iq::IsOn(void) { return(this->r2iqOn); }
+
+void fft_mt_r2iq::setWorkerCount(int workers)
+{
+#if defined(__ANDROID__)
+	if (workers < 1)
+		workers = 1;
+	if (workers > N_MAX_R2IQ_THREADS)
+		workers = N_MAX_R2IQ_THREADS;
+	requested_android_worker_count = (uint32_t)workers;
+#else
+	(void)workers;
+#endif
+}
 
 #if defined(__ANDROID__)
 void fft_mt_r2iq::processFftChunk(r2iqThreadArg* th, const float* adcInTime, int k, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, fftwf_complex* pout, int decimate)
@@ -383,7 +397,7 @@ void fft_mt_r2iq::Init(float gain, ringbuffer<int16_t> *input, ringbuffer<float>
 		androidMaxWorkers = 1;
 	if (androidMaxWorkers > 3)
 		androidMaxWorkers = 3;
-	android_worker_count = androidMaxWorkers;
+	android_worker_count = std::min<uint32_t>((uint32_t)requested_android_worker_count, androidMaxWorkers);
 	if (android_worker_count < 1)
 		android_worker_count = 1;
 	processor_count = 1;

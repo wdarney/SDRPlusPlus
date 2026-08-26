@@ -106,6 +106,7 @@ private:
         if (c.contains("adcFreq")) { adcFreq = c["adcFreq"].get<double>(); }
         if (c.contains("rfGain")) { rfGain = c["rfGain"].get<float>(); }
         if (c.contains("ifGain")) { ifGain = c["ifGain"].get<float>(); }
+        if (c.contains("r2iqWorkers")) { r2iqWorkers = std::clamp(c["r2iqWorkers"].get<int>(), 1, 4); }
         if (c.contains("biasTeeHF")) { biasTeeHF = c["biasTeeHF"].get<bool>(); }
         if (c.contains("biasTeeVHF")) { biasTeeVHF = c["biasTeeVHF"].get<bool>(); }
         if (c.contains("dithering")) { dithering = c["dithering"].get<bool>(); }
@@ -120,6 +121,7 @@ private:
         c["adcFreq"] = adcFreq;
         c["rfGain"] = rfGain;
         c["ifGain"] = ifGain;
+        c["r2iqWorkers"] = r2iqWorkers;
         c["biasTeeHF"] = biasTeeHF;
         c["biasTeeVHF"] = biasTeeVHF;
         c["dithering"] = dithering;
@@ -335,6 +337,7 @@ private:
         bool stoppedOnlyChanged = req.contains("deviceLabel") || req.contains("deviceId") ||
                                   req.contains("sampleRate") || req.contains("sampleRateId") ||
                                   req.contains("adcClockMHz") || req.contains("mode") ||
+                                  req.contains("r2iqWorkers") ||
                                   req.value("refresh", false);
         if (running && stoppedOnlyChanged) {
             error = "stop SDR before changing device, sample rate, ADC clock, mode, or refresh";
@@ -389,6 +392,15 @@ private:
         }
         else if (req.contains("sampleRate")) {
             selectSampleRate(req["sampleRate"].get<double>());
+        }
+
+        if (req.contains("r2iqWorkers")) {
+            int workers = req["r2iqWorkers"].get<int>();
+            if (workers < 1 || workers > 4) {
+                error = "R2IQ worker count out of range";
+                return false;
+            }
+            r2iqWorkers = workers;
         }
 
         if (req.contains("gains")) {
@@ -653,6 +665,7 @@ private:
 
         flog::info("RX888: initializing RadioHandler");
         adcnominalfreq = (uint32_t)_this->adcFreq;
+        _this->radio.SetR2iqWorkerCount(_this->r2iqWorkers);
         _this->radioReady = _this->radio.Init(_this->fx3, onSamples, nullptr, _this);
         if (!_this->radioReady) {
             flog::error("RX888: RadioHandler init failed");
@@ -680,8 +693,8 @@ private:
         _this->activeSampleRate = _this->sampleRate;
         _this->activeSelector = _this->sampleRateIndex();
         _this->activeDecimation = _this->decimationIndex();
-        flog::info("RX888: starting stream selector={} decimation={} expected sample rate {} MHz",
-                   _this->activeSelector, _this->activeDecimation, _this->activeSampleRate / 1e6);
+        flog::info("RX888: starting stream selector={} decimation={} expected sample rate {} MHz r2iqWorkers={}",
+                   _this->activeSelector, _this->activeDecimation, _this->activeSampleRate / 1e6, _this->r2iqWorkers);
         _this->radio.Start(_this->activeSelector);
         _this->diagnosticThread = std::thread(&RX888SourceModule::diagnosticsLoop, _this);
         flog::info("RX888: Started direct Android core ({}, {} MHz, ADC {} MHz)",
@@ -789,6 +802,16 @@ private:
 
         if (_this->running) { SmGui::EndDisabled(); }
 
+        if (_this->running) { SmGui::BeginDisabled(); }
+        SmGui::LeftLabel("R2IQ Workers");
+        int workers = _this->r2iqWorkers;
+        SmGui::FillWidth();
+        if (ImGui::SliderInt(CONCAT("##rx888_r2iq_workers_", _this->name), &workers, 1, 4)) {
+            _this->r2iqWorkers = std::clamp(workers, 1, 4);
+            _this->saveConfig("r2iq-workers");
+        }
+        if (_this->running) { SmGui::EndDisabled(); }
+
         SmGui::LeftLabel("RF Gain");
         SmGui::FillWidth();
         const float* rfSteps = nullptr;
@@ -834,10 +857,11 @@ private:
             ImGui::TextUnformatted(_this->diagText.c_str());
         }
         if (_this->running) {
-            ImGui::Text("Active %.1f MHz  selector %d  decim %d",
+            ImGui::Text("Active %.1f MHz  selector %d  decim %d  workers %d",
                         _this->activeSampleRate / 1e6,
                         _this->activeSelector,
-                        _this->activeDecimation);
+                        _this->activeDecimation,
+                        _this->r2iqWorkers);
         }
         else {
             ImGui::TextUnformatted("Active stopped");
@@ -867,6 +891,7 @@ private:
     float ifGain = 0.0f;
     int rfGainCount = 64;
     int ifGainCount = 127;
+    int r2iqWorkers = 3;
     bool biasTeeHF = false;
     bool biasTeeVHF = false;
     bool dithering = true;

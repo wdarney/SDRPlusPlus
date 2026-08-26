@@ -36,6 +36,7 @@ public:
     RadioHandlerClass();
     virtual ~RadioHandlerClass();
     bool Init(fx3class* Fx3, void (*callback)(void* context, const float*, uint32_t), r2iqControlClass *r2iqCntrl = nullptr, void* context = nullptr);
+    void SetR2iqWorkerCount(int workers);
     bool Start(int srate_idx);
     bool Stop();
     bool Close();
@@ -113,6 +114,7 @@ private:
     uint16_t firmware;
     rf_mode modeRF;
     RadioModel radio;
+    int requestedR2iqWorkers;
 
     // transfer variables
 #if defined(__ANDROID__)
