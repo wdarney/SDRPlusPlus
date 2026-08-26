@@ -107,6 +107,7 @@ private:
         if (c.contains("rfGain")) { rfGain = c["rfGain"].get<float>(); }
         if (c.contains("ifGain")) { ifGain = c["ifGain"].get<float>(); }
         if (c.contains("r2iqWorkers")) { r2iqWorkers = std::clamp(c["r2iqWorkers"].get<int>(), 1, 4); }
+        if (c.contains("telemetryIntervalSec")) { telemetryIntervalSec = std::clamp(c["telemetryIntervalSec"].get<int>(), 1, 5); }
         if (c.contains("biasTeeHF")) { biasTeeHF = c["biasTeeHF"].get<bool>(); }
         if (c.contains("biasTeeVHF")) { biasTeeVHF = c["biasTeeVHF"].get<bool>(); }
         if (c.contains("dithering")) { dithering = c["dithering"].get<bool>(); }
@@ -122,6 +123,7 @@ private:
         c["rfGain"] = rfGain;
         c["ifGain"] = ifGain;
         c["r2iqWorkers"] = r2iqWorkers;
+        c["telemetryIntervalSec"] = telemetryIntervalSec.load();
         c["biasTeeHF"] = biasTeeHF;
         c["biasTeeVHF"] = biasTeeVHF;
         c["dithering"] = dithering;
@@ -329,7 +331,13 @@ private:
             {"biasTeeLiveMutable", true},
             {"supportsDithering", true},
             {"dithering", dithering},
-            {"ditheringLiveMutable", true}
+            {"ditheringLiveMutable", true},
+            {"telemetryIntervalSec", telemetryIntervalSec.load()},
+            {"telemetrySpeeds", json::array({
+                json({{"label", "Fast"}, {"intervalSec", 1}, {"selected", telemetryIntervalSec.load() == 1}}),
+                json({{"label", "Slow"}, {"intervalSec", 5}, {"selected", telemetryIntervalSec.load() != 1}})
+            })},
+            {"telemetryLiveMutable", true}
         });
     }
 
@@ -401,6 +409,15 @@ private:
                 return false;
             }
             r2iqWorkers = workers;
+        }
+
+        if (req.contains("telemetryIntervalSec")) {
+            int intervalSec = req["telemetryIntervalSec"].get<int>();
+            if (intervalSec != 1 && intervalSec != 5) {
+                error = "telemetry interval must be 1 or 5 seconds";
+                return false;
+            }
+            telemetryIntervalSec = intervalSec;
         }
 
         if (req.contains("gains")) {
@@ -554,8 +571,10 @@ private:
         R2iqTimingSnapshot lastTiming = radio.getR2iqTimingSnapshot();
 
         while (running) {
-            std::this_thread::sleep_for(1s);
+            int intervalSec = telemetryIntervalSec.load();
+            std::this_thread::sleep_for(std::chrono::seconds(intervalSec));
             if (!running) { break; }
+            double intervalScale = 1.0 / (double)intervalSec;
 
             uint64_t usbBytes = rx888_android_get_usb_bytes();
             uint64_t usbTransfers = rx888_android_get_usb_transfers();
@@ -569,9 +588,9 @@ private:
             int outputEmpty = radio.getOutputEmptyCount();
             R2iqTimingSnapshot timing = radio.getR2iqTimingSnapshot();
 
-            double usbMBps = (double)(usbBytes - lastUsbBytes) / (1024.0 * 1024.0);
-            double dspMSps = (double)(samples - lastSamples) / 1000000.0;
-            double swapWaitMs = (double)(swapWaitNs - lastSwapWaitNs) / 1000000.0;
+            double usbMBps = (double)(usbBytes - lastUsbBytes) / (1024.0 * 1024.0) * intervalScale;
+            double dspMSps = (double)(samples - lastSamples) / 1000000.0 * intervalScale;
+            double swapWaitMs = (double)(swapWaitNs - lastSwapWaitNs) / 1000000.0 * intervalScale;
             uint64_t timingChunks = timing.chunks - lastTiming.chunks;
             uint64_t forwardNs = timing.forwardNs - lastTiming.forwardNs;
             uint64_t shiftNs = timing.shiftNs - lastTiming.shiftNs;
@@ -594,19 +613,22 @@ private:
             int deltaOutputFull = outputFull - lastOutputFull;
             int deltaOutputEmpty = outputEmpty - lastOutputEmpty;
             {
+                uint64_t usbTransfersPerSec = (uint64_t)((double)deltaUsbTransfers * intervalScale);
+                uint64_t blocksPerSec = (uint64_t)((double)deltaBlocks * intervalScale);
+                uint64_t timingChunksPerSec = (uint64_t)((double)timingChunks * intervalScale);
                 char buf[512];
                 snprintf(buf, sizeof(buf),
                          "Diag USB %.1f MiB/s  DSP %.2f MS/s\nXfer/s %llu  blocks/s %llu  swap %.0f ms/s\nR2IQ chunks/s %llu  fwd %.0fms %.0f%%  inv %.0fms %.0f%%\nshift %.0fms %.0f%%  copy %.0fms %.0f%%  sync %.0fms %.0f%%\nUSB err %llu (+%llu)  oversize %llu\nIn full %d (+%d)  empty %d (+%d)\nOut full %d (+%d)  empty %d (+%d)  stops %llu",
                          usbMBps, dspMSps,
-                         (unsigned long long)deltaUsbTransfers,
-                         (unsigned long long)deltaBlocks,
+                         (unsigned long long)usbTransfersPerSec,
+                         (unsigned long long)blocksPerSec,
                          swapWaitMs,
-                         (unsigned long long)timingChunks,
-                         ms(forwardNs), pct(forwardNs),
-                         ms(inverseNs), pct(inverseNs),
-                         ms(shiftNs), pct(shiftNs),
-                         ms(copyNs), pct(copyNs),
-                         ms(syncNs), pct(syncNs),
+                         (unsigned long long)timingChunksPerSec,
+                         ms(forwardNs) * intervalScale, pct(forwardNs),
+                         ms(inverseNs) * intervalScale, pct(inverseNs),
+                         ms(shiftNs) * intervalScale, pct(shiftNs),
+                         ms(copyNs) * intervalScale, pct(copyNs),
+                         ms(syncNs) * intervalScale, pct(syncNs),
                          (unsigned long long)usbErrors,
                          (unsigned long long)deltaUsbErrors,
                          (unsigned long long)oversizedDrops.load(),
@@ -619,18 +641,21 @@ private:
                 diagText = buf;
             }
             char logBuf[640];
+            uint64_t usbTransfersPerSec = (uint64_t)((double)deltaUsbTransfers * intervalScale);
+            uint64_t blocksPerSec = (uint64_t)((double)deltaBlocks * intervalScale);
+            uint64_t timingChunksPerSec = (uint64_t)((double)timingChunks * intervalScale);
             snprintf(logBuf, sizeof(logBuf),
                      "usb=%.1fMiB/s dsp=%.2fMS/s xfers/s=%llu blocks/s=%llu swap=%.0fms/s r2iqChunks/s=%llu fwd=%.0fms %.0f%% inv=%.0fms %.0f%% shift=%.0fms %.0f%% copy=%.0fms %.0f%% sync=%.0fms %.0f%% usbErr=%llu (+%llu) oversize=%llu inFull=%d (+%d) inEmpty=%d (+%d) outFull=%d (+%d) outEmpty=%d (+%d) stops=%llu",
                      usbMBps, dspMSps,
-                     (unsigned long long)deltaUsbTransfers,
-                     (unsigned long long)deltaBlocks,
+                     (unsigned long long)usbTransfersPerSec,
+                     (unsigned long long)blocksPerSec,
                      swapWaitMs,
-                     (unsigned long long)timingChunks,
-                     ms(forwardNs), pct(forwardNs),
-                     ms(inverseNs), pct(inverseNs),
-                     ms(shiftNs), pct(shiftNs),
-                     ms(copyNs), pct(copyNs),
-                     ms(syncNs), pct(syncNs),
+                     (unsigned long long)timingChunksPerSec,
+                     ms(forwardNs) * intervalScale, pct(forwardNs),
+                     ms(inverseNs) * intervalScale, pct(inverseNs),
+                     ms(shiftNs) * intervalScale, pct(shiftNs),
+                     ms(copyNs) * intervalScale, pct(copyNs),
+                     ms(syncNs) * intervalScale, pct(syncNs),
                      (unsigned long long)usbErrors,
                      (unsigned long long)deltaUsbErrors,
                      (unsigned long long)oversizedDrops.load(),
@@ -841,6 +866,14 @@ private:
         }
         if (_this->running) { SmGui::EndDisabled(); }
 
+        SmGui::LeftLabel("Telemetry");
+        int telemetryIdx = _this->telemetryIntervalSec.load() == 1 ? 0 : 1;
+        SmGui::FillWidth();
+        if (SmGui::Combo(CONCAT("##rx888_telemetry_", _this->name), &telemetryIdx, "Fast\0Slow\0")) {
+            _this->telemetryIntervalSec = telemetryIdx == 0 ? 1 : 5;
+            _this->saveConfig("telemetry");
+        }
+
         SmGui::LeftLabel("RF Gain");
         SmGui::FillWidth();
         const float* rfSteps = nullptr;
@@ -921,6 +954,7 @@ private:
     int rfGainCount = 64;
     int ifGainCount = 127;
     int r2iqWorkers = 3;
+    std::atomic<int> telemetryIntervalSec{5};
     bool biasTeeHF = false;
     bool biasTeeVHF = false;
     bool dithering = true;
