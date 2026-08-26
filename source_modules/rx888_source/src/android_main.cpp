@@ -8,6 +8,7 @@
 #include <utils/flog.h>
 #include <android_backend.h>
 #include "../sddc_core/RadioHandler.h"
+#include "../sddc_core/thread_names.h"
 #include "../sddc_core/arch/android/FX3handler_android.h"
 #include <algorithm>
 #include <atomic>
@@ -524,6 +525,8 @@ private:
     }
 
     void diagnosticsLoop() {
+        rx888_set_thread_name("rx888-diag");
+
         using namespace std::chrono_literals;
 
         uint64_t lastUsbBytes = rx888_android_get_usb_bytes();

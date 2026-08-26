@@ -1,4 +1,5 @@
 #include "FX3handler_android.h"
+#include "../../thread_names.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -415,6 +416,8 @@ void android_fx3handler::onAsyncTransfer(AsyncTransferSlot* slot, libusb_transfe
 }
 
 void android_fx3handler::streamLoop() {
+    rx888_set_thread_name("rx888-usb");
+
     asyncSlots.clear();
     activeAsyncTransfers = 0;
 
