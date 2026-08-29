@@ -1,0 +1,67 @@
+name: Windows waterfall upload A-B core
+
+on:
+  push:
+    branches: [codex/windows-waterfall-upload-test]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build_windows_core:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PothosSDR build dependencies
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://downloads.myriadrf.org/builds/PothosSDR/PothosSDR-2020.01.26-vc14-x64.exe" -OutFile "${{runner.workspace}}/pothos.exe"
+          New-Item -ItemType Directory -Force -Path "C:/Program Files/PothosSDR" | Out-Null
+          7z x "${{runner.workspace}}/pothos.exe" -o"C:/Program Files/PothosSDR/"
+          vcpkg install fftw3:x64-windows glfw3:x64-windows zstd:x64-windows
+
+      - name: Configure core-only Windows build
+        shell: pwsh
+        run: |
+          $buildDir = "${{runner.workspace}}/build-waterfall-upload-test"
+          $moduleOptions = Select-String -Path "$env:GITHUB_WORKSPACE/CMakeLists.txt" -Pattern '^option\((OPT_BUILD_[A-Z0-9_]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $cmakeArgs = @(
+            '-S', $env:GITHUB_WORKSPACE,
+            '-B', $buildDir,
+            '-A', 'x64',
+            '-DCMAKE_BUILD_TYPE=Release',
+            '-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake'
+          )
+          foreach ($option in $moduleOptions) {
+            $cmakeArgs += "-D${option}=OFF"
+          }
+          & cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build sdrpp_core.dll
+        shell: pwsh
+        run: |
+          cmake --build "${{runner.workspace}}/build-waterfall-upload-test" --config Release --target sdrpp_core --parallel 8
+
+      - name: Verify Windows x64 core and record SHA-256
+        shell: pwsh
+        run: |
+          python -m pip install pefile
+          @'
+          import pathlib
+          import pefile
+
+          dll = pathlib.Path(r"${{runner.workspace}}/build-waterfall-upload-test/core/Release/sdrpp_core.dll")
+          pe = pefile.PE(str(dll))
+          if pe.FILE_HEADER.Machine != 0x8664:
+              raise SystemExit(f"Unexpected PE machine: 0x{pe.FILE_HEADER.Machine:04x}")
+          print(f"Verified PE32+ x86-64: {dll}")
+          '@ | python -
+          Get-FileHash "${{runner.workspace}}/build-waterfall-upload-test/core/Release/sdrpp_core.dll" -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdrpp-core-windows-x64-waterfall-upload-test
+          path: ${{runner.workspace}}/build-waterfall-upload-test/core/Release/sdrpp_core.dll

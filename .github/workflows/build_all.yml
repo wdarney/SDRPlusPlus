@@ -4,9 +4,11 @@ on:
     push:
         branches-ignore:
         - nightly
+        - codex/windows-waterfall-upload-test
     pull_request:
         branches-ignore:
         - nightly
+        - codex/windows-waterfall-upload-test
 
 env:
     # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)

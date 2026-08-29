@@ -249,6 +249,9 @@ namespace ImGui {
         ImGuiWindow* window;
 
         ImTextureID textureId;
+        int textureWidth = 0;
+        int textureHeight = 0;
+        bool textureAllocated = false;
 
         std::recursive_mutex buf_mtx;
         std::recursive_mutex latestFFTMtx;

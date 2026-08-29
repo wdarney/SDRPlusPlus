@@ -736,7 +736,14 @@ namespace ImGui {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dataWidth, waterfallHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, (uint8_t*)waterfallFb);
+        if (!textureAllocated || textureWidth != dataWidth || textureHeight != waterfallHeight) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dataWidth, waterfallHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, (uint8_t*)waterfallFb);
+            textureWidth = dataWidth;
+            textureHeight = waterfallHeight;
+            textureAllocated = true;
+            return;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dataWidth, waterfallHeight, GL_RGBA, GL_UNSIGNED_BYTE, (uint8_t*)waterfallFb);
 #endif
     }
 
