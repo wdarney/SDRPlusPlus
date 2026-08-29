@@ -32,6 +32,7 @@ jobs:
             '-B', $buildDir,
             '-A', 'x64',
             '-DCMAKE_BUILD_TYPE=Release',
+            '-DCMAKE_CXX_FLAGS=/DNOMINMAX',
             '-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake'
           )
           foreach ($option in $moduleOptions) {
