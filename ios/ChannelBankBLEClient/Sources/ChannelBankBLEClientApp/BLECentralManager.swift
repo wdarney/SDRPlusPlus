@@ -211,7 +211,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private func apply(_ operation: @escaping () async throws -> ChannelBankState) async {
         do {
             let state = try await operation()
-            acceptFullState(state)
+            acceptCommandStateResponse(state)
             lastError = nil
         } catch {
             lastError = userVisibleError(error)
@@ -660,6 +660,15 @@ extension BLECentralManager: CBPeripheralDelegate {
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
         monitorPlaybackIfNeeded(state)
+    }
+
+    private func acceptCommandStateResponse(_ state: ChannelBankState) {
+        if state.isSummaryShaped {
+            appendDiagnostic("Merging compact State response seq=\(state.seq.map(String.init) ?? "-")")
+            acceptStateSummary(state.asSummary)
+        } else {
+            acceptFullState(state)
+        }
     }
 
     private func acceptStateSummary(_ summary: ChannelBankStateSummary) {

@@ -256,6 +256,75 @@ public struct ChannelBankState: Codable, Equatable {
         nextSettings.recordingEnabled = summary.recordingEnabled ?? nextSettings.recordingEnabled
         settings = nextSettings
     }
+
+    public var isSummaryShaped: Bool {
+        guard hasSummaryFields else { return false }
+        return module == nil &&
+            enabled == nil &&
+            waterfallCenterHz == nil &&
+            usableSpanHz == nil &&
+            bwUsage == nil &&
+            sdrppHeartbeat == nil &&
+            sources == nil &&
+            sdrppServer == nil &&
+            sourceControls == nil &&
+            sourceOffset == nil &&
+            settings == nil &&
+            activeChannels == nil &&
+            recentChannels == nil &&
+            detectedSlots == nil &&
+            manualDetected == nil &&
+            snrOverview == nil &&
+            playbackLock == nil &&
+            currentlyPlayingFreqKey == nil &&
+            history == nil &&
+            diagnostics == nil &&
+            scanStopIndex == nil &&
+            scanStopCount == nil &&
+            bookmarkScanStopIndex == nil &&
+            bookmarkScanStopCount == nil &&
+            lastTranscriptName == nil &&
+            lastTranscriptText == nil
+    }
+
+    public var asSummary: ChannelBankStateSummary {
+        ChannelBankStateSummary(
+            v: nil,
+            seq: seq,
+            serverTimeMs: serverTimeMs,
+            running: running,
+            radioPlaying: radioPlaying,
+            selectedSource: selectedSource,
+            centerHz: centerHz,
+            sampleRate: sampleRate,
+            mode: mode,
+            demodMode: demodMode,
+            snrThresholdDb: snrThresholdDb,
+            maxChannels: maxChannels,
+            recordingEnabled: recordingEnabled,
+            activeChannelCount: activeChannelCount,
+            playbackQueued: playbackQueued,
+            playback: playback
+        )
+    }
+
+    private var hasSummaryFields: Bool {
+        seq != nil ||
+            serverTimeMs != nil ||
+            running != nil ||
+            radioPlaying != nil ||
+            selectedSource != nil ||
+            centerHz != nil ||
+            sampleRate != nil ||
+            mode != nil ||
+            demodMode != nil ||
+            snrThresholdDb != nil ||
+            maxChannels != nil ||
+            recordingEnabled != nil ||
+            activeChannelCount != nil ||
+            playbackQueued != nil ||
+            playback != nil
+    }
 }
 
 public struct ChannelBankStateSummary: Codable, Equatable {
@@ -276,7 +345,41 @@ public struct ChannelBankStateSummary: Codable, Equatable {
     public var playbackQueued: Int?
     public var playback: PlaybackState?
 
-    public init() {}
+    public init(
+        v: Int? = nil,
+        seq: Int64? = nil,
+        serverTimeMs: Int64? = nil,
+        running: Bool? = nil,
+        radioPlaying: Bool? = nil,
+        selectedSource: String? = nil,
+        centerHz: Double? = nil,
+        sampleRate: Double? = nil,
+        mode: String? = nil,
+        demodMode: String? = nil,
+        snrThresholdDb: Double? = nil,
+        maxChannels: Int? = nil,
+        recordingEnabled: Bool? = nil,
+        activeChannelCount: Int? = nil,
+        playbackQueued: Int? = nil,
+        playback: PlaybackState? = nil
+    ) {
+        self.v = v
+        self.seq = seq
+        self.serverTimeMs = serverTimeMs
+        self.running = running
+        self.radioPlaying = radioPlaying
+        self.selectedSource = selectedSource
+        self.centerHz = centerHz
+        self.sampleRate = sampleRate
+        self.mode = mode
+        self.demodMode = demodMode
+        self.snrThresholdDb = snrThresholdDb
+        self.maxChannels = maxChannels
+        self.recordingEnabled = recordingEnabled
+        self.activeChannelCount = activeChannelCount
+        self.playbackQueued = playbackQueued
+        self.playback = playback
+    }
 }
 
 public struct SourceListResponse: Codable, Equatable {

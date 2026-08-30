@@ -64,8 +64,9 @@ The app currently:
 - Sends Start/Stop Channel Bank, Start/Stop Radio, center tune, source, SDR++
   Server, source offset, source-control, Channel Bank settings, playback-lock,
   recording-session, Clear WAVs, and frequency block/unblock commands.
-- Applies successful mutating command Response bodies immediately because they
-  contain the updated full State.
+- Applies successful mutating command Response bodies immediately. Full State
+  responses replace the local model, while compact Summary-shaped responses are
+  merged without clearing omitted detail fields.
 - Watches State playback identity, pulls paged `/api/audio/current-playback`
   data, validates page offsets, assembles Base64 WAV/M4A data into a temporary
   file, and plays it locally with AVFoundation.

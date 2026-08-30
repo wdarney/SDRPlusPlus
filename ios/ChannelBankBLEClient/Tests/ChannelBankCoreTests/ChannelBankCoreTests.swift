@@ -135,10 +135,15 @@ final class ChannelBankClientTests: XCTestCase {
         XCTAssertEqual(summary.activeChannelCount, 3)
         XCTAssertEqual(summary.playback?.fileName, "fire.wav")
 
+        let compactResponseState = try JSONDecoder().decode(ChannelBankState.self, from: raw)
+        XCTAssertTrue(compactResponseState.isSummaryShaped)
+        XCTAssertEqual(compactResponseState.asSummary.seq, 1042)
+        XCTAssertEqual(compactResponseState.asSummary.playback?.fileName, "fire.wav")
+
         var state = ChannelBankState()
         state.history = [HistoryEntry(freqHz: 155_475_000, name: "County Fire", count: 2)]
         state.sourceControls = RX888SourceControls()
-        state.merge(summary: summary)
+        state.merge(summary: compactResponseState.asSummary)
 
         XCTAssertEqual(state.seq, 1042)
         XCTAssertEqual(state.running, true)
@@ -148,6 +153,14 @@ final class ChannelBankClientTests: XCTestCase {
         XCTAssertEqual(state.settings?.maxChannels, 16)
         XCTAssertEqual(state.history?.first?.name, "County Fire")
         XCTAssertNotNil(state.sourceControls)
+    }
+
+    func testFullStateIsNotSummaryShaped() throws {
+        var state = ChannelBankState()
+        state.seq = 7
+        state.running = true
+        state.settings = ChannelBankSettings(snrThresholdDb: 8)
+        XCTAssertFalse(state.isSummaryShaped)
     }
 
     func testParityStateDecoding() throws {
