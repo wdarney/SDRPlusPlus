@@ -98,7 +98,9 @@ public struct ChannelBankState: Codable, Equatable {
     public var serverTimeMs: Int64?
     public var selectedSource: String?
     public var sources: [String]?
+    public var sdrppServer: SDRPPServerState?
     public var sourceControls: RX888SourceControls?
+    public var sourceOffset: SourceOffsetState?
     public var settings: ChannelBankSettings?
     public var snrThresholdDb: Double?
     public var maxChannels: Int?
@@ -111,15 +113,23 @@ public struct ChannelBankState: Codable, Equatable {
     public var playbackQueued: Int?
     public var playback: PlaybackState?
     public var playbackLock: PlaybackLock?
+    public var currentlyPlayingFreqKey: Int64?
     public var history: [HistoryEntry]?
     public var diagnostics: Diagnostics?
+    public var scanStopIndex: Int?
+    public var scanStopCount: Int?
+    public var bookmarkScanStopIndex: Int?
+    public var bookmarkScanStopCount: Int?
+    public var lastTranscriptName: String?
+    public var lastTranscriptText: String?
     public var extra: [String: JSONValue] = [:]
 
     enum CodingKeys: String, CodingKey {
         case module, enabled, running, mode, demodMode, centerHz, waterfallCenterHz, sampleRate, usableSpanHz, bwUsage
-        case radioPlaying, sdrppHeartbeat, serverTimeMs, selectedSource, sources, sourceControls, settings, snrThresholdDb
+        case radioPlaying, sdrppHeartbeat, serverTimeMs, selectedSource, sources, sdrppServer, sourceControls, sourceOffset, settings, snrThresholdDb
         case maxChannels, recordingEnabled, activeChannels, recentChannels, detectedSlots, manualDetected, snrOverview
-        case playbackQueued, playback, playbackLock, history, diagnostics
+        case playbackQueued, playback, playbackLock, currentlyPlayingFreqKey, history, diagnostics
+        case scanStopIndex, scanStopCount, bookmarkScanStopIndex, bookmarkScanStopCount, lastTranscriptName, lastTranscriptText
     }
 
     public init(from decoder: Decoder) throws {
@@ -139,7 +149,9 @@ public struct ChannelBankState: Codable, Equatable {
         serverTimeMs = try? container.decodeIfPresent(Int64.self, forKey: .serverTimeMs)
         selectedSource = try? container.decodeIfPresent(String.self, forKey: .selectedSource)
         sources = try? container.decodeIfPresent([String].self, forKey: .sources)
+        sdrppServer = try? container.decodeIfPresent(SDRPPServerState.self, forKey: .sdrppServer)
         sourceControls = try? container.decodeIfPresent(RX888SourceControls.self, forKey: .sourceControls)
+        sourceOffset = try? container.decodeIfPresent(SourceOffsetState.self, forKey: .sourceOffset)
         settings = try? container.decodeIfPresent(ChannelBankSettings.self, forKey: .settings)
         snrThresholdDb = try? container.decodeIfPresent(Double.self, forKey: .snrThresholdDb)
         maxChannels = try? container.decodeIfPresent(Int.self, forKey: .maxChannels)
@@ -152,8 +164,15 @@ public struct ChannelBankState: Codable, Equatable {
         playbackQueued = try? container.decodeIfPresent(Int.self, forKey: .playbackQueued)
         playback = try? container.decodeIfPresent(PlaybackState.self, forKey: .playback)
         playbackLock = try? container.decodeIfPresent(PlaybackLock.self, forKey: .playbackLock)
+        currentlyPlayingFreqKey = try? container.decodeIfPresent(Int64.self, forKey: .currentlyPlayingFreqKey)
         history = try? container.decodeIfPresent([HistoryEntry].self, forKey: .history)
         diagnostics = try? container.decodeIfPresent(Diagnostics.self, forKey: .diagnostics)
+        scanStopIndex = try? container.decodeIfPresent(Int.self, forKey: .scanStopIndex)
+        scanStopCount = try? container.decodeIfPresent(Int.self, forKey: .scanStopCount)
+        bookmarkScanStopIndex = try? container.decodeIfPresent(Int.self, forKey: .bookmarkScanStopIndex)
+        bookmarkScanStopCount = try? container.decodeIfPresent(Int.self, forKey: .bookmarkScanStopCount)
+        lastTranscriptName = try? container.decodeIfPresent(String.self, forKey: .lastTranscriptName)
+        lastTranscriptText = try? container.decodeIfPresent(String.self, forKey: .lastTranscriptText)
     }
 
     public init() {}
@@ -175,7 +194,9 @@ public struct ChannelBankState: Codable, Equatable {
         try container.encodeIfPresent(serverTimeMs, forKey: .serverTimeMs)
         try container.encodeIfPresent(selectedSource, forKey: .selectedSource)
         try container.encodeIfPresent(sources, forKey: .sources)
+        try container.encodeIfPresent(sdrppServer, forKey: .sdrppServer)
         try container.encodeIfPresent(sourceControls, forKey: .sourceControls)
+        try container.encodeIfPresent(sourceOffset, forKey: .sourceOffset)
         try container.encodeIfPresent(settings, forKey: .settings)
         try container.encodeIfPresent(snrThresholdDb, forKey: .snrThresholdDb)
         try container.encodeIfPresent(maxChannels, forKey: .maxChannels)
@@ -188,9 +209,36 @@ public struct ChannelBankState: Codable, Equatable {
         try container.encodeIfPresent(playbackQueued, forKey: .playbackQueued)
         try container.encodeIfPresent(playback, forKey: .playback)
         try container.encodeIfPresent(playbackLock, forKey: .playbackLock)
+        try container.encodeIfPresent(currentlyPlayingFreqKey, forKey: .currentlyPlayingFreqKey)
         try container.encodeIfPresent(history, forKey: .history)
         try container.encodeIfPresent(diagnostics, forKey: .diagnostics)
+        try container.encodeIfPresent(scanStopIndex, forKey: .scanStopIndex)
+        try container.encodeIfPresent(scanStopCount, forKey: .scanStopCount)
+        try container.encodeIfPresent(bookmarkScanStopIndex, forKey: .bookmarkScanStopIndex)
+        try container.encodeIfPresent(bookmarkScanStopCount, forKey: .bookmarkScanStopCount)
+        try container.encodeIfPresent(lastTranscriptName, forKey: .lastTranscriptName)
+        try container.encodeIfPresent(lastTranscriptText, forKey: .lastTranscriptText)
     }
+}
+
+public struct SourceListResponse: Codable, Equatable {
+    public var selected: String?
+    public var sources: [String]?
+}
+
+public struct SDRPPServerState: Codable, Equatable {
+    public var available: Bool?
+    public var host: String?
+    public var port: Int?
+    public var connected: Bool?
+    public var sourceRunning: Bool?
+}
+
+public struct SourceOffsetState: Codable, Equatable {
+    public var selected: String?
+    public var manualOffsetHz: Double?
+    public var effectiveOffsetHz: Double?
+    public var modes: [String]?
 }
 
 public struct ChannelBankChannel: Codable, Equatable, Identifiable {
@@ -238,10 +286,15 @@ public struct HistoryEntry: Codable, Equatable, Identifiable {
     public var name: String?
     public var count: Int?
     public var blocked: Bool?
-    public var lastSeen: String?
+    public var lastSeen: Int64?
     public var description: String?
 
-    public init(freqHz: Double, name: String? = nil, count: Int? = nil, blocked: Bool? = nil, lastSeen: String? = nil, description: String? = nil) {
+    public var lastSeenDisplay: String {
+        guard let lastSeen, lastSeen > 0 else { return "-" }
+        return Date(timeIntervalSince1970: TimeInterval(lastSeen)).formatted(date: .omitted, time: .standard)
+    }
+
+    public init(freqHz: Double, name: String? = nil, count: Int? = nil, blocked: Bool? = nil, lastSeen: Int64? = nil, description: String? = nil) {
         self.freqHz = freqHz
         self.name = name
         self.count = count
@@ -261,12 +314,12 @@ public struct HistoryEntry: Codable, Equatable, Identifiable {
         count = try? container.decodeIfPresent(Int.self, forKey: .count)
         blocked = try? container.decodeIfPresent(Bool.self, forKey: .blocked)
         description = try? container.decodeIfPresent(String.self, forKey: .description)
-        if let value = try? container.decodeIfPresent(String.self, forKey: .lastSeen) {
+        if let value = try? container.decodeIfPresent(Int64.self, forKey: .lastSeen) {
             lastSeen = value
-        } else if let value = try? container.decodeIfPresent(Int64.self, forKey: .lastSeen) {
-            lastSeen = String(value)
         } else if let value = try? container.decodeIfPresent(Double.self, forKey: .lastSeen) {
-            lastSeen = String(Int64(value))
+            lastSeen = Int64(value)
+        } else if let value = try? container.decodeIfPresent(String.self, forKey: .lastSeen), let parsed = Int64(value) {
+            lastSeen = parsed
         } else {
             lastSeen = nil
         }
@@ -291,6 +344,13 @@ public struct ChannelBankSettings: Codable, Equatable {
     public var bwUsage: Double?
     public var recordingEnabled: Bool?
     public var channelSpacingHz: Double?
+    public var minTransmissionMs: Int?
+    public var signalHoldMs: Int?
+    public var tailMs: Int?
+    public var scanQuietSec: Double?
+    public var scanNoSignalSec: Double?
+    public var transcriptionBackend: Int?
+    public var transcriptionBackendName: String?
 }
 
 public struct RX888SourceControls: Codable, Equatable {
@@ -317,7 +377,11 @@ public struct RX888SourceControls: Codable, Equatable {
     public var supportsDithering: Bool?
     public var dithering: Bool?
     public var ditheringLiveMutable: Bool?
+    public var r2iqWorkers: Int?
     public var telemetryIntervalSec: Int?
+    public var telemetrySpeeds: [TelemetrySpeed]?
+    public var telemetryLiveMutable: Bool?
+    public var toggles: [SourceControlToggle]?
 }
 
 public struct RX888Device: Codable, Equatable, Identifiable {
@@ -340,6 +404,22 @@ public struct RX888Gain: Codable, Equatable, Identifiable {
     public var min: Double?
     public var max: Double?
     public var step: Double?
+    public var available: Bool?
+    public var liveMutable: Bool?
+}
+
+public struct TelemetrySpeed: Codable, Equatable, Identifiable {
+    public var id: Int { intervalSec ?? -1 }
+    public var label: String?
+    public var intervalSec: Int?
+    public var selected: Bool?
+}
+
+public struct SourceControlToggle: Codable, Equatable, Identifiable {
+    public var id: String { key }
+    public var key: String
+    public var label: String?
+    public var value: Bool?
     public var available: Bool?
     public var liveMutable: Bool?
 }
@@ -384,6 +464,37 @@ public struct RecordingPage: Codable, Equatable {
     public var contentType: String?
 }
 
+public struct RecordingList: Codable, Equatable {
+    public var available: Bool?
+    public var root: String?
+    public var activeSession: String?
+    public var files: [RecordingItem]?
+}
+
+public struct RecordingItem: Codable, Equatable, Identifiable {
+    public var id: String { path }
+    public var path: String
+    public var name: String?
+    public var session: String?
+    public var size: Int64?
+    public var modifiedMs: Int64?
+}
+
+public struct ClearWavsResult: Codable, Equatable {
+    public var ok: Bool?
+    public var deleted: Int?
+    public var skipped: Int?
+    public var error: String?
+}
+
+public struct LiveAudioDescriptor: Codable, Equatable {
+    public var format: String?
+    public var rate: Int?
+    public var channels: Int?
+    public var characteristic: String?
+    public var note: String?
+}
+
 public enum ChannelBankFormatters {
     public static func mhz(_ hz: Double?) -> String {
         guard let hz, hz.isFinite, hz > 0 else { return "-" }
@@ -395,5 +506,30 @@ public enum ChannelBankFormatters {
         if hz >= 1_000_000 { return String(format: "%.3f MHz", hz / 1_000_000) }
         if hz >= 1_000 { return String(format: "%.1f kHz", hz / 1_000) }
         return String(format: "%.0f Hz", hz)
+    }
+
+    public static func bytes(_ bytes: Int64?) -> String {
+        guard let bytes, bytes > 0 else { return "0 B" }
+        let value = Double(bytes)
+        if value >= 1_048_576 { return String(format: "%.2f MB", value / 1_048_576) }
+        if value >= 1024 { return String(format: "%.1f KB", value / 1024) }
+        return "\(bytes) B"
+    }
+
+    public static func millisTime(_ ms: Int64) -> String {
+        guard ms > 0 else { return "-" }
+        return Date(timeIntervalSince1970: TimeInterval(ms) / 1000).formatted(date: .omitted, time: .shortened)
+    }
+
+    public static func spacingPreset(_ id: Int) -> String {
+        switch id {
+        case 0: return "8.333 kHz"
+        case 1: return "12.5 kHz"
+        case 2: return "25 kHz"
+        case 3: return "50 kHz"
+        case 4: return "100 kHz"
+        case 5: return "200 kHz"
+        default: return "\(id)"
+        }
     }
 }

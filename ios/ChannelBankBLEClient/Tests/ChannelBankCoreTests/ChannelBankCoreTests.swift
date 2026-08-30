@@ -107,6 +107,46 @@ final class ChannelBankClientTests: XCTestCase {
         XCTAssertNil(state.running)
     }
 
+    func testParityStateDecoding() throws {
+        let raw = Data(#"""
+        {
+          "selectedSource":"RX888",
+          "sources":["RX888","SDR++ Server"],
+          "sdrppServer":{"available":true,"host":"192.168.1.10","port":5259,"connected":false,"sourceRunning":false},
+          "sourceOffset":{"selected":"Manual","manualOffsetHz":1250,"effectiveOffsetHz":1250,"modes":["None","Manual","LNB"]},
+          "settings":{"mode":"scan","spacingId":2,"channelSpacingHz":25000,"demodMode":"NFM","snrThresholdDb":6.5,"maxChannels":8,"bwUsage":0.8,"recordingEnabled":true,"minTransmissionMs":400,"signalHoldMs":700,"tailMs":500,"scanQuietSec":2.5,"scanNoSignalSec":0.5,"transcriptionBackend":0,"transcriptionBackendName":"Off"},
+          "sourceControls":{"available":true,"source":"RX888","running":false,"deviceId":0,"devices":[{"id":0,"label":"RX888"}],"sampleRate":32000000,"sampleRates":[{"id":1,"value":32000000,"label":"32 MHz","selected":true}],"supportsAdcFreq":true,"adcClockMHz":64,"adcMinMHz":16,"adcMaxMHz":140,"mode":"HF","modes":["HF","VHF"],"gains":[{"name":"LNA","label":"LNA","value":8,"min":0,"max":31.5,"step":0.5,"available":true,"liveMutable":true}],"supportsNewBiasTee":true,"supportsBiasTee":true,"biasTeeHF":false,"biasTeeVHF":true,"biasTeeLiveMutable":true,"supportsDithering":true,"dithering":false,"ditheringLiveMutable":true,"r2iqWorkers":2,"telemetryIntervalSec":1,"telemetrySpeeds":[{"label":"Fast","intervalSec":1,"selected":true}],"telemetryLiveMutable":true,"toggles":[{"key":"preamp","label":"Preamp","value":true,"available":true}]},
+          "currentlyPlayingFreqKey":157067,
+          "history":[{"freqHz":157067000,"name":"Test","count":3,"blocked":false,"lastSeen":1798644000,"description":"ok"}],
+          "scanStopIndex":4,
+          "scanStopCount":12,
+          "bookmarkScanStopIndex":1,
+          "bookmarkScanStopCount":5
+        }
+        """#.utf8)
+        let state = try JSONDecoder().decode(ChannelBankState.self, from: raw)
+        XCTAssertEqual(state.sdrppServer?.host, "192.168.1.10")
+        XCTAssertEqual(state.sourceOffset?.effectiveOffsetHz, 1250)
+        XCTAssertEqual(state.settings?.minTransmissionMs, 400)
+        XCTAssertEqual(state.sourceControls?.r2iqWorkers, 2)
+        XCTAssertEqual(state.sourceControls?.telemetrySpeeds?.first?.intervalSec, 1)
+        XCTAssertEqual(state.sourceControls?.toggles?.first?.key, "preamp")
+        XCTAssertEqual(state.history?.first?.lastSeen, 1_798_644_000)
+        XCTAssertEqual(state.scanStopCount, 12)
+    }
+
+    func testAuxiliaryPayloadDecoding() throws {
+        let recordingsRaw = Data(#"{"available":true,"root":"/tmp/rec","activeSession":"field","files":[{"path":"field/a.m4a","name":"a.m4a","session":"field","size":12345,"modifiedMs":1798644000000}]}"#.utf8)
+        let recordings = try JSONDecoder().decode(RecordingList.self, from: recordingsRaw)
+        XCTAssertEqual(recordings.files?.first?.path, "field/a.m4a")
+        XCTAssertEqual(recordings.files?.first?.size, 12345)
+
+        let audioRaw = Data(#"{"characteristic":"7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000","format":"pcm_s16le","rate":48000,"channels":1,"note":"enable notifications"}"#.utf8)
+        let audio = try JSONDecoder().decode(LiveAudioDescriptor.self, from: audioRaw)
+        XCTAssertEqual(audio.format, "pcm_s16le")
+        XCTAssertEqual(audio.rate, 48000)
+    }
+
     private final class FakeTransport: ChannelBankTransport {
         var frames: [Data] = []
 

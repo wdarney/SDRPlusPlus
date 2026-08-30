@@ -57,6 +57,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     @Published public private(set) var connectedName: String?
     @Published public private(set) var protocolDocument: String?
     @Published public private(set) var latestState: ChannelBankState?
+    @Published public private(set) var recordings: RecordingList?
+    @Published public private(set) var liveAudioDescriptor: LiveAudioDescriptor?
     @Published public private(set) var lastError: String?
     @Published public private(set) var broadScanActive = false
     @Published public private(set) var scanDiagnostics: [String] = []
@@ -140,8 +142,57 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         Task { await apply { try await self.client.setCenterHz(hz) } }
     }
 
+    public func setSource(_ name: String) {
+        updateLatestState { $0.selectedSource = name }
+        Task { await apply { try await self.client.setSource(name) } }
+    }
+
+    public func setSDRPPServer(host: String, port: Int) {
+        Task { await apply { try await self.client.setSDRPPServer(host: host, port: port) } }
+    }
+
+    public func setSDRPPServerConnected(_ connected: Bool) {
+        Task { await apply { try await self.client.setSDRPPServerConnected(connected) } }
+    }
+
+    public func setSourceOffset(selected: String, manualOffsetHz: Double? = nil) {
+        Task { await apply { try await self.client.setSourceOffset(selected: selected, manualOffsetHz: manualOffsetHz) } }
+    }
+
+    public func setSourceControls(_ body: [String: JSONValue]) {
+        Task { await apply { try await self.client.setSourceControls(body) } }
+    }
+
+    public func setChannelBankSettings(_ body: [String: JSONValue]) {
+        Task { await apply { try await self.client.setChannelBankSettings(body) } }
+    }
+
     public func setFrequency(_ hz: Double, blocked: Bool) {
         Task { await apply { try await self.client.setFrequency(hz, blocked: blocked) } }
+    }
+
+    public func setPlaybackLock(hz: Double) {
+        Task { await apply { try await self.client.setPlaybackLock(hz: hz) } }
+    }
+
+    public func clearPlaybackLock() {
+        Task { await apply { try await self.client.setPlaybackLock(hz: 0) } }
+    }
+
+    public func refreshRecordings() {
+        Task { await loadRecordings() }
+    }
+
+    public func setRecordingSession(name: String) {
+        Task { await applyRecordingList { try await self.client.setRecordingSession(name: name) } }
+    }
+
+    public func clearRecordedWavs() {
+        Task { await applyClearWavs() }
+    }
+
+    public func loadLiveAudioDescriptor() {
+        Task { await applyLiveAudioDescriptor() }
     }
 
     @MainActor
@@ -158,6 +209,42 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private func performStateRefresh() async {
         do {
             latestState = try await client.getState()
+            lastError = nil
+        } catch {
+            lastError = userVisibleError(error)
+        }
+    }
+
+    @MainActor
+    private func loadRecordings() async {
+        await applyRecordingList { try await self.client.getRecordings() }
+    }
+
+    @MainActor
+    private func applyRecordingList(_ operation: @escaping () async throws -> RecordingList) async {
+        do {
+            recordings = try await operation()
+            lastError = nil
+        } catch {
+            lastError = userVisibleError(error)
+        }
+    }
+
+    @MainActor
+    private func applyClearWavs() async {
+        do {
+            let result = try await client.clearRecordedWavs()
+            lastError = "Clear WAVs: deleted \(result.deleted ?? 0), skipped \(result.skipped ?? 0)"
+            recordings = try? await client.getRecordings()
+        } catch {
+            lastError = userVisibleError(error)
+        }
+    }
+
+    @MainActor
+    private func applyLiveAudioDescriptor() async {
+        do {
+            liveAudioDescriptor = try await client.getLiveAudioDescriptor()
             lastError = nil
         } catch {
             lastError = userVisibleError(error)
@@ -219,6 +306,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         connectedName = nil
         protocolDocument = nil
         latestState = nil
+        recordings = nil
+        liveAudioDescriptor = nil
         protocolCharacteristic = nil
         commandCharacteristic = nil
         responseCharacteristic = nil

@@ -43,14 +43,22 @@ The app currently:
 - Connects to the five Channel Bank characteristics.
 - Reads the Protocol characteristic.
 - Enables Response and State indications.
-- Reads the State characteristic after State indications are enabled.
+- Receives and reassembles live State indications without doing a startup State
+  characteristic read.
 - Decodes live State into the Radio, Center, Channel Bank, active-channel,
   waterfall, history, playback, settings, and diagnostics panels.
-- Sends Start/Stop Channel Bank, Start/Stop Radio, center tune, and frequency
-  block/unblock commands.
+- Decodes the broader WebUI/BLE State schema, including `sdrppServer`,
+  `sourceOffset`, scan counters, RX888 telemetry/toggles, complete Channel Bank
+  settings, recordings, and numeric Unix-second `history[].lastSeen` values.
+- Sends Start/Stop Channel Bank, Start/Stop Radio, center tune, source, SDR++
+  Server, source offset, source-control, Channel Bank settings, playback-lock,
+  recording-session, Clear WAVs, and frequency block/unblock commands.
+- Applies successful mutating command Response bodies immediately because they
+  contain the updated full State.
 - Tolerates dropped/partial State and Response fragments without surfacing them
   as primary UI errors.
-- Accepts numeric or legacy string `history[].lastSeen` values.
+- Accepts numeric or legacy string `history[].lastSeen` values and exposes them
+  to the UI as Unix seconds.
 
 ## Validation So Far
 
@@ -60,7 +68,7 @@ Local iOS validation:
 swift test
 ```
 
-Current result: 15 tests passing.
+Current result after WebUI parity schema/client expansion: 17 tests passing.
 
 Physical iPhone validation:
 
@@ -75,10 +83,12 @@ Physical iPhone validation:
 - Some UI fields can still feel out of sync during live operation. The basic BLE
   framing, discovery, and State decode gates are now through; remaining work is
   likely field-specific state merge/timing rather than raw transport failure.
-- Command response ordering should be watched during rapid user actions.
-- Recording download/playback controls exist at the protocol/client layer but
-  are not fully exposed as a polished iOS workflow yet.
-- Destructive WAV cleanup is intentionally not exposed in the first iOS UI.
+- Command response ordering should be watched during rapid user actions,
+  especially if pressing Start/Stop pauses the State first/complete cycle.
+- Recording listing, recording sessions, and guarded Clear WAVs are exposed.
+  Paged recording download/playback still needs a polished iOS workflow.
+- Live Audio characteristic discovery exists and `/api/audio/live.pcm` can be
+  requested, but the app does not yet subscribe to or play the PCM Audio stream.
 - Protocol v1 is unauthenticated and should only be used on trusted nearby
   development devices.
 
@@ -94,3 +104,7 @@ After installing both the Android APK and iOS app:
   error.
 - Tapping Start/Stop Radio or Start/Stop Bank should produce a matching State
   update in the app.
+- If a command times out and State indications stop, compare Android logs with
+  iOS diagnostics:
+  `TX Command first`, `RX Response first`, `RX Response complete`,
+  `RX State first afterResponseMs=...`, and `RX State complete`.

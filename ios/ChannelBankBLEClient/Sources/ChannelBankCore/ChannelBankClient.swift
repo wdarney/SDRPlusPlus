@@ -93,6 +93,34 @@ public final class ChannelBankClient {
         try await request(method: "GET", path: "/api/state", responseBody: ChannelBankState.self)
     }
 
+    public func getSources() async throws -> SourceListResponse {
+        try await request(method: "GET", path: "/api/sources", responseBody: SourceListResponse.self)
+    }
+
+    public func getSDRPPServer() async throws -> SDRPPServerState {
+        try await request(method: "GET", path: "/api/sdrpp-server", responseBody: SDRPPServerState.self)
+    }
+
+    public func getSourceControls() async throws -> RX888SourceControls {
+        try await request(method: "GET", path: "/api/source-controls", responseBody: RX888SourceControls.self)
+    }
+
+    public func getSourceOffset() async throws -> SourceOffsetState {
+        try await request(method: "GET", path: "/api/source-offset", responseBody: SourceOffsetState.self)
+    }
+
+    public func getChannelBankSettings() async throws -> ChannelBankSettings {
+        try await request(method: "GET", path: "/api/channel-bank/settings", responseBody: ChannelBankSettings.self)
+    }
+
+    public func getRecordings() async throws -> RecordingList {
+        try await request(method: "GET", path: "/api/recordings", responseBody: RecordingList.self)
+    }
+
+    public func getLiveAudioDescriptor() async throws -> LiveAudioDescriptor {
+        try await request(method: "GET", path: "/api/audio/live.pcm", responseBody: LiveAudioDescriptor.self)
+    }
+
     public func setChannelBankRunning(_ running: Bool) async throws -> ChannelBankState {
         try await request(method: "POST", path: running ? "/api/start" : "/api/stop", responseBody: ChannelBankState.self)
     }
@@ -105,6 +133,48 @@ public final class ChannelBankClient {
         try await request(method: "POST", path: "/api/center", body: ["hz": JSONValue(.number(hz))], responseBody: ChannelBankState.self)
     }
 
+    public func setSource(_ name: String) async throws -> ChannelBankState {
+        try await request(
+            method: "POST",
+            path: "/api/source",
+            body: ["name": JSONValue(.string(name))],
+            responseBody: ChannelBankState.self
+        )
+    }
+
+    public func setSDRPPServer(host: String, port: Int) async throws -> ChannelBankState {
+        try await request(
+            method: "POST",
+            path: "/api/sdrpp-server",
+            body: ["host": JSONValue(.string(host)), "port": JSONValue(.number(Double(port)))],
+            responseBody: ChannelBankState.self
+        )
+    }
+
+    public func setSDRPPServerConnected(_ connected: Bool) async throws -> ChannelBankState {
+        try await request(
+            method: "POST",
+            path: connected ? "/api/sdrpp-server/connect" : "/api/sdrpp-server/disconnect",
+            responseBody: ChannelBankState.self
+        )
+    }
+
+    public func setSourceOffset(selected: String, manualOffsetHz: Double? = nil) async throws -> ChannelBankState {
+        var body: [String: JSONValue] = ["selected": JSONValue(.string(selected))]
+        if let manualOffsetHz {
+            body["manualOffsetHz"] = JSONValue(.number(manualOffsetHz))
+        }
+        return try await request(method: "POST", path: "/api/source-offset", body: body, responseBody: ChannelBankState.self)
+    }
+
+    public func setSourceControls(_ body: [String: JSONValue]) async throws -> ChannelBankState {
+        try await request(method: "POST", path: "/api/source-controls", body: body, responseBody: ChannelBankState.self)
+    }
+
+    public func setChannelBankSettings(_ body: [String: JSONValue]) async throws -> ChannelBankState {
+        try await request(method: "POST", path: "/api/channel-bank/settings", body: body, responseBody: ChannelBankState.self)
+    }
+
     public func setFrequency(_ hz: Double, blocked: Bool) async throws -> ChannelBankState {
         try await request(
             method: "POST",
@@ -112,6 +182,28 @@ public final class ChannelBankClient {
             body: ["hz": JSONValue(.number(hz)), "blocked": JSONValue(.bool(blocked))],
             responseBody: ChannelBankState.self
         )
+    }
+
+    public func setPlaybackLock(hz: Double) async throws -> ChannelBankState {
+        try await request(
+            method: "POST",
+            path: "/api/playback-lock",
+            body: ["hz": JSONValue(.number(hz))],
+            responseBody: ChannelBankState.self
+        )
+    }
+
+    public func setRecordingSession(name: String) async throws -> RecordingList {
+        try await request(
+            method: "POST",
+            path: "/api/recordings/session",
+            body: ["name": JSONValue(.string(name))],
+            responseBody: RecordingList.self
+        )
+    }
+
+    public func clearRecordedWavs() async throws -> ClearWavsResult {
+        try await request(method: "POST", path: "/api/recordings/clear-wavs", responseBody: ClearWavsResult.self)
     }
 
     public func recordingPage(file: String, offset: Int, limit: Int = 4096) async throws -> RecordingPage {
