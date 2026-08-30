@@ -109,7 +109,8 @@ private:
     void * r2iqThreadf_android(r2iqThreadArg *th);
     void androidWorkerLoop(unsigned workerIdx);
     void androidRunBlock(fftwf_complex* pout, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, int decimate);
-    void processFftChunk(r2iqThreadArg* th, const float* adcInTime, int k, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, fftwf_complex* pout, int decimate);
+    void processFftChunk(r2iqThreadArg* th, const float* adcInTime, int k, int mfft, int mtunebin, const fftwf_complex* filter, const fftwf_complex* filter2, bool lsb, fftwf_complex* pout, int decimate, R2iqTimingSnapshot* timing);
+    void publishTimingSample(const R2iqTimingSnapshot& timing);
 #endif
 
     fftwf_complex **filterHw;       // Hw complex to each decimation ratio
@@ -139,6 +140,9 @@ private:
     const fftwf_complex* android_filter;
     const fftwf_complex* android_filter2;
     bool android_lsb;
+    bool android_measure_timing;
+    uint64_t android_timing_block_seq;
+    R2iqTimingSnapshot android_worker_timing[N_MAX_R2IQ_THREADS];
     std::atomic<uint64_t> timing_chunks;
     std::atomic<uint64_t> timing_forward_ns;
     std::atomic<uint64_t> timing_shift_ns;

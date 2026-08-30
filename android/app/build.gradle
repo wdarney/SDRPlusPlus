@@ -84,6 +84,74 @@ task copyKitLibs(type: Copy) {
     into 'jniLibs'
 }
 
+def rx888OptimizedFftw = file('../../source_modules/rx888_source/android-prebuilt/arm64-v8a/libfftw3f.so')
+def rx888OptimizedFftwSha256 = '2090834c7a41f71451de700e23176b1a91a3cc500819e7726d2ac0161cbf055d'
+
+task verifyRx888OptimizedFftw {
+    description = 'Verify the RX888 ARM64 NEON FFTW library'
+    inputs.file rx888OptimizedFftw
+    doLast {
+        if (!rx888OptimizedFftw.exists()) {
+            throw new GradleException("Missing optimized RX888 FFTW library: ${rx888OptimizedFftw}")
+        }
+
+        def bytes = rx888OptimizedFftw.bytes
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+                .digest(bytes).encodeHex().toString()
+        if (digest != rx888OptimizedFftwSha256) {
+            throw new GradleException("Unexpected RX888 FFTW SHA-256: ${digest}")
+        }
+
+        def markers = new String(bytes, 'ISO-8859-1')
+        if (markers.contains('NO_SIMD') || !markers.contains('fftw-3.3.10-neon')) {
+            throw new GradleException('RX888 FFTW is not the expected ARM64 NEON build')
+        }
+    }
+}
+
+task copyRx888OptimizedFftw(type: Copy) {
+    description = 'Overlay the optimized RX888 ARM64 FFTW library'
+    dependsOn copyKitLibs
+    dependsOn verifyRx888OptimizedFftw
+    from rx888OptimizedFftw
+    into 'jniLibs/arm64-v8a'
+}
+
+def verifyRx888FftwBytes = { byte[] bytes, String location ->
+    def digest = java.security.MessageDigest.getInstance('SHA-256')
+            .digest(bytes).encodeHex().toString()
+    if (digest != rx888OptimizedFftwSha256) {
+        throw new GradleException("Unexpected RX888 FFTW SHA-256 in ${location}: ${digest}")
+    }
+
+    def markers = new String(bytes, 'ISO-8859-1')
+    if (markers.contains('NO_SIMD') || !markers.contains('fftw-3.3.10-neon')) {
+        throw new GradleException("RX888 FFTW in ${location} is not the expected ARM64 NEON build")
+    }
+}
+
+afterEvaluate {
+    tasks.named('assembleRelease').configure {
+        doLast {
+            def apk = file("${buildDir}/outputs/apk/release/app-release.apk")
+            if (!apk.exists()) {
+                throw new GradleException("Missing release APK: ${apk}")
+            }
+
+            def zip = new java.util.zip.ZipFile(apk)
+            try {
+                def entry = zip.getEntry('lib/arm64-v8a/libfftw3f.so')
+                if (entry == null) {
+                    throw new GradleException('Release APK is missing ARM64 FFTW')
+                }
+                verifyRx888FftwBytes(zip.getInputStream(entry).bytes, apk.name)
+            } finally {
+                zip.close()
+            }
+        }
+    }
+}
+
 task deleteJniLibs (type: Delete) {
     delete 'jniLibs'
 }
@@ -100,4 +168,4 @@ dependencies {
 copyResources.dependsOn deleteTempAssets
 copyKitLibs.dependsOn deleteJniLibs
 preBuild.dependsOn copyResources
-preBuild.dependsOn copyKitLibs
+preBuild.dependsOn copyRx888OptimizedFftw
