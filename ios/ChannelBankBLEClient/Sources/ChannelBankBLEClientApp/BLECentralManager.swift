@@ -126,10 +126,12 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     public func setChannelBankRunning(_ running: Bool) {
+        updateLatestState { $0.running = running }
         Task { await apply { try await self.client.setChannelBankRunning(running) } }
     }
 
     public func setRadioRunning(_ running: Bool) {
+        updateLatestState { $0.radioPlaying = running }
         Task { await apply { try await self.client.setRadioRunning(running) } }
     }
 
@@ -159,6 +161,12 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         } catch {
             lastError = userVisibleError(error)
         }
+    }
+
+    private func updateLatestState(_ update: (inout ChannelBankState) -> Void) {
+        guard var state = latestState else { return }
+        update(&state)
+        latestState = state
     }
 
     private func userVisibleError(_ error: Error) -> String {
