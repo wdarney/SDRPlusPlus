@@ -76,6 +76,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var scanRequested = false
     private var responseNotificationsEnabled = false
     private var stateNotificationsEnabled = false
+    private var lastResponseCompletionTime: Date?
 
     public override init() {
         super.init()
@@ -196,6 +197,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
                 return "Frame error: invalid UTF-8"
             }
         }
+        if error is DecodingError {
+            return "Decode error: \(decodingDiagnostic(error))"
+        }
         return error.localizedDescription
     }
 
@@ -206,6 +210,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
 
     public func writeCommandFrame(_ data: Data) async throws {
         guard let peripheral, let commandCharacteristic else { return }
+        logOutgoingCommandFrame(data)
         let type: CBCharacteristicWriteType = commandCharacteristic.properties.contains(.write) ? .withResponse : .withoutResponse
         peripheral.writeValue(data, for: commandCharacteristic, type: type)
     }
@@ -224,6 +229,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         client.reset()
         responseNotificationsEnabled = false
         stateNotificationsEnabled = false
+        lastResponseCompletionTime = nil
         status = .disconnected(reason)
     }
 
@@ -245,10 +251,16 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     private func appendDiagnostic(_ message: String) {
-        scanDiagnostics.append(message)
-        if scanDiagnostics.count > 14 {
-            scanDiagnostics.removeFirst(scanDiagnostics.count - 14)
+        scanDiagnostics.append("\(Self.diagnosticTimestamp()) \(message)")
+        if scanDiagnostics.count > 40 {
+            scanDiagnostics.removeFirst(scanDiagnostics.count - 40)
         }
+    }
+
+    private static func diagnosticTimestamp(_ date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter.string(from: date)
     }
 }
 
@@ -396,11 +408,15 @@ extension BLECentralManager: CBPeripheralDelegate {
         }
         if characteristic.uuid == Self.responseUUID {
             do {
+                logIncomingFrame(value, label: "Response")
                 if let complete = try responseAssembler.push(value) {
+                    lastResponseCompletionTime = Date()
+                    appendDiagnostic("RX Response complete id=\(complete.messageID) bytes=\(complete.payload.count)")
                     client.receiveResponsePayload(complete.payload)
                 }
             } catch {
                 if looksLikeJSON(value) {
+                    appendDiagnostic("RX raw Response JSON bytes=\(value.count)")
                     client.receiveResponsePayload(value)
                 } else if let frameError = error as? ChannelBankFrameError,
                           frameError.isRecoverableFragmentLoss {
@@ -411,15 +427,18 @@ extension BLECentralManager: CBPeripheralDelegate {
             }
         } else if characteristic.uuid == Self.stateUUID {
             do {
+                logIncomingFrame(value, label: "State")
                 if let complete = try stateAssembler.push(value) {
+                    appendDiagnostic("RX State complete id=\(complete.messageID) bytes=\(complete.payload.count)")
                     try acceptStatePayload(complete.payload)
                 }
             } catch {
                 if looksLikeJSON(value) {
                     do {
+                        appendDiagnostic("RX raw State JSON bytes=\(value.count)")
                         try acceptStatePayload(value)
                     } catch {
-                        appendDiagnostic("Ignored undecodable State JSON: \(userVisibleError(error))")
+                        appendDiagnostic("Ignored undecodable State JSON: \(decodingDiagnostic(error))")
                     }
                 } else if let frameError = error as? ChannelBankFrameError,
                           frameError.isRecoverableFragmentLoss {
@@ -443,6 +462,55 @@ extension BLECentralManager: CBPeripheralDelegate {
 
     private func looksLikeJSON(_ data: Data) -> Bool {
         data.first { !$0.isWhitespace } == UInt8(ascii: "{")
+    }
+
+    private func logOutgoingCommandFrame(_ data: Data) {
+        guard let frame = try? ChannelBankFrame(data: data) else {
+            appendDiagnostic("TX Command raw bytes=\(data.count)")
+            return
+        }
+        guard frame.isFirst else { return }
+        var details = ""
+        if frame.isLast,
+           let request = try? decoder.decode(ChannelBankRequest.self, from: frame.payload) {
+            details = " \(request.method) \(request.path)"
+        }
+        appendDiagnostic("TX Command first id=\(frame.messageID) offset=\(frame.offset) bytes=\(data.count)\(details)")
+    }
+
+    private func logIncomingFrame(_ data: Data, label: String) {
+        guard let frame = try? ChannelBankFrame(data: data) else { return }
+        if frame.isFirst {
+            var suffix = ""
+            if label == "State", let responseTime = lastResponseCompletionTime {
+                let ms = Int(Date().timeIntervalSince(responseTime) * 1000)
+                suffix = " afterResponseMs=\(ms)"
+            }
+            appendDiagnostic("RX \(label) first id=\(frame.messageID) offset=\(frame.offset) bytes=\(data.count)\(suffix)")
+        }
+    }
+
+    private func decodingDiagnostic(_ error: Error) -> String {
+        guard let decodingError = error as? DecodingError else {
+            return userVisibleError(error)
+        }
+        switch decodingError {
+        case .typeMismatch(let type, let context):
+            return "typeMismatch expected=\(type) path=\(Self.codingPath(context.codingPath)) \(context.debugDescription)"
+        case .valueNotFound(let type, let context):
+            return "valueNotFound expected=\(type) path=\(Self.codingPath(context.codingPath)) \(context.debugDescription)"
+        case .keyNotFound(let key, let context):
+            return "keyNotFound key=\(key.stringValue) path=\(Self.codingPath(context.codingPath)) \(context.debugDescription)"
+        case .dataCorrupted(let context):
+            return "dataCorrupted path=\(Self.codingPath(context.codingPath)) \(context.debugDescription)"
+        @unknown default:
+            return String(describing: decodingError)
+        }
+    }
+
+    private static func codingPath(_ path: [CodingKey]) -> String {
+        guard !path.isEmpty else { return "$" }
+        return path.map(\.stringValue).joined(separator: ".")
     }
 }
 
