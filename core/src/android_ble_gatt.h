@@ -13,6 +13,7 @@ using RequestHandler = std::function<std::string(const std::string&)>;
 
 void registerRequestHandler(RequestHandler handler);
 void unregisterRequestHandler();
+bool registerNativeMethods();
 
 void start();
 void stop();

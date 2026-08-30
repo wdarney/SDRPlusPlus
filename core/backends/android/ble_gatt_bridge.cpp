@@ -128,3 +128,34 @@ Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattSubscriptionChanged(
     stateSubscribers.store(state == JNI_TRUE);
     audioSubscribers.store(audio == JNI_TRUE);
 }
+
+namespace android_ble_gatt {
+
+bool registerNativeMethods() {
+    bool registered = false;
+    withActivity([&registered](JNIEnv* env, jobject activity) {
+        jclass cls = env->GetObjectClass(activity);
+        if (!cls) return;
+
+        JNINativeMethod methods[] = {
+            {
+                const_cast<char*>("nativeChannelBankGattRequest"),
+                const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
+                reinterpret_cast<void*>(
+                    Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattRequest)
+            },
+            {
+                const_cast<char*>("nativeChannelBankGattSubscriptionChanged"),
+                const_cast<char*>("(ZZ)V"),
+                reinterpret_cast<void*>(
+                    Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattSubscriptionChanged)
+            }
+        };
+        registered = env->RegisterNatives(cls, methods, 2) == JNI_OK;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    });
+    return registered;
+}
+
+}

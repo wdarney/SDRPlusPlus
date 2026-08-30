@@ -15,6 +15,7 @@
 #include <gui/style.h>
 #include <gui/menus/theme.h>
 #include <filesystem>
+#include <android_ble_gatt.h>
 
 // Credit to the ImGui android OpenGL3 example for a lot of this code!
 
@@ -520,6 +521,9 @@ extern "C" {
         app->onAppCmd = backend::handleAppCmd;
         app->onInputEvent = backend::handleInputEvent;
         backend::app = app;
+        if (!android_ble_gatt::registerNativeMethods()) {
+            flog::error("Could not register Channel Bank BLE native methods");
+        }
 
         // Check if this is the first time we run or not
         if (backend::initialized) {
