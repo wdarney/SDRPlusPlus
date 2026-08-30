@@ -373,9 +373,6 @@ extension BLECentralManager: CBPeripheralDelegate {
         } else if characteristic.uuid == Self.stateUUID {
             stateNotificationsEnabled = characteristic.isNotifying
             appendDiagnostic("State indications \(characteristic.isNotifying ? "enabled" : "disabled")")
-            if characteristic.isNotifying {
-                peripheral.readValue(for: characteristic)
-            }
         }
     }
 
