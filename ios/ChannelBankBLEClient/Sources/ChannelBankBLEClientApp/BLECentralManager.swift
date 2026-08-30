@@ -78,6 +78,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var scanRequested = false
     private var responseNotificationsEnabled = false
     private var stateNotificationsEnabled = false
+    private var initialStateRequested = false
     private var lastResponseCompletionTime: Date?
 
     public override init() {
@@ -215,6 +216,13 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         }
     }
 
+    private func requestInitialStateIfReady() {
+        guard responseNotificationsEnabled, stateNotificationsEnabled, !initialStateRequested else { return }
+        initialStateRequested = true
+        appendDiagnostic("Requesting initial /api/state")
+        refreshState()
+    }
+
     @MainActor
     private func loadRecordings() async {
         await applyRecordingList { try await self.client.getRecordings() }
@@ -318,6 +326,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         client.reset()
         responseNotificationsEnabled = false
         stateNotificationsEnabled = false
+        initialStateRequested = false
         lastResponseCompletionTime = nil
         status = .disconnected(reason)
     }
@@ -483,6 +492,7 @@ extension BLECentralManager: CBPeripheralDelegate {
             stateNotificationsEnabled = characteristic.isNotifying
             appendDiagnostic("State indications \(characteristic.isNotifying ? "enabled" : "disabled")")
         }
+        requestInitialStateIfReady()
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {

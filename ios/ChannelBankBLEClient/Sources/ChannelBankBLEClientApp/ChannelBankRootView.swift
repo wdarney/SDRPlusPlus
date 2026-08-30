@@ -117,7 +117,7 @@ public struct ChannelBankRootView: View {
 
     private var emptyStatePanel: some View {
         Panel("State") {
-            Text("Select a discovered SDR++ peripheral to read protocol information, enable state notifications, and request /api/state.")
+            Text(connected ? "Waiting for the first complete State snapshot." : "Select a discovered SDR++ peripheral to connect.")
                 .foregroundStyle(.secondary)
         }
     }
