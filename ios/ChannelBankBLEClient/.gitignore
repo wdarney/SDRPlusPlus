@@ -1,0 +1,5 @@
+.build/
+.derived-data/
+.xcode-derived*/
+build-xcode-ios/
+ChannelBankBLEClient.xcodeproj/
