@@ -490,6 +490,9 @@ public:
 
     ~ChannelBankModule() {
 #ifdef __ANDROID__
+        bleStatePublisherRunning = false;
+        bleStatePublisherCv.notify_all();
+        if (bleStatePublisherThread.joinable()) bleStatePublisherThread.join();
         android_ble_gatt::stop();
         android_ble_gatt::unregisterRequestHandler();
 #endif
@@ -534,6 +537,8 @@ public:
         android_ble_gatt::registerRequestHandler(
             [this](const std::string& request) { return handleBleGattRequest(request); });
         android_ble_gatt::start();
+        bleStatePublisherRunning = true;
+        bleStatePublisherThread = std::thread(&ChannelBankModule::bleStatePublisherFunc, this);
 #endif
     }
     void enable()  { enabled = true; }
@@ -6185,6 +6190,23 @@ self.addEventListener("fetch", event => {
         }
     }
 
+#ifdef __ANDROID__
+    void bleStatePublisherFunc() {
+        std::unique_lock<std::mutex> lk(bleStatePublisherMtx);
+        while (bleStatePublisherRunning) {
+            if (bleStatePublisherCv.wait_for(lk, std::chrono::milliseconds(500), [this] {
+                    return !bleStatePublisherRunning.load();
+                })) break;
+            lk.unlock();
+            if (android_ble_gatt::hasStateSubscribers()) {
+                android_ble_gatt::notifyState(handleBleGattRequest(
+                    R"({"v":1,"id":0,"method":"GET","path":"/api/state"})"));
+            }
+            lk.lock();
+        }
+    }
+#endif
+
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
@@ -7672,14 +7694,6 @@ self.addEventListener("fetch", event => {
     static void menuHandler(void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
         _this->processWebUiActions();
-#ifdef __ANDROID__
-        auto bleNow = std::chrono::steady_clock::now();
-        if (android_ble_gatt::hasStateSubscribers() && bleNow >= _this->nextBleStateNotify) {
-            android_ble_gatt::notifyState(_this->handleBleGattRequest(
-                R"({"v":1,"id":0,"method":"GET","path":"/api/state"})"));
-            _this->nextBleStateNotify = bleNow + std::chrono::milliseconds(500);
-        }
-#endif
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         // Reset each frame; set below whenever a channel/history row is hovered.
@@ -9849,7 +9863,10 @@ self.addEventListener("fetch", event => {
     std::chrono::steady_clock::time_point lastCpuWall;
     std::clock_t lastCpuClock = 0;
 #ifdef __ANDROID__
-    std::chrono::steady_clock::time_point nextBleStateNotify{};
+    std::atomic<bool> bleStatePublisherRunning { false };
+    std::thread bleStatePublisherThread;
+    std::mutex bleStatePublisherMtx;
+    std::condition_variable bleStatePublisherCv;
 #endif
     std::atomic<bool> webServerRunning { false };
     std::thread  webServerThread;

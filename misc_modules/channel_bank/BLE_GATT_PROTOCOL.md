@@ -32,7 +32,7 @@ Command writes and Response, State, and Audio updates use the same 8-byte little
 | 4 | `u32le` | Byte offset of this payload in the reassembled message. |
 | 8 | bytes | Payload, up to `min(504, negotiated ATT MTU minus 11)` bytes. The complete header plus payload never exceeds the ATT attribute-value limit of 512 bytes. |
 
-Clients should request the largest MTU their platform supports, assemble by `(characteristic, messageId)`, require contiguous offsets, discard incomplete messages on disconnect or a new `FIRST`, and reject unknown versions. Prepared writes are not used; large commands are split into application frames. Response and State indications are reliable. State coalesces while a prior snapshot is pending; Audio notifications are intentionally lossy and may be dropped under backpressure. The Protocol characteristic advertises `maxAttributeValueBytes:512` so clients can apply the same cap to Command frames.
+Clients should request the largest MTU their platform supports, assemble by `(characteristic, messageId)`, require contiguous offsets, discard incomplete messages on disconnect or a new `FIRST`, and reject unknown versions. Prepared writes are not used; large commands are split into application frames. Response and State indications are reliable. Android permits exactly one indication in flight and sends the next fragment only after `onNotificationSent(..., GATT_SUCCESS)`. Response frames have priority after the current in-flight fragment; State and Audio use a separate stream queue, so a large periodic snapshot cannot hold a command response behind all of its remaining fragments. State coalesces while a prior snapshot is pending; Audio notifications are intentionally lossy and may be dropped under backpressure. The Protocol characteristic advertises `maxAttributeValueBytes:512` so clients can apply the same cap to Command frames.
 
 ## Request and response envelopes
 
@@ -173,6 +173,7 @@ Audio messages contain one contiguous block of raw PCM after frame reassembly. T
 - Android 12+ declares and requests runtime `android.permission.BLUETOOTH_ADVERTISE` and `android.permission.BLUETOOTH_CONNECT`.
 - BLE hardware is optional in the manifest; lack of adapter, disabled Bluetooth, lack of advertiser support, or denied permission leaves the service unavailable without breaking SDR++.
 - The server is requested when the Channel Bank module finishes initialization, advertises the service UUID while the activity/module is alive, and closes advertising/GATT on module unload or activity destruction. Permission grant retries startup.
+- A dedicated Channel Bank lifecycle thread produces subscribed State snapshots every 500 ms. Cadence does not depend on `menuHandler`, the module panel being visible, or Channel Bank currently running. If an earlier snapshot is still queued, the new snapshot is coalesced and the following publisher tick supplies the next current snapshot.
 - Version 1 deliberately matches the unauthenticated WebUI control model and does not require pairing or characteristic encryption. Any nearby BLE central may control SDR++ or download listed recordings. A production deployment should add an explicit opt-in and authentication policy without changing the v1 payload envelopes.
 
 ## Implementation ownership and portability
