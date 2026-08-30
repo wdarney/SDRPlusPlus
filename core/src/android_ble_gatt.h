@@ -19,8 +19,10 @@ void start();
 void stop();
 
 bool hasStateSubscribers();
+bool hasSummarySubscribers();
 bool hasAudioSubscribers();
 void notifyState(const std::string& json);
+void notifySummary(const std::string& json);
 void publishAudio(const int16_t* samples, size_t count);
 
 }

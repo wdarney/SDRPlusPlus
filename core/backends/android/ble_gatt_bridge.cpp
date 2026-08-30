@@ -15,6 +15,7 @@ namespace {
 std::mutex handlerMtx;
 android_ble_gatt::RequestHandler requestHandler;
 std::atomic<bool> stateSubscribers{false};
+std::atomic<bool> summarySubscribers{false};
 std::atomic<bool> audioSubscribers{false};
 
 template <typename Fn>
@@ -58,6 +59,7 @@ void unregisterRequestHandler() {
     std::lock_guard<std::mutex> lock(handlerMtx);
     requestHandler = nullptr;
     stateSubscribers.store(false);
+    summarySubscribers.store(false);
     audioSubscribers.store(false);
 }
 
@@ -65,6 +67,7 @@ void start() { callVoid("startChannelBankGatt"); }
 void stop() { callVoid("stopChannelBankGatt"); }
 
 bool hasStateSubscribers() { return stateSubscribers.load(); }
+bool hasSummarySubscribers() { return summarySubscribers.load(); }
 bool hasAudioSubscribers() { return audioSubscribers.load(); }
 
 void notifyState(const std::string& json) {
@@ -73,6 +76,22 @@ void notifyState(const std::string& json) {
         jclass cls = env->GetObjectClass(activity);
         jmethodID method = cls ? env->GetMethodID(
             cls, "notifyChannelBankGattState", "(Ljava/lang/String;)V") : nullptr;
+        if (method) {
+            jstring value = env->NewStringUTF(json.c_str());
+            env->CallVoidMethod(activity, method, value);
+            env->DeleteLocalRef(value);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+    });
+}
+
+void notifySummary(const std::string& json) {
+    if (!hasSummarySubscribers()) return;
+    withActivity([&json](JNIEnv* env, jobject activity) {
+        jclass cls = env->GetObjectClass(activity);
+        jmethodID method = cls ? env->GetMethodID(
+            cls, "notifyChannelBankGattSummary", "(Ljava/lang/String;)V") : nullptr;
         if (method) {
             jstring value = env->NewStringUTF(json.c_str());
             env->CallVoidMethod(activity, method, value);
@@ -124,8 +143,9 @@ Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattRequest(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattSubscriptionChanged(
-    JNIEnv*, jobject, jboolean state, jboolean audio) {
+    JNIEnv*, jobject, jboolean state, jboolean summary, jboolean audio) {
     stateSubscribers.store(state == JNI_TRUE);
+    summarySubscribers.store(summary == JNI_TRUE);
     audioSubscribers.store(audio == JNI_TRUE);
 }
 
@@ -146,7 +166,7 @@ bool registerNativeMethods() {
             },
             {
                 const_cast<char*>("nativeChannelBankGattSubscriptionChanged"),
-                const_cast<char*>("(ZZ)V"),
+                const_cast<char*>("(ZZZ)V"),
                 reinterpret_cast<void*>(
                     Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattSubscriptionChanged)
             }

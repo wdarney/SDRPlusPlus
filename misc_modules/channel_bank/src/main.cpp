@@ -1346,6 +1346,62 @@ private:
         };
     }
 
+#ifdef __ANDROID__
+    json webStateSummarySnapshot() {
+        int activeChannelCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(channelsMtx);
+            activeChannelCount = (int)activeChannels.size();
+        }
+
+        int64_t playingKey = currentlyPlayingFreqKey.load();
+        double playingFreqHz = currentlyPlayingFreqHz.load();
+        int playbackQueued = 0;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            playbackQueued = (int)playbackQueue.size();
+        }
+        json playback = {
+            {"active", playingKey != 0},
+            {"freqKey", playingKey},
+            {"positionMs", -1},
+            {"queued", playbackQueued}
+        };
+        if (playingKey != 0) {
+            double freqHz = playingFreqHz > 0.0
+                ? playingFreqHz : (double)playingKey * 1000.0;
+            playback["freqHz"] = freqHz;
+            playback["name"] = displayName(freqHz);
+            std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
+            if (!currentPlaybackPath.empty()) {
+                playback["fileName"] = std::filesystem::path(
+                    currentPlaybackPath).filename().string();
+            }
+        }
+
+        uint64_t seq = bleSummarySequence.fetch_add(1) + 1;
+        return {
+            {"v", 1},
+            {"seq", seq},
+            {"serverTimeMs", std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()},
+            {"running", running},
+            {"radioPlaying", gui::mainWindow.isPlaying()},
+            {"selectedSource", selectedSourceName()},
+            {"centerHz", lastKnownCenter},
+            {"sampleRate", lastKnownSr},
+            {"mode", detectionModeName()},
+            {"demodMode", demodModeName(demodMode)},
+            {"snrThresholdDb", snrThreshold},
+            {"maxChannels", maxChannels},
+            {"recordingEnabled", recordingEnabled},
+            {"activeChannelCount", activeChannelCount},
+            {"playbackQueued", playbackQueued},
+            {"playback", playback}
+        };
+    }
+#endif
+
     bool applyChannelBankSettings(const json& body, std::string& error) {
         if (!body.is_object()) {
             error = "settings payload must be an object";
@@ -1899,6 +1955,9 @@ private:
         j["sdrppHeartbeat"] = webHeartbeat.fetch_add(1) + 1;
         j["serverTimeMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+#ifdef __ANDROID__
+        j["seq"] = bleSummarySequence.load();
+#endif
         j["selectedSource"] = selectedSourceName();
         j["sources"] = sourceNamesJson();
         j["sdrppServer"] = serverSourceStateJson();
@@ -4378,6 +4437,8 @@ self.addEventListener("fetch", event => {
             if (method == "GET") {
                 if (path == "/api/state" || path == "/state")
                     return bleEnvelope(id, 200, webStateSnapshot());
+                if (path == "/api/state/summary")
+                    return bleEnvelope(id, 200, webStateSummarySnapshot());
                 if (path == "/api/sources")
                     return bleEnvelope(id, 200, {{"selected", selectedSourceName()}, {"sources", sourceNamesJson()}});
                 if (path == "/api/sdrpp-server") return bleEnvelope(id, 200, serverSourceStateJson());
@@ -4415,18 +4476,18 @@ self.addEventListener("fetch", event => {
             if (path == "/api/start") {
                 onUi([this] {
                     if (!folderSelect.pathIsValid()) return json({{"_status", 409}, {"error", "recording path is invalid"}});
-                    start(); return webStateSnapshot();
+                    start(); return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/stop") {
-                onUi([this] { stop(); return webStateSnapshot(); });
+                onUi([this] { stop(); return webStateSummarySnapshot(); });
             }
             else if (path == "/api/channel-bank/settings") {
                 onUi([this, body] {
                     std::string error;
                     if (!applyChannelBankSettings(body, error))
                         return json({{"_status", running ? 409 : 400}, {"error", error}});
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/frequency/block") {
@@ -4434,7 +4495,7 @@ self.addEventListener("fetch", event => {
                 onUi([this, hz, blocked] {
                     std::string error;
                     if (!setFrequencyBlocked(hz, blocked, error)) return json({{"_status", 400}, {"error", error}});
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/playback-lock") {
@@ -4442,7 +4503,7 @@ self.addEventListener("fetch", event => {
                 onUi([this, hz] {
                     std::string error;
                     if (!setPlaybackLock(hz, error)) return json({{"_status", 400}, {"error", error}});
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/recordings/session") {
@@ -4468,7 +4529,7 @@ self.addEventListener("fetch", event => {
                     if (source.empty() || !sourceExists(source)) return json({{"_status", 404}, {"error", "source not found"}});
                     sigpath::sourceManager.selectSource(source);
                     core::configManager.acquire(); core::configManager.conf["source"] = source;
-                    core::configManager.release(true); return webStateSnapshot();
+                    core::configManager.release(true); return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/source-controls") {
@@ -4482,14 +4543,14 @@ self.addEventListener("fetch", event => {
                         if (req.response[0]) try { error = json::parse(req.response).value("error", error); } catch (...) {}
                         return json({{"_status", gui::mainWindow.isPlaying() ? 409 : 400}, {"error", error}});
                     }
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/source-offset") {
                 onUi([this, body] {
                     std::string error;
                     if (!applySourceOffsetSettings(body, error)) return json({{"_status", 400}, {"error", error}});
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/sdrpp-server") {
@@ -4503,7 +4564,7 @@ self.addEventListener("fetch", event => {
                     SDRPPServerSourceControlV1 req{}; strncpy(req.host, host.c_str(), sizeof(req.host) - 1); req.port = port;
                     if (!callServerSourceControl(SERVER_SOURCE_CONTROL_SET, &req) || !req.ok)
                         return json({{"_status", 409}, {"error", "server target is busy or invalid"}});
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/sdrpp-server/connect" || path == "/api/sdrpp-server/disconnect") {
@@ -4516,21 +4577,21 @@ self.addEventListener("fetch", event => {
                     SDRPPServerSourceControlV1 state{};
                     bool ok = callServerSourceControl(connect ? SERVER_SOURCE_CONTROL_CONNECT : SERVER_SOURCE_CONTROL_DISCONNECT, &state);
                     if (connect && (!ok || !state.connected)) return json({{"_status", 502}, {"error", "server connection failed"}});
-                    return webStateSnapshot();
+                    return webStateSummarySnapshot();
                 });
             }
             else if (path == "/api/play") {
-                onUi([this] { gui::mainWindow.setPlayState(true); sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency()); return webStateSnapshot(); });
+                onUi([this] { gui::mainWindow.setPlayState(true); sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency()); return webStateSummarySnapshot(); });
             }
             else if (path == "/api/stop-radio" || path == "/api/radio/stop") {
-                onUi([this] { gui::mainWindow.setPlayState(false); return webStateSnapshot(); });
+                onUi([this] { gui::mainWindow.setPlayState(false); return webStateSummarySnapshot(); });
             }
             else if (path == "/api/center") {
                 double hz = body.value("hz", 0.0);
                 if (!std::isfinite(hz) || hz <= 0.0) return bleEnvelope(id, 400, {}, "hz must be positive", "invalid_argument");
                 onUi([this, hz] {
                     gui::waterfall.setCenterFrequency(hz); gui::waterfall.centerFreqMoved = true;
-                    sigpath::sourceManager.tune(hz); lastKnownCenter = hz; return webStateSnapshot();
+                    sigpath::sourceManager.tune(hz); lastKnownCenter = hz; return webStateSummarySnapshot();
                 });
             }
             else return bleEnvelope(id, 404, {}, "not found", "not_found");
@@ -4538,7 +4599,12 @@ self.addEventListener("fetch", event => {
             if (!uiError.empty()) return bleEnvelope(id, 503, {}, uiError, "ui_timeout");
             int status = result.value("_status", 200);
             if (result.contains("error")) return bleEnvelope(id, status, {}, result.value("error", "request failed"));
-            return bleEnvelope(id, status, result);
+            std::string response = bleEnvelope(id, status, result);
+            if (status >= 200 && status < 300 && android_ble_gatt::hasSummarySubscribers()) {
+                android_ble_gatt::notifySummary(bleEnvelope(
+                    0, 200, webStateSummarySnapshot()));
+            }
+            return response;
         }
         catch (const std::exception& e) {
             return bleEnvelope(id, 400, {}, e.what(), "invalid_request");
@@ -4606,6 +4672,12 @@ self.addEventListener("fetch", event => {
             sendHttpResponse(fd, "200 OK", "application/json", webStateSnapshot().dump());
             return;
         }
+#ifdef __ANDROID__
+        if (method == "GET" && path == "/api/state/summary") {
+            sendHttpResponse(fd, "200 OK", "application/json", webStateSummarySnapshot().dump());
+            return;
+        }
+#endif
         if (method == "GET" && path == "/api/sources") {
             sendHttpResponse(fd, "200 OK", "application/json", json({
                 {"selected", selectedSourceName()},
@@ -6193,12 +6265,18 @@ self.addEventListener("fetch", event => {
 #ifdef __ANDROID__
     void bleStatePublisherFunc() {
         std::unique_lock<std::mutex> lk(bleStatePublisherMtx);
+        unsigned fullStateTicks = 0;
         while (bleStatePublisherRunning) {
             if (bleStatePublisherCv.wait_for(lk, std::chrono::milliseconds(500), [this] {
                     return !bleStatePublisherRunning.load();
                 })) break;
             lk.unlock();
-            if (android_ble_gatt::hasStateSubscribers()) {
+            ++fullStateTicks;
+            if (android_ble_gatt::hasSummarySubscribers()) {
+                android_ble_gatt::notifySummary(bleEnvelope(
+                    0, 200, webStateSummarySnapshot()));
+            }
+            if (android_ble_gatt::hasStateSubscribers() && fullStateTicks % 10 == 0) {
                 android_ble_gatt::notifyState(handleBleGattRequest(
                     R"({"v":1,"id":0,"method":"GET","path":"/api/state"})"));
             }
@@ -9867,6 +9945,7 @@ self.addEventListener("fetch", event => {
     std::thread bleStatePublisherThread;
     std::mutex bleStatePublisherMtx;
     std::condition_variable bleStatePublisherCv;
+    std::atomic<uint64_t> bleSummarySequence { 0 };
 #endif
     std::atomic<bool> webServerRunning { false };
     std::thread  webServerThread;

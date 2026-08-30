@@ -28,7 +28,7 @@ import org.json.JSONObject
 internal class ChannelBankGattServer(
     private val activity: MainActivity,
     private val requestHandler: (String) -> String,
-    private val subscriptionChanged: (Boolean, Boolean) -> Unit
+    private val subscriptionChanged: (Boolean, Boolean, Boolean) -> Unit
 ) {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("7d2f0000-8c4b-4d7a-9a61-8e3c4f2a1000")
@@ -37,6 +37,7 @@ internal class ChannelBankGattServer(
         val RESPONSE_UUID: UUID = UUID.fromString("7d2f0003-8c4b-4d7a-9a61-8e3c4f2a1000")
         val STATE_UUID: UUID = UUID.fromString("7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000")
         val AUDIO_UUID: UUID = UUID.fromString("7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000")
+        val SUMMARY_UUID: UUID = UUID.fromString("7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         const val FRAME_VERSION: Byte = 1
@@ -58,7 +59,7 @@ internal class ChannelBankGattServer(
         val messageId: Int,
         val offset: Int,
         val flags: Int,
-        val responsePriority: Boolean
+        val priority: Int
     )
 
     private val manager = activity.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -70,17 +71,22 @@ internal class ChannelBankGattServer(
     private val assemblies = ConcurrentHashMap<RequestKey, Assembly>()
     private val responseByAddress = ConcurrentHashMap<String, ByteArray>()
     private val stateByAddress = ConcurrentHashMap<String, ByteArray>()
+    private val summaryByAddress = ConcurrentHashMap<String, ByteArray>()
     private val stateSubscribers = ConcurrentHashMap.newKeySet<String>()
+    private val summarySubscribers = ConcurrentHashMap.newKeySet<String>()
     private val audioSubscribers = ConcurrentHashMap.newKeySet<String>()
     private val responseOutgoing = ArrayDeque<Outgoing>()
+    private val summaryOutgoing = ArrayDeque<Outgoing>()
     private val streamOutgoing = ArrayDeque<Outgoing>()
     private var sending: Outgoing? = null
+    private var summaryMessageInProgress = false
     private var audioSequence = 0
 
     private lateinit var protocol: BluetoothGattCharacteristic
     private lateinit var command: BluetoothGattCharacteristic
     private lateinit var response: BluetoothGattCharacteristic
     private lateinit var state: BluetoothGattCharacteristic
+    private lateinit var summary: BluetoothGattCharacteristic
     private lateinit var audio: BluetoothGattCharacteristic
 
     fun start(): Boolean {
@@ -101,6 +107,7 @@ internal class ChannelBankGattServer(
         // State snapshots can span many ATT packets. Use acknowledged indications
         // so a dropped fragment cannot invalidate the rest of the JSON message.
         state = notifyingCharacteristic(STATE_UUID, indicate = true)
+        summary = notifyingCharacteristic(SUMMARY_UUID, indicate = true)
         audio = notifyingCharacteristic(AUDIO_UUID, indicate = false)
 
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
@@ -108,6 +115,7 @@ internal class ChannelBankGattServer(
         service.addCharacteristic(command)
         service.addCharacteristic(response)
         service.addCharacteristic(state)
+        service.addCharacteristic(summary)
         service.addCharacteristic(audio)
 
         server = manager.openGattServer(activity, callback) ?: return false
@@ -134,14 +142,18 @@ internal class ChannelBankGattServer(
         assemblies.clear()
         responseByAddress.clear()
         stateByAddress.clear()
+        summaryByAddress.clear()
         stateSubscribers.clear()
+        summarySubscribers.clear()
         audioSubscribers.clear()
         synchronized(streamOutgoing) {
             responseOutgoing.clear()
+            summaryOutgoing.clear()
             streamOutgoing.clear()
             sending = null
+            summaryMessageInProgress = false
         }
-        subscriptionChanged(false, false)
+        subscriptionChanged(false, false, false)
     }
 
     fun notifyState(json: String) {
@@ -150,6 +162,15 @@ internal class ChannelBankGattServer(
             val device = connected[address] ?: return@forEach
             stateByAddress[address] = payload
             enqueueFramed(device, state, messageId = 0, payload = payload, confirm = true)
+        }
+    }
+
+    fun notifySummary(json: String) {
+        val payload = json.toByteArray(Charsets.UTF_8)
+        summarySubscribers.forEach { address ->
+            val device = connected[address] ?: return@forEach
+            summaryByAddress[address] = payload
+            enqueueFramed(device, summary, messageId = 0, payload = payload, confirm = true)
         }
     }
 
@@ -224,7 +245,7 @@ internal class ChannelBankGattServer(
     }
 
     private fun protocolJson(): ByteArray =
-        """{"protocol":"sdrpp.channel-bank.gatt","version":1,"encoding":"json-utf8","frameHeader":"u8 version,u8 flags,u16le messageId,u32le offset","maxAttributeValueBytes":512,"maxRequestBytes":1048576,"audio":{"format":"pcm_s16le","rate":48000,"channels":1}}"""
+        """{"protocol":"sdrpp.channel-bank.gatt","version":1,"encoding":"json-utf8","frameHeader":"u8 version,u8 flags,u16le messageId,u32le offset","maxAttributeValueBytes":512,"maxRequestBytes":1048576,"summaryCharacteristic":"7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000","audio":{"format":"pcm_s16le","rate":48000,"channels":1}}"""
             .toByteArray(Charsets.UTF_8)
 
     private fun sendRead(device: BluetoothDevice, requestId: Int, offset: Int, value: ByteArray) {
@@ -289,7 +310,11 @@ internal class ChannelBankGattServer(
         // 517 (whose MTU-3 notification budget would otherwise be 514).
         val frameSize = minOf(MAX_ATTRIBUTE_VALUE_BYTES, maxOf(HEADER_SIZE + 1, mtu - 3))
         val partSize = frameSize - HEADER_SIZE
-        val responsePriority = characteristic.uuid == RESPONSE_UUID
+        val priority = when (characteristic.uuid) {
+            RESPONSE_UUID -> 0
+            SUMMARY_UUID -> 1
+            else -> 2
+        }
         val frames = ArrayList<Outgoing>(maxOf(1, (payload.size + partSize - 1) / partSize))
         var offset = 0
         do {
@@ -301,16 +326,19 @@ internal class ChannelBankGattServer(
                 .put(FRAME_VERSION).put(flags.toByte()).putShort(messageId.toShort()).putInt(offset)
             if (count > 0) frame.put(payload, offset, count)
             frames.add(Outgoing(device, characteristic, frame.array(), confirm,
-                messageId, offset, flags, responsePriority))
+                messageId, offset, flags, priority))
             offset += count
         } while (offset < payload.size)
         var outcome = "queued"
         var beforeResponses = 0
+        var beforeSummaries = 0
         var beforeStreams = 0
         var afterResponses = 0
+        var afterSummaries = 0
         var afterStreams = 0
         synchronized(streamOutgoing) {
             beforeResponses = responseOutgoing.size
+            beforeSummaries = summaryOutgoing.size
             beforeStreams = streamOutgoing.size
             // Keep at most one complete State snapshot queued per client. The
             // next 500 ms publisher tick supplies the newest snapshot once it
@@ -320,32 +348,59 @@ internal class ChannelBankGattServer(
                 }) {
                 outcome = "coalesced"
             }
+            else if (characteristic.uuid == SUMMARY_UUID && summaryOutgoing.any {
+                    it.device.address == device.address
+                }) {
+                // Replace an entirely queued summary with the newest value.
+                // Never remove the message currently awaiting its indication callback.
+                val inFlight = sending
+                summaryOutgoing.removeAll {
+                    it.device.address == device.address && it !== inFlight
+                }
+                summaryOutgoing.addAll(frames)
+                outcome = "replaced"
+            }
             // Audio remains a lossy stream. Drop a complete message before it
             // enters the queue so a client never sees an unterminated partial.
-            else if (!confirm && responseOutgoing.size + streamOutgoing.size + frames.size > 256) {
+            else if (!confirm && responseOutgoing.size + summaryOutgoing.size + streamOutgoing.size + frames.size > 256) {
                 outcome = "skipped"
             }
-            else if (responsePriority) responseOutgoing.addAll(frames)
+            else if (priority == 0) responseOutgoing.addAll(frames)
+            else if (priority == 1) summaryOutgoing.addAll(frames)
             else streamOutgoing.addAll(frames)
             afterResponses = responseOutgoing.size
+            afterSummaries = summaryOutgoing.size
             afterStreams = streamOutgoing.size
         }
         if (characteristic.uuid == STATE_UUID) {
             Log.i(TAG, "State publish: timestamp=${System.currentTimeMillis()} payloadBytes=${payload.size} " +
                 "fragments=${frames.size} mtu=$mtu outcome=$outcome " +
-                "queueBefore=response:$beforeResponses,stream:$beforeStreams " +
-                "queueAfter=response:$afterResponses,stream:$afterStreams")
+                "queueBefore=response:$beforeResponses,summary:$beforeSummaries,stream:$beforeStreams " +
+                "queueAfter=response:$afterResponses,summary:$afterSummaries,stream:$afterStreams")
+        } else if (characteristic.uuid == SUMMARY_UUID) {
+            Log.i(TAG, "Summary publish: timestamp=${System.currentTimeMillis()} payloadBytes=${payload.size} " +
+                "fragments=${frames.size} mtu=$mtu outcome=$outcome " +
+                "queueBefore=response:$beforeResponses,summary:$beforeSummaries,stream:$beforeStreams " +
+                "queueAfter=response:$afterResponses,summary:$afterSummaries,stream:$afterStreams")
         }
-        if (outcome == "queued") sendNext()
+        if (outcome == "queued" || outcome == "replaced") sendNext()
     }
 
     private fun sendNext() {
         val item = synchronized(streamOutgoing) {
             if (sending != null) return
-            val next = if (responseOutgoing.isNotEmpty()) responseOutgoing.first()
+            val next = if (summaryMessageInProgress && summaryOutgoing.isNotEmpty()) summaryOutgoing.first()
+                       else if (responseOutgoing.isNotEmpty()) responseOutgoing.first()
+                       else if (summaryOutgoing.isNotEmpty()) summaryOutgoing.first()
                        else if (streamOutgoing.isNotEmpty()) streamOutgoing.first()
                        else return
             sending = next
+            if (next.priority == 1 && (next.flags and FLAG_FIRST) != 0) {
+                // Once a compact summary starts, finish it before a response
+                // overtakes its remaining fragments. This lets clients apply
+                // the newer summary sequence before an older command body.
+                summaryMessageInProgress = true
+            }
             next
         }
         item.characteristic.value = item.value
@@ -353,8 +408,16 @@ internal class ChannelBankGattServer(
                        catch (_: SecurityException) { false }
         if (!accepted) {
             synchronized(streamOutgoing) {
-                val queue = if (item.responsePriority) responseOutgoing else streamOutgoing
-                if (queue.isNotEmpty()) queue.removeFirst()
+                val queue = when (item.priority) {
+                    0 -> responseOutgoing
+                    1 -> summaryOutgoing
+                    else -> streamOutgoing
+                }
+                while (queue.isNotEmpty()) {
+                    val dropped = queue.removeFirst()
+                    if ((dropped.flags and FLAG_LAST) != 0) break
+                }
+                if (item.priority == 1) summaryMessageInProgress = false
                 sending = null
             }
             Log.w(TAG, "Fragment rejected: characteristic=${item.characteristic.uuid} id=${item.messageId} " +
@@ -364,7 +427,7 @@ internal class ChannelBankGattServer(
     }
 
     private fun updateSubscriptions() {
-        subscriptionChanged(stateSubscribers.isNotEmpty(), audioSubscribers.isNotEmpty())
+        subscriptionChanged(stateSubscribers.isNotEmpty(), summarySubscribers.isNotEmpty(), audioSubscribers.isNotEmpty())
     }
 
     private val callback = object : BluetoothGattServerCallback() {
@@ -377,12 +440,15 @@ internal class ChannelBankGattServer(
                 connected.remove(device.address)
                 mtuByAddress.remove(device.address)
                 stateSubscribers.remove(device.address)
+                summarySubscribers.remove(device.address)
                 audioSubscribers.remove(device.address)
                 assemblies.keys.removeAll { it.address == device.address }
                 synchronized(streamOutgoing) {
                     responseOutgoing.removeAll { it.device.address == device.address }
+                    summaryOutgoing.removeAll { it.device.address == device.address }
                     streamOutgoing.removeAll { it.device.address == device.address }
                     if (sending?.device?.address == device.address) sending = null
+                    if (sending == null) summaryMessageInProgress = false
                 }
                 updateSubscriptions()
                 Log.i(TAG, "Client disconnected, status=$status")
@@ -404,6 +470,8 @@ internal class ChannelBankGattServer(
                 RESPONSE_UUID -> responseByAddress[device.address] ?: ByteArray(0)
                 STATE_UUID -> requestHandler("""{"v":1,"id":0,"method":"GET","path":"/api/state"}""")
                     .toByteArray(Charsets.UTF_8).also { stateByAddress[device.address] = it }
+                SUMMARY_UUID -> requestHandler("""{"v":1,"id":0,"method":"GET","path":"/api/state/summary"}""")
+                    .toByteArray(Charsets.UTF_8).also { summaryByAddress[device.address] = it }
                 else -> ByteArray(0)
             }
             sendRead(device, requestId, offset, value)
@@ -424,12 +492,14 @@ internal class ChannelBankGattServer(
         ) {
             val enabled = when (descriptor.characteristic.uuid) {
                 STATE_UUID -> stateSubscribers.contains(device.address)
+                SUMMARY_UUID -> summarySubscribers.contains(device.address)
                 AUDIO_UUID -> audioSubscribers.contains(device.address)
                 RESPONSE_UUID -> true
                 else -> false
             }
             sendRead(device, requestId, offset,
                 if (enabled && (descriptor.characteristic.uuid == STATE_UUID ||
+                                descriptor.characteristic.uuid == SUMMARY_UUID ||
                                 descriptor.characteristic.uuid == RESPONSE_UUID))
                     BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                 else if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -448,10 +518,11 @@ internal class ChannelBankGattServer(
                               value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
                 when (descriptor.characteristic.uuid) {
                     STATE_UUID -> if (enabled) stateSubscribers.add(device.address) else stateSubscribers.remove(device.address)
+                    SUMMARY_UUID -> if (enabled) summarySubscribers.add(device.address) else summarySubscribers.remove(device.address)
                     AUDIO_UUID -> if (enabled) audioSubscribers.add(device.address) else audioSubscribers.remove(device.address)
                 }
                 updateSubscriptions()
-                Log.i(TAG, "Subscriptions changed: state=${stateSubscribers.size}, audio=${audioSubscribers.size}")
+                Log.i(TAG, "Subscriptions changed: state=${stateSubscribers.size}, summary=${summarySubscribers.size}, audio=${audioSubscribers.size}")
             }
             if (responseNeeded) server?.sendResponse(device, requestId, status, 0, null)
         }
@@ -462,6 +533,7 @@ internal class ChannelBankGattServer(
             }
             var delivered: Outgoing? = null
             var responseDepth = 0
+            var summaryDepth = 0
             var streamDepth = 0
             synchronized(streamOutgoing) {
                 val current = sending
@@ -470,9 +542,16 @@ internal class ChannelBankGattServer(
                     return
                 }
                 delivered = current
-                val queue = if (current.responsePriority) responseOutgoing else streamOutgoing
+                val queue = when (current.priority) {
+                    0 -> responseOutgoing
+                    1 -> summaryOutgoing
+                    else -> streamOutgoing
+                }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     if (queue.isNotEmpty()) queue.removeFirst()
+                    if (current.priority == 1 && (current.flags and FLAG_LAST) != 0) {
+                        summaryMessageInProgress = false
+                    }
                 } else {
                     // The failed fragment did not reach the client. Discard the
                     // remainder of that message instead of sending fragments
@@ -482,16 +561,18 @@ internal class ChannelBankGattServer(
                         if (dropped.value.size >= HEADER_SIZE &&
                             (dropped.value[1].toInt() and FLAG_LAST) != 0) break
                     }
+                    if (current.priority == 1) summaryMessageInProgress = false
                 }
                 sending = null
                 responseDepth = responseOutgoing.size
+                summaryDepth = summaryOutgoing.size
                 streamDepth = streamOutgoing.size
             }
             delivered?.let {
                 Log.d(TAG, "Fragment delivered: characteristic=${it.characteristic.uuid} id=${it.messageId} " +
                     "offset=${it.offset} first=${(it.flags and FLAG_FIRST) != 0} " +
                     "last=${(it.flags and FLAG_LAST) != 0} status=$status " +
-                    "queueAfter=response:$responseDepth,stream:$streamDepth")
+                    "queueAfter=response:$responseDepth,summary:$summaryDepth,stream:$streamDepth")
             }
             sendNext()
         }

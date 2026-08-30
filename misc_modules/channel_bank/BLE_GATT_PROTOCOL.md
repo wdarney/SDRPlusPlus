@@ -15,8 +15,9 @@ Primary service: `7d2f0000-8c4b-4d7a-9a61-8e3c4f2a1000`
 | Protocol | `7d2f0001-8c4b-4d7a-9a61-8e3c4f2a1000` | Read | Raw UTF-8 JSON capability document; long reads use ATT offsets. |
 | Command | `7d2f0002-8c4b-4d7a-9a61-8e3c4f2a1000` | Write, Write Without Response | Framed UTF-8 JSON request. Maximum reassembled request is 1 MiB. |
 | Response | `7d2f0003-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Indicate | Framed response indications. A raw UTF-8 copy of the most recent response can be recovered with a long read. Enable indications before sending commands. |
-| State | `7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Indicate | A GET-state response envelope. Indications are emitted at most every 500 ms while subscribed, with at most one complete snapshot queued per client. Long read returns a fresh raw envelope. |
+| State | `7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Indicate | A complete GET-state response envelope. Periodic indications are emitted every five seconds while subscribed, with at most one complete snapshot queued per client. Long read returns a fresh raw envelope. |
 | Audio | `7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Notify | Framed PCM audio notifications: signed 16-bit little-endian, mono, 48 kHz. |
+| State Summary | `7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Indicate | Compact, reliable UI state emitted every 500 ms and immediately after successful mutations. New summaries replace queued stale summaries. |
 
 The standard Client Characteristic Configuration descriptor UUID `00002902-0000-1000-8000-00805f9b34fb` controls indications/notifications.
 
@@ -32,7 +33,7 @@ Command writes and Response, State, and Audio updates use the same 8-byte little
 | 4 | `u32le` | Byte offset of this payload in the reassembled message. |
 | 8 | bytes | Payload, up to `min(504, negotiated ATT MTU minus 11)` bytes. The complete header plus payload never exceeds the ATT attribute-value limit of 512 bytes. |
 
-Clients should request the largest MTU their platform supports, assemble by `(characteristic, messageId)`, require contiguous offsets, discard incomplete messages on disconnect or a new `FIRST`, and reject unknown versions. Prepared writes are not used; large commands are split into application frames. Response and State indications are reliable. Android permits exactly one indication in flight and sends the next fragment only after `onNotificationSent(..., GATT_SUCCESS)`. Response frames have priority after the current in-flight fragment; State and Audio use a separate stream queue, so a large periodic snapshot cannot hold a command response behind all of its remaining fragments. State coalesces while a prior snapshot is pending; Audio notifications are intentionally lossy and may be dropped under backpressure. The Protocol characteristic advertises `maxAttributeValueBytes:512` so clients can apply the same cap to Command frames.
+Clients should request the largest MTU their platform supports, assemble by `(characteristic, messageId)`, require contiguous offsets, discard incomplete messages on disconnect or a new `FIRST`, and reject unknown versions. Prepared writes are not used; large commands are split into application frames. Response, State Summary, and State indications are reliable. Android permits exactly one indication in flight and sends the next fragment only after `onNotificationSent(..., GATT_SUCCESS)`. After the current in-flight fragment, the queue order is Response, State Summary, then full State/Audio. A newer State Summary replaces stale queued summary fragments; clients must therefore accept a new `FIRST` as replacement for an incomplete older summary. Full State coalesces while a prior snapshot is pending; Audio notifications are intentionally lossy and may be dropped under backpressure. The Protocol characteristic advertises `maxAttributeValueBytes:512` so clients can apply the same cap to Command frames.
 
 ## Request and response envelopes
 
@@ -73,13 +74,14 @@ Status values preserve WebUI HTTP semantics: `200` success, `400` invalid payloa
 
 ## WebUI-to-BLE mapping
 
-The BLE request `method` and `path` are identical to the WebUI route. A successful mutating route returns the full state snapshot in `body`.
+The BLE request `method` and `path` are identical to the WebUI route. On Android, successful control mutations return the compact State Summary in `body`; clients merge its present fields into their current full model. Recording/session operations retain their route-specific response bodies.
 
 | WebUI surface | BLE request or characteristic | Request data / behavior |
 |---|---|---|
 | HTML `/` and `/index.html` | Protocol characteristic | No HTML is transported. A client renders its own UI from this contract and State. |
 | `OPTIONS` / CORS | Not applicable | BLE has no browser CORS preflight. |
 | `GET /api/state`, `GET /state` | State read/indicate, or Command GET | Complete state envelope. |
+| `GET /api/state/summary` | State Summary read/indicate, or Command GET | Compact state for immediately visible controls. |
 | `GET /api/sources` | Command GET | Returns `selected` and `sources[]`. |
 | `GET /api/sdrpp-server` | Command GET | Returns server-source availability/target/connection state. |
 | `GET /api/source-controls` | Command GET | Returns RX888 controls when RX888 is selected; otherwise `available:false`. |
@@ -163,6 +165,12 @@ The `body` of a state response contains:
 
 Clients must ignore unknown fields and tolerate conditional/missing fields for forward compatibility.
 
+## State Summary schema and cadence
+
+The State Summary body contains `v`, monotonic `seq`, `serverTimeMs`, `running`, `radioPlaying`, `selectedSource`, `centerHz`, `sampleRate`, `mode`, `demodMode`, `snrThresholdDb`, `maxChannels`, `recordingEnabled`, `activeChannelCount`, `playbackQueued`, and `playback`. The playback object uses the same fields as full State, including `fileName` while active.
+
+Summary indications are produced every 500 ms while subscribed and immediately after a successful mutating BLE command. Full State remains available by read or command at any time, but its periodic indication cadence is five seconds so its roughly 20 KB payload does not monopolize reliable BLE indications. Full State includes the latest `seq`; a client should merge summary fields rather than clear fields omitted by the summary, and ignore an older sequence when a newer one is already applied.
+
 ## Audio behavior and limits
 
 Audio messages contain one contiguous block of raw PCM after frame reassembly. The existing Channel Bank selection rule is retained: one current channel is chosen, with a 500 ms hold before another channel can take over. Audio is best effort. 48 kHz mono PCM is roughly 768 kbit/s before BLE overhead and will not be sustainable on every Android radio, connection interval, PHY, or negotiated MTU. Clients should request a large MTU and 2M PHY when available, tolerate dropped message sequence numbers, and treat this as an experimental parity path. Control, state, and recording download do not depend on continuous audio success.
@@ -173,7 +181,7 @@ Audio messages contain one contiguous block of raw PCM after frame reassembly. T
 - Android 12+ declares and requests runtime `android.permission.BLUETOOTH_ADVERTISE` and `android.permission.BLUETOOTH_CONNECT`.
 - BLE hardware is optional in the manifest; lack of adapter, disabled Bluetooth, lack of advertiser support, or denied permission leaves the service unavailable without breaking SDR++.
 - The server is requested when the Channel Bank module finishes initialization, advertises the service UUID while the activity/module is alive, and closes advertising/GATT on module unload or activity destruction. Permission grant retries startup.
-- A dedicated Channel Bank lifecycle thread produces subscribed State snapshots every 500 ms. Cadence does not depend on `menuHandler`, the module panel being visible, or Channel Bank currently running. If an earlier snapshot is still queued, the new snapshot is coalesced and the following publisher tick supplies the next current snapshot.
+- A dedicated Channel Bank lifecycle thread produces State Summary snapshots every 500 ms and full State snapshots every five seconds. Cadence does not depend on `menuHandler`, the module panel being visible, or Channel Bank currently running. Stale queued summaries are replaced and full snapshots are coalesced.
 - Version 1 deliberately matches the unauthenticated WebUI control model and does not require pairing or characteristic encryption. Any nearby BLE central may control SDR++ or download listed recordings. A production deployment should add an explicit opt-in and authentication policy without changing the v1 payload envelopes.
 
 ## Implementation ownership and portability
