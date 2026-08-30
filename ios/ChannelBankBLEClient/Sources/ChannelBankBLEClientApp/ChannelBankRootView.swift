@@ -448,6 +448,9 @@ public struct ChannelBankRootView: View {
                 ("Recording", state.recordingEnabled == true ? "Enabled" : "Disabled"),
                 ("Lock", state.playbackLock?.active == true ? ChannelBankFormatters.mhz(state.playbackLock?.freqHz) : "Off")
             ])
+            Text("Monitor: \(model.ble.audioMonitorStatus)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             HStack {
                 if let hz = state.playback?.freqHz {
                     Button("Lock Current") { model.ble.setPlaybackLock(hz: hz) }

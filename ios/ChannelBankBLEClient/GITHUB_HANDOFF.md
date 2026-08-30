@@ -55,6 +55,12 @@ The app currently:
   recording-session, Clear WAVs, and frequency block/unblock commands.
 - Applies successful mutating command Response bodies immediately because they
   contain the updated full State.
+- Watches State playback identity, pulls paged `/api/audio/current-playback`
+  data, validates page offsets, assembles Base64 WAV/M4A data into a temporary
+  file, and plays it locally with AVFoundation.
+- Retries brief current-playback `404` races with bounded backoff and falls back
+  to `/api/recordings` plus `/api/recordings/download` when the completed
+  recording is available there.
 - Tolerates dropped/partial State and Response fragments without surfacing them
   as primary UI errors.
 - Accepts numeric or legacy string `history[].lastSeen` values and exposes them
@@ -68,12 +74,13 @@ Local iOS validation:
 swift test
 ```
 
-Current result after WebUI parity schema/client expansion: 17 tests passing.
+Current result after pull/download audio implementation: 18 tests passing.
 
 Physical iPhone validation:
 
 - App builds and signs with Apple development team `7WP947RA97`.
 - App installs successfully on the connected iPhone.
+- Pull/download audio build installs successfully on the connected iPhone.
 - iOS discovers/connects to Android SDR++ Channel Bank BLE.
 - The native interface populates from live Android State.
 - Basic start/stop controls reach Android and change SDR++ behavior.
@@ -85,10 +92,13 @@ Physical iPhone validation:
   likely field-specific state merge/timing rather than raw transport failure.
 - Command response ordering should be watched during rapid user actions,
   especially if pressing Start/Stop pauses the State first/complete cycle.
-- Recording listing, recording sessions, and guarded Clear WAVs are exposed.
-  Paged recording download/playback still needs a polished iOS workflow.
+- Recording listing, recording sessions, guarded Clear WAVs, current-playback
+  pull, and recording-download fallback are exposed. A polished recording
+  browser with manual tap-to-download/play controls remains follow-up.
 - Live Audio characteristic discovery exists and `/api/audio/live.pcm` can be
-  requested, but the app does not yet subscribe to or play the PCM Audio stream.
+  requested, but continuous PCM notifications are intentionally not the default
+  path. Keep that mode optional because it competes with State and command
+  traffic.
 - Protocol v1 is unauthenticated and should only be used on trusted nearby
   development devices.
 
@@ -104,6 +114,10 @@ After installing both the Android APK and iOS app:
   error.
 - Tapping Start/Stop Radio or Start/Stop Bank should produce a matching State
   update in the app.
+- When Android reports a new playback file in State, iOS should show
+  `Monitor: Pulling ...`, then play the assembled temporary WAV/M4A locally.
+- If current playback is not ready yet, iOS should retry briefly, then use the
+  recordings-list/download fallback if the finished file is listed.
 - If a command times out and State indications stop, compare Android logs with
   iOS diagnostics:
   `TX Command first`, `RX Response first`, `RX Response complete`,

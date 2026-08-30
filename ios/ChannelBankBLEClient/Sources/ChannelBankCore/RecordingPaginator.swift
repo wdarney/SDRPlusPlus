@@ -3,6 +3,7 @@ import Foundation
 public enum RecordingPaginationError: Error, Equatable {
     case missingData
     case invalidBase64
+    case offsetMismatch(expected: Int, got: Int)
     case didNotAdvance
 }
 
@@ -17,6 +18,9 @@ public struct RecordingPaginator {
         var next = offset
         while true {
             let page = try await fetch(next)
+            if let offset = page.offset, offset != next {
+                throw RecordingPaginationError.offsetMismatch(expected: next, got: offset)
+            }
             guard let base64 = page.dataBase64 else { throw RecordingPaginationError.missingData }
             guard let data = Data(base64Encoded: base64) else { throw RecordingPaginationError.invalidBase64 }
             output.append(data)

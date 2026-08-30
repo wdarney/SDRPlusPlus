@@ -221,4 +221,17 @@ final class RecordingPaginatorTests: XCTestCase {
         let data = try await RecordingPaginator().collect { _ in page }
         XCTAssertEqual(data, Data([1, 2, 3]))
     }
+
+    func testRecordingPaginationRejectsOffsetMismatch() async throws {
+        let page = RecordingPage(dataBase64: Data([1]).base64EncodedString(), offset: 4, nextOffset: 5, size: 5, eof: false, name: "bad.wav", contentType: "audio/wav")
+        do {
+            _ = try await RecordingPaginator().collect { _ in page }
+            XCTFail("Expected offset mismatch")
+        } catch RecordingPaginationError.offsetMismatch(let expected, let got) {
+            XCTAssertEqual(expected, 0)
+            XCTAssertEqual(got, 4)
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
+    }
 }

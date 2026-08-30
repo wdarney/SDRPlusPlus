@@ -67,6 +67,11 @@ public struct ChannelBankRequest: Codable, Equatable {
 public struct ChannelBankErrorBody: Codable, Error, Equatable {
     public var code: String
     public var message: String
+
+    public init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
 }
 
 public struct ChannelBankResponse<Body: Codable & Equatable>: Codable, Equatable {

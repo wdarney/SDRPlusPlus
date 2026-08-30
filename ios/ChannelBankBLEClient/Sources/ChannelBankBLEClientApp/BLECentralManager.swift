@@ -1,6 +1,7 @@
 #if canImport(ChannelBankCore)
 import ChannelBankCore
 #endif
+import AVFoundation
 import CoreBluetooth
 import Foundation
 
@@ -59,6 +60,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     @Published public private(set) var latestState: ChannelBankState?
     @Published public private(set) var recordings: RecordingList?
     @Published public private(set) var liveAudioDescriptor: LiveAudioDescriptor?
+    @Published public private(set) var audioMonitorStatus: String = "Idle"
     @Published public private(set) var lastError: String?
     @Published public private(set) var broadScanActive = false
     @Published public private(set) var scanDiagnostics: [String] = []
@@ -80,6 +82,10 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var stateNotificationsEnabled = false
     private var initialStateRequested = false
     private var lastResponseCompletionTime: Date?
+    private var playbackTask: Task<Void, Never>?
+    private var activePlaybackIdentity: String?
+    private var completedPlaybackIdentities: Set<String> = []
+    private var audioPlayer: AVAudioPlayer?
 
     public override init() {
         super.init()
@@ -199,7 +205,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     @MainActor
     private func apply(_ operation: @escaping () async throws -> ChannelBankState) async {
         do {
-            latestState = try await operation()
+            let state = try await operation()
+            latestState = state
+            monitorPlaybackIfNeeded(state)
             lastError = nil
         } catch {
             lastError = userVisibleError(error)
@@ -209,7 +217,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     @MainActor
     private func performStateRefresh() async {
         do {
-            latestState = try await client.getState()
+            let state = try await client.getState()
+            latestState = state
+            monitorPlaybackIfNeeded(state)
             lastError = nil
         } catch {
             lastError = userVisibleError(error)
@@ -316,6 +326,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         latestState = nil
         recordings = nil
         liveAudioDescriptor = nil
+        audioMonitorStatus = "Idle"
         protocolCharacteristic = nil
         commandCharacteristic = nil
         responseCharacteristic = nil
@@ -328,6 +339,11 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         stateNotificationsEnabled = false
         initialStateRequested = false
         lastResponseCompletionTime = nil
+        playbackTask?.cancel()
+        playbackTask = nil
+        activePlaybackIdentity = nil
+        audioPlayer?.stop()
+        audioPlayer = nil
         status = .disconnected(reason)
     }
 
@@ -553,9 +569,183 @@ extension BLECentralManager: CBPeripheralDelegate {
         let envelope = try decoder.decode(ChannelBankResponse<ChannelBankState>.self, from: payload)
         if envelope.ok, let body = envelope.body {
             latestState = body
+            monitorPlaybackIfNeeded(body)
             lastError = nil
         } else if let error = envelope.error {
             lastError = "\(envelope.status) \(error.code): \(error.message)"
+        }
+    }
+
+    private func monitorPlaybackIfNeeded(_ state: ChannelBankState) {
+        guard let identity = playbackIdentity(for: state) else { return }
+        guard identity != activePlaybackIdentity, !completedPlaybackIdentities.contains(identity) else { return }
+
+        playbackTask?.cancel()
+        activePlaybackIdentity = identity
+        audioMonitorStatus = "Pulling \(state.playback?.fileName ?? state.playback?.name ?? "playback")"
+        appendDiagnostic("Audio pull start id=\(identity)")
+        playbackTask = Task { [weak self, state, identity] in
+            await self?.pullAndPlay(state: state, identity: identity)
+        }
+    }
+
+    private func playbackIdentity(for state: ChannelBankState) -> String? {
+        guard state.playback?.active == true else { return nil }
+        if let file = state.playback?.file, !file.isEmpty { return file }
+        if let fileName = state.playback?.fileName, !fileName.isEmpty {
+            if let key = state.playback?.freqKey { return "\(key):\(fileName)" }
+            return fileName
+        }
+        return nil
+    }
+
+    private func pullAndPlay(state: ChannelBankState, identity: String) async {
+        do {
+            let download = try await pullCurrentPlaybackWithRetry()
+            try Task.checkCancellation()
+            let url = try writePlaybackFile(download, fallbackName: state.playback?.fileName ?? state.playback?.name)
+            try Task.checkCancellation()
+            await play(url: url, identity: identity, bytes: download.data.count)
+        } catch is CancellationError {
+            await MainActor.run {
+                if activePlaybackIdentity == identity {
+                    audioMonitorStatus = "Canceled"
+                }
+            }
+        } catch {
+            do {
+                let download = try await pullRecordingFallback(state: state)
+                try Task.checkCancellation()
+                let url = try writePlaybackFile(download, fallbackName: state.playback?.fileName ?? state.playback?.name)
+                try Task.checkCancellation()
+                await play(url: url, identity: identity, bytes: download.data.count)
+            } catch is CancellationError {
+                await MainActor.run {
+                    if activePlaybackIdentity == identity {
+                        audioMonitorStatus = "Canceled"
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    if activePlaybackIdentity == identity {
+                        audioMonitorStatus = "Playback pull failed"
+                        lastError = userVisibleError(error)
+                    }
+                }
+            }
+        }
+    }
+
+    private struct PulledAudio {
+        var data: Data
+        var name: String?
+        var contentType: String?
+    }
+
+    private func pullCurrentPlaybackWithRetry() async throws -> PulledAudio {
+        let delays: [UInt64] = [0, 250_000_000, 500_000_000, 1_000_000_000]
+        var lastError: Error?
+        for delay in delays {
+            if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+            do {
+                return try await pullPages { offset in
+                    try await self.client.currentPlaybackPage(offset: offset)
+                }
+            } catch {
+                lastError = error
+                guard error.isHTTPStatus(404) else { throw error }
+            }
+        }
+        throw lastError ?? ChannelBankClientError.requestTimedOut(-1)
+    }
+
+    private func pullRecordingFallback(state: ChannelBankState) async throws -> PulledAudio {
+        await MainActor.run { audioMonitorStatus = "Trying recordings fallback" }
+        let list = try await client.getRecordings()
+        await MainActor.run { recordings = list }
+        guard let file = matchingRecordingFile(state: state, list: list) else {
+            throw ChannelBankClientError.server(
+                ChannelBankErrorBody(code: "recording_not_found", message: "Current playback file was not found in recordings"),
+                status: 404
+            )
+        }
+        return try await pullPages { offset in
+            try await self.client.recordingPage(file: file.path, offset: offset)
+        }
+    }
+
+    private func matchingRecordingFile(state: ChannelBankState, list: RecordingList) -> RecordingItem? {
+        guard let files = list.files else { return nil }
+        let playbackFile = state.playback?.file
+        let playbackName = state.playback?.fileName ?? state.playback?.name
+        if let playbackFile, let exact = files.first(where: { $0.path == playbackFile }) {
+            return exact
+        }
+        if let playbackFile, let suffix = files.first(where: { playbackFile.hasSuffix($0.path) || $0.path.hasSuffix(playbackFile) }) {
+            return suffix
+        }
+        if let playbackName, let named = files.first(where: { $0.name == playbackName || $0.path.hasSuffix(playbackName) }) {
+            return named
+        }
+        return nil
+    }
+
+    private func pullPages(fetch: @escaping (Int) async throws -> RecordingPage) async throws -> PulledAudio {
+        var firstPage: RecordingPage?
+        let data = try await RecordingPaginator().collect { offset in
+            let page = try await fetch(offset)
+            if firstPage == nil { firstPage = page }
+            return page
+        }
+        return PulledAudio(data: data, name: firstPage?.name, contentType: firstPage?.contentType)
+    }
+
+    private func writePlaybackFile(_ audio: PulledAudio, fallbackName: String?) throws -> URL {
+        let rawName = audio.name ?? fallbackName ?? "channel-bank-playback"
+        let ext = playbackFileExtension(contentType: audio.contentType, name: rawName)
+        let safeName = rawName
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        let base = safeName.isEmpty ? "channel-bank-playback" : safeName
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(base)-\(UUID().uuidString)")
+            .appendingPathExtension(ext)
+        try audio.data.write(to: url, options: .atomic)
+        return url
+    }
+
+    private func playbackFileExtension(contentType: String?, name: String) -> String {
+        let lowerName = name.lowercased()
+        if lowerName.hasSuffix(".m4a") { return "m4a" }
+        if lowerName.hasSuffix(".wav") { return "wav" }
+        let lowerType = contentType?.lowercased() ?? ""
+        if lowerType.contains("mp4") || lowerType.contains("m4a") { return "m4a" }
+        return "wav"
+    }
+
+    @MainActor
+    private func play(url: URL, identity: String, bytes: Int) async {
+        #if os(iOS)
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            lastError = error.localizedDescription
+        }
+        #endif
+        do {
+            audioPlayer?.stop()
+            let player = try AVAudioPlayer(contentsOf: url)
+            player.prepareToPlay()
+            player.play()
+            audioPlayer = player
+            completedPlaybackIdentities.insert(identity)
+            audioMonitorStatus = "Playing \(url.lastPathComponent)"
+            appendDiagnostic("Audio pull complete id=\(identity) bytes=\(bytes)")
+        } catch {
+            audioMonitorStatus = "Playback failed"
+            lastError = error.localizedDescription
         }
     }
 
@@ -638,6 +828,16 @@ private extension ChannelBankFrameError {
         case .invalidUTF8:
             return "invalid UTF-8"
         }
+    }
+}
+
+private extension Error {
+    func isHTTPStatus(_ status: Int) -> Bool {
+        guard let error = self as? ChannelBankClientError else { return false }
+        if case .server(_, let actualStatus) = error {
+            return actualStatus == status
+        }
+        return false
     }
 }
 
