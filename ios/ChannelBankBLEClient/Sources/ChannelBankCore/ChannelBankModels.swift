@@ -88,6 +88,7 @@ public struct EmptyBody: Codable, Equatable {
 }
 
 public struct ChannelBankState: Codable, Equatable {
+    public var seq: Int64?
     public var module: String?
     public var enabled: Bool?
     public var running: Bool?
@@ -110,6 +111,7 @@ public struct ChannelBankState: Codable, Equatable {
     public var snrThresholdDb: Double?
     public var maxChannels: Int?
     public var recordingEnabled: Bool?
+    public var activeChannelCount: Int?
     public var activeChannels: [ChannelBankChannel]?
     public var recentChannels: [RecentChannel]?
     public var detectedSlots: Int?
@@ -130,15 +132,16 @@ public struct ChannelBankState: Codable, Equatable {
     public var extra: [String: JSONValue] = [:]
 
     enum CodingKeys: String, CodingKey {
-        case module, enabled, running, mode, demodMode, centerHz, waterfallCenterHz, sampleRate, usableSpanHz, bwUsage
+        case seq, module, enabled, running, mode, demodMode, centerHz, waterfallCenterHz, sampleRate, usableSpanHz, bwUsage
         case radioPlaying, sdrppHeartbeat, serverTimeMs, selectedSource, sources, sdrppServer, sourceControls, sourceOffset, settings, snrThresholdDb
-        case maxChannels, recordingEnabled, activeChannels, recentChannels, detectedSlots, manualDetected, snrOverview
+        case maxChannels, recordingEnabled, activeChannelCount, activeChannels, recentChannels, detectedSlots, manualDetected, snrOverview
         case playbackQueued, playback, playbackLock, currentlyPlayingFreqKey, history, diagnostics
         case scanStopIndex, scanStopCount, bookmarkScanStopIndex, bookmarkScanStopCount, lastTranscriptName, lastTranscriptText
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try? container.decodeIfPresent(Int64.self, forKey: .seq)
         module = try? container.decodeIfPresent(String.self, forKey: .module)
         enabled = try? container.decodeIfPresent(Bool.self, forKey: .enabled)
         running = try? container.decodeIfPresent(Bool.self, forKey: .running)
@@ -161,6 +164,7 @@ public struct ChannelBankState: Codable, Equatable {
         snrThresholdDb = try? container.decodeIfPresent(Double.self, forKey: .snrThresholdDb)
         maxChannels = try? container.decodeIfPresent(Int.self, forKey: .maxChannels)
         recordingEnabled = try? container.decodeIfPresent(Bool.self, forKey: .recordingEnabled)
+        activeChannelCount = try? container.decodeIfPresent(Int.self, forKey: .activeChannelCount)
         activeChannels = try? container.decodeIfPresent([ChannelBankChannel].self, forKey: .activeChannels)
         recentChannels = try? container.decodeIfPresent([RecentChannel].self, forKey: .recentChannels)
         detectedSlots = try? container.decodeIfPresent(Int.self, forKey: .detectedSlots)
@@ -184,6 +188,7 @@ public struct ChannelBankState: Codable, Equatable {
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(seq, forKey: .seq)
         try container.encodeIfPresent(module, forKey: .module)
         try container.encodeIfPresent(enabled, forKey: .enabled)
         try container.encodeIfPresent(running, forKey: .running)
@@ -206,6 +211,7 @@ public struct ChannelBankState: Codable, Equatable {
         try container.encodeIfPresent(snrThresholdDb, forKey: .snrThresholdDb)
         try container.encodeIfPresent(maxChannels, forKey: .maxChannels)
         try container.encodeIfPresent(recordingEnabled, forKey: .recordingEnabled)
+        try container.encodeIfPresent(activeChannelCount, forKey: .activeChannelCount)
         try container.encodeIfPresent(activeChannels, forKey: .activeChannels)
         try container.encodeIfPresent(recentChannels, forKey: .recentChannels)
         try container.encodeIfPresent(detectedSlots, forKey: .detectedSlots)
@@ -224,6 +230,53 @@ public struct ChannelBankState: Codable, Equatable {
         try container.encodeIfPresent(lastTranscriptName, forKey: .lastTranscriptName)
         try container.encodeIfPresent(lastTranscriptText, forKey: .lastTranscriptText)
     }
+
+    public mutating func merge(summary: ChannelBankStateSummary) {
+        seq = summary.seq ?? seq
+        serverTimeMs = summary.serverTimeMs ?? serverTimeMs
+        running = summary.running ?? running
+        radioPlaying = summary.radioPlaying ?? radioPlaying
+        selectedSource = summary.selectedSource ?? selectedSource
+        centerHz = summary.centerHz ?? centerHz
+        sampleRate = summary.sampleRate ?? sampleRate
+        mode = summary.mode ?? mode
+        demodMode = summary.demodMode ?? demodMode
+        snrThresholdDb = summary.snrThresholdDb ?? snrThresholdDb
+        maxChannels = summary.maxChannels ?? maxChannels
+        recordingEnabled = summary.recordingEnabled ?? recordingEnabled
+        activeChannelCount = summary.activeChannelCount ?? activeChannelCount
+        playbackQueued = summary.playbackQueued ?? playbackQueued
+        playback = summary.playback ?? playback
+
+        var nextSettings = settings ?? ChannelBankSettings()
+        nextSettings.mode = summary.mode ?? nextSettings.mode
+        nextSettings.demodMode = summary.demodMode ?? nextSettings.demodMode
+        nextSettings.snrThresholdDb = summary.snrThresholdDb ?? nextSettings.snrThresholdDb
+        nextSettings.maxChannels = summary.maxChannels ?? nextSettings.maxChannels
+        nextSettings.recordingEnabled = summary.recordingEnabled ?? nextSettings.recordingEnabled
+        settings = nextSettings
+    }
+}
+
+public struct ChannelBankStateSummary: Codable, Equatable {
+    public var v: Int?
+    public var seq: Int64?
+    public var serverTimeMs: Int64?
+    public var running: Bool?
+    public var radioPlaying: Bool?
+    public var selectedSource: String?
+    public var centerHz: Double?
+    public var sampleRate: Double?
+    public var mode: String?
+    public var demodMode: String?
+    public var snrThresholdDb: Double?
+    public var maxChannels: Int?
+    public var recordingEnabled: Bool?
+    public var activeChannelCount: Int?
+    public var playbackQueued: Int?
+    public var playback: PlaybackState?
+
+    public init() {}
 }
 
 public struct SourceListResponse: Codable, Equatable {

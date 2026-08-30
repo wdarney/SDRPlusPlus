@@ -384,12 +384,13 @@ public struct ChannelBankRootView: View {
     }
 
     private func channelBankPanel(_ state: ChannelBankState) -> some View {
-        Panel("Channel Bank") {
+        let activeCount = state.activeChannels?.count ?? state.activeChannelCount ?? 0
+        return Panel("Channel Bank") {
             MetricGrid(items: [
                 ("Bank", state.running == true ? "Running" : "Stopped"),
                 ("Mode", state.mode ?? "-"),
                 ("Demod", state.demodMode ?? "-"),
-                ("Active", "\(state.activeChannels?.count ?? 0) / \(state.maxChannels ?? 0)")
+                ("Active", "\(activeCount) / \(state.maxChannels ?? 0)")
             ])
             HStack {
                 Button("Start Bank") { model.ble.setChannelBankRunning(true) }
@@ -404,7 +405,11 @@ public struct ChannelBankRootView: View {
     private func activeChannelsPanel(_ state: ChannelBankState) -> some View {
         Panel("Active Channels") {
             if (state.activeChannels ?? []).isEmpty {
-                Text("No active channels").foregroundStyle(.secondary)
+                if let activeChannelCount = state.activeChannelCount, activeChannelCount > 0 {
+                    Text("\(activeChannelCount) active channels").foregroundStyle(.secondary)
+                } else {
+                    Text("No active channels").foregroundStyle(.secondary)
+                }
             } else {
                 ForEach(state.activeChannels ?? []) { channel in
                     HStack {

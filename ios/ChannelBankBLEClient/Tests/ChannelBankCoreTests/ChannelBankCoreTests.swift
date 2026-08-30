@@ -99,12 +99,55 @@ final class ChannelBankClientTests: XCTestCase {
     }
 
     func testStateDecodingWithMissingAndUnknownFields() throws {
-        let raw = Data(#"{"selectedSource":"RX888","centerHz":157067450,"activeChannels":[{"freqHz":157000000,"extra":true}],"newFutureField":"ok"}"#.utf8)
+        let raw = Data(#"{"seq":12,"selectedSource":"RX888","centerHz":157067450,"activeChannelCount":1,"activeChannels":[{"freqHz":157000000,"extra":true}],"newFutureField":"ok"}"#.utf8)
         let state = try JSONDecoder().decode(ChannelBankState.self, from: raw)
+        XCTAssertEqual(state.seq, 12)
         XCTAssertEqual(state.selectedSource, "RX888")
         XCTAssertEqual(state.centerHz, 157067450)
+        XCTAssertEqual(state.activeChannelCount, 1)
         XCTAssertEqual(state.activeChannels?.first?.freqHz, 157000000)
         XCTAssertNil(state.running)
+    }
+
+    func testStateSummaryDecodingAndMergePreservesDetails() throws {
+        let raw = Data(#"""
+        {
+          "v":1,
+          "seq":1042,
+          "serverTimeMs":1788125402000,
+          "running":true,
+          "radioPlaying":true,
+          "selectedSource":"RX888",
+          "centerHz":157067450,
+          "sampleRate":8000000,
+          "mode":"auto",
+          "demodMode":"NFM",
+          "snrThresholdDb":8,
+          "maxChannels":16,
+          "recordingEnabled":true,
+          "activeChannelCount":3,
+          "playbackQueued":1,
+          "playback":{"active":true,"freqHz":155475000,"name":"County Fire","fileName":"fire.wav"}
+        }
+        """#.utf8)
+        let summary = try JSONDecoder().decode(ChannelBankStateSummary.self, from: raw)
+        XCTAssertEqual(summary.seq, 1042)
+        XCTAssertEqual(summary.activeChannelCount, 3)
+        XCTAssertEqual(summary.playback?.fileName, "fire.wav")
+
+        var state = ChannelBankState()
+        state.history = [HistoryEntry(freqHz: 155_475_000, name: "County Fire", count: 2)]
+        state.sourceControls = RX888SourceControls()
+        state.merge(summary: summary)
+
+        XCTAssertEqual(state.seq, 1042)
+        XCTAssertEqual(state.running, true)
+        XCTAssertEqual(state.selectedSource, "RX888")
+        XCTAssertEqual(state.activeChannelCount, 3)
+        XCTAssertEqual(state.settings?.snrThresholdDb, 8)
+        XCTAssertEqual(state.settings?.maxChannels, 16)
+        XCTAssertEqual(state.history?.first?.name, "County Fire")
+        XCTAssertNotNil(state.sourceControls)
     }
 
     func testParityStateDecoding() throws {

@@ -93,6 +93,10 @@ public final class ChannelBankClient {
         try await request(method: "GET", path: "/api/state", responseBody: ChannelBankState.self)
     }
 
+    public func getStateSummary() async throws -> ChannelBankStateSummary {
+        try await request(method: "GET", path: "/api/state/summary", responseBody: ChannelBankStateSummary.self)
+    }
+
     public func getSources() async throws -> SourceListResponse {
         try await request(method: "GET", path: "/api/sources", responseBody: SourceListResponse.self)
     }

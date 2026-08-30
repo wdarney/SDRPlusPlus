@@ -14,6 +14,11 @@ it does not expose a GATT server.
 - Connect, discover all five characteristics, and read the Protocol
   characteristic.
 - Enable Response indications and State notifications.
+- Optionally enable State Summary indications on
+  `7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000` when Android exposes the summary
+  characteristic.
+- Use State Summary to populate the immediately visible interface quickly, while
+  full State remains the detail/history compatibility path.
 - Send `GET /api/state`.
 - Decode and display connection status, selected source, radio state, Channel
   Bank state, center frequency, sample rate, RX888 controls, active channels,
@@ -31,6 +36,8 @@ source settings after connection.
 This client reproduces the WebUI activity waterfall from state snapshots. It
 does not transport or draw the real SDR++ FFT waterfall. Rows advance only when
 a new State notification is received, and the circular buffer retains 72 rows.
+State Summary updates can update counters and running status before the detailed
+active-channel arrays arrive.
 
 ## Security note
 

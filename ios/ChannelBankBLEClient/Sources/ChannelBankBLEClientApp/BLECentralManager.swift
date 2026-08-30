@@ -52,6 +52,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private static let responseUUID = CBUUID(string: "7d2f0003-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let stateUUID = CBUUID(string: "7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let audioUUID = CBUUID(string: "7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000")
+    private static let stateSummaryUUID = CBUUID(string: "7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000")
 
     @Published public private(set) var status: BLEConnectionStatus = .idle
     @Published public private(set) var discovered: [DiscoveredPeripheral] = []
@@ -72,14 +73,18 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var responseCharacteristic: CBCharacteristic?
     private var stateCharacteristic: CBCharacteristic?
     private var audioCharacteristic: CBCharacteristic?
+    private var stateSummaryCharacteristic: CBCharacteristic?
     private let responseAssembler = ChannelBankFrameAssembler()
     private let stateAssembler = ChannelBankFrameAssembler()
+    private let stateSummaryAssembler = ChannelBankFrameAssembler()
     private let decoder = JSONDecoder()
     private lazy var client = ChannelBankClient(transport: self)
     private var broadScanFallbackTask: Task<Void, Never>?
     private var scanRequested = false
     private var responseNotificationsEnabled = false
     private var stateNotificationsEnabled = false
+    private var stateSummaryNotificationsEnabled = false
+    private var latestSequence: Int64?
     private var initialStateFallbackTask: Task<Void, Never>?
     private var lastResponseCompletionTime: Date?
     private var playbackTask: Task<Void, Never>?
@@ -206,8 +211,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private func apply(_ operation: @escaping () async throws -> ChannelBankState) async {
         do {
             let state = try await operation()
-            latestState = state
-            monitorPlaybackIfNeeded(state)
+            acceptFullState(state)
             lastError = nil
         } catch {
             lastError = userVisibleError(error)
@@ -218,10 +222,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private func performStateRefresh(suppressTimeoutError: Bool = false) async {
         do {
             let state = try await client.getState()
-            latestState = state
-            initialStateFallbackTask?.cancel()
-            initialStateFallbackTask = nil
-            monitorPlaybackIfNeeded(state)
+            acceptFullState(state)
             lastError = nil
         } catch {
             if suppressTimeoutError, error.isRequestTimeout {
@@ -233,8 +234,11 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     private func requestInitialStateIfReady() {
-        guard responseNotificationsEnabled, stateNotificationsEnabled, latestState == nil, initialStateFallbackTask == nil else { return }
-        appendDiagnostic("Waiting for subscribed State snapshot")
+        guard responseNotificationsEnabled,
+              (stateNotificationsEnabled || stateSummaryNotificationsEnabled),
+              latestState == nil,
+              initialStateFallbackTask == nil else { return }
+        appendDiagnostic(stateSummaryNotificationsEnabled ? "Waiting for subscribed State Summary snapshot" : "Waiting for subscribed State snapshot")
         initialStateFallbackTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 8_000_000_000)
             guard let self, self.latestState == nil else { return }
@@ -342,11 +346,15 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         responseCharacteristic = nil
         stateCharacteristic = nil
         audioCharacteristic = nil
+        stateSummaryCharacteristic = nil
         responseAssembler.reset()
         stateAssembler.reset()
+        stateSummaryAssembler.reset()
         client.reset()
         responseNotificationsEnabled = false
         stateNotificationsEnabled = false
+        stateSummaryNotificationsEnabled = false
+        latestSequence = nil
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
         lastResponseCompletionTime = nil
@@ -472,7 +480,14 @@ extension BLECentralManager: CBPeripheralDelegate {
             lastError = "SDR++ service not found"
             return
         }
-        peripheral.discoverCharacteristics([Self.protocolUUID, Self.commandUUID, Self.responseUUID, Self.stateUUID, Self.audioUUID], for: service)
+        peripheral.discoverCharacteristics([
+            Self.protocolUUID,
+            Self.commandUUID,
+            Self.responseUUID,
+            Self.stateUUID,
+            Self.audioUUID,
+            Self.stateSummaryUUID
+        ], for: service)
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
@@ -487,6 +502,7 @@ extension BLECentralManager: CBPeripheralDelegate {
             case Self.responseUUID: responseCharacteristic = characteristic
             case Self.stateUUID: stateCharacteristic = characteristic
             case Self.audioUUID: audioCharacteristic = characteristic
+            case Self.stateSummaryUUID: stateSummaryCharacteristic = characteristic
             default: break
             }
         }
@@ -503,6 +519,11 @@ extension BLECentralManager: CBPeripheralDelegate {
         if let stateCharacteristic {
             peripheral.setNotifyValue(true, for: stateCharacteristic)
         }
+        if let stateSummaryCharacteristic {
+            peripheral.setNotifyValue(true, for: stateSummaryCharacteristic)
+        } else {
+            appendDiagnostic("State Summary characteristic not present")
+        }
         connectedName = peripheral.name ?? connectedName
         status = .connected(connectedName ?? "SDR++ Channel Bank")
     }
@@ -518,6 +539,9 @@ extension BLECentralManager: CBPeripheralDelegate {
         } else if characteristic.uuid == Self.stateUUID {
             stateNotificationsEnabled = characteristic.isNotifying
             appendDiagnostic("State indications \(characteristic.isNotifying ? "enabled" : "disabled")")
+        } else if characteristic.uuid == Self.stateSummaryUUID {
+            stateSummaryNotificationsEnabled = characteristic.isNotifying
+            appendDiagnostic("State Summary indications \(characteristic.isNotifying ? "enabled" : "disabled")")
         }
         requestInitialStateIfReady()
     }
@@ -573,20 +597,86 @@ extension BLECentralManager: CBPeripheralDelegate {
                     appendDiagnostic("Ignored State frame: \(userVisibleError(error))")
                 }
             }
+        } else if characteristic.uuid == Self.stateSummaryUUID {
+            do {
+                logIncomingFrame(value, label: "State Summary")
+                if let complete = try stateSummaryAssembler.push(value) {
+                    appendDiagnostic("RX State Summary complete id=\(complete.messageID) bytes=\(complete.payload.count)")
+                    try acceptStateSummaryPayload(complete.payload)
+                }
+            } catch {
+                if looksLikeJSON(value) {
+                    do {
+                        appendDiagnostic("RX raw State Summary JSON bytes=\(value.count)")
+                        try acceptStateSummaryPayload(value)
+                    } catch {
+                        appendDiagnostic("Ignored undecodable State Summary JSON: \(decodingDiagnostic(error))")
+                    }
+                } else if let frameError = error as? ChannelBankFrameError,
+                          frameError.isRecoverableFragmentLoss {
+                    appendDiagnostic("Dropped partial State Summary frame: \(frameError.diagnosticLabel)")
+                } else {
+                    appendDiagnostic("Ignored State Summary frame: \(userVisibleError(error))")
+                }
+            }
         }
     }
 
     private func acceptStatePayload(_ payload: Data) throws {
         let envelope = try decoder.decode(ChannelBankResponse<ChannelBankState>.self, from: payload)
         if envelope.ok, let body = envelope.body {
-            latestState = body
-            initialStateFallbackTask?.cancel()
-            initialStateFallbackTask = nil
-            monitorPlaybackIfNeeded(body)
+            acceptFullState(body)
             lastError = nil
         } else if let error = envelope.error {
             lastError = "\(envelope.status) \(error.code): \(error.message)"
         }
+    }
+
+    private func acceptStateSummaryPayload(_ payload: Data) throws {
+        if !topLevelJSONHasKey("ok", in: payload),
+           let summary = try? decoder.decode(ChannelBankStateSummary.self, from: payload) {
+            acceptStateSummary(summary)
+            return
+        }
+
+        let envelope = try decoder.decode(ChannelBankResponse<ChannelBankStateSummary>.self, from: payload)
+        if envelope.ok, let body = envelope.body {
+            acceptStateSummary(body)
+            lastError = nil
+        } else if let error = envelope.error {
+            lastError = "\(envelope.status) \(error.code): \(error.message)"
+        }
+    }
+
+    private func acceptFullState(_ state: ChannelBankState) {
+        if let seq = state.seq {
+            if let latestSequence, seq < latestSequence {
+                appendDiagnostic("Ignored stale State seq=\(seq) latest=\(latestSequence)")
+                return
+            }
+            latestSequence = seq
+        }
+        latestState = state
+        initialStateFallbackTask?.cancel()
+        initialStateFallbackTask = nil
+        monitorPlaybackIfNeeded(state)
+    }
+
+    private func acceptStateSummary(_ summary: ChannelBankStateSummary) {
+        if let seq = summary.seq {
+            if let latestSequence, seq <= latestSequence {
+                appendDiagnostic("Ignored stale State Summary seq=\(seq) latest=\(latestSequence)")
+                return
+            }
+            latestSequence = seq
+        }
+        var state = latestState ?? ChannelBankState()
+        state.merge(summary: summary)
+        latestState = state
+        initialStateFallbackTask?.cancel()
+        initialStateFallbackTask = nil
+        monitorPlaybackIfNeeded(state)
+        lastError = nil
     }
 
     private func monitorPlaybackIfNeeded(_ state: ChannelBankState) {
@@ -764,6 +854,11 @@ extension BLECentralManager: CBPeripheralDelegate {
 
     private func looksLikeJSON(_ data: Data) -> Bool {
         data.first { !$0.isWhitespace } == UInt8(ascii: "{")
+    }
+
+    private func topLevelJSONHasKey(_ key: String, in data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object[key] != nil
     }
 
     private func logOutgoingCommandFrame(_ data: Data) {

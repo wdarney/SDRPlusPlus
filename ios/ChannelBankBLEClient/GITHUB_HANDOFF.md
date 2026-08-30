@@ -43,11 +43,19 @@ The app currently:
 - Connects to the five Channel Bank characteristics.
 - Reads the Protocol characteristic.
 - Enables Response and State indications.
+- Optionally discovers State Summary characteristic
+  `7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000` and enables indications when present.
+- Accepts State Summary as raw JSON or as the normal response envelope from
+  `GET /api/state/summary`.
+- Merges State Summary fields into the local State model without clearing
+  fields that are absent from the summary.
+- Uses `seq` when present to ignore stale Summary/State updates.
 - Receives and reassembles live State indications without doing a startup State
   characteristic read or immediate startup `/api/state` command.
-- Waits for the subscribed State stream first; if no complete State arrives
-  after 8 seconds, it sends a quiet fallback `/api/state` request and keeps
-  waiting on State indications if that fallback times out.
+- Waits for the subscribed State Summary stream first when available, otherwise
+  the full State stream; if no snapshot arrives after 8 seconds, it sends a
+  quiet fallback `/api/state` request and keeps waiting on indications if that
+  fallback times out.
 - Decodes live State into the Radio, Center, Channel Bank, active-channel,
   waterfall, history, playback, settings, and diagnostics panels.
 - Decodes the broader WebUI/BLE State schema, including `sdrppServer`,
@@ -104,6 +112,9 @@ Physical iPhone validation:
   traffic.
 - Protocol v1 is unauthenticated and should only be used on trusted nearby
   development devices.
+- Best experience follow-up: Android should publish a small State Summary every
+  250-500 ms and immediately after user actions, prioritize Response then State
+  Summary then full State, and let full State hydrate detail/history less often.
 
 ## Useful Retest Markers
 
@@ -111,6 +122,8 @@ After installing both the Android APK and iOS app:
 
 - iOS should discover a peripheral advertising the Channel Bank UUID.
 - Connection diagnostics should show Response and State indications enabled.
+- On Android builds with State Summary, diagnostics should also show
+  `State Summary indications enabled` followed by `RX State Summary complete`.
 - The first visible UI state should populate without an immediate
   `Request timed out id=1` startup error.
 - If fragment loss occurs, it should be diagnostic-only, not the primary red
