@@ -175,8 +175,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
             switch clientError {
             case .server(let serverError, let status):
                 return "\(status) \(serverError.code): \(serverError.message)"
-            case .requestTimedOut:
-                return "Request timed out"
+            case .requestTimedOut(let id):
+                return id >= 0 ? "Request timed out id=\(id)" : "Request timed out"
             default:
                 return String(describing: clientError)
             }

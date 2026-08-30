@@ -41,7 +41,7 @@ public final class ChannelBankClient {
         query: [String: JSONValue]? = nil,
         body: [String: JSONValue]? = nil,
         responseBody: Body.Type = Body.self,
-        timeoutNanoseconds: UInt64 = 5_000_000_000
+        timeoutNanoseconds: UInt64 = 20_000_000_000
     ) async throws -> Body {
         let id = nextID
         nextID += 1
