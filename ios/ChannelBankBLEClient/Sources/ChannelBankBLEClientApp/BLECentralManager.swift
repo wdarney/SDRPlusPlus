@@ -80,7 +80,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var scanRequested = false
     private var responseNotificationsEnabled = false
     private var stateNotificationsEnabled = false
-    private var initialStateRequested = false
+    private var initialStateFallbackTask: Task<Void, Never>?
     private var lastResponseCompletionTime: Date?
     private var playbackTask: Task<Void, Never>?
     private var activePlaybackIdentity: String?
@@ -215,22 +215,32 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     @MainActor
-    private func performStateRefresh() async {
+    private func performStateRefresh(suppressTimeoutError: Bool = false) async {
         do {
             let state = try await client.getState()
             latestState = state
+            initialStateFallbackTask?.cancel()
+            initialStateFallbackTask = nil
             monitorPlaybackIfNeeded(state)
             lastError = nil
         } catch {
+            if suppressTimeoutError, error.isRequestTimeout {
+                appendDiagnostic("Initial /api/state fallback timed out; still waiting for State indications")
+                return
+            }
             lastError = userVisibleError(error)
         }
     }
 
     private func requestInitialStateIfReady() {
-        guard responseNotificationsEnabled, stateNotificationsEnabled, !initialStateRequested else { return }
-        initialStateRequested = true
-        appendDiagnostic("Requesting initial /api/state")
-        refreshState()
+        guard responseNotificationsEnabled, stateNotificationsEnabled, latestState == nil, initialStateFallbackTask == nil else { return }
+        appendDiagnostic("Waiting for subscribed State snapshot")
+        initialStateFallbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self, self.latestState == nil else { return }
+            self.appendDiagnostic("Fallback requesting /api/state")
+            await self.performStateRefresh(suppressTimeoutError: true)
+        }
     }
 
     @MainActor
@@ -337,7 +347,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         client.reset()
         responseNotificationsEnabled = false
         stateNotificationsEnabled = false
-        initialStateRequested = false
+        initialStateFallbackTask?.cancel()
+        initialStateFallbackTask = nil
         lastResponseCompletionTime = nil
         playbackTask?.cancel()
         playbackTask = nil
@@ -569,6 +580,8 @@ extension BLECentralManager: CBPeripheralDelegate {
         let envelope = try decoder.decode(ChannelBankResponse<ChannelBankState>.self, from: payload)
         if envelope.ok, let body = envelope.body {
             latestState = body
+            initialStateFallbackTask?.cancel()
+            initialStateFallbackTask = nil
             monitorPlaybackIfNeeded(body)
             lastError = nil
         } else if let error = envelope.error {
@@ -836,6 +849,14 @@ private extension Error {
         guard let error = self as? ChannelBankClientError else { return false }
         if case .server(_, let actualStatus) = error {
             return actualStatus == status
+        }
+        return false
+    }
+
+    var isRequestTimeout: Bool {
+        guard let error = self as? ChannelBankClientError else { return false }
+        if case .requestTimedOut = error {
+            return true
         }
         return false
     }

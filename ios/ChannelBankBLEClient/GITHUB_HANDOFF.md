@@ -44,7 +44,10 @@ The app currently:
 - Reads the Protocol characteristic.
 - Enables Response and State indications.
 - Receives and reassembles live State indications without doing a startup State
-  characteristic read.
+  characteristic read or immediate startup `/api/state` command.
+- Waits for the subscribed State stream first; if no complete State arrives
+  after 8 seconds, it sends a quiet fallback `/api/state` request and keeps
+  waiting on State indications if that fallback times out.
 - Decodes live State into the Radio, Center, Channel Bank, active-channel,
   waterfall, history, playback, settings, and diagnostics panels.
 - Decodes the broader WebUI/BLE State schema, including `sdrppServer`,
@@ -108,8 +111,8 @@ After installing both the Android APK and iOS app:
 
 - iOS should discover a peripheral advertising the Channel Bank UUID.
 - Connection diagnostics should show Response and State indications enabled.
-- The first visible UI state should populate without a persistent
-  `Request timed out` error.
+- The first visible UI state should populate without an immediate
+  `Request timed out id=1` startup error.
 - If fragment loss occurs, it should be diagnostic-only, not the primary red
   error.
 - Tapping Start/Stop Radio or Start/Stop Bank should produce a matching State
