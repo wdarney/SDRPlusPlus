@@ -55,6 +55,9 @@
 #include <cctype>
 #include <functional>
 #include <memory>
+#ifdef __ANDROID__
+#include <android_ble_gatt.h>
+#endif
 #ifdef __APPLE__
 #include "transcription.h"
 #endif
@@ -486,6 +489,10 @@ public:
     }
 
     ~ChannelBankModule() {
+#ifdef __ANDROID__
+        android_ble_gatt::stop();
+        android_ble_gatt::unregisterRequestHandler();
+#endif
         stopWebServer();
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
@@ -523,6 +530,11 @@ public:
             }
         }
         if (webControlEnabled) startWebServer();
+#ifdef __ANDROID__
+        android_ble_gatt::registerRequestHandler(
+            [this](const std::string& request) { return handleBleGattRequest(request); });
+        android_ble_gatt::start();
+#endif
     }
     void enable()  { enabled = true; }
     void disable() { enabled = false; restoreWaterfallVisibility(); }
@@ -3973,7 +3985,13 @@ self.addEventListener("fetch", event => {
     }
 
     void publishLiveAudio(ChannelSlot& slot, const float* mono, int count) {
-        if (liveAudioClients.load() <= 0 || !mono || count <= 0) return;
+        if (!mono || count <= 0) return;
+#ifdef __ANDROID__
+        bool bleAudioWanted = android_ble_gatt::hasAudioSubscribers();
+#else
+        bool bleAudioWanted = false;
+#endif
+        if (liveAudioClients.load() <= 0 && !bleAudioWanted) return;
 
         std::vector<int16_t> chunk;
         chunk.resize((size_t)count);
@@ -3985,7 +4003,12 @@ self.addEventListener("fetch", event => {
     }
 
     void publishLiveAudioPcm(double freqHz, const int16_t* pcm, int count, bool forceSelect) {
-        if (liveAudioClients.load() <= 0 || !pcm || count <= 0) return;
+        if (!pcm || count <= 0) return;
+#ifdef __ANDROID__
+        if (android_ble_gatt::hasAudioSubscribers())
+            android_ble_gatt::publishAudio(pcm, (size_t)count);
+#endif
+        if (liveAudioClients.load() <= 0) return;
 
         std::unique_lock<std::mutex> lk(liveAudioMtx, std::try_to_lock);
         if (!lk.owns_lock()) {
@@ -4200,6 +4223,326 @@ self.addEventListener("fetch", event => {
             return json::object();
         }
     }
+
+#ifdef __ANDROID__
+    static std::string base64Encode(const uint8_t* data, size_t size) {
+        static constexpr char alphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((size + 2) / 3) * 4);
+        for (size_t i = 0; i < size; i += 3) {
+            uint32_t n = (uint32_t)data[i] << 16;
+            if (i + 1 < size) n |= (uint32_t)data[i + 1] << 8;
+            if (i + 2 < size) n |= data[i + 2];
+            out.push_back(alphabet[(n >> 18) & 63]);
+            out.push_back(alphabet[(n >> 12) & 63]);
+            out.push_back(i + 1 < size ? alphabet[(n >> 6) & 63] : '=');
+            out.push_back(i + 2 < size ? alphabet[n & 63] : '=');
+        }
+        return out;
+    }
+
+    json recordingPageJson(const json& request, std::string& error, int& status) {
+        json query = request.value("query", json::object());
+        json body = request.value("body", json::object());
+        std::string rel = query.value("file", body.value("file", std::string()));
+        int64_t offset = body.value("offset", (int64_t)0);
+        int limit = std::clamp(body.value("limit", 4096), 1, 16384);
+        if (rel.empty()) { status = 400; error = "file required"; return {}; }
+        if (offset < 0) { status = 400; error = "offset must be non-negative"; return {}; }
+
+        std::filesystem::path rootPath = recordingsRootPath();
+        if (rootPath.empty()) { status = 404; error = "recordings folder not available"; return {}; }
+        std::filesystem::path relPath(rel);
+        if (relPath.is_absolute()) { status = 400; error = "absolute paths are not allowed"; return {}; }
+        std::error_code ec;
+        std::filesystem::path filePath = std::filesystem::weakly_canonical(rootPath / relPath, ec);
+        if (ec || !pathIsInside(filePath, rootPath) ||
+            !std::filesystem::is_regular_file(filePath, ec) || ec) {
+            status = 404; error = "recording not found"; return {};
+        }
+        uintmax_t fileSize = std::filesystem::file_size(filePath, ec);
+        if (ec || (uint64_t)offset > fileSize) {
+            status = 416; error = "offset is past end of recording"; return {};
+        }
+        std::ifstream file(filePath, std::ios::binary);
+        if (!file.is_open()) { status = 404; error = "recording not readable"; return {}; }
+        file.seekg(offset);
+        size_t count = (size_t)std::min<uint64_t>((uint64_t)limit, fileSize - (uint64_t)offset);
+        std::vector<uint8_t> bytes(count);
+        if (count) file.read((char*)bytes.data(), (std::streamsize)count);
+        count = (size_t)file.gcount();
+        std::string ext = filePath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return {
+            {"file", rel},
+            {"name", filePath.filename().string()},
+            {"contentType", ext == ".m4a" ? "audio/mp4" : "audio/wav"},
+            {"offset", offset},
+            {"nextOffset", offset + (int64_t)count},
+            {"size", fileSize},
+            {"eof", (uint64_t)(offset + (int64_t)count) >= fileSize},
+            {"dataBase64", base64Encode(bytes.data(), count)}
+        };
+    }
+
+    json currentPlaybackPageJson(const json& request, std::string& error, int& status) {
+        if (currentlyPlayingFreqKey.load() == 0) {
+            status = 404;
+            error = "no active playback";
+            return {};
+        }
+
+        std::string path;
+        {
+            std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
+            path = currentPlaybackPath;
+        }
+        if (path.empty()) {
+            status = 404;
+            error = "playback file unavailable";
+            return {};
+        }
+
+        json body = request.value("body", json::object());
+        int64_t offset = body.value("offset", (int64_t)0);
+        int limit = std::clamp(body.value("limit", 4096), 1, 16384);
+        if (offset < 0) {
+            status = 400;
+            error = "offset must be non-negative";
+            return {};
+        }
+
+        std::error_code ec;
+        std::filesystem::path filePath = std::filesystem::weakly_canonical(path, ec);
+        if (ec || !std::filesystem::is_regular_file(filePath, ec) || ec) {
+            status = 404;
+            error = "playback file not found";
+            return {};
+        }
+        uintmax_t fileSize = std::filesystem::file_size(filePath, ec);
+        if (ec || (uint64_t)offset > fileSize) {
+            status = 416;
+            error = "offset is past end of playback file";
+            return {};
+        }
+        std::ifstream file(filePath, std::ios::binary);
+        if (!file.is_open()) {
+            status = 404;
+            error = "playback file not readable";
+            return {};
+        }
+        file.seekg(offset);
+        size_t count = (size_t)std::min<uint64_t>((uint64_t)limit, fileSize - (uint64_t)offset);
+        std::vector<uint8_t> bytes(count);
+        if (count) file.read((char*)bytes.data(), (std::streamsize)count);
+        count = (size_t)file.gcount();
+        std::string ext = filePath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return {
+            {"name", filePath.filename().string()},
+            {"contentType", ext == ".m4a" ? "audio/mp4" : "audio/wav"},
+            {"offset", offset},
+            {"nextOffset", offset + (int64_t)count},
+            {"size", fileSize},
+            {"eof", (uint64_t)(offset + (int64_t)count) >= fileSize},
+            {"dataBase64", base64Encode(bytes.data(), count)}
+        };
+    }
+
+    std::string bleEnvelope(int64_t id, int status, const json& body,
+                            const std::string& error = {}, const std::string& code = {}) {
+        json out = {{"v", 1}, {"id", id}, {"ok", error.empty()}, {"status", status}};
+        if (error.empty()) out["body"] = body;
+        else out["error"] = {{"code", code.empty() ? "request_failed" : code}, {"message", error}};
+        return out.dump();
+    }
+
+    std::string handleBleGattRequest(const std::string& text) {
+        int64_t id = 0;
+        try {
+            json request = json::parse(text);
+            id = request.value("id", (int64_t)0);
+            if (request.value("v", 0) != 1)
+                return bleEnvelope(id, 400, {}, "unsupported protocol version", "bad_version");
+            std::string method = request.value("method", std::string());
+            std::string path = request.value("path", std::string());
+            std::transform(method.begin(), method.end(), method.begin(),
+                           [](unsigned char c) { return (char)std::toupper(c); });
+
+            if (method == "GET") {
+                if (path == "/api/state" || path == "/state")
+                    return bleEnvelope(id, 200, webStateSnapshot());
+                if (path == "/api/sources")
+                    return bleEnvelope(id, 200, {{"selected", selectedSourceName()}, {"sources", sourceNamesJson()}});
+                if (path == "/api/sdrpp-server") return bleEnvelope(id, 200, serverSourceStateJson());
+                if (path == "/api/source-controls") return bleEnvelope(id, 200, selectedSourceControlsJson());
+                if (path == "/api/source-offset") return bleEnvelope(id, 200, sourceOffsetStateJson());
+                if (path == "/api/channel-bank/settings") return bleEnvelope(id, 200, channelBankSettingsJson());
+                if (path == "/api/recordings") return bleEnvelope(id, 200, recordingsListJson());
+                if (path == "/api/recordings/download") {
+                    std::string error; int status = 200;
+                    json page = recordingPageJson(request, error, status);
+                    return bleEnvelope(id, status, page, error, status == 416 ? "range" : "recording_error");
+                }
+                if (path == "/api/audio/current-playback") {
+                    std::string error; int status = 200;
+                    json page = currentPlaybackPageJson(request, error, status);
+                    return bleEnvelope(id, status, page, error, status == 416 ? "range" : "playback_error");
+                }
+                if (path == "/api/audio/live.pcm" || path == "/api/audio/live.wav") {
+                    return bleEnvelope(id, 200, {
+                        {"characteristic", "7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000"},
+                        {"format", "pcm_s16le"}, {"rate", 48000}, {"channels", 1},
+                        {"note", "enable notifications on the audio characteristic"}
+                    });
+                }
+            }
+
+            if (method != "POST") return bleEnvelope(id, 404, {}, "not found", "not_found");
+            json body = request.value("body", json::object());
+            json result;
+            std::string uiError;
+            auto onUi = [&](std::function<json()> fn) -> bool {
+                return runOnUiThread(std::move(fn), result, uiError);
+            };
+
+            if (path == "/api/start") {
+                onUi([this] {
+                    if (!folderSelect.pathIsValid()) return json({{"_status", 409}, {"error", "recording path is invalid"}});
+                    start(); return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/stop") {
+                onUi([this] { stop(); return webStateSnapshot(); });
+            }
+            else if (path == "/api/channel-bank/settings") {
+                onUi([this, body] {
+                    std::string error;
+                    if (!applyChannelBankSettings(body, error))
+                        return json({{"_status", running ? 409 : 400}, {"error", error}});
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/frequency/block") {
+                double hz = body.value("hz", 0.0); bool blocked = body.value("blocked", true);
+                onUi([this, hz, blocked] {
+                    std::string error;
+                    if (!setFrequencyBlocked(hz, blocked, error)) return json({{"_status", 400}, {"error", error}});
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/playback-lock") {
+                double hz = body.value("hz", 0.0);
+                onUi([this, hz] {
+                    std::string error;
+                    if (!setPlaybackLock(hz, error)) return json({{"_status", 400}, {"error", error}});
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/recordings/session") {
+                std::string session = body.value("name", std::string());
+                onUi([this, session] {
+                    std::string error;
+                    if (!setRecordingSession(session, error))
+                        return json({{"_status", 400}, {"error", error}});
+                    return recordingsListJson();
+                });
+            }
+            else if (path == "/api/recordings/clear-wavs") {
+                result = clearRecordedWavsJson();
+                std::string httpStatus = result.value("_httpStatus", std::string("200 OK"));
+                result.erase("_httpStatus");
+                if (httpStatus.rfind("404", 0) == 0) result["_status"] = 404;
+                else if (httpStatus.rfind("400", 0) == 0) result["_status"] = 400;
+            }
+            else if (path == "/api/source") {
+                std::string source = body.value("name", std::string());
+                onUi([this, source] {
+                    if (gui::mainWindow.isPlaying()) return json({{"_status", 409}, {"error", "stop SDR before changing source"}});
+                    if (source.empty() || !sourceExists(source)) return json({{"_status", 404}, {"error", "source not found"}});
+                    sigpath::sourceManager.selectSource(source);
+                    core::configManager.acquire(); core::configManager.conf["source"] = source;
+                    core::configManager.release(true); return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/source-controls") {
+                onUi([this, body] {
+                    if (selectedSourceName() != "RX888")
+                        return json({{"_status", 404}, {"error", "selected source has no web controls"}});
+                    RX888SourceControlV1 req{}; std::string value = body.dump();
+                    strncpy(req.request, value.c_str(), sizeof(req.request) - 1);
+                    if (!callRX888SourceControl(RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
+                        std::string error = "RX888 source control failed";
+                        if (req.response[0]) try { error = json::parse(req.response).value("error", error); } catch (...) {}
+                        return json({{"_status", gui::mainWindow.isPlaying() ? 409 : 400}, {"error", error}});
+                    }
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/source-offset") {
+                onUi([this, body] {
+                    std::string error;
+                    if (!applySourceOffsetSettings(body, error)) return json({{"_status", 400}, {"error", error}});
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/sdrpp-server") {
+                std::string host = body.value("host", std::string()); int port = body.value("port", 0);
+                onUi([this, host, port] {
+                    if (gui::mainWindow.isPlaying()) return json({{"_status", 409}, {"error", "stop SDR before changing server target"}});
+                    if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1"))
+                        return json({{"_status", 404}, {"error", "SDR++ Server source control unavailable"}});
+                    if (host.empty() || port <= 0 || port > 65535)
+                        return json({{"_status", 400}, {"error", "host and valid port required"}});
+                    SDRPPServerSourceControlV1 req{}; strncpy(req.host, host.c_str(), sizeof(req.host) - 1); req.port = port;
+                    if (!callServerSourceControl(SERVER_SOURCE_CONTROL_SET, &req) || !req.ok)
+                        return json({{"_status", 409}, {"error", "server target is busy or invalid"}});
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/sdrpp-server/connect" || path == "/api/sdrpp-server/disconnect") {
+                bool connect = path.find("disconnect") == std::string::npos;
+                onUi([this, connect] {
+                    if (gui::mainWindow.isPlaying())
+                        return json({{"_status", 409}, {"error", connect ? "stop SDR before connecting server source" : "stop SDR before disconnecting server source"}});
+                    if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1"))
+                        return json({{"_status", 404}, {"error", "SDR++ Server source control unavailable"}});
+                    SDRPPServerSourceControlV1 state{};
+                    bool ok = callServerSourceControl(connect ? SERVER_SOURCE_CONTROL_CONNECT : SERVER_SOURCE_CONTROL_DISCONNECT, &state);
+                    if (connect && (!ok || !state.connected)) return json({{"_status", 502}, {"error", "server connection failed"}});
+                    return webStateSnapshot();
+                });
+            }
+            else if (path == "/api/play") {
+                onUi([this] { gui::mainWindow.setPlayState(true); sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency()); return webStateSnapshot(); });
+            }
+            else if (path == "/api/stop-radio" || path == "/api/radio/stop") {
+                onUi([this] { gui::mainWindow.setPlayState(false); return webStateSnapshot(); });
+            }
+            else if (path == "/api/center") {
+                double hz = body.value("hz", 0.0);
+                if (!std::isfinite(hz) || hz <= 0.0) return bleEnvelope(id, 400, {}, "hz must be positive", "invalid_argument");
+                onUi([this, hz] {
+                    gui::waterfall.setCenterFrequency(hz); gui::waterfall.centerFreqMoved = true;
+                    sigpath::sourceManager.tune(hz); lastKnownCenter = hz; return webStateSnapshot();
+                });
+            }
+            else return bleEnvelope(id, 404, {}, "not found", "not_found");
+
+            if (!uiError.empty()) return bleEnvelope(id, 503, {}, uiError, "ui_timeout");
+            int status = result.value("_status", 200);
+            if (result.contains("error")) return bleEnvelope(id, status, {}, result.value("error", "request failed"));
+            return bleEnvelope(id, status, result);
+        }
+        catch (const std::exception& e) {
+            return bleEnvelope(id, 400, {}, e.what(), "invalid_request");
+        }
+        catch (...) {
+            return bleEnvelope(id, 500, {}, "request failed", "internal_error");
+        }
+    }
+#endif
 
     bool sourceExists(const std::string& name) {
         auto sources = sigpath::sourceManager.getSourceNames();
@@ -7329,6 +7672,14 @@ self.addEventListener("fetch", event => {
     static void menuHandler(void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
         _this->processWebUiActions();
+#ifdef __ANDROID__
+        auto bleNow = std::chrono::steady_clock::now();
+        if (android_ble_gatt::hasStateSubscribers() && bleNow >= _this->nextBleStateNotify) {
+            android_ble_gatt::notifyState(_this->handleBleGattRequest(
+                R"({"v":1,"id":0,"method":"GET","path":"/api/state"})"));
+            _this->nextBleStateNotify = bleNow + std::chrono::milliseconds(500);
+        }
+#endif
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         // Reset each frame; set below whenever a channel/history row is hovered.
@@ -9497,6 +9848,9 @@ self.addEventListener("fetch", event => {
     bool         cpuSampleValid = false;
     std::chrono::steady_clock::time_point lastCpuWall;
     std::clock_t lastCpuClock = 0;
+#ifdef __ANDROID__
+    std::chrono::steady_clock::time_point nextBleStateNotify{};
+#endif
     std::atomic<bool> webServerRunning { false };
     std::thread  webServerThread;
     std::mutex   webServerMtx;

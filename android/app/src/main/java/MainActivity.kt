@@ -70,6 +70,48 @@ class MainActivity : NativeActivity() {
     public var SDR_VID : Int = -1;
     public var SDR_PID : Int = -1;
     public var SDR_FD : Int = -1;
+    private var channelBankGatt: ChannelBankGattServer? = null
+    private var channelBankGattWanted = false
+
+    private external fun nativeChannelBankGattRequest(request: String): String
+    private external fun nativeChannelBankGattSubscriptionChanged(state: Boolean, audio: Boolean)
+
+    fun startChannelBankGatt() {
+        channelBankGattWanted = true
+        runOnUiThread {
+            if (android.os.Build.VERSION.SDK_INT >= 31 &&
+                (checkSelfPermission("android.permission.BLUETOOTH_ADVERTISE") != PackageManager.PERMISSION_GRANTED ||
+                 checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED)) {
+                ActivityCompat.requestPermissions(this,
+                    arrayOf("android.permission.BLUETOOTH_ADVERTISE", "android.permission.BLUETOOTH_CONNECT"), 42)
+                return@runOnUiThread
+            }
+            if (channelBankGatt == null) {
+                channelBankGatt = ChannelBankGattServer(
+                    this,
+                    { request -> nativeChannelBankGattRequest(request) },
+                    { state, audio -> nativeChannelBankGattSubscriptionChanged(state, audio) }
+                )
+            }
+            channelBankGatt?.start()
+        }
+    }
+
+    fun stopChannelBankGatt() {
+        channelBankGattWanted = false
+        runOnUiThread {
+            channelBankGatt?.stop()
+            channelBankGatt = null
+        }
+    }
+
+    fun notifyChannelBankGattState(json: String) {
+        channelBankGatt?.notifyState(json)
+    }
+
+    fun publishChannelBankGattAudio(pcmS16Le: ByteArray) {
+        channelBankGatt?.publishAudio(pcmS16Le)
+    }
 
     fun checkAndAsk(permission: String) {
         if (PermissionChecker.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
@@ -113,6 +155,8 @@ class MainActivity : NativeActivity() {
 
     public override fun onDestroy() {
         setKeepaliveActive(false);
+        channelBankGatt?.stop()
+        channelBankGatt = null
         super.onDestroy();
     }
 
@@ -120,6 +164,12 @@ class MainActivity : NativeActivity() {
         // Hide bars again
         hideSystemBars();
         super.onResume();
+        if (channelBankGattWanted) startChannelBankGatt()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 42 && channelBankGattWanted) startChannelBankGatt()
     }
 
     fun showSoftInput() {
