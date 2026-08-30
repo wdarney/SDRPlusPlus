@@ -15,14 +15,14 @@ Primary service: `7d2f0000-8c4b-4d7a-9a61-8e3c4f2a1000`
 | Protocol | `7d2f0001-8c4b-4d7a-9a61-8e3c4f2a1000` | Read | Raw UTF-8 JSON capability document; long reads use ATT offsets. |
 | Command | `7d2f0002-8c4b-4d7a-9a61-8e3c4f2a1000` | Write, Write Without Response | Framed UTF-8 JSON request. Maximum reassembled request is 1 MiB. |
 | Response | `7d2f0003-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Indicate | Framed response indications. A raw UTF-8 copy of the most recent response can be recovered with a long read. Enable indications before sending commands. |
-| State | `7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Notify | A GET-state response envelope. Notifications are emitted at most every 500 ms while subscribed. Long read returns a fresh raw envelope. |
+| State | `7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Indicate | A GET-state response envelope. Indications are emitted at most every 500 ms while subscribed, with at most one complete snapshot queued per client. Long read returns a fresh raw envelope. |
 | Audio | `7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000` | Read, Notify | Framed PCM audio notifications: signed 16-bit little-endian, mono, 48 kHz. |
 
 The standard Client Characteristic Configuration descriptor UUID `00002902-0000-1000-8000-00805f9b34fb` controls indications/notifications.
 
 ## Framing
 
-Command writes and Response, State, and Audio notifications use the same 8-byte little-endian header:
+Command writes and Response, State, and Audio updates use the same 8-byte little-endian header:
 
 | Offset | Type | Meaning |
 |---:|---|---|
@@ -30,9 +30,9 @@ Command writes and Response, State, and Audio notifications use the same 8-byte 
 | 1 | `u8` | Flags: bit 0 `FIRST`, bit 1 `LAST`; both set for a one-frame message. |
 | 2 | `u16le` | Message ID. The response echoes the request ID. State uses `0`. Audio uses a wrapping sequence number. |
 | 4 | `u32le` | Byte offset of this payload in the reassembled message. |
-| 8 | bytes | Payload, up to negotiated ATT MTU minus 11 bytes. |
+| 8 | bytes | Payload, up to `min(504, negotiated ATT MTU minus 11)` bytes. The complete header plus payload never exceeds the ATT attribute-value limit of 512 bytes. |
 
-Clients should request the largest MTU their platform supports, assemble by `(characteristic, messageId)`, require contiguous offsets, discard incomplete messages on disconnect or a new `FIRST`, and reject unknown versions. Prepared writes are not used; large commands are split into application frames. Response indications are reliable. State and Audio notifications are intentionally lossy and may be dropped under backpressure.
+Clients should request the largest MTU their platform supports, assemble by `(characteristic, messageId)`, require contiguous offsets, discard incomplete messages on disconnect or a new `FIRST`, and reject unknown versions. Prepared writes are not used; large commands are split into application frames. Response and State indications are reliable. State coalesces while a prior snapshot is pending; Audio notifications are intentionally lossy and may be dropped under backpressure. The Protocol characteristic advertises `maxAttributeValueBytes:512` so clients can apply the same cap to Command frames.
 
 ## Request and response envelopes
 
@@ -79,7 +79,7 @@ The BLE request `method` and `path` are identical to the WebUI route. A successf
 |---|---|---|
 | HTML `/` and `/index.html` | Protocol characteristic | No HTML is transported. A client renders its own UI from this contract and State. |
 | `OPTIONS` / CORS | Not applicable | BLE has no browser CORS preflight. |
-| `GET /api/state`, `GET /state` | State read/notify, or Command GET | Complete state envelope. |
+| `GET /api/state`, `GET /state` | State read/indicate, or Command GET | Complete state envelope. |
 | `GET /api/sources` | Command GET | Returns `selected` and `sources[]`. |
 | `GET /api/sdrpp-server` | Command GET | Returns server-source availability/target/connection state. |
 | `GET /api/source-controls` | Command GET | Returns RX888 controls when RX888 is selected; otherwise `available:false`. |
@@ -156,7 +156,7 @@ The `body` of a state response contains:
 - `recentChannels[]`: `{freqHz,name,blocked,ageMs}`.
 - Detection: `detectedSlots`, `manualDetected`, `snrOverview[]`, whose entries are `{freqHz,snrDb,detected,rawDetected,blocked}`.
 - Playback: `playbackQueued`; `playback` has `{active,freqKey,positionMs,queued}` plus `{freqHz,name,file,fileName}` while active (Android position is `-1`); `playbackLock` is `{active:false}` or `{active:true,freqHz,name}`; `currentlyPlayingFreqKey`.
-- `history[]`: up to 160 entries `{freqHz,name,count,blocked,lastSeen,description}`.
+- `history[]`: up to 160 entries `{freqHz,name,count,blocked,lastSeen,description}`. `lastSeen` is a numeric Unix timestamp in seconds, not a formatted string; zero means no recorded sighting time.
 - `diagnostics`: `{rssBytes,cpuPercent,activeChannels,maxChannels,playbackQueued,webClientThreads,transcriptionJobs,pendingEncodes,liveAudioClients,liveAudioQueuedSamples}`. `rssBytes` and transcription/encode counts are zero on Android in this branch; the first CPU sample is `-1`.
 - Scan-only conditional fields: `scanStopIndex`, `scanStopCount`, `bookmarkScanStopIndex`, `bookmarkScanStopCount`.
 - `lastTranscriptName` and `lastTranscriptText` exist only on Apple/Windows builds, not Android.

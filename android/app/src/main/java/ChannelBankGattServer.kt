@@ -43,6 +43,7 @@ internal class ChannelBankGattServer(
         const val FLAG_LAST = 2
         const val HEADER_SIZE = 8
         const val MAX_REQUEST_BYTES = 1024 * 1024
+        const val MAX_ATTRIBUTE_VALUE_BYTES = 512
         private const val TAG = "ChannelBankGatt"
     }
 
@@ -91,7 +92,9 @@ internal class ChannelBankGattServer(
             BluetoothGattCharacteristic.PERMISSION_WRITE
         )
         response = notifyingCharacteristic(RESPONSE_UUID, indicate = true)
-        state = notifyingCharacteristic(STATE_UUID, indicate = false)
+        // State snapshots can span many ATT packets. Use acknowledged indications
+        // so a dropped fragment cannot invalidate the rest of the JSON message.
+        state = notifyingCharacteristic(STATE_UUID, indicate = true)
         audio = notifyingCharacteristic(AUDIO_UUID, indicate = false)
 
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
@@ -136,7 +139,7 @@ internal class ChannelBankGattServer(
         stateSubscribers.forEach { address ->
             val device = connected[address] ?: return@forEach
             stateByAddress[address] = payload
-            enqueueFramed(device, state, messageId = 0, payload = payload, confirm = false)
+            enqueueFramed(device, state, messageId = 0, payload = payload, confirm = true)
         }
     }
 
@@ -211,7 +214,7 @@ internal class ChannelBankGattServer(
     }
 
     private fun protocolJson(): ByteArray =
-        """{"protocol":"sdrpp.channel-bank.gatt","version":1,"encoding":"json-utf8","frameHeader":"u8 version,u8 flags,u16le messageId,u32le offset","maxRequestBytes":1048576,"audio":{"format":"pcm_s16le","rate":48000,"channels":1}}"""
+        """{"protocol":"sdrpp.channel-bank.gatt","version":1,"encoding":"json-utf8","frameHeader":"u8 version,u8 flags,u16le messageId,u32le offset","maxAttributeValueBytes":512,"maxRequestBytes":1048576,"audio":{"format":"pcm_s16le","rate":48000,"channels":1}}"""
             .toByteArray(Charsets.UTF_8)
 
     private fun sendRead(device: BluetoothDevice, requestId: Int, offset: Int, value: ByteArray) {
@@ -220,7 +223,7 @@ internal class ChannelBankGattServer(
             return
         }
         val mtu = mtuByAddress[device.address] ?: 23
-        val end = minOf(value.size, offset + maxOf(1, mtu - 1))
+        val end = minOf(value.size, offset + minOf(MAX_ATTRIBUTE_VALUE_BYTES, maxOf(1, mtu - 1)))
         server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.copyOfRange(offset, end))
     }
 
@@ -263,13 +266,11 @@ internal class ChannelBankGattServer(
         confirm: Boolean
     ) {
         val mtu = mtuByAddress[device.address] ?: 23
-        val partSize = maxOf(1, mtu - 3 - HEADER_SIZE)
-        val frameCount = maxOf(1, (payload.size + partSize - 1) / partSize)
-        synchronized(outgoing) {
-            // State and audio are lossy streams. Drop a complete message before
-            // framing it so a client never receives an unterminated partial one.
-            if (!confirm && outgoing.size + frameCount > 256) return
-        }
+        // ATT values are limited to 512 bytes even when the negotiated MTU is
+        // 517 (whose MTU-3 notification budget would otherwise be 514).
+        val frameSize = minOf(MAX_ATTRIBUTE_VALUE_BYTES, maxOf(HEADER_SIZE + 1, mtu - 3))
+        val partSize = frameSize - HEADER_SIZE
+        val frames = ArrayList<Outgoing>(maxOf(1, (payload.size + partSize - 1) / partSize))
         var offset = 0
         do {
             val count = minOf(partSize, payload.size - offset)
@@ -279,11 +280,21 @@ internal class ChannelBankGattServer(
             val frame = ByteBuffer.allocate(HEADER_SIZE + count).order(ByteOrder.LITTLE_ENDIAN)
                 .put(FRAME_VERSION).put(flags.toByte()).putShort(messageId.toShort()).putInt(offset)
             if (count > 0) frame.put(payload, offset, count)
-            synchronized(outgoing) {
-                outgoing.add(Outgoing(device, characteristic, frame.array(), confirm))
-            }
+            frames.add(Outgoing(device, characteristic, frame.array(), confirm))
             offset += count
         } while (offset < payload.size)
+        synchronized(outgoing) {
+            // Keep at most one complete State snapshot queued per client. The
+            // next 500 ms publisher tick supplies the newest snapshot once it
+            // drains, avoiding an unbounded reliable-indication backlog.
+            if (characteristic.uuid == STATE_UUID && outgoing.any {
+                    it.device.address == device.address && it.characteristic.uuid == STATE_UUID
+                }) return
+            // Audio remains a lossy stream. Drop a complete message before it
+            // enters the queue so a client never sees an unterminated partial.
+            if (!confirm && outgoing.size + frames.size > 256) return
+            outgoing.addAll(frames)
+        }
         sendNext()
     }
 
@@ -311,6 +322,7 @@ internal class ChannelBankGattServer(
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 connected[device.address] = device
                 mtuByAddress[device.address] = 23
+                Log.i(TAG, "Client connected, status=$status")
             } else {
                 connected.remove(device.address)
                 mtuByAddress.remove(device.address)
@@ -318,11 +330,13 @@ internal class ChannelBankGattServer(
                 audioSubscribers.remove(device.address)
                 assemblies.keys.removeAll { it.address == device.address }
                 updateSubscriptions()
+                Log.i(TAG, "Client disconnected, status=$status")
             }
         }
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             mtuByAddress[device.address] = mtu.coerceAtLeast(23)
+            Log.i(TAG, "Client MTU changed to $mtu")
         }
 
         override fun onCharacteristicReadRequest(
@@ -359,7 +373,10 @@ internal class ChannelBankGattServer(
                 else -> false
             }
             sendRead(device, requestId, offset,
-                if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                if (enabled && (descriptor.characteristic.uuid == STATE_UUID ||
+                                descriptor.characteristic.uuid == RESPONSE_UUID))
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                else if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
         }
 
@@ -378,13 +395,28 @@ internal class ChannelBankGattServer(
                     AUDIO_UUID -> if (enabled) audioSubscribers.add(device.address) else audioSubscribers.remove(device.address)
                 }
                 updateSubscriptions()
+                Log.i(TAG, "Subscriptions changed: state=${stateSubscribers.size}, audio=${audioSubscribers.size}")
             }
             if (responseNeeded) server?.sendResponse(device, requestId, status, 0, null)
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "Characteristic delivery failed, status=$status")
+            }
             synchronized(outgoing) {
-                if (outgoing.isNotEmpty()) outgoing.removeFirst()
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    if (outgoing.isNotEmpty()) outgoing.removeFirst()
+                } else {
+                    // The failed fragment did not reach the client. Discard the
+                    // remainder of that message instead of sending fragments
+                    // that can only produce missing-first/offset errors.
+                    while (outgoing.isNotEmpty()) {
+                        val dropped = outgoing.removeFirst()
+                        if (dropped.value.size >= HEADER_SIZE &&
+                            (dropped.value[1].toInt() and FLAG_LAST) != 0) break
+                    }
+                }
                 sending = false
             }
             sendNext()
