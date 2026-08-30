@@ -98,14 +98,20 @@ public struct ChannelBankRootView: View {
                     .lineLimit(2)
             }
             if !model.ble.scanDiagnostics.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(model.ble.scanDiagnostics, id: \.self) { line in
-                        Text(line)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                ScrollView(.vertical) {
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        ForEach(model.ble.scanDiagnostics, id: \.self) { line in
+                            Text(line)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding(.vertical, 2)
                 }
+                .frame(maxHeight: 170)
+                .scrollIndicators(.visible)
             }
             if let lastError = model.ble.lastError {
                 Text(lastError)
