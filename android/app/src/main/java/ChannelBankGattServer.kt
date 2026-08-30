@@ -17,6 +17,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
+import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
@@ -42,6 +43,7 @@ internal class ChannelBankGattServer(
         const val FLAG_LAST = 2
         const val HEADER_SIZE = 8
         const val MAX_REQUEST_BYTES = 1024 * 1024
+        private const val TAG = "ChannelBankGatt"
     }
 
     private data class RequestKey(val address: String, val messageId: Int)
@@ -104,19 +106,11 @@ internal class ChannelBankGattServer(
             stop()
             return false
         }
-        val advertiser = bluetoothAdapter.bluetoothLeAdvertiser ?: return false
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-            .setConnectable(true)
-            .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
-            .build()
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
-        advertiseCallback = object : AdvertiseCallback() {}
-        advertiser.startAdvertising(settings, data, advertiseCallback)
+        if (bluetoothAdapter.bluetoothLeAdvertiser == null) {
+            Log.w(TAG, "BLE advertiser is not available on this device")
+            return false
+        }
+        startAdvertising(bluetoothAdapter, attempt = 0)
         return true
     }
 
@@ -172,6 +166,48 @@ internal class ChannelBankGattServer(
         if (Build.VERSION.SDK_INT < 31) return true
         return activity.checkSelfPermission("android.permission.BLUETOOTH_ADVERTISE") == PackageManager.PERMISSION_GRANTED &&
                activity.checkSelfPermission("android.permission.BLUETOOTH_CONNECT") == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun startAdvertising(bluetoothAdapter: BluetoothAdapter, attempt: Int) {
+        val advertiser = bluetoothAdapter.bluetoothLeAdvertiser ?: return
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            .setConnectable(true)
+            .setTimeout(0)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+            .build()
+        val serviceUuid = ParcelUuid(SERVICE_UUID)
+        val dataBuilder = AdvertiseData.Builder().setIncludeDeviceName(false)
+        val scanResponseBuilder = AdvertiseData.Builder().setIncludeDeviceName(false)
+
+        when (attempt) {
+            0 -> dataBuilder.addServiceUuid(serviceUuid)
+            1 -> scanResponseBuilder.addServiceUuid(serviceUuid).setIncludeDeviceName(true)
+            else -> dataBuilder.setIncludeDeviceName(true)
+        }
+
+        advertiseCallback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                Log.i(TAG, "BLE advertising started, attempt=$attempt")
+            }
+
+            override fun onStartFailure(errorCode: Int) {
+                Log.w(TAG, "BLE advertising failed, attempt=$attempt, error=$errorCode")
+                advertiseCallback = null
+                if (attempt < 2) startAdvertising(bluetoothAdapter, attempt + 1)
+            }
+        }
+
+        try {
+            advertiser.startAdvertising(settings, dataBuilder.build(), scanResponseBuilder.build(), advertiseCallback)
+            Log.i(TAG, "Requested BLE advertising start, attempt=$attempt")
+        } catch (se: SecurityException) {
+            Log.w(TAG, "BLE advertising blocked by permission", se)
+        } catch (iae: IllegalArgumentException) {
+            Log.w(TAG, "BLE advertising data rejected, attempt=$attempt", iae)
+            advertiseCallback = null
+            if (attempt < 2) startAdvertising(bluetoothAdapter, attempt + 1)
+        }
     }
 
     private fun protocolJson(): ByteArray =
