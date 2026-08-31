@@ -17,7 +17,7 @@ public struct SNRChartView: View {
             let peak = points.map(\.snrDb).max() ?? 0
             let above = points.filter { $0.snrDb >= threshold }.count
             let detected = points.filter { $0.detected == true }.count
-            Text(points.isEmpty ? "No SNR data yet" : "\(above)/\(points.count) above / peak \(peak, specifier: "%.1f") dB / detected \(detected)")
+            Text(points.isEmpty ? "Waiting for a full State snapshot and live SNR data" : "\(above)/\(points.count) above / peak \(peak, specifier: "%.1f") dB / detected \(detected)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Canvas { context, size in
@@ -74,6 +74,11 @@ public struct ActivityWaterfallView: View {
                 Text("\(ChannelBankFormatters.mhz(span.lowHz)) to \(ChannelBankFormatters.mhz(span.highHz))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if store.latestSelectablePoints.isEmpty {
+                    Text("Waiting for recent or active channel activity")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 GeometryReader { geometry in
                     Canvas { context, size in
                         let rect = CGRect(origin: .zero, size: size)

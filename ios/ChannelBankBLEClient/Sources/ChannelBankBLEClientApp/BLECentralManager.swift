@@ -86,6 +86,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var stateSummaryNotificationsEnabled = false
     private var latestSequence: Int64?
     private var initialStateFallbackTask: Task<Void, Never>?
+    private var fullStateRefreshTask: Task<Void, Never>?
+    private var hasReceivedFullState = false
     private var lastResponseCompletionTime: Date?
     private var playbackTask: Task<Void, Never>?
     private var activePlaybackIdentity: String?
@@ -205,6 +207,22 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
 
     public func loadLiveAudioDescriptor() {
         Task { await applyLiveAudioDescriptor() }
+    }
+
+    public func monitorCurrentPlayback() {
+        guard let state = latestState else {
+            audioMonitorStatus = "Waiting for playback State"
+            return
+        }
+        guard let identity = playbackIdentity(for: state) else {
+            audioMonitorStatus = state.playback?.active == true ? "Waiting for playback file" : "No active playback"
+            requestFullStateAfterSummaryIfNeeded()
+            return
+        }
+        playbackTask?.cancel()
+        completedPlaybackIdentities.remove(identity)
+        activePlaybackIdentity = nil
+        monitorPlaybackIfNeeded(state)
     }
 
     @MainActor
@@ -357,6 +375,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         latestSequence = nil
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
+        fullStateRefreshTask?.cancel()
+        fullStateRefreshTask = nil
+        hasReceivedFullState = false
         lastResponseCompletionTime = nil
         playbackTask?.cancel()
         playbackTask = nil
@@ -649,6 +670,10 @@ extension BLECentralManager: CBPeripheralDelegate {
     }
 
     private func acceptFullState(_ state: ChannelBankState) {
+        if state.isSummaryShaped {
+            acceptStateSummary(state.asSummary)
+            return
+        }
         if let seq = state.seq {
             if let latestSequence, seq < latestSequence {
                 appendDiagnostic("Ignored stale State seq=\(seq) latest=\(latestSequence)")
@@ -656,6 +681,9 @@ extension BLECentralManager: CBPeripheralDelegate {
             }
             latestSequence = seq
         }
+        hasReceivedFullState = true
+        fullStateRefreshTask?.cancel()
+        fullStateRefreshTask = nil
         latestState = state
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
@@ -686,6 +714,22 @@ extension BLECentralManager: CBPeripheralDelegate {
         initialStateFallbackTask = nil
         monitorPlaybackIfNeeded(state)
         lastError = nil
+        requestFullStateAfterSummaryIfNeeded()
+    }
+
+    private func requestFullStateAfterSummaryIfNeeded() {
+        guard !hasReceivedFullState, fullStateRefreshTask == nil else { return }
+        appendDiagnostic("Requesting one full State snapshot for charts and history")
+        fullStateRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self else { return }
+            guard !Task.isCancelled, !self.hasReceivedFullState else {
+                self.fullStateRefreshTask = nil
+                return
+            }
+            await self.performStateRefresh(suppressTimeoutError: true)
+            self.fullStateRefreshTask = nil
+        }
     }
 
     private func monitorPlaybackIfNeeded(_ state: ChannelBankState) {

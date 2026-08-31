@@ -407,7 +407,7 @@ public struct ChannelBankRootView: View {
                     .disabled(state.running == true)
                 Button("Stop Channel Bank") { model.ble.setChannelBankRunning(false) }
                     .disabled(state.running != true)
-                Button("Monitor Audio") { model.ble.loadLiveAudioDescriptor() }
+                Button("Monitor Audio") { model.ble.monitorCurrentPlayback() }
             }
             .buttonStyle(.bordered)
             Text("Monitor: \(model.ble.audioMonitorStatus)")
