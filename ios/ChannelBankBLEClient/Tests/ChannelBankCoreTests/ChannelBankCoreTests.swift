@@ -275,9 +275,29 @@ final class RecordingPaginatorTests: XCTestCase {
     }
 
     func testCurrentPlaybackPagination() async throws {
-        let page = RecordingPage(dataBase64: Data([1, 2, 3]).base64EncodedString(), offset: 0, nextOffset: 3, size: 3, eof: true, name: "playback.wav", contentType: "audio/wav")
-        let data = try await RecordingPaginator().collect { _ in page }
-        XCTAssertEqual(data, Data([1, 2, 3]))
+        let pages = [
+            RecordingPage(transferId: "cb-1", dataBase64: Data([1, 2]).base64EncodedString(), offset: 0, nextOffset: 2, size: 3, eof: false, name: "playback.wav", contentType: "audio/wav"),
+            RecordingPage(transferId: "cb-1", dataBase64: Data([3]).base64EncodedString(), offset: 2, nextOffset: 3, size: 3, eof: true, name: "playback.wav", contentType: "audio/wav")
+        ]
+        var receivedTransferIds: [String?] = []
+        let recording = try await RecordingPaginator().collectLeased { offset, transferId in
+            receivedTransferIds.append(transferId)
+            return pages[offset == 0 ? 0 : 1]
+        }
+        XCTAssertEqual(recording.data, Data([1, 2, 3]))
+        XCTAssertEqual(recording.transferId, "cb-1")
+        XCTAssertEqual(receivedTransferIds, [nil, "cb-1"])
+    }
+
+    func testCurrentPlaybackPaginationRejectsMissingTransferID() async throws {
+        let page = RecordingPage(dataBase64: Data([1]).base64EncodedString(), offset: 0, nextOffset: 1, size: 1, eof: true, name: "playback.wav", contentType: "audio/wav")
+        do {
+            _ = try await RecordingPaginator().collectLeased { _, _ in page }
+            XCTFail("Expected missing transfer ID")
+        } catch RecordingPaginationError.missingTransferID {
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
     }
 
     func testRecordingPaginationRejectsOffsetMismatch() async throws {

@@ -220,12 +220,28 @@ public final class ChannelBankClient {
         )
     }
 
-    public func currentPlaybackPage(offset: Int, limit: Int = 4096) async throws -> RecordingPage {
-        try await request(
+    public func currentPlaybackPage(offset: Int, transferId: String? = nil, limit: Int = 4096) async throws -> RecordingPage {
+        var body: [String: JSONValue] = [
+            "offset": JSONValue(.number(Double(offset))),
+            "limit": JSONValue(.number(Double(limit)))
+        ]
+        if let transferId, !transferId.isEmpty {
+            body["transferId"] = JSONValue(.string(transferId))
+        }
+        return try await request(
             method: "GET",
             path: "/api/audio/current-playback",
-            body: ["offset": JSONValue(.number(Double(offset))), "limit": JSONValue(.number(Double(limit)))],
+            body: body,
             responseBody: RecordingPage.self
+        )
+    }
+
+    public func cancelCurrentPlayback(transferId: String) async throws {
+        _ = try await request(
+            method: "GET",
+            path: "/api/audio/current-playback",
+            body: ["transferId": JSONValue(.string(transferId)), "cancel": JSONValue(.bool(true))],
+            responseBody: EmptyBody.self
         )
     }
 }

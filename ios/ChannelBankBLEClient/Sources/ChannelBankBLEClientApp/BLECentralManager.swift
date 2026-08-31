@@ -94,6 +94,23 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var completedPlaybackIdentities: Set<String> = []
     private var audioPlayer: AVAudioPlayer?
 
+    private final class PlaybackTransferLease: @unchecked Sendable {
+        private let lock = NSLock()
+        private var id: String?
+
+        func set(_ id: String) {
+            lock.lock()
+            self.id = id
+            lock.unlock()
+        }
+
+        func value() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return id
+        }
+    }
+
     public override init() {
         super.init()
         _ = central
@@ -804,15 +821,39 @@ extension BLECentralManager: CBPeripheralDelegate {
         for delay in delays {
             if delay > 0 { try await Task.sleep(nanoseconds: delay) }
             do {
-                return try await pullPages { offset in
-                    try await self.client.currentPlaybackPage(offset: offset)
-                }
+                return try await pullLeasedCurrentPlayback()
             } catch {
                 lastError = error
                 guard error.isHTTPStatus(404) else { throw error }
             }
         }
         throw lastError ?? ChannelBankClientError.requestTimedOut(-1)
+    }
+
+    private func pullLeasedCurrentPlayback() async throws -> PulledAudio {
+        let lease = PlaybackTransferLease()
+        let cancelLease: @Sendable () -> Void = { [weak self, lease] in
+            guard let self, let transferId = lease.value() else { return }
+            Task {
+                try? await self.client.cancelCurrentPlayback(transferId: transferId)
+            }
+        }
+        return try await withTaskCancellationHandler(operation: {
+            do {
+                var firstPage: RecordingPage?
+                let recording = try await RecordingPaginator().collectLeased { offset, transferId in
+                    let page = try await self.client.currentPlaybackPage(offset: offset, transferId: transferId)
+                    if let pageTransferId = page.transferId { lease.set(pageTransferId) }
+                    if firstPage == nil { firstPage = page }
+                    self.appendDiagnostic("Audio page transfer=\(page.transferId ?? "missing") offset=\(page.offset ?? offset) eof=\(page.eof == true)")
+                    return page
+                }
+                return PulledAudio(data: recording.data, name: firstPage?.name, contentType: firstPage?.contentType)
+            } catch {
+                cancelLease()
+                throw error
+            }
+        }, onCancel: cancelLease)
     }
 
     private func pullRecordingFallback(state: ChannelBankState) async throws -> PulledAudio {
