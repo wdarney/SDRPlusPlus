@@ -170,7 +170,7 @@ final class ChannelBankClientTests: XCTestCase {
           "sources":["RX888","SDR++ Server"],
           "sdrppServer":{"available":true,"host":"192.168.1.10","port":5259,"connected":false,"sourceRunning":false},
           "sourceOffset":{"selected":"Manual","manualOffsetHz":1250,"effectiveOffsetHz":1250,"modes":["None","Manual","LNB"]},
-          "settings":{"mode":"scan","spacingId":2,"channelSpacingHz":25000,"demodMode":"NFM","snrThresholdDb":6.5,"maxChannels":8,"bwUsage":0.8,"recordingEnabled":true,"minTransmissionMs":400,"signalHoldMs":700,"tailMs":500,"scanQuietSec":2.5,"scanNoSignalSec":0.5,"transcriptionBackend":0,"transcriptionBackendName":"Off"},
+          "settings":{"mode":"scan","spacingId":2,"channelSpacingHz":25000,"demodMode":"NFM","snrThresholdDb":6.5,"manualLocalSnrEnabled":true,"manualStormGuardEnabled":true,"maxChannels":8,"bwUsage":0.8,"recordingEnabled":true,"minTransmissionMs":400,"signalHoldMs":700,"tailMs":500,"scanQuietSec":2.5,"scanNoSignalSec":0.5,"transcriptionBackend":0,"transcriptionBackendName":"Off"},
           "sourceControls":{"available":true,"source":"RX888","running":false,"deviceId":0,"devices":[{"id":0,"label":"RX888"}],"sampleRate":32000000,"sampleRates":[{"id":1,"value":32000000,"label":"32 MHz","selected":true}],"supportsAdcFreq":true,"adcClockMHz":64,"adcMinMHz":16,"adcMaxMHz":140,"mode":"HF","modes":["HF","VHF"],"gains":[{"name":"LNA","label":"LNA","value":8,"min":0,"max":31.5,"step":0.5,"available":true,"liveMutable":true}],"supportsNewBiasTee":true,"supportsBiasTee":true,"biasTeeHF":false,"biasTeeVHF":true,"biasTeeLiveMutable":true,"supportsDithering":true,"dithering":false,"ditheringLiveMutable":true,"r2iqWorkers":2,"telemetryIntervalSec":1,"telemetrySpeeds":[{"label":"Fast","intervalSec":1,"selected":true}],"telemetryLiveMutable":true,"toggles":[{"key":"preamp","label":"Preamp","value":true,"available":true}]},
           "currentlyPlayingFreqKey":157067,
           "history":[{"freqHz":157067000,"name":"Test","count":3,"blocked":false,"lastSeen":1798644000,"description":"ok"}],
@@ -184,6 +184,8 @@ final class ChannelBankClientTests: XCTestCase {
         XCTAssertEqual(state.sdrppServer?.host, "192.168.1.10")
         XCTAssertEqual(state.sourceOffset?.effectiveOffsetHz, 1250)
         XCTAssertEqual(state.settings?.minTransmissionMs, 400)
+        XCTAssertTrue(state.settings?.manualLocalSnrEnabled == true)
+        XCTAssertTrue(state.settings?.manualStormGuardEnabled == true)
         XCTAssertEqual(state.sourceControls?.r2iqWorkers, 2)
         XCTAssertEqual(state.sourceControls?.telemetrySpeeds?.first?.intervalSec, 1)
         XCTAssertEqual(state.sourceControls?.toggles?.first?.key, "preamp")

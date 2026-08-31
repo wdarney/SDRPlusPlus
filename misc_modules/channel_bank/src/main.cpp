@@ -55,9 +55,6 @@
 #include <cctype>
 #include <functional>
 #include <memory>
-#ifdef __ANDROID__
-#include <android_ble_gatt.h>
-#endif
 #ifdef __APPLE__
 #include "transcription.h"
 #endif
@@ -387,6 +384,16 @@ public:
             bookmarkScanMode = config.conf[name]["bookmarkScanMode"];
         if (config.conf[name].contains("manualPassbandLimit"))
             manualPassbandLimit = config.conf[name]["manualPassbandLimit"];
+        if (config.conf[name].contains("manualLocalSnrEnabled"))
+            manualLocalSnrEnabled = config.conf[name]["manualLocalSnrEnabled"];
+        if (config.conf[name].contains("manualStormGuardEnabled"))
+            manualStormGuardEnabled = config.conf[name]["manualStormGuardEnabled"];
+        if (config.conf[name].contains("manualSnrOverrides") &&
+            config.conf[name]["manualSnrOverrides"].is_object()) {
+            for (auto& [key, value] : config.conf[name]["manualSnrOverrides"].items())
+                if (value.is_number())
+                    manualSnrOverrides[key] = std::clamp(value.get<float>(), 1.0f, 30.0f);
+        }
         if (config.conf[name].contains("manualFrequencies"))
             for (auto& j : config.conf[name]["manualFrequencies"])
                 manualFrequencies.push_back(j.get<double>());
@@ -489,13 +496,6 @@ public:
     }
 
     ~ChannelBankModule() {
-#ifdef __ANDROID__
-        bleStatePublisherRunning = false;
-        bleStatePublisherCv.notify_all();
-        if (bleStatePublisherThread.joinable()) bleStatePublisherThread.join();
-        android_ble_gatt::stop();
-        android_ble_gatt::unregisterRequestHandler();
-#endif
         stopWebServer();
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
@@ -533,13 +533,6 @@ public:
             }
         }
         if (webControlEnabled) startWebServer();
-#ifdef __ANDROID__
-        android_ble_gatt::registerRequestHandler(
-            [this](const std::string& request) { return handleBleGattRequest(request); });
-        android_ble_gatt::start();
-        bleStatePublisherRunning = true;
-        bleStatePublisherThread = std::thread(&ChannelBankModule::bleStatePublisherFunc, this);
-#endif
     }
     void enable()  { enabled = true; }
     void disable() { enabled = false; restoreWaterfallVisibility(); }
@@ -557,7 +550,14 @@ public:
         instPower.clear();
         rawSlotMisses.clear();
         rawManualMisses.clear();
+        manualLocalNoiseFloors.clear();
         globalNoiseFloor = 0.0f;
+        displayNoiseFloor = 0.0f;
+        floorHistory.clear();
+        {
+            std::lock_guard<std::mutex> lck(manualDetectedMtx);
+            manualThresholdDb.clear();
+        }
         { std::lock_guard<std::mutex> lck(channelsMtx); recentChannels.clear(); }
 
         if (scanMode) {
@@ -612,22 +612,7 @@ public:
         monitorStream.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         monitorSinkStream = new SinkManager::Stream();
         monitorSinkStream->init(&monitorStream, &monitorSrHandler, 48000.0f);
-#if defined(__ANDROID__)
-        monitorProviderRegisteredHandler.ctx = this;
-        monitorProviderRegisteredHandler.handler = [](std::string provider, void* ctx) {
-            if (provider == "Audio") {
-                ((ChannelBankModule*)ctx)->ensureAndroidMonitorAudioSink();
-            }
-        };
-        sigpath::sinkManager.onSinkProviderRegistered.bindHandler(&monitorProviderRegisteredHandler);
-        monitorProviderHandlerBound = true;
-#endif
         sigpath::sinkManager.registerStream(name + "_monitor", monitorSinkStream);
-#if defined(__ANDROID__)
-        // Android has no comfortable desktop-style sink setup flow; make preview
-        // playback audible by default instead of leaving the monitor on "None".
-        ensureAndroidMonitorAudioSink();
-#endif
         monitorSinkStream->start();
 
         // Start playback thread
@@ -670,12 +655,6 @@ public:
 
         // Tear down monitor stream
         monitorSinkStream->stop();
-#if defined(__ANDROID__)
-        if (monitorProviderHandlerBound) {
-            sigpath::sinkManager.onSinkProviderRegistered.unbindHandler(&monitorProviderRegisteredHandler);
-            monitorProviderHandlerBound = false;
-        }
-#endif
         sigpath::sinkManager.unregisterStream(name + "_monitor");
         delete monitorSinkStream;
         monitorSinkStream = nullptr;
@@ -1045,7 +1024,7 @@ public:
         std::string path = requestedWav.string();
         slot.currentFinalM4APath.clear();
 
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+#if defined(__APPLE__) || defined(_WIN32)
         // Intermediate WAVs are scratch files when recording is disabled or
         // when the final output will be M4A. Keep those off network shares.
         if (!recordingEnabled || m4aEnabled) {
@@ -1333,6 +1312,8 @@ private:
             {"channelSpacingHz", channelSpacing},
             {"demodMode", demodModeName(demodMode)},
             {"snrThresholdDb", snrThreshold},
+            {"manualLocalSnrEnabled", manualLocalSnrEnabled},
+            {"manualStormGuardEnabled", manualStormGuardEnabled},
             {"maxChannels", maxChannels},
             {"bwUsage", bwUsage},
             {"recordingEnabled", recordingEnabled},
@@ -1345,62 +1326,6 @@ private:
             {"transcriptionBackendName", transcriptionBackendName()}
         };
     }
-
-#ifdef __ANDROID__
-    json webStateSummarySnapshot() {
-        int activeChannelCount = 0;
-        {
-            std::lock_guard<std::mutex> lk(channelsMtx);
-            activeChannelCount = (int)activeChannels.size();
-        }
-
-        int64_t playingKey = currentlyPlayingFreqKey.load();
-        double playingFreqHz = currentlyPlayingFreqHz.load();
-        int playbackQueued = 0;
-        {
-            std::lock_guard<std::mutex> lk(playbackMtx);
-            playbackQueued = (int)playbackQueue.size();
-        }
-        json playback = {
-            {"active", playingKey != 0},
-            {"freqKey", playingKey},
-            {"positionMs", -1},
-            {"queued", playbackQueued}
-        };
-        if (playingKey != 0) {
-            double freqHz = playingFreqHz > 0.0
-                ? playingFreqHz : (double)playingKey * 1000.0;
-            playback["freqHz"] = freqHz;
-            playback["name"] = displayName(freqHz);
-            std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
-            if (!currentPlaybackPath.empty()) {
-                playback["fileName"] = std::filesystem::path(
-                    currentPlaybackPath).filename().string();
-            }
-        }
-
-        uint64_t seq = bleSummarySequence.fetch_add(1) + 1;
-        return {
-            {"v", 1},
-            {"seq", seq},
-            {"serverTimeMs", std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()},
-            {"running", running},
-            {"radioPlaying", gui::mainWindow.isPlaying()},
-            {"selectedSource", selectedSourceName()},
-            {"centerHz", lastKnownCenter},
-            {"sampleRate", lastKnownSr},
-            {"mode", detectionModeName()},
-            {"demodMode", demodModeName(demodMode)},
-            {"snrThresholdDb", snrThreshold},
-            {"maxChannels", maxChannels},
-            {"recordingEnabled", recordingEnabled},
-            {"activeChannelCount", activeChannelCount},
-            {"playbackQueued", playbackQueued},
-            {"playback", playback}
-        };
-    }
-#endif
 
     bool applyChannelBankSettings(const json& body, std::string& error) {
         if (!body.is_object()) {
@@ -1464,6 +1389,14 @@ private:
             error = "snr threshold must be numeric";
             return false;
         }
+        if (body.contains("manualLocalSnrEnabled") && !body["manualLocalSnrEnabled"].is_boolean()) {
+            error = "local SNR floors must be true or false";
+            return false;
+        }
+        if (body.contains("manualStormGuardEnabled") && !body["manualStormGuardEnabled"].is_boolean()) {
+            error = "storm guard must be true or false";
+            return false;
+        }
         if (body.contains("maxChannels") && !body["maxChannels"].is_number_integer()) {
             error = "max channels must be an integer";
             return false;
@@ -1522,6 +1455,14 @@ private:
             snrThreshold = std::clamp(body["snrThresholdDb"].get<float>(), 1.0f, 30.0f);
             config.conf[name]["snrThreshold"] = snrThreshold;
         }
+        if (body.contains("manualLocalSnrEnabled")) {
+            manualLocalSnrEnabled = body["manualLocalSnrEnabled"].get<bool>();
+            config.conf[name]["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
+        }
+        if (body.contains("manualStormGuardEnabled")) {
+            manualStormGuardEnabled = body["manualStormGuardEnabled"].get<bool>();
+            config.conf[name]["manualStormGuardEnabled"] = manualStormGuardEnabled;
+        }
         if (body.contains("maxChannels")) {
             maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, MAX_CHANNELS_HARD_LIMIT);
             config.conf[name]["maxChannels"] = maxChannels;
@@ -1566,6 +1507,9 @@ private:
         config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
         config.conf[name]["activeProfile"] = activeProfileName;
         config.release(true);
+        if (body.contains("snrThresholdDb") || body.contains("demodMode") ||
+            body.contains("manualLocalSnrEnabled") || body.contains("manualStormGuardEnabled"))
+            resetDetectorFloor();
         if (transcriptionTurnedOff) stopTranscriptionWork();
         return true;
     }
@@ -1575,10 +1519,12 @@ private:
             error = "hz must be positive";
             return false;
         }
+        int64_t key = freqKey(hz);
+        double keyHz = (double)key * 1000.0;
         {
             std::lock_guard<std::mutex> lk(freqLogMtx);
-            auto& entry = freqLog[freqKey(hz)];
-            if (entry.freqHz == 0.0) entry.freqHz = hz;
+            auto& entry = freqLog[key];
+            entry.freqHz = keyHz;
             entry.blocked = blocked;
         }
         saveFreqLog();
@@ -1806,6 +1752,8 @@ private:
                     {"slot", idx},
                     {"freqHz", slot->freqHz},
                     {"gridFreqHz", slot->gridFreqHz},
+                    {"freqKey", freqKey(slot->gridFreqHz)},
+                    {"blockHz", (double)freqKey(slot->gridFreqHz) * 1000.0},
                     {"name", displayName(slot->freqHz)},
                     {"blocked", isBlocked(slot->gridFreqHz)},
                     {"recording", slot->fileOpen},
@@ -1819,6 +1767,8 @@ private:
                 auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - ch.destroyedAt).count();
                 recent.push_back({
                     {"freqHz", ch.freqHz},
+                    {"freqKey", freqKey(ch.freqHz)},
+                    {"blockHz", (double)freqKey(ch.freqHz) * 1000.0},
                     {"name", displayName(ch.freqHz)},
                     {"blocked", isBlocked(ch.freqHz)},
                     {"ageMs", ageMs}
@@ -1846,11 +1796,13 @@ private:
                 std::set<int> localDetected;
                 std::set<int> localRawDetected;
                 std::map<int, float> localSnr;
+                std::map<int, float> localThresholds;
                 {
                     std::lock_guard<std::mutex> lk(manualDetectedMtx);
                     localDetected = manualDetected;
                     localRawDetected = rawManualDetected;
                     localSnr = manualSnrDb;
+                    localThresholds = manualThresholdDb;
                 }
                 std::vector<double> localFreqs = getActiveManualFreqs();
                 for (auto& [idx, snrDb] : localSnr) {
@@ -1860,6 +1812,7 @@ private:
                     snrOverview.push_back({
                         {"freqHz", freqHz},
                         {"snrDb", snrDb},
+                        {"thresholdDb", localThresholds.count(idx) ? localThresholds[idx] : snrThreshold},
                         {"detected", localDetected.count(idx) > 0},
                         {"rawDetected", localRawDetected.count(idx) > 0},
                         {"blocked", isBlocked(freqHz)}
@@ -1931,6 +1884,8 @@ private:
                 const auto& e = it->second;
                 history.push_back({
                     {"freqHz", e.freqHz},
+                    {"freqKey", it->first},
+                    {"blockHz", (double)it->first * 1000.0},
                     {"name", displayName(e.freqHz)},
                     {"count", e.count},
                     {"blocked", e.blocked},
@@ -1955,9 +1910,6 @@ private:
         j["sdrppHeartbeat"] = webHeartbeat.fetch_add(1) + 1;
         j["serverTimeMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-#ifdef __ANDROID__
-        j["seq"] = bleSummarySequence.load();
-#endif
         j["selectedSource"] = selectedSourceName();
         j["sources"] = sourceNamesJson();
         j["sdrppServer"] = serverSourceStateJson();
@@ -2151,6 +2103,8 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
 <label class="control"><span class="label">Transcribe</span><select id="cbTranscribe"><option value="0">Off</option><option value="1">Apple Speech</option><option value="2">Whisper ATC Large</option><option value="3">Whisper ATC Medium</option><option value="4">Whisper Turbo</option></select></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
+<label class="control"><span class="label">Local SNR floors</span><button class="secondary" id="cbLocalSnrToggle" type="button">-</button></label>
+<label class="control"><span class="label">Storm guard</span><button class="secondary" id="cbStormGuardToggle" type="button">-</button></label>
 </div>
 </section>
 <section>
@@ -2268,6 +2222,8 @@ let historySortDir = -1;
 let blockedSortKey = "freq";
 let blockedSortDir = 1;
 let currentRecordingEnabled = true;
+let currentLocalSnrEnabled = true;
+let currentStormGuardEnabled = true;
 const spanWaterfallFrames = [];
 const spanWaterfallMaxFrames = 72;
 let spanWaterfallKey = "";
@@ -2297,7 +2253,10 @@ async function post(path, body, refreshAfter = true) {
     try { msg = (await r.json()).error || msg; } catch (_) {}
     throw new Error(msg);
   }
+  let data = null;
+  try { data = await r.json(); } catch (_) {}
   if (refreshAfter) await refresh(true);
+  return data;
 }
 function setControlValue(id, value) {
   const el = document.getElementById(id);
@@ -2501,7 +2460,8 @@ function renderSourceOffset(s) {
 async function blockFrequency(hz, blocked) {
   const status = document.getElementById("heatmapStatus");
   if (status) status.textContent = blocked ? "Blocking frequency..." : "Unblocking frequency...";
-  const ok = await postAndReport("/api/frequency/block", { hz, blocked });
+  const ok = await postAndReport("/api/frequency/block", { hz, blocked }, false);
+  if (ok) await refresh(true);
   if (status) status.textContent = ok ? (blocked ? "Frequency blocked" : "Frequency unblocked") : "Block action failed";
 }
 async function setPlaybackLock(hz) {
@@ -2512,6 +2472,14 @@ async function setPlaybackLock(hz) {
 }
 function sameFreqKey(a, b) {
   return Math.round(Number(a || 0) / 1000) === Math.round(Number(b || 0) / 1000);
+}
+function blockHzFor(item) {
+  item = item || {};
+  const hz = Number(item.blockHz || 0);
+  if (Number.isFinite(hz) && hz > 0) return hz.toFixed(0);
+  const key = Number(item.freqKey || 0);
+  if (Number.isFinite(key) && key > 0) return (key * 1000).toFixed(0);
+  return Number(item.gridFreqHz || item.freqHz || 0).toFixed(0);
 }
 function fmtLastSeen(seconds) {
   const ts = Number(seconds || 0);
@@ -2564,7 +2532,7 @@ function renderActivityHistory(s) {
   const rows = sortHistoryRows([...(s.history || [])]);
   body.innerHTML = rows.map(h => {
     const isLocked = lockedHz > 0 && sameFreqKey(h.freqHz, lockedHz);
-    const hz = Number(h.freqHz).toFixed(0);
+    const hz = blockHzFor(h);
     return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : hz})">${isLocked ? "Unlock" : "Lock"}</button></td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${hz}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`;
   }).join("") || `<tr><td colspan="6" class="muted">No history yet</td></tr>`;
 }
@@ -2581,7 +2549,7 @@ function renderBlockedFrequencies(s) {
   });
   const rows = sortRows((s.history || []).filter(h => h.blocked), blockedSortKey, blockedSortDir);
   body.innerHTML = rows.map(h =>
-    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action danger" onclick="blockFrequency(${Number(h.freqHz).toFixed(0)}, false)">Unblock</button></td></tr>`
+    `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action danger" onclick="blockFrequency(${blockHzFor(h)}, false)">Unblock</button></td></tr>`
   ).join("") || `<tr><td colspan="5" class="muted">No blocked frequencies</td></tr>`;
 }
 function renderSourceControls(s) {
@@ -2705,6 +2673,7 @@ function renderHeatMap(s) {
       lastSeen: 0
     };
     row.freqHz = data.gridFreqHz || data.freqHz || row.freqHz;
+    row.blockHz = data.blockHz || (data.freqKey ? Number(data.freqKey) * 1000 : row.blockHz);
     row.name = data.name || row.name;
     row.count = Math.max(row.count, data.count || 0);
     row.blocked = row.blocked || !!data.blocked;
@@ -2742,7 +2711,7 @@ function renderHeatMap(s) {
     ].filter(Boolean).join(" / ");
     return `<div class="heat-cell ${item.blocked ? "blocked" : ""} ${item.live ? "live" : ""}"
         style="background:${bg}"
-        onclick="blockFrequency(${Number(item.freqHz).toFixed(0)}, ${item.blocked ? "false" : "true"})"
+        onclick="blockFrequency(${blockHzFor(item)}, ${item.blocked ? "false" : "true"})"
         title="${item.blocked ? "Unblock" : "Block"} ${esc(fmtMHz(item.freqHz))}">
         <div class="heat-freq">${esc(fmtMHz(item.freqHz))}</div>
         <div class="heat-name">${esc(item.name || "")}</div>
@@ -2845,12 +2814,14 @@ function drawSnrChart(s) {
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
   const threshold = Number(s.snrThresholdDb || s.settings?.snrThresholdDb || 0);
+  const pointThreshold = p => Number.isFinite(Number(p.thresholdDb)) ? Number(p.thresholdDb) : threshold;
   const peak = points.length ? Math.max(...points.map(p => Number(p.snrDb))) : 0;
-  const maxDb = Math.max(30, threshold + 5, Math.ceil(peak + 2));
+  const thresholdPeak = points.length ? Math.max(...points.map(pointThreshold)) : threshold;
+  const maxDb = Math.max(30, thresholdPeak + 5, Math.ceil(peak + 2));
   const minDb = -5;
   const yFor = db => padT + (1 - ((db - minDb) / (maxDb - minDb))) * plotH;
   const xFor = hz => padL + ((hz - info.lo) / info.span) * plotW;
-  const above = points.filter(p => Number(p.snrDb) >= threshold).length;
+  const above = points.filter(p => Number(p.snrDb) >= pointThreshold(p)).length;
   const detected = points.filter(p => p.detected).length;
   if (summary) {
     summary.textContent = points.length
@@ -2884,8 +2855,13 @@ function drawSnrChart(s) {
     const x = xFor(Number(p.freqHz));
     const y = yFor(Math.max(0, db));
     const h = Math.max(1, Math.abs(baseY - y));
-    ctx.fillStyle = p.blocked ? "#bc3d3d" : p.detected ? "#62d26f" : p.rawDetected ? "#ffb15c" : (db >= threshold ? "#7aa7ff" : "#36516d");
+    ctx.fillStyle = p.blocked ? "#bc3d3d" : p.detected ? "#62d26f" : p.rawDetected ? "#ffb15c" : (db >= pointThreshold(p) ? "#7aa7ff" : "#36516d");
     ctx.fillRect(x - barW / 2, Math.min(baseY, y), barW, h);
+    if (Math.abs(pointThreshold(p) - threshold) > 0.05) {
+      const py = yFor(pointThreshold(p));
+      ctx.fillStyle = "#f4d35e";
+      ctx.fillRect(x - 5, py - 1, 10, 2);
+    }
   });
 
   const thresholdY = yFor(threshold);
@@ -3196,7 +3172,7 @@ async function startMediaElementMonitor(runId) {
   setupMonitorMediaSession();
   if (!monitorAudioEl) {
     monitorAudioEl = new Audio();
-    monitorAudioEl.preload = "none";
+    monitorAudioEl.preload = "auto";
     monitorAudioEl.controls = false;
     monitorAudioEl.playsInline = true;
     monitorAudioEl.autoplay = false;
@@ -3361,6 +3337,7 @@ function stopMonitorAudio() {
 }
 async function refresh(force = false) {
   const nowMs = performance.now();
+  if (!force && document.hidden) return;
   if (refreshInFlight) {
     if (!force && nowMs - lastRefreshStarted < 4500) return;
     if (refreshAbort) refreshAbort.abort();
@@ -3443,6 +3420,14 @@ async function refresh(force = false) {
     const recToggle = document.getElementById("cbRecordingToggle");
     recToggle.textContent = currentRecordingEnabled ? "On - keeping files" : "Off - monitor only";
     recToggle.className = currentRecordingEnabled ? "primary" : "danger";
+    currentLocalSnrEnabled = settings.manualLocalSnrEnabled !== false;
+    const localSnrToggle = document.getElementById("cbLocalSnrToggle");
+    localSnrToggle.textContent = currentLocalSnrEnabled ? "On - per frequency" : "Off - shared floor";
+    localSnrToggle.className = currentLocalSnrEnabled ? "primary" : "danger";
+    currentStormGuardEnabled = settings.manualStormGuardEnabled !== false;
+    const stormToggle = document.getElementById("cbStormGuardToggle");
+    stormToggle.textContent = currentStormGuardEnabled ? "On - freeze impulses" : "Off";
+    stormToggle.className = currentStormGuardEnabled ? "primary" : "danger";
     document.getElementById("cbMode").disabled = !!s.running;
     document.getElementById("cbSpacing").disabled = !!s.running;
     document.getElementById("cbDemod").disabled = !!s.running;
@@ -3451,7 +3436,7 @@ async function refresh(force = false) {
 	    renderActivityHistory(s);
 	    renderHeatMap(s);
 	    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
-	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${Number(ch.gridFreqHz || ch.freqHz).toFixed(0)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${blockHzFor(ch)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
 	    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
 	    renderBlockedFrequencies(s);
     const tx = (s.lastTranscriptText || "").trim();
@@ -3496,6 +3481,12 @@ if (monitorAudioModeEl) {
 }
 document.getElementById("cbRecordingToggle").onclick = () => {
   saveSettingValue("recordingEnabled", !currentRecordingEnabled);
+};
+document.getElementById("cbLocalSnrToggle").onclick = () => {
+  saveSettingValue("manualLocalSnrEnabled", !currentLocalSnrEnabled);
+};
+document.getElementById("cbStormGuardToggle").onclick = () => {
+  saveSettingValue("manualStormGuardEnabled", !currentStormGuardEnabled);
 };
 document.getElementById("serverApply").onclick = () => {
   const host = document.getElementById("serverHost").value.trim();
@@ -4049,13 +4040,7 @@ self.addEventListener("fetch", event => {
     }
 
     void publishLiveAudio(ChannelSlot& slot, const float* mono, int count) {
-        if (!mono || count <= 0) return;
-#ifdef __ANDROID__
-        bool bleAudioWanted = android_ble_gatt::hasAudioSubscribers();
-#else
-        bool bleAudioWanted = false;
-#endif
-        if (liveAudioClients.load() <= 0 && !bleAudioWanted) return;
+        if (liveAudioClients.load() <= 0 || !mono || count <= 0) return;
 
         std::vector<int16_t> chunk;
         chunk.resize((size_t)count);
@@ -4067,12 +4052,7 @@ self.addEventListener("fetch", event => {
     }
 
     void publishLiveAudioPcm(double freqHz, const int16_t* pcm, int count, bool forceSelect) {
-        if (!pcm || count <= 0) return;
-#ifdef __ANDROID__
-        if (android_ble_gatt::hasAudioSubscribers())
-            android_ble_gatt::publishAudio(pcm, (size_t)count);
-#endif
-        if (liveAudioClients.load() <= 0) return;
+        if (liveAudioClients.load() <= 0 || !pcm || count <= 0) return;
 
         std::unique_lock<std::mutex> lk(liveAudioMtx, std::try_to_lock);
         if (!lk.owns_lock()) {
@@ -4288,333 +4268,6 @@ self.addEventListener("fetch", event => {
         }
     }
 
-#ifdef __ANDROID__
-    static std::string base64Encode(const uint8_t* data, size_t size) {
-        static constexpr char alphabet[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::string out;
-        out.reserve(((size + 2) / 3) * 4);
-        for (size_t i = 0; i < size; i += 3) {
-            uint32_t n = (uint32_t)data[i] << 16;
-            if (i + 1 < size) n |= (uint32_t)data[i + 1] << 8;
-            if (i + 2 < size) n |= data[i + 2];
-            out.push_back(alphabet[(n >> 18) & 63]);
-            out.push_back(alphabet[(n >> 12) & 63]);
-            out.push_back(i + 1 < size ? alphabet[(n >> 6) & 63] : '=');
-            out.push_back(i + 2 < size ? alphabet[n & 63] : '=');
-        }
-        return out;
-    }
-
-    json recordingPageJson(const json& request, std::string& error, int& status) {
-        json query = request.value("query", json::object());
-        json body = request.value("body", json::object());
-        std::string rel = query.value("file", body.value("file", std::string()));
-        int64_t offset = body.value("offset", (int64_t)0);
-        int limit = std::clamp(body.value("limit", 4096), 1, 16384);
-        if (rel.empty()) { status = 400; error = "file required"; return {}; }
-        if (offset < 0) { status = 400; error = "offset must be non-negative"; return {}; }
-
-        std::filesystem::path rootPath = recordingsRootPath();
-        if (rootPath.empty()) { status = 404; error = "recordings folder not available"; return {}; }
-        std::filesystem::path relPath(rel);
-        if (relPath.is_absolute()) { status = 400; error = "absolute paths are not allowed"; return {}; }
-        std::error_code ec;
-        std::filesystem::path filePath = std::filesystem::weakly_canonical(rootPath / relPath, ec);
-        if (ec || !pathIsInside(filePath, rootPath) ||
-            !std::filesystem::is_regular_file(filePath, ec) || ec) {
-            status = 404; error = "recording not found"; return {};
-        }
-        uintmax_t fileSize = std::filesystem::file_size(filePath, ec);
-        if (ec || (uint64_t)offset > fileSize) {
-            status = 416; error = "offset is past end of recording"; return {};
-        }
-        std::ifstream file(filePath, std::ios::binary);
-        if (!file.is_open()) { status = 404; error = "recording not readable"; return {}; }
-        file.seekg(offset);
-        size_t count = (size_t)std::min<uint64_t>((uint64_t)limit, fileSize - (uint64_t)offset);
-        std::vector<uint8_t> bytes(count);
-        if (count) file.read((char*)bytes.data(), (std::streamsize)count);
-        count = (size_t)file.gcount();
-        std::string ext = filePath.extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-        return {
-            {"file", rel},
-            {"name", filePath.filename().string()},
-            {"contentType", ext == ".m4a" ? "audio/mp4" : "audio/wav"},
-            {"offset", offset},
-            {"nextOffset", offset + (int64_t)count},
-            {"size", fileSize},
-            {"eof", (uint64_t)(offset + (int64_t)count) >= fileSize},
-            {"dataBase64", base64Encode(bytes.data(), count)}
-        };
-    }
-
-    json currentPlaybackPageJson(const json& request, std::string& error, int& status) {
-        if (currentlyPlayingFreqKey.load() == 0) {
-            status = 404;
-            error = "no active playback";
-            return {};
-        }
-
-        std::string path;
-        {
-            std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
-            path = currentPlaybackPath;
-        }
-        if (path.empty()) {
-            status = 404;
-            error = "playback file unavailable";
-            return {};
-        }
-
-        json body = request.value("body", json::object());
-        int64_t offset = body.value("offset", (int64_t)0);
-        int limit = std::clamp(body.value("limit", 4096), 1, 16384);
-        if (offset < 0) {
-            status = 400;
-            error = "offset must be non-negative";
-            return {};
-        }
-
-        std::error_code ec;
-        std::filesystem::path filePath = std::filesystem::weakly_canonical(path, ec);
-        if (ec || !std::filesystem::is_regular_file(filePath, ec) || ec) {
-            status = 404;
-            error = "playback file not found";
-            return {};
-        }
-        uintmax_t fileSize = std::filesystem::file_size(filePath, ec);
-        if (ec || (uint64_t)offset > fileSize) {
-            status = 416;
-            error = "offset is past end of playback file";
-            return {};
-        }
-        std::ifstream file(filePath, std::ios::binary);
-        if (!file.is_open()) {
-            status = 404;
-            error = "playback file not readable";
-            return {};
-        }
-        file.seekg(offset);
-        size_t count = (size_t)std::min<uint64_t>((uint64_t)limit, fileSize - (uint64_t)offset);
-        std::vector<uint8_t> bytes(count);
-        if (count) file.read((char*)bytes.data(), (std::streamsize)count);
-        count = (size_t)file.gcount();
-        std::string ext = filePath.extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-        return {
-            {"name", filePath.filename().string()},
-            {"contentType", ext == ".m4a" ? "audio/mp4" : "audio/wav"},
-            {"offset", offset},
-            {"nextOffset", offset + (int64_t)count},
-            {"size", fileSize},
-            {"eof", (uint64_t)(offset + (int64_t)count) >= fileSize},
-            {"dataBase64", base64Encode(bytes.data(), count)}
-        };
-    }
-
-    std::string bleEnvelope(int64_t id, int status, const json& body,
-                            const std::string& error = {}, const std::string& code = {}) {
-        json out = {{"v", 1}, {"id", id}, {"ok", error.empty()}, {"status", status}};
-        if (error.empty()) out["body"] = body;
-        else out["error"] = {{"code", code.empty() ? "request_failed" : code}, {"message", error}};
-        return out.dump();
-    }
-
-    std::string handleBleGattRequest(const std::string& text) {
-        int64_t id = 0;
-        try {
-            json request = json::parse(text);
-            id = request.value("id", (int64_t)0);
-            if (request.value("v", 0) != 1)
-                return bleEnvelope(id, 400, {}, "unsupported protocol version", "bad_version");
-            std::string method = request.value("method", std::string());
-            std::string path = request.value("path", std::string());
-            std::transform(method.begin(), method.end(), method.begin(),
-                           [](unsigned char c) { return (char)std::toupper(c); });
-
-            if (method == "GET") {
-                if (path == "/api/state" || path == "/state")
-                    return bleEnvelope(id, 200, webStateSnapshot());
-                if (path == "/api/state/summary")
-                    return bleEnvelope(id, 200, webStateSummarySnapshot());
-                if (path == "/api/sources")
-                    return bleEnvelope(id, 200, {{"selected", selectedSourceName()}, {"sources", sourceNamesJson()}});
-                if (path == "/api/sdrpp-server") return bleEnvelope(id, 200, serverSourceStateJson());
-                if (path == "/api/source-controls") return bleEnvelope(id, 200, selectedSourceControlsJson());
-                if (path == "/api/source-offset") return bleEnvelope(id, 200, sourceOffsetStateJson());
-                if (path == "/api/channel-bank/settings") return bleEnvelope(id, 200, channelBankSettingsJson());
-                if (path == "/api/recordings") return bleEnvelope(id, 200, recordingsListJson());
-                if (path == "/api/recordings/download") {
-                    std::string error; int status = 200;
-                    json page = recordingPageJson(request, error, status);
-                    return bleEnvelope(id, status, page, error, status == 416 ? "range" : "recording_error");
-                }
-                if (path == "/api/audio/current-playback") {
-                    std::string error; int status = 200;
-                    json page = currentPlaybackPageJson(request, error, status);
-                    return bleEnvelope(id, status, page, error, status == 416 ? "range" : "playback_error");
-                }
-                if (path == "/api/audio/live.pcm" || path == "/api/audio/live.wav") {
-                    return bleEnvelope(id, 200, {
-                        {"characteristic", "7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000"},
-                        {"format", "pcm_s16le"}, {"rate", 48000}, {"channels", 1},
-                        {"note", "enable notifications on the audio characteristic"}
-                    });
-                }
-            }
-
-            if (method != "POST") return bleEnvelope(id, 404, {}, "not found", "not_found");
-            json body = request.value("body", json::object());
-            json result;
-            std::string uiError;
-            auto onUi = [&](std::function<json()> fn) -> bool {
-                return runOnUiThread(std::move(fn), result, uiError);
-            };
-
-            if (path == "/api/start") {
-                onUi([this] {
-                    if (!folderSelect.pathIsValid()) return json({{"_status", 409}, {"error", "recording path is invalid"}});
-                    start(); return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/stop") {
-                onUi([this] { stop(); return webStateSummarySnapshot(); });
-            }
-            else if (path == "/api/channel-bank/settings") {
-                onUi([this, body] {
-                    std::string error;
-                    if (!applyChannelBankSettings(body, error))
-                        return json({{"_status", running ? 409 : 400}, {"error", error}});
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/frequency/block") {
-                double hz = body.value("hz", 0.0); bool blocked = body.value("blocked", true);
-                onUi([this, hz, blocked] {
-                    std::string error;
-                    if (!setFrequencyBlocked(hz, blocked, error)) return json({{"_status", 400}, {"error", error}});
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/playback-lock") {
-                double hz = body.value("hz", 0.0);
-                onUi([this, hz] {
-                    std::string error;
-                    if (!setPlaybackLock(hz, error)) return json({{"_status", 400}, {"error", error}});
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/recordings/session") {
-                std::string session = body.value("name", std::string());
-                onUi([this, session] {
-                    std::string error;
-                    if (!setRecordingSession(session, error))
-                        return json({{"_status", 400}, {"error", error}});
-                    return recordingsListJson();
-                });
-            }
-            else if (path == "/api/recordings/clear-wavs") {
-                result = clearRecordedWavsJson();
-                std::string httpStatus = result.value("_httpStatus", std::string("200 OK"));
-                result.erase("_httpStatus");
-                if (httpStatus.rfind("404", 0) == 0) result["_status"] = 404;
-                else if (httpStatus.rfind("400", 0) == 0) result["_status"] = 400;
-            }
-            else if (path == "/api/source") {
-                std::string source = body.value("name", std::string());
-                onUi([this, source] {
-                    if (gui::mainWindow.isPlaying()) return json({{"_status", 409}, {"error", "stop SDR before changing source"}});
-                    if (source.empty() || !sourceExists(source)) return json({{"_status", 404}, {"error", "source not found"}});
-                    sigpath::sourceManager.selectSource(source);
-                    core::configManager.acquire(); core::configManager.conf["source"] = source;
-                    core::configManager.release(true); return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/source-controls") {
-                onUi([this, body] {
-                    if (selectedSourceName() != "RX888")
-                        return json({{"_status", 404}, {"error", "selected source has no web controls"}});
-                    RX888SourceControlV1 req{}; std::string value = body.dump();
-                    strncpy(req.request, value.c_str(), sizeof(req.request) - 1);
-                    if (!callRX888SourceControl(RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
-                        std::string error = "RX888 source control failed";
-                        if (req.response[0]) try { error = json::parse(req.response).value("error", error); } catch (...) {}
-                        return json({{"_status", gui::mainWindow.isPlaying() ? 409 : 400}, {"error", error}});
-                    }
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/source-offset") {
-                onUi([this, body] {
-                    std::string error;
-                    if (!applySourceOffsetSettings(body, error)) return json({{"_status", 400}, {"error", error}});
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/sdrpp-server") {
-                std::string host = body.value("host", std::string()); int port = body.value("port", 0);
-                onUi([this, host, port] {
-                    if (gui::mainWindow.isPlaying()) return json({{"_status", 409}, {"error", "stop SDR before changing server target"}});
-                    if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1"))
-                        return json({{"_status", 404}, {"error", "SDR++ Server source control unavailable"}});
-                    if (host.empty() || port <= 0 || port > 65535)
-                        return json({{"_status", 400}, {"error", "host and valid port required"}});
-                    SDRPPServerSourceControlV1 req{}; strncpy(req.host, host.c_str(), sizeof(req.host) - 1); req.port = port;
-                    if (!callServerSourceControl(SERVER_SOURCE_CONTROL_SET, &req) || !req.ok)
-                        return json({{"_status", 409}, {"error", "server target is busy or invalid"}});
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/sdrpp-server/connect" || path == "/api/sdrpp-server/disconnect") {
-                bool connect = path.find("disconnect") == std::string::npos;
-                onUi([this, connect] {
-                    if (gui::mainWindow.isPlaying())
-                        return json({{"_status", 409}, {"error", connect ? "stop SDR before connecting server source" : "stop SDR before disconnecting server source"}});
-                    if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1"))
-                        return json({{"_status", 404}, {"error", "SDR++ Server source control unavailable"}});
-                    SDRPPServerSourceControlV1 state{};
-                    bool ok = callServerSourceControl(connect ? SERVER_SOURCE_CONTROL_CONNECT : SERVER_SOURCE_CONTROL_DISCONNECT, &state);
-                    if (connect && (!ok || !state.connected)) return json({{"_status", 502}, {"error", "server connection failed"}});
-                    return webStateSummarySnapshot();
-                });
-            }
-            else if (path == "/api/play") {
-                onUi([this] { gui::mainWindow.setPlayState(true); sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency()); return webStateSummarySnapshot(); });
-            }
-            else if (path == "/api/stop-radio" || path == "/api/radio/stop") {
-                onUi([this] { gui::mainWindow.setPlayState(false); return webStateSummarySnapshot(); });
-            }
-            else if (path == "/api/center") {
-                double hz = body.value("hz", 0.0);
-                if (!std::isfinite(hz) || hz <= 0.0) return bleEnvelope(id, 400, {}, "hz must be positive", "invalid_argument");
-                onUi([this, hz] {
-                    gui::waterfall.setCenterFrequency(hz); gui::waterfall.centerFreqMoved = true;
-                    sigpath::sourceManager.tune(hz); lastKnownCenter = hz; return webStateSummarySnapshot();
-                });
-            }
-            else return bleEnvelope(id, 404, {}, "not found", "not_found");
-
-            if (!uiError.empty()) return bleEnvelope(id, 503, {}, uiError, "ui_timeout");
-            int status = result.value("_status", 200);
-            if (result.contains("error")) return bleEnvelope(id, status, {}, result.value("error", "request failed"));
-            std::string response = bleEnvelope(id, status, result);
-            if (status >= 200 && status < 300 && android_ble_gatt::hasSummarySubscribers()) {
-                android_ble_gatt::notifySummary(bleEnvelope(
-                    0, 200, webStateSummarySnapshot()));
-            }
-            return response;
-        }
-        catch (const std::exception& e) {
-            return bleEnvelope(id, 400, {}, e.what(), "invalid_request");
-        }
-        catch (...) {
-            return bleEnvelope(id, 500, {}, "request failed", "internal_error");
-        }
-    }
-#endif
-
     bool sourceExists(const std::string& name) {
         auto sources = sigpath::sourceManager.getSourceNames();
         return std::find(sources.begin(), sources.end(), name) != sources.end();
@@ -4672,12 +4325,6 @@ self.addEventListener("fetch", event => {
             sendHttpResponse(fd, "200 OK", "application/json", webStateSnapshot().dump());
             return;
         }
-#ifdef __ANDROID__
-        if (method == "GET" && path == "/api/state/summary") {
-            sendHttpResponse(fd, "200 OK", "application/json", webStateSummarySnapshot().dump());
-            return;
-        }
-#endif
         if (method == "GET" && path == "/api/sources") {
             sendHttpResponse(fd, "200 OK", "application/json", json({
                 {"selected", selectedSourceName()},
@@ -4781,7 +4428,13 @@ self.addEventListener("fetch", event => {
                 if (!setFrequencyBlocked(hz, blocked, error)) {
                     return json({{"ok", false}, {"error", error}, {"_httpStatus", "400 Bad Request"}});
                 }
-                return webStateSnapshot();
+                int64_t key = freqKey(hz);
+                return json({
+                    {"ok", true},
+                    {"freqKey", key},
+                    {"blockHz", (double)key * 1000.0},
+                    {"blocked", blocked}
+                });
             });
             return;
         }
@@ -5160,6 +4813,7 @@ self.addEventListener("fetch", event => {
             instPower.clear();
             rawSlotMisses.clear();
             rawManualMisses.clear();
+            manualLocalNoiseFloors.clear();
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
             floorHistory.clear();
@@ -5179,6 +4833,7 @@ self.addEventListener("fetch", event => {
             manualVotes.clear();
             rawSlotMisses.clear();
             rawManualMisses.clear();
+            manualLocalNoiseFloors.clear();
             {
                 std::lock_guard<std::mutex> lk(detectedMtx);
                 detectedSlots.clear();
@@ -5189,6 +4844,7 @@ self.addEventListener("fetch", event => {
                 manualDetected.clear();
                 rawManualDetected.clear();
                 manualSnrDb.clear();
+                manualThresholdDb.clear();
             }
 #ifndef CB_NO_RNNOISE
             {
@@ -5262,7 +4918,7 @@ self.addEventListener("fetch", event => {
 
         double binHz  = lastKnownSr / FFT_SIZE;
         std::vector<double> manualPassbandFreqs;
-        if (manualMode && manualPassbandLimit)
+        if (manualMode && manualPassbandLimit && !manualLocalSnrEnabled)
             manualPassbandFreqs = getActiveManualFreqs();
 
         std::vector<uint8_t> manualPassbandMask;
@@ -5450,12 +5106,141 @@ self.addEventListener("fetch", event => {
             std::map<int,float> newManualInstantSnr;
             std::map<int,float> newManualCentroidHz;
             std::map<int,float> newManualWidthHz;
+            std::map<int,float> newManualThresholdDb;
+
+            struct ManualWindow {
+                bool  valid = false;
+                int   centerBin = 0;
+                int   lo = 0, hi = -1;
+                int   guard1Lo = -1, guard1Hi = -1;
+                int   guard2Lo = -1, guard2Hi = -1;
+                float noiseFloor = 0.0f;
+                float instantNoiseFloor = 0.0f;
+                float thresholdDb = 0.0f;
+            };
+            std::vector<ManualWindow> manualWindows(localFreqs.size());
+            std::vector<uint8_t> manualSignalMask(FFT_SIZE, 0);
+
+            std::map<std::string, float> localOverrides;
+            {
+                std::lock_guard<std::mutex> lk(manualFreqMtx);
+                localOverrides = manualSnrOverrides;
+            }
+
+            // First build every modulation-aware signal window. The combined mask
+            // keeps another configured channel from contaminating a frequency's
+            // local noise shoulders when bookmarks are closely spaced.
             for (int i = 0; i < (int)localFreqs.size(); i++) {
                 double freqOffset = localFreqs[i] - lastKnownCenter;
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
-                int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
-                int halfBins2 = std::max(1, (int)std::round(std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
-                int lo, hi;
+                auto& w = manualWindows[i];
+                w.valid = true;
+                w.centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+                int halfBins2 = std::max(1, (int)std::round(
+                    std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
+                if (demodMode == DEMOD_USB) {
+                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
+                    w.lo = w.centerBin;
+                    w.hi = std::clamp(w.centerBin + ssbBins, 0, FFT_SIZE - 1);
+                    w.guard1Lo = w.hi + 1;
+                    w.guard1Hi = std::clamp(w.hi + ssbBins, 0, FFT_SIZE - 1);
+                    w.guard2Lo = std::clamp(w.centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    w.guard2Hi = std::max(0, w.centerBin - 1);
+                } else if (demodMode == DEMOD_LSB) {
+                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
+                    w.lo = std::clamp(w.centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    w.hi = w.centerBin;
+                    w.guard1Lo = std::clamp(w.lo - ssbBins, 0, FFT_SIZE - 1);
+                    w.guard1Hi = w.lo - 1;
+                    w.guard2Lo = w.hi + 1;
+                    w.guard2Hi = std::clamp(w.hi + ssbBins, 0, FFT_SIZE - 1);
+                } else {
+                    w.lo = std::clamp(w.centerBin - halfBins2, 0, FFT_SIZE - 1);
+                    w.hi = std::clamp(w.centerBin + halfBins2, 0, FFT_SIZE - 1);
+                }
+                for (int b = w.lo; b <= w.hi; b++) manualSignalMask[b] = 1;
+                auto overrideIt = localOverrides.find(manualSnrOverrideKey(localFreqs[i], demodMode));
+                w.thresholdDb = overrideIt == localOverrides.end() ? snrThreshold : overrideIt->second;
+                newManualThresholdDb[i] = w.thresholdDb;
+            }
+
+            auto noisePercentile = [&](const std::vector<float>& source, int lo, int hi) -> float {
+                std::vector<float> samples;
+                lo = std::clamp(lo, 0, FFT_SIZE - 1);
+                hi = std::clamp(hi, 0, FFT_SIZE - 1);
+                if (lo > hi) return 0.0f;
+                samples.reserve(hi - lo + 1);
+                for (int b = lo; b <= hi; b++)
+                    if (!manualSignalMask[b]) samples.push_back(source[b]);
+                if (samples.empty()) return 0.0f;
+                std::sort(samples.begin(), samples.end());
+                size_t idx = std::min(samples.size() - 1,
+                                      (size_t)std::floor(samples.size() * 0.20));
+                return std::max(samples[idx], 1e-30f);
+            };
+
+            int stormEligible = 0;
+            int stormRaised = 0;
+            constexpr float MANUAL_STORM_RISE_DB = 4.0f;
+            const float stormRiseLinear = powf(10.0f, MANUAL_STORM_RISE_DB / 10.0f);
+            const float maxFloorRisePerFrame = powf(10.0f, 0.5f / 10.0f);
+            for (int i = 0; i < (int)manualWindows.size(); i++) {
+                auto& w = manualWindows[i];
+                if (!w.valid) continue;
+                // Use at least 8 kHz of noise bins on each side. At a 5 MHz
+                // span a 2.8 kHz USB window is only a handful of FFT bins; the
+                // wider shoulders make the percentile stable without becoming
+                // a span-wide measurement again.
+                int width = std::max(w.hi - w.lo + 1,
+                                     std::max(2, (int)std::round(8000.0 / binHz)));
+                int gap = std::max(1, (int)std::round(300.0 / binHz));
+                float leftFloor  = noisePercentile(power,     w.lo - gap - width, w.lo - gap - 1);
+                float rightFloor = noisePercentile(power,     w.hi + gap + 1, w.hi + gap + width);
+                float leftInst   = noisePercentile(instPower, w.lo - gap - width, w.lo - gap - 1);
+                float rightInst  = noisePercentile(instPower, w.hi + gap + 1, w.hi + gap + width);
+
+                auto lowerValid = [](float a, float b) {
+                    if (a <= 0.0f) return b;
+                    if (b <= 0.0f) return a;
+                    return std::min(a, b);
+                };
+                float rawLocal = lowerValid(leftFloor, rightFloor);
+                float instLocal = lowerValid(leftInst, rightInst);
+                if (rawLocal <= 0.0f) rawLocal = globalNoiseFloor;
+                if (instLocal <= 0.0f) instLocal = rawLocal;
+
+                std::string floorKey = manualSnrOverrideKey(localFreqs[i], demodMode);
+                float& tracked = manualLocalNoiseFloors[floorKey];
+                if (tracked > 0.0f) {
+                    stormEligible++;
+                    if (instLocal > tracked * stormRiseLinear) stormRaised++;
+                    // Track sustained atmospheric changes, but cap upward motion at
+                    // 0.5 dB/frame so a single large crash cannot poison sensitivity
+                    // for the following weak transmission. Release slowly to avoid
+                    // threshold pumping between closely spaced crashes.
+                    float a = rawLocal > tracked ? 0.30f : 0.04f;
+                    float next = a * rawLocal + (1.0f - a) * tracked;
+                    tracked = std::min(next, tracked * maxFloorRisePerFrame);
+                } else {
+                    tracked = rawLocal;
+                }
+                w.noiseFloor = manualLocalSnrEnabled ? tracked : globalNoiseFloor;
+                w.instantNoiseFloor = manualLocalSnrEnabled ? instLocal : globalNoiseFloor;
+            }
+
+            // A common-mode jump in the local noise shoulders around at least two
+            // frequencies is a storm/broadband event. Preserve accumulated votes and
+            // active-channel state for the frame instead of treating the crash as a
+            // signal or a dropout.
+            bool manualStormEvent = manualLocalSnrEnabled && manualStormGuardEnabled &&
+                                    stormEligible >= 2 && stormRaised * 5 >= stormEligible * 3;
+            widebandEvent = widebandEvent || manualStormEvent;
+
+            for (int i = 0; i < (int)localFreqs.size(); i++) {
+                auto& w = manualWindows[i];
+                if (!w.valid) continue;
+                int centerBin = w.centerBin;
+                int lo = w.lo, hi = w.hi;
                 // Two guard bands per SSB mode (-1 = unused):
                 //   guard1: outer guard, same side as the voice passband
                 //           (above carrier for USB, below for LSB) — catches interferers
@@ -5465,39 +5250,8 @@ self.addEventListener("fetch", event => {
                 //           whose upper/lower sideband leaks across the carrier
                 // USB voice has zero energy below the carrier; LSB has zero above.
                 // Any elevation there means an adjacent signal is leaking through.
-                int guard1Lo = -1, guard1Hi = -1;
-                int guard2Lo = -1, guard2Hi = -1;
-                if (demodMode == DEMOD_USB) {
-                    // USB energy lives in 300-2800 Hz above the carrier only.
-                    // Using halfBins2*2 (≈6.6 kHz for 8.33 kHz channel spacing)
-                    // is far too wide and catches adjacent HFDL signals 6 kHz up.
-                    // Clamp the window to the actual SSB passband width (2800 Hz).
-                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
-                    lo = centerBin;
-                    hi = std::clamp(centerBin + ssbBins, 0, FFT_SIZE - 1);
-                    // guard1: above the voice passband (catches HFDL above the bookmark)
-                    guard1Lo = hi + 1;
-                    guard1Hi = std::clamp(hi + ssbBins, 0, FFT_SIZE - 1);
-                    // guard2: below the carrier (catches HFDL below the bookmark)
-                    // USB voice never has energy here, so any elevation is interference.
-                    guard2Lo = std::clamp(centerBin - ssbBins, 0, FFT_SIZE - 1);
-                    guard2Hi = std::max(0, centerBin - 1);
-                } else if (demodMode == DEMOD_LSB) {
-                    // Mirror: LSB energy lives in 300-2800 Hz below the carrier.
-                    int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
-                    lo = std::clamp(centerBin - ssbBins, 0, FFT_SIZE - 1);
-                    hi = centerBin;
-                    // guard1: below the voice passband (catches HFDL below the bookmark)
-                    guard1Lo = std::clamp(lo - ssbBins, 0, FFT_SIZE - 1);
-                    guard1Hi = lo - 1;
-                    // guard2: above the carrier (catches HFDL above the bookmark)
-                    guard2Lo = hi + 1;
-                    guard2Hi = std::clamp(hi + ssbBins, 0, FFT_SIZE - 1);
-                } else {
-                    // AM / NFM / WFM: symmetric window around carrier
-                    lo = std::clamp(centerBin - halfBins2, 0, FFT_SIZE - 1);
-                    hi = std::clamp(centerBin + halfBins2, 0, FFT_SIZE - 1);
-                }
+                int guard1Lo = w.guard1Lo, guard1Hi = w.guard1Hi;
+                int guard2Lo = w.guard2Lo, guard2Hi = w.guard2Hi;
                 float sum = 0.0f, instSum = 0.0f;
                 for (int b = lo; b <= hi; b++) {
                     sum     += power[b];
@@ -5506,8 +5260,8 @@ self.addEventListener("fetch", event => {
                 int nBins2 = hi - lo + 1;
                 float mean     = sum     / (float)nBins2;
                 float instMean = instSum / (float)nBins2;
-                if (globalNoiseFloor > 0.0f && instMean > 1e-30f)
-                    newManualInstantSnr[i] = 10.0f * log10f(instMean / globalNoiseFloor);
+                if (w.noiseFloor > 0.0f && instMean > 1e-30f)
+                    newManualInstantSnr[i] = 10.0f * log10f(instMean / w.noiseFloor);
                 double centroidWeighted = 0.0;
                 double centroidPower = 0.0;
                 for (int b = lo; b <= hi; b++) {
@@ -5533,11 +5287,14 @@ self.addEventListener("fetch", event => {
                 // Using instMean for voting caused strong-signal modulation spikes to
                 // accumulate votes on adjacent channels, triggering false detections.
                 //
-                // Hysteresis: once a file is open on this index, use holdSnrLinear
-                // (= snrThreshold - holdHysteresisDb) so brief fades don't drain votes.
-                float effSnr   = openSlotIndices.count(i) ? holdSnrLinear : snrLinear;
-                bool aboveVote = (mean     > globalNoiseFloor * effSnr);
-                bool aboveRaw  = (instMean > globalNoiseFloor * effSnr);
+                // Hysteresis and per-frequency calibration are applied in dB so
+                // overrides retain the same hold margin as the global threshold.
+                float effectiveThresholdDb = w.thresholdDb -
+                    (openSlotIndices.count(i) ? holdHysteresisDb : 0.0f);
+                float startSnrLinear = powf(10.0f, w.thresholdDb / 10.0f);
+                float effSnr = powf(10.0f, effectiveThresholdDb / 10.0f);
+                bool aboveVote = (mean     > w.noiseFloor * effSnr);
+                bool aboveRaw  = (instMean > w.noiseFloor * effSnr);
 
                 // Guard-band suppression for USB/LSB.
                 //
@@ -5569,7 +5326,7 @@ self.addEventListener("fetch", event => {
                     float gMean     = gSum     / (float)nGuard;
                     float gInstMean = gInstSum / (float)nGuard;
                     // Activation gate: slow EMA (stable, ignores single-frame noise spikes).
-                    if (gMean > globalNoiseFloor * (snrLinear * 0.5f)) {
+                    if (gMean > w.noiseFloor * (startSnrLinear * 0.5f)) {
                         // Ratio uses instantaneous power for both numerator and denominator.
                         // This eliminates EMA charge-up lag at transmission start:
                         //   • New voice tx: instMean jumps immediately → ratio is high → passes.
@@ -5639,8 +5396,8 @@ self.addEventListener("fetch", event => {
 
                 if (aboveRaw && !widebandEvent) newRawDetected.insert(i);  // raw, un-voted
                 // Store per-freq SNR for M4A metadata
-                if (globalNoiseFloor > 0.0f)
-                    newManualSnr[i] = 10.0f * log10f(mean / globalNoiseFloor);
+                if (w.noiseFloor > 0.0f)
+                    newManualSnr[i] = 10.0f * log10f(mean / w.noiseFloor);
                 // Votes frozen during wideband events (lightning protection)
                 if (!widebandEvent) {
                     int& v = manualVotes[i];
@@ -5653,6 +5410,7 @@ self.addEventListener("fetch", event => {
                 manualDetected    = newDetected;
                 rawManualDetected = newRawDetected;   // copy — keep newRawDetected usable below
                 manualSnrDb       = std::move(newManualSnr);
+                manualThresholdDb = newManualThresholdDb;
             }
             {
                 std::lock_guard<std::mutex> dlck(displayMtx);
@@ -5665,12 +5423,18 @@ self.addEventListener("fetch", event => {
                 displaySnap.numSlots  = 0;
                 displaySnap.manualCenterBins.clear();
                 displaySnap.manualActiveFlags.clear();
+                displaySnap.manualThresholdDb.clear();
                 for (int i = 0; i < (int)localFreqs.size(); i++) {
                     double freqOffset = localFreqs[i] - lastKnownCenter;
                     if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
                     int bin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
                     displaySnap.manualCenterBins.push_back(bin);
                     displaySnap.manualActiveFlags.push_back(newDetected.count(i) > 0);
+                    auto wit = manualWindows.begin() + i;
+                    float absoluteThreshold = wit->noiseFloor *
+                        powf(10.0f, wit->thresholdDb / 10.0f);
+                    displaySnap.manualThresholdDb.push_back(
+                        10.0f * log10f(absoluteThreshold + 1e-30f));
                 }
                 std::vector<float> sorted = displaySnap.power;
                 int lo5  = (int)(FFT_SIZE * 0.05f);
@@ -5892,6 +5656,9 @@ self.addEventListener("fetch", event => {
             displaySnap.threshDb  = 10.0f * log10f(displayNoiseFloor * snrLinear + 1e-30f);
             displaySnap.detected  = detected;
             displaySnap.numSlots  = numSlots;
+            displaySnap.manualCenterBins.clear();
+            displaySnap.manualActiveFlags.clear();
+            displaySnap.manualThresholdDb.clear();
             // Auto-range: 5th/95th percentile for a clean y-axis.
             // nth_element is O(n) vs std::sort's O(n log n) — saves ~50% of
             // this block's CPU on 8192-element arrays at 20 Hz.
@@ -6261,29 +6028,6 @@ self.addEventListener("fetch", event => {
             }
         }
     }
-
-#ifdef __ANDROID__
-    void bleStatePublisherFunc() {
-        std::unique_lock<std::mutex> lk(bleStatePublisherMtx);
-        unsigned fullStateTicks = 0;
-        while (bleStatePublisherRunning) {
-            if (bleStatePublisherCv.wait_for(lk, std::chrono::milliseconds(500), [this] {
-                    return !bleStatePublisherRunning.load();
-                })) break;
-            lk.unlock();
-            ++fullStateTicks;
-            if (android_ble_gatt::hasSummarySubscribers()) {
-                android_ble_gatt::notifySummary(bleEnvelope(
-                    0, 200, webStateSummarySnapshot()));
-            }
-            if (android_ble_gatt::hasStateSubscribers() && fullStateTicks % 10 == 0) {
-                android_ble_gatt::notifyState(handleBleGattRequest(
-                    R"({"v":1,"id":0,"method":"GET","path":"/api/state"})"));
-            }
-            lk.lock();
-        }
-    }
-#endif
 
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
@@ -7355,56 +7099,30 @@ self.addEventListener("fetch", event => {
                     if (currentPlaybackPath == path) currentPlaybackPath.clear();
                 }
             } else {
-#if !defined(__ANDROID__)
-                // Write silence to keep monitorStream continuously flowing.
-                // swap() naturally throttles to the consumer's 48 kHz read rate.
-                memcpy(monitorStream.writeBuf, silence.data(), CHUNK * sizeof(dsp::stereo_t));
-                if (!monitorStream.swap(CHUNK)) { return; }
-#else
                 std::unique_lock<std::mutex> lk(playbackMtx);
                 playbackCv.wait_for(lk, std::chrono::milliseconds(250), [this] {
                     return !playbackQueue.empty() || !playbackRunning.load();
                 });
-#endif
             }
         }
     }
 
     void playbackWavFile(const std::string& path, double playFreq) {
-#if defined(__ANDROID__)
-        ensureAndroidMonitorAudioSink();
-#endif
-        playbackStartedCount++;
         // Write one silence chunk before opening the file so the file I/O
         // happens while the consumer processes audio — prevents underrun pop.
         const int PREBUF = 1024;
         memset(monitorStream.writeBuf, 0, PREBUF * sizeof(dsp::stereo_t));
-        if (!monitorStream.swap(PREBUF)) {
-            playbackSwapFailCount++;
-            return;
-        }
+        if (!monitorStream.swap(PREBUF)) { return; }
 
         std::ifstream f(path, std::ios::binary);
-        if (!f.is_open()) {
-            playbackOpenFailCount++;
-            flog::warn("[ChannelBank] Playback failed to open WAV: {0}", path);
-            return;
-        }
+        if (!f.is_open()) { return; }
 
         // Parse minimal WAV header to find data start
         char riff[4]; f.read(riff, 4);
-        if (std::string(riff, 4) != "RIFF") {
-            playbackBadWavCount++;
-            flog::warn("[ChannelBank] Playback invalid WAV RIFF: {0}", path);
-            return;
-        }
+        if (std::string(riff, 4) != "RIFF") { return; }
         uint32_t fileSize; f.read((char*)&fileSize, 4);
         char wave[4]; f.read(wave, 4);
-        if (std::string(wave, 4) != "WAVE") {
-            playbackBadWavCount++;
-            flog::warn("[ChannelBank] Playback invalid WAV WAVE: {0}", path);
-            return;
-        }
+        if (std::string(wave, 4) != "WAVE") { return; }
 
         // Walk chunks — parse fmt for channel count, find data
         uint16_t fmtChannels = 2;
@@ -7425,11 +7143,7 @@ self.addEventListener("fetch", event => {
                 f.seekg(chunkSize, std::ios::cur);
             }
         }
-        if (dataSize == 0) {
-            playbackNoDataCount++;
-            flog::warn("[ChannelBank] Playback WAV has no data chunk: {0}", path);
-            return;
-        }
+        if (dataSize == 0) { return; }
 
         // Read int16 (mono or stereo) → float stereo_t, write to monitorStream in chunks
         const int CHUNK       = 1024;
@@ -7467,13 +7181,9 @@ self.addEventListener("fetch", event => {
             }
             publishLiveAudioPcm(playFreq, browserPcm.data(), samples, true);
             memcpy(monitorStream.writeBuf, buf.data(), samples * sizeof(dsp::stereo_t));
-            if (!monitorStream.swap(samples)) {
-                playbackSwapFailCount++;
-                break;
-            }
+            if (!monitorStream.swap(samples)) { break; }
             remaining    -= bytesRead;
             samplesRead  += samples;
-            playbackSamplesCount += samples;
 #if defined(__APPLE__) || defined(_WIN32)
             // Publish the playback cursor for the synced-transcript overlay.
             // The WAV is 48 kHz so ms = samples * 1000 / 48000.  Atomic store —
@@ -7898,6 +7608,7 @@ self.addEventListener("fetch", event => {
             config.conf[_this->name]["maxChannels"] = _this->maxChannels;
             config.release(true);
         }
+
         ImGui::LeftLabel("BW Usage");
         ImGui::FillWidth();
         {
@@ -8069,23 +7780,44 @@ self.addEventListener("fetch", event => {
 
         if (_this->running) { style::endDisabled(); }
 
-        bool canLimitPassbands = _this->manualMode;
-        if (!canLimitPassbands) style::beginDisabled();
-        if (ImGui::Checkbox(CONCAT("Limit to manual passbands##_cb_manpb_", _this->name),
-                            &_this->manualPassbandLimit)) {
-            config.acquire();
-            config.conf[_this->name]["manualPassbandLimit"] = _this->manualPassbandLimit;
-            config.release(true);
+        bool canTuneManualDetector = _this->manualMode;
+        if (!canTuneManualDetector) style::beginDisabled();
+        if (ImGui::Checkbox(CONCAT("Local SNR floors##_cb_local_snr_", _this->name),
+                            &_this->manualLocalSnrEnabled)) {
+            _this->saveManualConfig();
             _this->resetDetectorFloor();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Manual mode only.\n"
-                              "USB watches bookmark to +channel spacing.\n"
-                              "LSB watches -channel spacing to bookmark.\n"
-                              "AM/NFM/WFM watch a centered channel-width passband.\n"
-                              "When off, manual detection uses the current full-span floor.");
+            ImGui::SetTooltip("Manual mode only. Measures each configured frequency\n"
+                              "against nearby modulation-aware noise shoulders.\n"
+                              "USB/LSB use one-sided voice windows; AM/NFM/WFM\n"
+                              "use symmetric windows. Disable to restore the legacy\n"
+                              "shared noise floor.");
         }
-        if (!canLimitPassbands) style::endDisabled();
+        if (ImGui::Checkbox(CONCAT("Storm guard##_cb_storm_guard_", _this->name),
+                            &_this->manualStormGuardEnabled)) {
+            _this->saveManualConfig();
+            _this->resetDetectorFloor();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Freeze detection votes for a frame when the nearby\n"
+                              "noise around most manual frequencies jumps together.\n"
+                              "Votes and active-channel state are preserved, not reset.");
+        }
+        if (!canTuneManualDetector) style::endDisabled();
+
+        // Keep the old shared-floor mask available strictly as an A/B fallback.
+        // It has no effect while local floors are enabled.
+        if (_this->manualMode && !_this->manualLocalSnrEnabled) {
+            if (ImGui::Checkbox(CONCAT("Limit shared floor to passbands##_cb_manpb_", _this->name),
+                                &_this->manualPassbandLimit)) {
+                _this->saveManualConfig();
+                _this->resetDetectorFloor();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Legacy detector only. Restricts the single shared\n"
+                                  "noise-floor estimate to the combined manual passbands.");
+        }
 
         // Manual frequency list — editable while running
         if (_this->manualMode) {
@@ -8213,7 +7945,7 @@ self.addEventListener("fetch", event => {
 
                 int toRemove = -1;
                 ImGui::BeginChild(CONCAT("##_cb_manlist_", _this->name),
-                                  ImVec2(menuWidth, 120), true);
+                                  ImVec2(menuWidth, 190), true);
 
                 // Helper lambda: draw a watch toggle button.
                 // Orange [W] = watched, default [ ] = not watched.
@@ -8240,6 +7972,65 @@ self.addEventListener("fetch", event => {
                         ImGui::SetTooltip(watched ? "Watching — click to stop" : "Click to watch");
                 };
 
+                // Optional modulation-specific SNR override. Unchecked rows inherit
+                // the global threshold; enabling starts at the current global value.
+                auto thresholdControl = [&](const char* idSuffix, double hz, int activeIndex) {
+                    std::string key = _this->manualSnrOverrideKey(hz, _this->demodMode);
+                    bool enabled = false;
+                    float value = _this->snrThreshold;
+                    {
+                        std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                        auto it = _this->manualSnrOverrides.find(key);
+                        if (it != _this->manualSnrOverrides.end()) {
+                            enabled = true;
+                            value = it->second;
+                        }
+                    }
+
+                    ImGui::Indent(24.0f);
+                    char enableId[64];
+                    snprintf(enableId, sizeof(enableId), "SNR override##%s_enable", idSuffix);
+                    if (ImGui::Checkbox(enableId, &enabled)) {
+                        {
+                            std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                            if (enabled) _this->manualSnrOverrides[key] = _this->snrThreshold;
+                            else _this->manualSnrOverrides.erase(key);
+                        }
+                        _this->saveManualConfig();
+                        _this->resetDetectorFloor();
+                        value = _this->snrThreshold;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Override the global start threshold for this\n"
+                                          "frequency in the current modulation mode only.");
+                    ImGui::SameLine();
+                    if (!enabled) style::beginDisabled();
+                    ImGui::SetNextItemWidth(78.0f);
+                    char valueId[48];
+                    snprintf(valueId, sizeof(valueId), "##%s_value", idSuffix);
+                    if (ImGui::DragFloat(valueId, &value, 0.1f, 1.0f, 30.0f, "%.1f dB")) {
+                        value = std::clamp(value, 1.0f, 30.0f);
+                        {
+                            std::lock_guard<std::mutex> lk(_this->manualFreqMtx);
+                            _this->manualSnrOverrides[key] = value;
+                        }
+                        _this->saveManualConfig();
+                        _this->resetDetectorFloor();
+                    }
+                    if (!enabled) style::endDisabled();
+                    float currentSnr = NAN;
+                    {
+                        std::lock_guard<std::mutex> lk(_this->manualDetectedMtx);
+                        auto it = _this->manualSnrDb.find(activeIndex);
+                        if (it != _this->manualSnrDb.end()) currentSnr = it->second;
+                    }
+                    if (std::isfinite(currentSnr)) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("%.1f now", currentSnr);
+                    }
+                    ImGui::Unindent(24.0f);
+                };
+
                 // — Custom entries —
                 for (int i = 0; i < (int)customFreqs.size(); i++) {
                     double hz = customFreqs[i];
@@ -8251,6 +8042,7 @@ self.addEventListener("fetch", event => {
                     ImGui::SameLine(menuWidth - 38);
                     char rmBtn[32]; snprintf(rmBtn, sizeof(rmBtn), "X##_cb_rm_%d", i);
                     if (ImGui::SmallButton(rmBtn)) toRemove = i;
+                    thresholdControl(idBuf, hz, i);
                 }
 
                 // — Bound bookmark list entries (read-only; can watch, cannot remove) —
@@ -8261,6 +8053,7 @@ self.addEventListener("fetch", event => {
                     ImGui::SameLine();
                     std::string dname = _this->displayName(hz);
                     ImGui::TextDisabled("%s", dname.c_str());
+                    thresholdControl(idBuf, hz, (int)customFreqs.size() + i);
                 }
 
                 ImGui::EndChild();
@@ -8493,14 +8286,28 @@ self.addEventListener("fetch", event => {
                     dl->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(0, 210, 0, 200));
                 }
 
-                // Global threshold line (orange horizontal line across full width)
-                float ty = dBtoY(snap.threshDb);
-                dl->AddLine(ImVec2(pos.x, ty), ImVec2(pos.x + W, ty),
-                            IM_COL32(255, 120, 0, 200), 1.5f);
+                // Manual/local mode has a different absolute threshold at each
+                // frequency, so draw short orange ticks instead of a misleading
+                // full-span line. Auto and legacy Manual mode keep the global line.
+                bool localThresholds = !snap.manualThresholdDb.empty() &&
+                    snap.manualThresholdDb.size() == snap.manualCenterBins.size();
+                if (localThresholds) {
+                    for (int m = 0; m < (int)snap.manualCenterBins.size(); m++) {
+                        float x = binToX(snap.manualCenterBins[m]);
+                        float y = dBtoY(snap.manualThresholdDb[m]);
+                        dl->AddLine(ImVec2(x - 5.0f, y), ImVec2(x + 5.0f, y),
+                                    IM_COL32(255, 120, 0, 220), 2.0f);
+                    }
+                } else {
+                    float ty = dBtoY(snap.threshDb);
+                    dl->AddLine(ImVec2(pos.x, ty), ImVec2(pos.x + W, ty),
+                                IM_COL32(255, 120, 0, 200), 1.5f);
+                }
 
                 // Legend
                 dl->AddText(ImVec2(pos.x + 4, pos.y + 2),  IM_COL32(0, 210, 0, 200),   "Power");
-                dl->AddText(ImVec2(pos.x + 4, pos.y + 14), IM_COL32(255, 120, 0, 200),  "Threshold");
+                dl->AddText(ImVec2(pos.x + 4, pos.y + 14), IM_COL32(255, 120, 0, 200),
+                            localThresholds ? "Local thresholds" : "Threshold");
                 dl->AddText(ImVec2(pos.x + 4, pos.y + 26), IM_COL32(255, 200, 0, 200),  "Detected");
 
                 // dB range labels
@@ -9044,14 +8851,6 @@ self.addEventListener("fetch", event => {
             }
             ImGui::Text("Active: %d  Recording: %d", total, recording);
             ImGui::Text("Monitor queue: %d pending", queued);
-            ImGui::Text("Monitor sink: %s", sigpath::sinkManager.getStreamSink(_this->name + "_monitor").c_str());
-            ImGui::Text("Playback: start %llu openFail %llu bad %llu noData %llu swapFail %llu samples %llu",
-                        (unsigned long long)_this->playbackStartedCount.load(),
-                        (unsigned long long)_this->playbackOpenFailCount.load(),
-                        (unsigned long long)_this->playbackBadWavCount.load(),
-                        (unsigned long long)_this->playbackNoDataCount.load(),
-                        (unsigned long long)_this->playbackSwapFailCount.load(),
-                        (unsigned long long)_this->playbackSamplesCount.load());
             // Inline "Flush" button — only useful when the queue actually has items
             if (queued > 0) {
                 ImGui::SameLine();
@@ -9610,6 +9409,11 @@ self.addEventListener("fetch", event => {
         config.conf[name]["manualMode"]       = manualMode;
         config.conf[name]["bookmarkScanMode"] = bookmarkScanMode;
         config.conf[name]["manualPassbandLimit"] = manualPassbandLimit;
+        config.conf[name]["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
+        config.conf[name]["manualStormGuardEnabled"] = manualStormGuardEnabled;
+        auto& snrOverrides = config.conf[name]["manualSnrOverrides"];
+        snrOverrides = nlohmann::json::object();
+        for (auto& [key, value] : manualSnrOverrides) snrOverrides[key] = value;
         auto& arr = config.conf[name]["manualFrequencies"];
         arr = nlohmann::json::array();
         for (double f : manualFrequencies) arr.push_back(f);
@@ -9677,6 +9481,11 @@ self.addEventListener("fetch", event => {
             if (!dup) out.push_back(bf);
         }
         return out;
+    }
+
+    std::string manualSnrOverrideKey(double freqHz, int mode) const {
+        return std::to_string(mode) + ":" +
+               std::to_string((int64_t)std::llround(freqHz / 1000.0));
     }
 
     bool manualPassbandBinsForFreq(double freqHz, double binHz, int& lo, int& hi) const {
@@ -9940,13 +9749,6 @@ self.addEventListener("fetch", event => {
     bool         cpuSampleValid = false;
     std::chrono::steady_clock::time_point lastCpuWall;
     std::clock_t lastCpuClock = 0;
-#ifdef __ANDROID__
-    std::atomic<bool> bleStatePublisherRunning { false };
-    std::thread bleStatePublisherThread;
-    std::mutex bleStatePublisherMtx;
-    std::condition_variable bleStatePublisherCv;
-    std::atomic<uint64_t> bleSummarySequence { 0 };
-#endif
     std::atomic<bool> webServerRunning { false };
     std::thread  webServerThread;
     std::mutex   webServerMtx;
@@ -10090,6 +9892,8 @@ self.addEventListener("fetch", event => {
     // Manual mode
     bool manualMode = false;
     bool manualPassbandLimit = false;
+    bool manualLocalSnrEnabled = true;
+    bool manualStormGuardEnabled = true;
     std::mutex manualFreqMtx;
     std::vector<double>   manualFrequencies;    // user-entered frequencies (custom additions)
     std::set<std::string> boundBookmarkLists;   // names of bound FM bookmark lists
@@ -10103,8 +9907,12 @@ self.addEventListener("fetch", event => {
     std::set<int>       manualDetected;      // written by DSP, read by mgmt thread
     std::set<int>       rawManualDetected;   // un-voted; instant fade-out (under manualDetectedMtx)
     std::map<int,float> manualSnrDb;         // per-freq SNR dB; manual/bookmark scan mode
+    std::map<int,float> manualThresholdDb;   // effective start threshold per manual frequency
     std::mutex          manualDetectedMtx;
     std::set<int64_t> watchedFreqs;       // watched freq keys; protected by manualFreqMtx
+    // Optional start thresholds are keyed by "demod-mode:rounded-kHz" so the
+    // same bookmark can retain different calibration in USB, LSB, AM, etc.
+    std::map<std::string, float> manualSnrOverrides; // protected by manualFreqMtx
     std::atomic<int64_t> watchAlert{0};   // non-zero = freqKey of watched freq that just fired
 
     // Description editor (UI thread only)
@@ -10152,6 +9960,7 @@ self.addEventListener("fetch", event => {
     std::vector<float>                      instPower;          // instantaneous per-frame power (no EMA) — fade trigger
     std::map<int, int>                      rawSlotMisses;      // DSP-thread-only: consecutive below-threshold frames (auto mode)
     std::map<int, int>                      rawManualMisses;    // DSP-thread-only: consecutive below-threshold frames (manual mode)
+    std::map<std::string, float>             manualLocalNoiseFloors; // DSP-thread-only, mode/frequency keyed
     bool                                    widebandEvent = false; // DSP-thread-only: >40% of slots above threshold this frame
     float                                   globalNoiseFloor  = 0.0f; // median-smoothed floor used for detection (linear)
     float                                   displayNoiseFloor = 0.0f; // EMA-smoothed copy for display only
@@ -10500,6 +10309,7 @@ self.addEventListener("fetch", event => {
         // Manual mode display
         std::vector<int>    manualCenterBins;
         std::vector<bool>   manualActiveFlags;
+        std::vector<float>  manualThresholdDb; // absolute per-frequency threshold for display
     };
     std::mutex       displayMtx;
     DisplaySnapshot  displaySnap;
@@ -10533,16 +10343,6 @@ self.addEventListener("fetch", event => {
     // PlaybackEntry now carries the segments alongside the WAV path so the
     // playback thread can install them as `playingSegments` for the synced
     // display.  Empty segments = no sync overlay (Apple Speech / transcription off).
-#if defined(__ANDROID__)
-    void ensureAndroidMonitorAudioSink() {
-        const std::string streamName = name + "_monitor";
-        if (sigpath::sinkManager.getStreamSink(streamName) == "Audio") {
-            return;
-        }
-        sigpath::sinkManager.setStreamSink(streamName, "Audio");
-    }
-#endif
-
     struct PlaybackEntry {
         std::string path;
         double      freqHz;
@@ -10575,25 +10375,17 @@ self.addEventListener("fetch", event => {
 #endif
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
     std::atomic<double>             currentlyPlayingFreqHz { 0.0 };
+#if defined(__APPLE__) || defined(_WIN32)
     std::string                     currentPlaybackPath;
     std::mutex                      currentPlaybackPathMtx;
+#endif
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
     std::thread                     playbackThread;
     std::atomic<bool>               playbackRunning { false };
-    std::atomic<uint64_t>           playbackStartedCount { 0 };
-    std::atomic<uint64_t>           playbackOpenFailCount { 0 };
-    std::atomic<uint64_t>           playbackBadWavCount { 0 };
-    std::atomic<uint64_t>           playbackNoDataCount { 0 };
-    std::atomic<uint64_t>           playbackSwapFailCount { 0 };
-    std::atomic<uint64_t>           playbackSamplesCount { 0 };
     dsp::stream<dsp::stereo_t>      monitorStream;
     SinkManager::Stream*            monitorSinkStream = nullptr;
     EventHandler<float>             monitorSrHandler;
-#if defined(__ANDROID__)
-    EventHandler<std::string>       monitorProviderRegisteredHandler;
-    bool                            monitorProviderHandlerBound = false;
-#endif
 
     // SDR state
     double lastKnownSr     = 0.0;
@@ -10654,6 +10446,8 @@ self.addEventListener("fetch", event => {
         p["manualMode"]         = manualMode;
         p["bookmarkScanMode"]   = bookmarkScanMode;
         p["manualPassbandLimit"]= manualPassbandLimit;
+        p["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
+        p["manualStormGuardEnabled"] = manualStormGuardEnabled;
         p["scanMode"]           = scanMode;
         p["scanQuietSec"]       = scanQuietSec;
         p["scanNoSignalSec"]    = scanNoSignalSec;
@@ -10666,6 +10460,9 @@ self.addEventListener("fetch", event => {
         for (auto& s : boundBookmarkLists) p["boundBookmarkLists"].push_back(s);
         p["watchedFreqs"]       = json::array();
         for (auto k : watchedFreqs) p["watchedFreqs"].push_back(k);
+        p["manualSnrOverrides"] = json::object();
+        for (auto& [key, value] : manualSnrOverrides)
+            p["manualSnrOverrides"][key] = value;
         p["scanRanges"]         = json::array();
         for (auto& r : scanRanges) p["scanRanges"].push_back({{"start", r.startHz}, {"stop", r.stopHz}});
         return p;
@@ -10712,6 +10509,8 @@ self.addEventListener("fetch", event => {
         manualMode         = p.value("manualMode", false);
         bookmarkScanMode   = p.value("bookmarkScanMode", false);
         manualPassbandLimit= p.value("manualPassbandLimit", false);
+        manualLocalSnrEnabled = p.value("manualLocalSnrEnabled", true);
+        manualStormGuardEnabled = p.value("manualStormGuardEnabled", true);
         scanMode           = p.value("scanMode", false);
         scanQuietSec       = p.value("scanQuietSec", 3.0f);
         scanNoSignalSec    = p.value("scanNoSignalSec", 1.0f);
@@ -10728,6 +10527,11 @@ self.addEventListener("fetch", event => {
         watchedFreqs.clear();
         if (p.contains("watchedFreqs"))
             for (auto& j : p["watchedFreqs"]) watchedFreqs.insert(j.get<int64_t>());
+        manualSnrOverrides.clear();
+        if (p.contains("manualSnrOverrides") && p["manualSnrOverrides"].is_object())
+            for (auto& [key, value] : p["manualSnrOverrides"].items())
+                if (value.is_number())
+                    manualSnrOverrides[key] = std::clamp(value.get<float>(), 1.0f, 30.0f);
         scanRanges.clear();
         if (p.contains("scanRanges"))
             for (auto& j : p["scanRanges"]) scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });

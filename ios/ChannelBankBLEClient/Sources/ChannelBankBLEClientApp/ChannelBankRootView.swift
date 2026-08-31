@@ -22,16 +22,17 @@ public struct ChannelBankRootView: View {
                         sourceControlsPanel(state)
                         centerPanel(state)
                         channelBankPanel(state)
+                        settingsPanel(state)
                         SNRChartView(state: state)
                         ActivityWaterfallView(store: model.waterfall) { fraction in
                             model.selectWaterfallFrequency(at: fraction)
                         }
-                        activeChannelsPanel(state)
                         activityHistoryPanel(state)
-                        playbackPanel(state)
+                        frequencyHeatMapPanel(state)
+                        activeChannelsPanel(state)
+                        playbackTranscriptPanel(state)
                         recordingsPanel
-                        settingsPanel(state)
-                        diagnosticsPanel(state)
+                        blockedFrequenciesPanel(state)
                     } else {
                         emptyStatePanel
                     }
@@ -129,7 +130,7 @@ public struct ChannelBankRootView: View {
     }
 
     private func radioPanel(_ state: ChannelBankState) -> some View {
-        Panel("Radio") {
+        Panel("SDR Source") {
             MetricGrid(items: [
                 ("Source", state.selectedSource ?? "-"),
                 ("Radio", state.radioPlaying == true ? "Running" : "Stopped"),
@@ -393,18 +394,25 @@ public struct ChannelBankRootView: View {
         let activeCount = state.activeChannels?.count ?? state.activeChannelCount ?? 0
         return Panel("Channel Bank") {
             MetricGrid(items: [
-                ("Bank", state.running == true ? "Running" : "Stopped"),
+                ("State", state.running == true ? "Running" : "Stopped"),
                 ("Mode", state.mode ?? "-"),
-                ("Demod", state.demodMode ?? "-"),
-                ("Active", "\(activeCount) / \(state.maxChannels ?? 0)")
+                ("Center", ChannelBankFormatters.mhz(state.centerHz)),
+                ("Active", "\(activeCount) / \(state.maxChannels ?? 0)"),
+                ("CPU", String(format: "%.1f%%", state.diagnostics?.cpuPercent ?? 0)),
+                ("Memory", ChannelBankFormatters.bytes(state.diagnostics?.rssBytes)),
+                ("Work", "ch \(state.diagnostics?.activeChannels ?? activeCount) / tx \(state.diagnostics?.transcriptionJobs ?? 0) / play \(state.playbackQueued ?? 0)")
             ])
             HStack {
-                Button("Start Bank") { model.ble.setChannelBankRunning(true) }
+                Button("Start Channel Bank") { model.ble.setChannelBankRunning(true) }
                     .disabled(state.running == true)
-                Button("Stop Bank") { model.ble.setChannelBankRunning(false) }
+                Button("Stop Channel Bank") { model.ble.setChannelBankRunning(false) }
                     .disabled(state.running != true)
+                Button("Monitor Audio") { model.ble.loadLiveAudioDescriptor() }
             }
             .buttonStyle(.bordered)
+            Text("Monitor: \(model.ble.audioMonitorStatus)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -419,6 +427,10 @@ public struct ChannelBankRootView: View {
             } else {
                 ForEach(state.activeChannels ?? []) { channel in
                     HStack {
+                        Text("\(channel.slot ?? 0)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, alignment: .leading)
                         StatusDot(color: channel.blocked == true ? .red : channel.signalPresent == true ? .green : .orange)
                         VStack(alignment: .leading) {
                             Text(channel.name ?? ChannelBankFormatters.mhz(channel.gridFreqHz ?? channel.freqHz))
@@ -426,6 +438,10 @@ public struct ChannelBankRootView: View {
                         }
                         Spacer()
                         if channel.recording == true { Text("REC").foregroundStyle(.red).font(.caption.bold()) }
+                        Button(channel.blocked == true ? "Unblock" : "Block") {
+                            model.ble.setFrequency(channel.gridFreqHz ?? channel.freqHz, blocked: channel.blocked != true)
+                        }
+                        .buttonStyle(.bordered)
                     }
                 }
             }
@@ -434,16 +450,28 @@ public struct ChannelBankRootView: View {
 
     private func activityHistoryPanel(_ state: ChannelBankState) -> some View {
         Panel("Activity History") {
-            let rows = Array((state.history ?? []).prefix(8))
+            let rows = (state.history ?? []).sorted { ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
             if rows.isEmpty {
                 Text("No history yet").foregroundStyle(.secondary)
             } else {
-                ForEach(rows) { row in
+                ForEach(rows.prefix(16)) { row in
                     HStack {
-                        Text(ChannelBankFormatters.mhz(row.freqHz)).monospacedDigit()
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ChannelBankFormatters.mhz(row.freqHz)).monospacedDigit()
+                            Text(row.name ?? "-").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
                         Spacer()
-                        Text("\(row.count ?? 0)")
-                        if row.blocked == true { Text("Blocked").foregroundStyle(.red) }
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("\(row.count ?? 0) hits")
+                            Text(row.lastSeenDisplay).font(.caption).foregroundStyle(.secondary)
+                        }
+                        if row.blocked == true { Text("Blocked").foregroundStyle(.red).font(.caption) }
+                        Button("Lock") { model.ble.setPlaybackLock(hz: row.freqHz) }
+                            .buttonStyle(.bordered)
+                        Button(row.blocked == true ? "Unblock" : "Block") {
+                            model.ble.setFrequency(row.freqHz, blocked: row.blocked != true)
+                        }
+                        .buttonStyle(.bordered)
                     }
                     .font(.callout)
                 }
@@ -451,8 +479,34 @@ public struct ChannelBankRootView: View {
         }
     }
 
-    private func playbackPanel(_ state: ChannelBankState) -> some View {
-        Panel("Playback") {
+    private func frequencyHeatMapPanel(_ state: ChannelBankState) -> some View {
+        Panel("Frequency Heat Map") {
+            let entries = (state.history ?? []).sorted { ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
+            if entries.isEmpty {
+                Text("No frequency activity yet").foregroundStyle(.secondary)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 7)], spacing: 7) {
+                    ForEach(entries.prefix(48)) { entry in
+                        Button {
+                            model.ble.setFrequency(entry.freqHz, blocked: entry.blocked != true)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(ChannelBankFormatters.mhz(entry.freqHz)).font(.callout.monospacedDigit())
+                                Text(entry.name ?? "-").font(.caption).lineLimit(1)
+                                Text("\(entry.count ?? 0) hits").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(entry.blocked == true ? .red : .blue)
+                    }
+                }
+            }
+        }
+    }
+
+    private func playbackTranscriptPanel(_ state: ChannelBankState) -> some View {
+        Panel("Playback / Transcript") {
             MetricGrid(items: [
                 ("Playback", state.playback?.active == true ? (state.playback?.name ?? "Active") : "Idle"),
                 ("Queued", "\(state.playbackQueued ?? state.playback?.queued ?? 0)"),
@@ -470,6 +524,32 @@ public struct ChannelBankRootView: View {
                     .disabled(state.playbackLock?.active != true)
             }
             .buttonStyle(.bordered)
+            Text(state.lastTranscriptText?.isEmpty == false ? "\(state.lastTranscriptName ?? "Last")\n\n\(state.lastTranscriptText ?? "")" : "No transcript yet.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func blockedFrequenciesPanel(_ state: ChannelBankState) -> some View {
+        Panel("Blocked Frequencies") {
+            let entries = (state.history ?? []).filter { $0.blocked == true }.sorted { ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
+            if entries.isEmpty {
+                Text("No blocked frequencies").foregroundStyle(.secondary)
+            } else {
+                ForEach(entries) { entry in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ChannelBankFormatters.mhz(entry.freqHz)).monospacedDigit()
+                            Text(entry.name ?? "-").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text("\(entry.count ?? 0) hits").font(.caption).foregroundStyle(.secondary)
+                        Button("Unblock") { model.ble.setFrequency(entry.freqHz, blocked: false) }
+                            .buttonStyle(.bordered)
+                    }
+                }
+            }
         }
     }
 
@@ -514,7 +594,7 @@ public struct ChannelBankRootView: View {
     }
 
     private func settingsPanel(_ state: ChannelBankState) -> some View {
-        Panel("Settings") {
+        Panel("Channel Bank Settings") {
             MetricGrid(items: [
                 ("Spacing", ChannelBankFormatters.compactHz(state.settings?.channelSpacingHz)),
                 ("Threshold", String(format: "%.1f dB", state.snrThresholdDb ?? state.settings?.snrThresholdDb ?? 0)),
@@ -574,16 +654,37 @@ public struct ChannelBankRootView: View {
             ToggleRow(label: "Recording", value: settings?.recordingEnabled ?? state.recordingEnabled ?? false) {
                 model.setSetting("recordingEnabled", bool: !(settings?.recordingEnabled ?? state.recordingEnabled ?? false))
             }
-            timingSettings(settings)
-            if let backend = settings?.transcriptionBackendName {
-                HStack {
-                    Text("Transcription")
-                    Spacer()
-                    Text(backend).foregroundStyle(.secondary)
-                    Button("Off") { model.setSetting("transcriptionBackend", int: 0) }
-                }
-                .buttonStyle(.bordered)
+            ToggleRow(label: "Local SNR floors", value: settings?.manualLocalSnrEnabled ?? false) {
+                model.setSetting("manualLocalSnrEnabled", bool: !(settings?.manualLocalSnrEnabled ?? false))
             }
+            ToggleRow(label: "Storm guard", value: settings?.manualStormGuardEnabled ?? false) {
+                model.setSetting("manualStormGuardEnabled", bool: !(settings?.manualStormGuardEnabled ?? false))
+            }
+            timingSettings(settings)
+            StepperRow(label: "Scan quiet", value: String(format: "%.1f s", settings?.scanQuietSec ?? 1)) {
+                model.setSetting("scanQuietSec", number: max(1, (settings?.scanQuietSec ?? 1) - 0.5))
+            } increment: {
+                model.setSetting("scanQuietSec", number: min(30, (settings?.scanQuietSec ?? 1) + 0.5))
+            }
+            StepperRow(label: "No-signal skip", value: String(format: "%.1f s", settings?.scanNoSignalSec ?? 0.1)) {
+                model.setSetting("scanNoSignalSec", number: max(0.1, (settings?.scanNoSignalSec ?? 0.1) - 0.1))
+            } increment: {
+                model.setSetting("scanNoSignalSec", number: min(5, (settings?.scanNoSignalSec ?? 0.1) + 0.1))
+            }
+            Menu {
+                Button("Off") { model.setSetting("transcriptionBackend", int: 0) }
+                Button("Apple Speech") { model.setSetting("transcriptionBackend", int: 1) }
+                Button("Whisper ATC Large") { model.setSetting("transcriptionBackend", int: 2) }
+                Button("Whisper ATC Medium") { model.setSetting("transcriptionBackend", int: 3) }
+                Button("Whisper Turbo") { model.setSetting("transcriptionBackend", int: 4) }
+            } label: {
+                HStack {
+                    Text("Transcribe")
+                    Spacer()
+                    Text(settings?.transcriptionBackendName ?? "Off").foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.bordered)
         }
     }
 

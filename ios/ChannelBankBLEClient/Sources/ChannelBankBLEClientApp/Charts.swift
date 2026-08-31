@@ -69,7 +69,7 @@ public struct ActivityWaterfallView: View {
     }
 
     public var body: some View {
-        Panel("Activity Waterfall") {
+        Panel("Activity Span") {
             if let span = store.spanInfo {
                 Text("\(ChannelBankFormatters.mhz(span.lowHz)) to \(ChannelBankFormatters.mhz(span.highHz))")
                     .font(.caption)

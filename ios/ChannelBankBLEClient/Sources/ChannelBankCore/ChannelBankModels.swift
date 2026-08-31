@@ -501,6 +501,8 @@ public struct ChannelBankSettings: Codable, Equatable {
     public var spacingId: Int?
     public var demodMode: String?
     public var snrThresholdDb: Double?
+    public var manualLocalSnrEnabled: Bool?
+    public var manualStormGuardEnabled: Bool?
     public var maxChannels: Int?
     public var bwUsage: Double?
     public var recordingEnabled: Bool?
