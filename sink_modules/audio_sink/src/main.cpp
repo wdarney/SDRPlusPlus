@@ -189,7 +189,11 @@ private:
         parameters.nChannels = 2;
         unsigned int bufferFrames = sampleRate / 60;
         RtAudio::StreamOptions opts;
-        opts.flags = RTAUDIO_MINIMIZE_LATENCY;
+        // On CoreAudio, RTAUDIO_MINIMIZE_LATENCY replaces bufferFrames with
+        // the device's absolute minimum.  That leaves too little scheduling
+        // headroom when SDR++ is backgrounded and produces audible underruns.
+        // Keep RtAudio's robust default while retaining our ~16.7 ms request.
+        opts.flags = 0;
         opts.streamName = _streamName;
 
         try {
@@ -221,10 +225,20 @@ private:
 
     static int callback(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames, double streamTime, RtAudioStreamStatus status, void* userData) {
         AudioSink* _this = (AudioSink*)userData;
+        memset(outputBuffer, 0, nBufferFrames * sizeof(dsp::stereo_t));
+
+        // RtAudio can invoke the callback synchronously while startStream() is
+        // still bringing up a newly selected sink. Never block that startup on
+        // the DSP packer, which may not have produced its first buffer yet.
+        if (!_this->stereoPacker.out.isDataReady()) {
+            return 0;
+        }
+
         int count = _this->stereoPacker.out.read();
         if (count < 0) { return 0; }
 
-        memcpy(outputBuffer, _this->stereoPacker.out.readBuf, nBufferFrames * sizeof(dsp::stereo_t));
+        int toCopy = std::min<int>(count, nBufferFrames);
+        memcpy(outputBuffer, _this->stereoPacker.out.readBuf, toCopy * sizeof(dsp::stereo_t));
         _this->stereoPacker.out.flush();
         return 0;
     }
