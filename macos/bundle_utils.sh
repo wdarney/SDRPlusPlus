@@ -143,6 +143,12 @@ bundle_install_binary() {
     # Install dependencies and change path
     local DEPS=$(bundle_get_exec_deps $EXEC_DEST)
     echo "$DEPS" | while read -r DEP; do
+        # System libraries and frameworks must keep their absolute paths.
+        # Rewriting them to @rpath makes otherwise valid plug-ins unloadable.
+        case "$DEP" in
+            /System/Library/*|/usr/lib/*) continue ;;
+        esac
+
         local DEP_NAME=$(basename $DEP)
 
         # Skip if this dep is blacklisted
