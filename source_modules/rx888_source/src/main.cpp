@@ -11,6 +11,7 @@
 #include <core.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -237,6 +238,34 @@ private:
 
     void refreshSampleRates(SoapySDR::Device* dev) {
         sampleRates = dev->listSampleRates(SOAPY_SDR_RX, 0);
+
+        // Newer Soapy drivers expose discrete rates as point ranges while the
+        // deprecated listSampleRates() compatibility call may return empty.
+        // Recover those values before falling back to the ADC-derived plan
+        // needed by older continuous-range drivers.
+        if (sampleRates.empty()) {
+            auto ranges = dev->getSampleRateRange(SOAPY_SDR_RX, 0);
+            for (const auto& range : ranges) {
+                double minimum = range.minimum();
+                double maximum = range.maximum();
+                double step = range.step();
+                if (std::abs(maximum - minimum) < 1.0) {
+                    sampleRates.push_back(minimum);
+                }
+                else if (step > 0.0) {
+                    for (double rate = minimum; rate <= maximum + 0.5 && sampleRates.size() < 128; rate += step)
+                        sampleRates.push_back(rate);
+                }
+            }
+        }
+
+        if (sampleRates.empty()) {
+            refreshDefaultSampleRates();
+            return;
+        }
+
+        std::sort(sampleRates.begin(), sampleRates.end());
+        sampleRates.erase(std::unique(sampleRates.begin(), sampleRates.end()), sampleRates.end());
         buildSrText();
     }
 
