@@ -8,6 +8,8 @@
 #include <gui/smgui.h>
 #include <airspyhf.h>
 #include <gui/widgets/stepped_slider.h>
+#include <algorithm>
+#include <cmath>
 
 #ifdef __ANDROID__
 #include <android_backend.h>
@@ -24,6 +26,12 @@ SDRPP_MOD_INFO{
 };
 
 ConfigManager config;
+
+struct AirspyHFSourceControlV1 {
+    char request[4096];
+    char response[32768];
+    bool ok = false;
+};
 
 const char* AGG_MODES_STR = "Off\0Low\0High\0";
 
@@ -51,10 +59,13 @@ public:
         selectByString(devSerial);
 
         sigpath::sourceManager.registerSource("Airspy HF+", &handler);
+        core::modComManager.registerInterface(
+            "airspyhf_source", "airspyhf_source.control.v1", controlHandler, this);
     }
 
     ~AirspyHFSourceModule() {
         stop(this);
+        core::modComManager.unregisterInterface("airspyhf_source.control.v1");
         sigpath::sourceManager.unregisterSource("Airspy HF+");
     }
 
@@ -222,6 +233,165 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    static void writeControlResponse(AirspyHFSourceControlV1* msg, const json& body, bool ok = true) {
+        if (!msg) return;
+        std::string text = body.dump();
+        strncpy(msg->response, text.c_str(), sizeof(msg->response) - 1);
+        msg->response[sizeof(msg->response) - 1] = '\0';
+        msg->ok = ok;
+    }
+
+    void saveDeviceConfig(const char* key, const json& value) {
+        if (selectedSerStr == "") return;
+        config.acquire();
+        config.conf["devices"][selectedSerStr][key] = value;
+        config.release(true);
+    }
+
+    json controlStateJson() {
+        json devices = json::array();
+        char buf[1024];
+        for (int i = 0; i < (int)devList.size(); i++) {
+            sprintf(buf, "%016" PRIX64, devList[i]);
+            devices.push_back({{"id", i}, {"label", buf}});
+        }
+
+        json rates = json::array();
+        for (int i = 0; i < (int)sampleRateList.size(); i++) {
+            rates.push_back({
+                {"id", i},
+                {"value", sampleRateList[i]},
+                {"label", getBandwdithScaled(sampleRateList[i])},
+                {"selected", i == srId}
+            });
+        }
+
+        json modes = json::array({"Off", "Low", "High"});
+        int modeId = std::clamp(agcMode, 0, 2);
+        json gains = json::array({
+            {{"name", "attenuation"}, {"label", "Attenuation"}, {"value", atten}, {"min", 0}, {"max", 48}, {"step", 6}, {"available", true}, {"liveMutable", true}}
+        });
+        json toggles = json::array({
+            {{"key", "lna"}, {"label", "HF LNA"}, {"value", hfLNA}, {"liveMutable", true}}
+        });
+
+        return json({
+            {"available", true}, {"source", "Airspy HF+"}, {"running", running},
+            {"deviceId", devId}, {"devices", devices},
+            {"sampleRate", sampleRate}, {"sampleRates", rates},
+            {"mode", modes[modeId]}, {"modes", modes},
+            {"gains", gains}, {"toggles", toggles}
+        });
+    }
+
+    bool applyControlJson(const json& req, std::string& error) {
+        bool stoppedOnlyChanged = req.contains("deviceId") || req.contains("sampleRateId") || req.value("refresh", false);
+        if (running && stoppedOnlyChanged) {
+            error = "stop SDR before changing device, sample rate, or refresh";
+            return false;
+        }
+
+        if (req.value("refresh", false)) {
+            refresh();
+            selectByString(selectedSerStr);
+            core::setInputSampleRate(sampleRate);
+        }
+
+        if (req.contains("deviceId")) {
+            int id = req["deviceId"].get<int>();
+            if (id < 0 || id >= (int)devList.size()) {
+                error = "device not found";
+                return false;
+            }
+            selectBySerial(devList[id]);
+            core::setInputSampleRate(sampleRate);
+            config.acquire();
+            config.conf["device"] = selectedSerStr;
+            config.release(true);
+        }
+
+        if (req.contains("sampleRateId")) {
+            int id = req["sampleRateId"].get<int>();
+            if (id < 0 || id >= (int)sampleRateList.size()) {
+                error = "sample rate not found";
+                return false;
+            }
+            srId = id;
+            sampleRate = sampleRateList[srId];
+            core::setInputSampleRate(sampleRate);
+            saveDeviceConfig("sampleRate", sampleRate);
+        }
+
+        if (req.contains("mode")) {
+            std::string mode = req["mode"].get<std::string>();
+            if (mode == "Off") agcMode = 0;
+            else if (mode == "Low") agcMode = 1;
+            else if (mode == "High") agcMode = 2;
+            else {
+                error = "AGC mode not found";
+                return false;
+            }
+            if (running) {
+                airspyhf_set_hf_agc(openDev, agcMode != 0);
+                if (agcMode > 0) airspyhf_set_hf_agc_threshold(openDev, agcMode - 1);
+            }
+            saveDeviceConfig("agcMode", agcMode);
+        }
+
+        if (req.contains("gains")) {
+            json gains = req["gains"];
+            if (gains.contains("attenuation")) {
+                atten = std::clamp<float>(gains["attenuation"].get<float>(), 0.0f, 48.0f);
+                atten = std::round(atten / 6.0f) * 6.0f;
+                if (running) airspyhf_set_hf_att(openDev, atten / 6.0f);
+                saveDeviceConfig("attenuation", atten);
+            }
+        }
+
+        if (req.contains("toggles")) {
+            json toggles = req["toggles"];
+            if (toggles.contains("lna")) {
+                hfLNA = toggles["lna"].get<bool>();
+                if (running) airspyhf_set_hf_lna(openDev, hfLNA);
+                saveDeviceConfig("lna", hfLNA);
+            }
+        }
+
+        return true;
+    }
+
+    enum ControlCode {
+        CONTROL_GET = 1,
+        CONTROL_SET = 2
+    };
+
+    static void controlHandler(int code, void* in, void* out, void* ctx) {
+        AirspyHFSourceModule* _this = (AirspyHFSourceModule*)ctx;
+        AirspyHFSourceControlV1* inMsg = (AirspyHFSourceControlV1*)in;
+        AirspyHFSourceControlV1* outMsg = (AirspyHFSourceControlV1*)(out ? out : in);
+        if (!_this || !outMsg) return;
+        try {
+            if (code == CONTROL_SET) {
+                json req = json::object();
+                if (inMsg && inMsg->request[0]) req = json::parse(inMsg->request);
+                std::string error;
+                if (!_this->applyControlJson(req, error)) {
+                    writeControlResponse(outMsg, json({{"ok", false}, {"error", error}}), false);
+                    return;
+                }
+            }
+            json state = _this->controlStateJson();
+            state["ok"] = true;
+            writeControlResponse(outMsg, state, true);
+        }
+        catch (const std::exception& e) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", e.what()}}), false);
+        }
+        catch (...) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", "AirspyHF control failed"}}), false);
+        }
     }
 
     static void menuSelected(void* ctx) {

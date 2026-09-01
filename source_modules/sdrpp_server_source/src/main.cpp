@@ -12,6 +12,7 @@
 #include <gui/dialogs/dialog_box.h>
 #include <vector>
 #include <string>
+#include <cstring>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -24,6 +25,14 @@ SDRPP_MOD_INFO{
 };
 
 static ConfigManager config;
+
+struct SDRPPServerSourceControlV1 {
+    char host[1024];
+    int port = 0;
+    bool connected = false;
+    bool running = false;
+    bool ok = false;
+};
 
 class SDRPPServerSourceModule : public ModuleManager::Instance {
 public:
@@ -64,10 +73,13 @@ public:
         config.release();
 
         sigpath::sourceManager.registerSource("SDR++ Server", &handler);
+        core::modComManager.registerInterface(
+            "sdrpp_server_source", "sdrpp_server_source.control.v1", controlHandler, this);
     }
 
     ~SDRPPServerSourceModule() {
         stop(this);
+        core::modComManager.unregisterInterface("sdrpp_server_source.control.v1");
         sigpath::sourceManager.unregisterSource("SDR++ Server");
     }
 
@@ -296,6 +308,83 @@ private:
 
     bool connected() {
         return client && client->isOpen();
+    }
+
+    enum ControlCode {
+        CONTROL_GET = 1,
+        CONTROL_SET = 2,
+        CONTROL_CONNECT = 3,
+        CONTROL_DISCONNECT = 4
+    };
+
+    static bool controlGet(void* ctx, SDRPPServerSourceControlV1* out) {
+        SDRPPServerSourceModule* _this = (SDRPPServerSourceModule*)ctx;
+        if (!_this || !out) return false;
+        strncpy(out->host, _this->hostname, sizeof(out->host) - 1);
+        out->host[sizeof(out->host) - 1] = '\0';
+        out->port = _this->port;
+        out->connected = _this->connected();
+        out->running = _this->running;
+        out->ok = true;
+        return true;
+    }
+
+    static bool controlSet(void* ctx, SDRPPServerSourceControlV1* inout) {
+        SDRPPServerSourceModule* _this = (SDRPPServerSourceModule*)ctx;
+        if (inout) inout->ok = false;
+        if (!_this || !inout) return false;
+        const char* host = inout->host;
+        int newPort = inout->port;
+        if (!_this || !host || !host[0] || newPort <= 0 || newPort > 65535) return false;
+        if (_this->connected() || _this->running) return false;
+        strncpy(_this->hostname, host, sizeof(_this->hostname) - 1);
+        _this->hostname[sizeof(_this->hostname) - 1] = '\0';
+        _this->port = newPort;
+        config.acquire();
+        config.conf["hostname"] = _this->hostname;
+        config.conf["port"] = _this->port;
+        config.release(true);
+        inout->connected = false;
+        inout->running = false;
+        inout->ok = true;
+        return true;
+    }
+
+    static bool controlConnect(void* ctx, SDRPPServerSourceControlV1* out) {
+        SDRPPServerSourceModule* _this = (SDRPPServerSourceModule*)ctx;
+        if (!_this) return false;
+        if (!_this->connected()) _this->tryConnect();
+        controlGet(ctx, out);
+        return _this->connected();
+    }
+
+    static void controlDisconnect(void* ctx, SDRPPServerSourceControlV1* out) {
+        SDRPPServerSourceModule* _this = (SDRPPServerSourceModule*)ctx;
+        if (!_this) return;
+        if (_this->connected()) _this->client->close();
+        controlGet(ctx, out);
+    }
+
+    static void controlHandler(int code, void* in, void* out, void* ctx) {
+        SDRPPServerSourceControlV1* inout = (SDRPPServerSourceControlV1*)(out ? out : in);
+        switch (code) {
+            case CONTROL_GET:
+                controlGet(ctx, inout);
+                break;
+            case CONTROL_SET:
+                controlSet(ctx, (SDRPPServerSourceControlV1*)in);
+                if (out && out != in) controlGet(ctx, (SDRPPServerSourceControlV1*)out);
+                break;
+            case CONTROL_CONNECT:
+                controlConnect(ctx, inout);
+                break;
+            case CONTROL_DISCONNECT:
+                controlDisconnect(ctx, inout);
+                break;
+            default:
+                if (inout) inout->ok = false;
+                break;
+        }
     }
 
     void tryConnect() {

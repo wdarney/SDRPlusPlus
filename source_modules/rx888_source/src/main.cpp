@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -33,6 +34,12 @@ SDRPP_MOD_INFO{
 };
 
 ConfigManager config;
+
+struct RX888SourceControlV1 {
+    char request[4096];
+    char response[32768];
+    bool ok = false;
+};
 
 class RX888SourceModule : public ModuleManager::Instance {
 public:
@@ -57,11 +64,14 @@ public:
         selectDevice(devLabel);
 
         sigpath::sourceManager.registerSource("RX888", &handler);
+        core::modComManager.registerInterface(
+            "rx888_source", "rx888_source.control.v1", controlHandler, this);
     }
 
     ~RX888SourceModule() {
         shuttingDown.store(true);
         restartAfterCleanup.store(false);
+        core::modComManager.unregisterInterface("rx888_source.control.v1");
         stop(this);
         if (cleanupThread.joinable()) {
             cleanupThread.join();
@@ -498,6 +508,226 @@ private:
         try { dev->writeSetting(key, value); }
         catch (const std::exception& e) {
             flog::warn("RX888: writeSetting({}) failed: {}", key, e.what());
+        }
+    }
+
+    static void writeControlResponse(RX888SourceControlV1* msg, const json& body, bool ok = true) {
+        if (!msg) return;
+        std::string text = body.dump();
+        strncpy(msg->response, text.c_str(), sizeof(msg->response) - 1);
+        msg->response[sizeof(msg->response) - 1] = '\0';
+        msg->ok = ok;
+    }
+
+    json controlStateJson() {
+        json devices = json::array();
+        for (int i = 0; i < (int)devList.size(); i++) {
+            devices.push_back({
+                {"id", i},
+                {"label", deviceLabel(devList[i])}
+            });
+        }
+
+        json rates = json::array();
+        int visible = 0;
+        for (int i = 0; i < (int)sampleRates.size(); i++) {
+            double sr = sampleRates[i];
+            if (mode == "VHF" && sr > VHF_MAX_SR) continue;
+            char label[32];
+            if (sr >= 1e6) snprintf(label, sizeof(label), "%.0f MHz", sr / 1e6);
+            else snprintf(label, sizeof(label), "%.0f kHz", sr / 1e3);
+            rates.push_back({
+                {"id", visible++},
+                {"value", sr},
+                {"label", label},
+                {"selected", i == srId}
+            });
+        }
+
+        json gains = json::array();
+        for (int i = 0; i < (int)gainList.size(); i++) {
+            double gmin = gainRanges[i].minimum();
+            double gmax = gainRanges[i].maximum();
+            gains.push_back({
+                {"name", gainList[i]},
+                {"label", gainList[i] + " Gain"},
+                {"value", uiGains[i]},
+                {"min", gmin},
+                {"max", gmax},
+                {"step", gainRanges[i].step() > 0.0 ? gainRanges[i].step() : 0.1},
+                {"available", gmin != gmax},
+                {"liveMutable", true}
+            });
+        }
+
+        json modes = json::array();
+        if (hasHF) modes.push_back("HF");
+        if (hasVHF) modes.push_back("VHF");
+
+        return json({
+            {"available", true},
+            {"source", "RX888"},
+            {"running", running.load()},
+            {"cleanupBusy", driverCleanupBusy->load()},
+            {"deviceId", devId},
+            {"devices", devices},
+            {"sampleRate", sampleRate},
+            {"sampleRates", rates},
+            {"supportsAdcFreq", supportsAdcFreq},
+            {"adcClockMHz", adcFreq / 1e6},
+            {"adcMinMHz", 16.0},
+            {"adcMaxMHz", 140.0},
+            {"mode", mode},
+            {"modes", modes},
+            {"gains", gains},
+            {"supportsNewBiasTee", supportsNewBiasTee},
+            {"supportsBiasTee", supportsBiasTee},
+            {"biasTeeHF", biasTeeHF},
+            {"biasTeeVHF", biasTeeVHF},
+            {"biasTeeLiveMutable", true},
+            {"supportsDithering", supportsDithering},
+            {"dithering", dithering},
+            {"ditheringLiveMutable", true}
+        });
+    }
+
+    bool applyControlJson(const json& req, std::string& error) {
+        bool stoppedOnlyChanged = req.contains("deviceLabel") || req.contains("deviceId") ||
+                                  req.contains("sampleRate") || req.contains("sampleRateId") ||
+                                  req.contains("adcClockMHz") || req.contains("mode") ||
+                                  req.value("refresh", false);
+        if (running.load() && stoppedOnlyChanged) {
+            error = "stop SDR before changing device, sample rate, ADC clock, mode, or refresh";
+            return false;
+        }
+
+        if (req.value("refresh", false)) {
+            refresh();
+            if (devId >= 0 && devId < (int)devList.size()) selectDevice(deviceLabel(devList[devId]));
+            else selectDevice("");
+        }
+
+        if (req.contains("deviceLabel")) {
+            selectDevice(req["deviceLabel"].get<std::string>());
+        }
+        else if (req.contains("deviceId")) {
+            int id = req["deviceId"].get<int>();
+            if (id < 0 || id >= (int)devList.size()) {
+                error = "device not found";
+                return false;
+            }
+            selectDevice(deviceLabel(devList[id]));
+        }
+
+        if (req.contains("mode")) {
+            std::string newMode = req["mode"].get<std::string>();
+            if ((newMode == "HF" && hasHF) || (newMode == "VHF" && hasVHF)) {
+                mode = newMode;
+                reQueryGainsForMode();
+                applyModeRateCap();
+            }
+            else {
+                error = "mode not available";
+                return false;
+            }
+        }
+
+        if (req.contains("adcClockMHz")) {
+            double mhz = req["adcClockMHz"].get<double>();
+            if (!std::isfinite(mhz) || mhz < 16.0 || mhz > 140.0) {
+                error = "ADC clock out of range";
+                return false;
+            }
+            adcFreq = mhz * 1e6;
+            applyModeRateCap();
+        }
+
+        if (req.contains("sampleRateId")) {
+            int visibleId = req["sampleRateId"].get<int>();
+            int realId = visibleToRealIdx(visibleId);
+            if (realId < 0 || realId >= (int)sampleRates.size()) {
+                error = "sample rate not found";
+                return false;
+            }
+            srVisibleId = visibleId;
+            srId = realId;
+            sampleRate = sampleRates[srId];
+            core::setInputSampleRate(sampleRate);
+        }
+        else if (req.contains("sampleRate")) {
+            selectSampleRate(req["sampleRate"].get<double>());
+        }
+
+        if (req.contains("gains")) {
+            for (auto& [key, val] : req["gains"].items()) {
+                auto it = std::find(gainList.begin(), gainList.end(), key);
+                if (it == gainList.end()) {
+                    error = "gain not found: " + key;
+                    return false;
+                }
+                int i = (int)std::distance(gainList.begin(), it);
+                float gmin = (float)gainRanges[i].minimum();
+                float gmax = (float)gainRanges[i].maximum();
+                float gain = val.get<float>();
+                gain = std::max(gmin, std::min(gain, gmax));
+                uiGains[i] = gain;
+                if (running.load() && dev)
+                    dev->setGain(SOAPY_SDR_RX, 0, gainList[i], gain);
+            }
+        }
+
+        if (req.contains("biasTeeHF")) {
+            biasTeeHF = req["biasTeeHF"].get<bool>();
+            if (supportsNewBiasTee) applySetting("UpdBiasT_HF", biasTeeHF ? "true" : "false");
+            else if (supportsBiasTee && mode == "HF") applySetting("biastee", biasTeeHF ? "true" : "false");
+        }
+        if (req.contains("biasTeeVHF")) {
+            biasTeeVHF = req["biasTeeVHF"].get<bool>();
+            if (supportsNewBiasTee) applySetting("UpdBiasT_VHF", biasTeeVHF ? "true" : "false");
+            else if (supportsBiasTee && mode == "VHF") applySetting("biastee", biasTeeVHF ? "true" : "false");
+        }
+        if (req.contains("dithering")) {
+            dithering = req["dithering"].get<bool>();
+            if (supportsDithering) {
+                applySetting("dithering", dithering ? "true" : "false");
+                applySetting("randomization", dithering ? "true" : "false");
+            }
+        }
+
+        saveConfig();
+        return true;
+    }
+
+    enum ControlCode {
+        CONTROL_GET = 1,
+        CONTROL_SET = 2
+    };
+
+    static void controlHandler(int code, void* in, void* out, void* ctx) {
+        RX888SourceModule* _this = (RX888SourceModule*)ctx;
+        RX888SourceControlV1* inMsg = (RX888SourceControlV1*)in;
+        RX888SourceControlV1* outMsg = (RX888SourceControlV1*)(out ? out : in);
+        if (!_this || !outMsg) return;
+
+        try {
+            if (code == CONTROL_SET) {
+                json req = json::object();
+                if (inMsg && inMsg->request[0]) req = json::parse(inMsg->request);
+                std::string error;
+                if (!_this->applyControlJson(req, error)) {
+                    writeControlResponse(outMsg, json({{"ok", false}, {"error", error}}), false);
+                    return;
+                }
+            }
+            json state = _this->controlStateJson();
+            state["ok"] = true;
+            writeControlResponse(outMsg, state, true);
+        }
+        catch (const std::exception& e) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", e.what()}}), false);
+        }
+        catch (...) {
+            writeControlResponse(outMsg, json({{"ok", false}, {"error", "RX888 control failed"}}), false);
         }
     }
 

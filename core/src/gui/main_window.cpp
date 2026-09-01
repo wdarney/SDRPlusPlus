@@ -201,6 +201,7 @@ void MainWindow::init() {
     gui::waterfall.vfoFreqChanged = false;
     gui::waterfall.centerFreqMoved = false;
     gui::waterfall.selectFirstVFO();
+    sigpath::vfoManager.applyFrequencyLocks(frequency);
 
     menuWidth = core::configManager.conf["menuWidth"];
     newWidth = menuWidth;
@@ -216,6 +217,7 @@ void MainWindow::init() {
     // Correct the offset of all VFOs so that they fit on the screen
     float finalBwHalf = gui::waterfall.getBandwidth() / 2.0;
     for (auto& [_name, _vfo] : gui::waterfall.vfos) {
+        if (_vfo->frequencyLocked) { continue; }
         if (_vfo->lowerOffset < -finalBwHalf) {
             sigpath::vfoManager.setCenterOffset(_name, (_vfo->bandwidth / 2) - finalBwHalf);
             continue;
@@ -244,12 +246,29 @@ void MainWindow::vfoAddedHandler(VFOManager::VFO* vfo, void* ctx) {
     MainWindow* _this = (MainWindow*)ctx;
     std::string name = vfo->getName();
     core::configManager.acquire();
-    if (!core::configManager.conf["vfoOffsets"].contains(name)) {
-        core::configManager.release();
+    bool hasOffset = core::configManager.conf["vfoOffsets"].contains(name);
+    double offset = hasOffset ? (double)core::configManager.conf["vfoOffsets"][name] : vfo->getOffset();
+    bool freqLocked = false;
+    double lockedFreq = gui::waterfall.getCenterFrequency() + offset;
+    if (core::configManager.conf.contains("vfoLocks") && core::configManager.conf["vfoLocks"].contains(name)) {
+        json lockConf = core::configManager.conf["vfoLocks"][name];
+        if (lockConf.is_boolean()) {
+            freqLocked = lockConf;
+        }
+        else if (lockConf.is_object()) {
+            if (lockConf.contains("enabled")) {
+                freqLocked = lockConf["enabled"];
+            }
+            if (lockConf.contains("frequency")) {
+                lockedFreq = lockConf["frequency"];
+            }
+        }
+    }
+    core::configManager.release();
+
+    if (!hasOffset && !freqLocked) {
         return;
     }
-    double offset = core::configManager.conf["vfoOffsets"][name];
-    core::configManager.release();
 
     double viewBW = gui::waterfall.getViewBandwidth();
     double viewOffset = gui::waterfall.getViewOffset();
@@ -259,7 +278,12 @@ void MainWindow::vfoAddedHandler(VFOManager::VFO* vfo, void* ctx) {
 
     double newOffset = std::clamp<double>(offset, viewLower, viewUpper);
 
-    sigpath::vfoManager.setCenterOffset(name, _this->initComplete ? newOffset : offset);
+    if (hasOffset) {
+        sigpath::vfoManager.setCenterOffset(name, (_this->initComplete && !freqLocked) ? newOffset : offset);
+    }
+    if (freqLocked) {
+        sigpath::vfoManager.restoreFrequencyLock(name, true, lockedFreq, gui::waterfall.getCenterFrequency());
+    }
 }
 
 void MainWindow::draw() {
@@ -277,10 +301,17 @@ void MainWindow::draw() {
             if (tuningMode == tuner::TUNER_MODE_CENTER) {
                 tuner::tune(tuner::TUNER_MODE_CENTER, gui::waterfall.selectedVFO, gui::waterfall.getCenterFrequency() + vfo->generalOffset);
             }
+            if (vfo->frequencyLocked) {
+                sigpath::vfoManager.setFrequencyLock(gui::waterfall.selectedVFO, true, gui::waterfall.getCenterFrequency());
+            }
             gui::freqSelect.setFrequency(gui::waterfall.getCenterFrequency() + vfo->generalOffset);
             gui::freqSelect.frequencyChanged = false;
             core::configManager.acquire();
             core::configManager.conf["vfoOffsets"][gui::waterfall.selectedVFO] = vfo->generalOffset;
+            if (vfo->frequencyLocked) {
+                core::configManager.conf["vfoLocks"][gui::waterfall.selectedVFO]["enabled"] = true;
+                core::configManager.conf["vfoLocks"][gui::waterfall.selectedVFO]["frequency"] = vfo->lockedFrequency;
+            }
             core::configManager.release(true);
         }
     }
@@ -299,6 +330,9 @@ void MainWindow::draw() {
         gui::freqSelect.frequencyChanged = false;
         tuner::tune(tuningMode, gui::waterfall.selectedVFO, gui::freqSelect.frequency);
         if (vfo != NULL) {
+            if (vfo->frequencyLocked) {
+                sigpath::vfoManager.setFrequencyLock(gui::waterfall.selectedVFO, true, gui::waterfall.getCenterFrequency());
+            }
             vfo->centerOffsetChanged = false;
             vfo->lowerOffsetChanged = false;
             vfo->upperOffsetChanged = false;
@@ -307,6 +341,10 @@ void MainWindow::draw() {
         core::configManager.conf["frequency"] = gui::waterfall.getCenterFrequency();
         if (vfo != NULL) {
             core::configManager.conf["vfoOffsets"][gui::waterfall.selectedVFO] = vfo->generalOffset;
+            if (vfo->frequencyLocked) {
+                core::configManager.conf["vfoLocks"][gui::waterfall.selectedVFO]["enabled"] = true;
+                core::configManager.conf["vfoLocks"][gui::waterfall.selectedVFO]["frequency"] = vfo->lockedFrequency;
+            }
         }
         core::configManager.release(true);
     }
@@ -315,6 +353,7 @@ void MainWindow::draw() {
     if (gui::waterfall.centerFreqMoved) {
         gui::waterfall.centerFreqMoved = false;
         sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency());
+        sigpath::vfoManager.applyFrequencyLocks(gui::waterfall.getCenterFrequency());
         if (vfo != NULL) {
             gui::freqSelect.setFrequency(gui::waterfall.getCenterFrequency() + vfo->generalOffset);
         }
@@ -323,6 +362,12 @@ void MainWindow::draw() {
         }
         core::configManager.acquire();
         core::configManager.conf["frequency"] = gui::waterfall.getCenterFrequency();
+        for (auto& [_name, _vfo] : gui::waterfall.vfos) {
+            if (!_vfo->frequencyLocked) { continue; }
+            core::configManager.conf["vfoOffsets"][_name] = _vfo->generalOffset;
+            core::configManager.conf["vfoLocks"][_name]["enabled"] = true;
+            core::configManager.conf["vfoLocks"][_name]["frequency"] = _vfo->lockedFrequency;
+        }
         core::configManager.release(true);
     }
 

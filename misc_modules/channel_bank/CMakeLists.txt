@@ -9,6 +9,9 @@ project(channel_bank)
 
 file(GLOB SRC "src/*.cpp")
 list(FILTER SRC EXCLUDE REGEX "src/main_ios\\.cpp$")
+if (ANDROID)
+    list(FILTER SRC EXCLUDE REGEX "src/transcription_whisper\\.cpp$")
+endif()
 if (APPLE AND NOT ANDROID)
     list(APPEND SRC src/transcription.mm src/encoding.mm src/transcription_whisper.mm)
     set_source_files_properties(src/transcription.mm src/encoding.mm src/transcription_whisper.mm PROPERTIES
@@ -145,6 +148,7 @@ elseif (MSVC)
     target_link_libraries(channel_bank PRIVATE
         whisper
         shell32
+        ws2_32
     )
     target_include_directories(channel_bank PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp/include
