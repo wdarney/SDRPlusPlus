@@ -10,7 +10,9 @@
 #include <signal_path/signal_path.h>
 #include <core.h>
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,7 +58,12 @@ public:
     }
 
     ~RX888SourceModule() {
+        shuttingDown.store(true);
+        restartAfterCleanup.store(false);
         stop(this);
+        if (cleanupThread.joinable()) {
+            cleanupThread.join();
+        }
         sigpath::sourceManager.unregisterSource("RX888");
     }
 
@@ -195,6 +202,9 @@ private:
     }
 
     void setDefaultCapabilities() {
+        hasHF  = true;
+        hasVHF = true;
+
         gainList = { "RF", "IF" };
         gainRanges.clear();
         uiGains.clear();
@@ -205,8 +215,6 @@ private:
             uiGains.push_back((float)def);
         }
 
-        hasHF  = true;
-        hasVHF = true;
         supportsNewBiasTee = true;
         supportsAdcFreq    = true;
         supportsBiasTee    = false;
@@ -241,6 +249,40 @@ private:
         }
 
         buildSrText();
+    }
+
+    bool clampAdcToDriverRange(SoapySDR::Device* dev) {
+        if (!supportsAdcFreq || !dev) return false;
+
+        try {
+            auto settingInfo = dev->getSettingInfo();
+            for (const auto& s : settingInfo) {
+                if (s.key != "adc_frequency") continue;
+
+                double minFreq = s.range.minimum();
+                double maxFreq = s.range.maximum();
+                if (maxFreq <= minFreq) return false;
+
+                double clamped = std::max(minFreq, std::min(adcFreq, maxFreq));
+                if (clamped == adcFreq) return false;
+
+                flog::warn("RX888: Saved ADC clock {} MHz is outside driver range {}-{} MHz; using {} MHz",
+                    adcFreq / 1e6, minFreq / 1e6, maxFreq / 1e6, clamped / 1e6);
+                adcFreq = clamped;
+                refreshDefaultSampleRates();
+                selectSampleRate(sampleRate);
+                saveConfig();
+                return true;
+            }
+        }
+        catch (const std::exception& e) {
+            flog::warn("RX888: Could not read driver ADC range: {}", e.what());
+        }
+        catch (...) {
+            flog::warn("RX888: Could not read driver ADC range");
+        }
+
+        return false;
     }
 
     // Max useful sample rate for VHF mode — R820T2 IF bandwidth is ~8-10 MHz
@@ -307,7 +349,7 @@ private:
     // Called when mode radio button changes while device is stopped —
     // spawns a background thread so the firmware-upload open doesn't block the UI.
     void reQueryGainsForMode() {
-        if (devList.empty() || devId < 0 || running) return;
+        if (devList.empty() || devId < 0 || running.load()) return;
         auto m    = mode;
         auto newList = std::vector<std::string>{ "RF", "IF" };
         std::vector<SoapySDR::Range> newRanges;
@@ -324,12 +366,14 @@ private:
     }
 
     void applyModeRateCap() {
+        bool changed = false;
         if (mode == "VHF" && sampleRate > VHF_MAX_SR) {
             selectSampleRate(VHF_MAX_SR);
-            saveConfig();
+            changed = true;
         }
         buildSrText();
         srVisibleId = realToVisibleIdx(srId);
+        if (changed) saveConfig();
     }
 
     void selectDevice(const std::string& label) {
@@ -432,7 +476,13 @@ private:
 
     static void start(void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
-        if (_this->running) return;
+        if (_this->shuttingDown.load()) return;
+        if (_this->running.load()) return;
+        if (_this->driverCleanupBusy->load()) {
+            _this->restartAfterCleanup.store(true);
+            flog::warn("RX888: Previous driver shutdown is still in progress; start queued");
+            return;
+        }
         if (_this->devId < 0) { flog::error("RX888: No device selected"); return; }
 
         try {
@@ -444,6 +494,7 @@ private:
         }
 
         // ADC frequency — set first as it determines valid sample rates
+        _this->clampAdcToDriverRange(_this->dev);
         if (_this->supportsAdcFreq)
             _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
 
@@ -480,7 +531,8 @@ private:
         _this->devStream = _this->dev->setupStream(SOAPY_SDR_RX, "CF32");
         _this->dev->activateStream(_this->devStream);
 
-        _this->running = true;
+        _this->stream.clearWriteStop();
+        _this->running.store(true);
         _this->workerThread = std::thread(_worker, _this);
         flog::info("RX888: Started ({}, {} MHz, ADC {} MHz)", _this->mode,
                    _this->sampleRate / 1e6, _this->adcFreq / 1e6);
@@ -488,26 +540,85 @@ private:
 
     static void stop(void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
-        if (!_this->running) return;
-        _this->running = false;
+        if (!_this->running.exchange(false)) return;
 
-        // Deactivate stream first — unblocks readStream in worker
-        _this->dev->deactivateStream(_this->devStream);
-        // Unblock any pending stream.swap()
-        _this->stream.stopWriter();
-        _this->workerThread.join();
-        _this->stream.clearWriteStop();
+        auto* dev = _this->dev;
+        auto* devStream = _this->devStream;
+        std::thread worker;
+        if (_this->workerThread.joinable()) {
+            worker = std::move(_this->workerThread);
+        }
 
-        _this->dev->closeStream(_this->devStream);
-        SoapySDR::Device::unmake(_this->dev);
         _this->dev = nullptr;
-        flog::info("RX888: Stopped");
+        _this->devStream = nullptr;
+
+        auto cleanupBusy = _this->driverCleanupBusy;
+        cleanupBusy->store(true);
+
+        // A completed cleanup remains joinable until it is collected. Joining
+        // it here is immediate and lets this member safely own the next cleanup.
+        if (_this->cleanupThread.joinable()) {
+            _this->cleanupThread.join();
+        }
+
+        // Unblock any pending stream.swap() immediately, then let the slow
+        // driver/USB shutdown continue off the SDR++ UI thread.
+        _this->stream.stopWriter();
+
+        _this->cleanupThread = std::thread([_this, dev, devStream, cleanupBusy, worker = std::move(worker)]() mutable {
+            // Tell the hardware stream to stop before joining the worker.  The RX888
+            // driver can otherwise keep readStream() alive long enough to leave the
+            // FX3/USB side in a half-stopped state, which makes the next Start fail
+            // until the app or device is power-cycled.
+            try {
+                if (dev && devStream) { dev->deactivateStream(devStream); }
+            }
+            catch (const std::exception& e) {
+                flog::warn("RX888: Driver deactivate failed during stop: {}", e.what());
+            }
+            catch (...) {
+                flog::warn("RX888: Driver deactivate failed during stop");
+            }
+
+            if (worker.joinable()) {
+                worker.join();
+            }
+            _this->stream.clearWriteStop();
+
+            try {
+                if (dev && devStream) { dev->closeStream(devStream); }
+            }
+            catch (const std::exception& e) {
+                flog::warn("RX888: Driver closeStream failed during stop: {}", e.what());
+            }
+            catch (...) {
+                flog::warn("RX888: Driver closeStream failed during stop");
+            }
+
+            try {
+                if (dev) { SoapySDR::Device::unmake(dev); }
+            }
+            catch (const std::exception& e) {
+                flog::warn("RX888: Driver unmake failed during stop: {}", e.what());
+            }
+            catch (...) {
+                flog::warn("RX888: Driver unmake failed during stop");
+            }
+
+            cleanupBusy->store(false);
+            flog::info("RX888: Driver cleanup finished");
+            if (!_this->shuttingDown.load() && _this->restartAfterCleanup.exchange(false)) {
+                flog::info("RX888: Running queued start after driver cleanup");
+                start(_this);
+            }
+        });
+        flog::info("RX888: Stop requested; driver cleanup is running in background");
     }
 
     static void tune(double freq, void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
         _this->freq = freq;
-        if (_this->running)
+        if (_this->running.load())
             _this->dev->setFrequency(SOAPY_SDR_RX, 0, freq);
     }
 
@@ -523,11 +634,12 @@ private:
                 std::string label = config.conf["device"];
                 config.release();
                 _this->selectDevice(label);
+                _this->saveConfig();
             }
             return;
         }
 
-        if (_this->running) SmGui::BeginDisabled();
+        if (_this->running.load()) SmGui::BeginDisabled();
 
         // Device selector
         SmGui::FillWidth();
@@ -537,16 +649,6 @@ private:
             _this->saveConfig();
         }
 
-        // Sample rate + Refresh on same line
-        SmGui::FillWidth();
-        SmGui::ForceSync();
-        if (SmGui::Combo(CONCAT("##rx888_sr_", _this->name), &_this->srVisibleId, _this->txtSrList.c_str())) {
-            _this->srId = _this->visibleToRealIdx(_this->srVisibleId);
-            _this->sampleRate = _this->sampleRates[_this->srId];
-            core::setInputSampleRate(_this->sampleRate);
-            _this->saveConfig();
-        }
-        SmGui::SameLine();
         SmGui::FillWidth();
         SmGui::ForceSync();
         if (SmGui::Button(CONCAT("Refresh##rx888_refr_", _this->name))) {
@@ -555,6 +657,17 @@ private:
             std::string label = config.conf["device"];
             config.release();
             _this->selectDevice(label);
+            _this->saveConfig();
+        }
+
+        // Sample rate
+        SmGui::FillWidth();
+        SmGui::ForceSync();
+        if (SmGui::Combo(CONCAT("##rx888_sr_", _this->name), &_this->srVisibleId, _this->txtSrList.c_str())) {
+            _this->srId = _this->visibleToRealIdx(_this->srVisibleId);
+            _this->sampleRate = _this->sampleRates[_this->srId];
+            core::setInputSampleRate(_this->sampleRate);
+            _this->saveConfig();
         }
 
         // ADC frequency (only shown if driver supports it)
@@ -564,6 +677,7 @@ private:
             float adcMHz = (float)(_this->adcFreq / 1e6);
             if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz, 16.0f, 140.0f, SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
                 _this->adcFreq = adcMHz * 1e6;
+                _this->applyModeRateCap();
                 _this->saveConfig();
             }
         }
@@ -591,7 +705,7 @@ private:
             }
         }
 
-        if (_this->running) SmGui::EndDisabled();
+        if (_this->running.load()) SmGui::EndDisabled();
 
         // --- Controls that work live ---
 
@@ -615,7 +729,7 @@ private:
                 changed = SmGui::SliderFloat(id.c_str(), &_this->uiGains[i], gmin, gmax);
             }
             if (changed) {
-                if (_this->running)
+                if (_this->running.load())
                     _this->dev->setGain(SOAPY_SDR_RX, 0, _this->gainList[i], _this->uiGains[i]);
                 _this->saveConfig();
             }
@@ -663,7 +777,7 @@ private:
         int flags     = 0;
         long long timeNs = 0;
 
-        while (_this->running) {
+        while (_this->running.load()) {
             int ret = _this->dev->readStream(_this->devStream,
                 (void**)&_this->stream.writeBuf, blockSize, flags, timeNs, 100000 /*us*/);
             if (ret < 0) {
@@ -680,7 +794,9 @@ private:
     bool enabled = true;
 
     // State
-    bool running = false;
+    std::atomic<bool> running{false};
+    std::atomic<bool> restartAfterCleanup{false};
+    std::atomic<bool> shuttingDown{false};
     double freq  = 100e6;
 
     // Device list
@@ -716,11 +832,13 @@ private:
     // SoapySDR handles
     SoapySDR::Device* dev       = nullptr;
     SoapySDR::Stream* devStream = nullptr;
+    std::shared_ptr<std::atomic<bool>> driverCleanupBusy = std::make_shared<std::atomic<bool>>(false);
 
     // DSP
     dsp::stream<dsp::complex_t> stream;
     SourceManager::SourceHandler handler;
     std::thread workerThread;
+    std::thread cleanupThread;
 };
 
 MOD_EXPORT void _INIT_() {
