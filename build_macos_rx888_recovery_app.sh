@@ -6,7 +6,7 @@ build_dir=${1:-"$script_dir/build-rx888-recovery-macos"}
 bundle=${2:-/Applications/SDR++-RX888-Recovery.app}
 jobs=${JOBS:-$(sysctl -n hw.logicalcpu)}
 
-sddc_ref=a2693c8947cb78a145d88839dcdcc1f2d472651d
+sddc_ref=2c89b681bb896ac43f4357f53db5ef92ca195121
 sddc_short=$(printf '%s' "$sddc_ref" | cut -c1-12)
 sddc_repo=${SDDC_DRIVER_REPOSITORY:-https://github.com/wdarney/SDDC_Driver.git}
 default_sddc_source="$script_dir/../SDDC_Driver-rx888-macos-integration"

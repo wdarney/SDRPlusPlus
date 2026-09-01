@@ -13,6 +13,7 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -185,7 +186,13 @@ private:
         hasHF  = std::find(antennas.begin(), antennas.end(), "HF")  != antennas.end();
         hasVHF = std::find(antennas.begin(), antennas.end(), "VHF") != antennas.end();
 
-        // Detect which settings keys this driver version supports
+        refreshSettingCapabilities(dev);
+        refreshSampleRates(dev);
+    }
+
+    void refreshSettingCapabilities(SoapySDR::Device* dev) {
+        // Detect which settings keys this driver version supports without
+        // replacing the saved gain values.
         auto settingInfo = dev->getSettingInfo();
         supportsNewBiasTee = false;
         supportsAdcFreq    = false;
@@ -197,8 +204,6 @@ private:
             if (s.key == "biastee")       supportsBiasTee = true;
             if (s.key == "dithering")     supportsDithering = true;
         }
-
-        refreshSampleRates(dev);
     }
 
     void setDefaultCapabilities() {
@@ -467,6 +472,52 @@ private:
         }
     }
 
+    static void cleanupFailedStart(RX888SourceModule* _this) {
+        _this->running.store(false);
+        _this->stream.stopWriter();
+
+        auto* dev = _this->dev;
+        auto* devStream = _this->devStream;
+        _this->dev = nullptr;
+        _this->devStream = nullptr;
+
+        try {
+            if (dev && devStream) dev->deactivateStream(devStream);
+        }
+        catch (const std::exception& e) {
+            flog::warn("RX888: Failed-start deactivate failed: {}", e.what());
+        }
+        catch (...) {
+            flog::warn("RX888: Failed-start deactivate failed");
+        }
+
+        if (_this->workerThread.joinable()) {
+            _this->workerThread.join();
+        }
+
+        try {
+            if (dev && devStream) dev->closeStream(devStream);
+        }
+        catch (const std::exception& e) {
+            flog::warn("RX888: Failed-start closeStream failed: {}", e.what());
+        }
+        catch (...) {
+            flog::warn("RX888: Failed-start closeStream failed");
+        }
+
+        try {
+            if (dev) SoapySDR::Device::unmake(dev);
+        }
+        catch (const std::exception& e) {
+            flog::warn("RX888: Failed-start unmake failed: {}", e.what());
+        }
+        catch (...) {
+            flog::warn("RX888: Failed-start unmake failed");
+        }
+
+        _this->stream.clearWriteStop();
+    }
+
     static void menuSelected(void* ctx) {
         RX888SourceModule* _this = (RX888SourceModule*)ctx;
         core::setInputSampleRate(_this->sampleRate);
@@ -487,55 +538,68 @@ private:
 
         try {
             _this->dev = SoapySDR::Device::make(_this->devList[_this->devId]);
+            if (!_this->dev) throw std::runtime_error("SoapySDR returned no device");
+
+            // Replace the pre-open fallback list with the rates and settings
+            // actually supported by this driver instance.
+            _this->refreshSettingCapabilities(_this->dev);
+            _this->clampAdcToDriverRange(_this->dev);
+            if (_this->supportsAdcFreq)
+                _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
+
+            double requestedSampleRate = _this->sampleRate;
+            _this->refreshSampleRates(_this->dev);
+            if (_this->sampleRates.empty())
+                throw std::runtime_error("Driver reported no supported sample rates");
+            _this->selectSampleRate(requestedSampleRate);
+            _this->applyModeRateCap();
+
+            // Program the ADC while the freshly opened MkII is still in its
+            // initialized HF state. Initializing the VHF tuner first can make
+            // the following STARTADC control transfer fail. Then select the
+            // requested antenna explicitly and preserve it while tuning.
+            _this->dev->setSampleRate(SOAPY_SDR_RX, 0, _this->sampleRate);
+            _this->dev->setAntenna(SOAPY_SDR_RX, 0, _this->mode);
+            _this->updateGainRanges();
+            _this->dev->setFrequency(SOAPY_SDR_RX, 0, _this->freq);
+
+            // Gains
+            for (int i = 0; i < (int)_this->gainList.size(); i++)
+                _this->dev->setGain(SOAPY_SDR_RX, 0, _this->gainList[i], _this->uiGains[i]);
+
+            // Bias tees (driver version–aware)
+            if (_this->supportsNewBiasTee) {
+                _this->applySetting("UpdBiasT_HF",  _this->biasTeeHF  ? "true" : "false");
+                _this->applySetting("UpdBiasT_VHF", _this->biasTeeVHF ? "true" : "false");
+            }
+            else if (_this->supportsBiasTee) {
+                bool biasOn = (_this->mode == "HF") ? _this->biasTeeHF : _this->biasTeeVHF;
+                _this->applySetting("biastee", biasOn ? "true" : "false");
+            }
+
+            // Dithering / randomization (old driver)
+            if (_this->supportsDithering) {
+                _this->applySetting("dithering",     _this->dithering ? "true" : "false");
+                _this->applySetting("randomization", _this->dithering ? "true" : "false");
+            }
+
+            _this->devStream = _this->dev->setupStream(SOAPY_SDR_RX, "CF32");
+            _this->dev->activateStream(_this->devStream);
+
+            _this->stream.clearWriteStop();
+            _this->running.store(true);
+            _this->workerThread = std::thread(_worker, _this);
+            flog::info("RX888: Started ({}, {} MHz, ADC {} MHz)", _this->mode,
+                       _this->sampleRate / 1e6, _this->adcFreq / 1e6);
         }
         catch (const std::exception& e) {
-            flog::error("RX888: Failed to open device: {}", e.what());
-            return;
+            flog::error("RX888: Start failed: {}", e.what());
+            cleanupFailedStart(_this);
         }
-
-        // ADC frequency — set first as it determines valid sample rates
-        _this->clampAdcToDriverRange(_this->dev);
-        if (_this->supportsAdcFreq)
-            _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
-
-        // Re-query sample rates (they depend on ADC freq) and reselect
-        _this->refreshDefaultSampleRates();
-        _this->selectSampleRate(_this->sampleRate);
-
-        // Antenna / mode — re-query gains after switching so ranges are correct for this mode
-        _this->dev->setAntenna(SOAPY_SDR_RX, 0, _this->mode);
-        _this->updateGainRanges();
-        _this->dev->setSampleRate(SOAPY_SDR_RX, 0, _this->sampleRate);
-        _this->dev->setFrequency(SOAPY_SDR_RX, 0, _this->freq);
-
-        // Gains
-        for (int i = 0; i < (int)_this->gainList.size(); i++)
-            _this->dev->setGain(SOAPY_SDR_RX, 0, _this->gainList[i], _this->uiGains[i]);
-
-        // Bias tees (driver version–aware)
-        if (_this->supportsNewBiasTee) {
-            _this->applySetting("UpdBiasT_HF",  _this->biasTeeHF  ? "true" : "false");
-            _this->applySetting("UpdBiasT_VHF", _this->biasTeeVHF ? "true" : "false");
+        catch (...) {
+            flog::error("RX888: Start failed with an unknown driver error");
+            cleanupFailedStart(_this);
         }
-        else if (_this->supportsBiasTee) {
-            bool biasOn = (_this->mode == "HF") ? _this->biasTeeHF : _this->biasTeeVHF;
-            _this->applySetting("biastee", biasOn ? "true" : "false");
-        }
-
-        // Dithering / randomization (old driver)
-        if (_this->supportsDithering) {
-            _this->applySetting("dithering",     _this->dithering ? "true" : "false");
-            _this->applySetting("randomization", _this->dithering ? "true" : "false");
-        }
-
-        _this->devStream = _this->dev->setupStream(SOAPY_SDR_RX, "CF32");
-        _this->dev->activateStream(_this->devStream);
-
-        _this->stream.clearWriteStop();
-        _this->running.store(true);
-        _this->workerThread = std::thread(_worker, _this);
-        flog::info("RX888: Started ({}, {} MHz, ADC {} MHz)", _this->mode,
-                   _this->sampleRate / 1e6, _this->adcFreq / 1e6);
     }
 
     static void stop(void* ctx) {
