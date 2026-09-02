@@ -226,16 +226,17 @@ void SinkManager::setStreamSink(std::string name, std::string providerName) {
         return;
     }
 
-    if (stream->running) {
-        stream->sink->stop();
+    bool wasRunning = stream->running;
+    if (wasRunning) {
+        stream->stop();
     }
     delete stream->sink;
     stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerNames.end(), providerName));
     stream->providerName = providerName;
     SinkManager::SinkProvider prov = providers[providerName];
     stream->sink = prov.create(stream, name, prov.ctx);
-    if (stream->running) {
-        stream->sink->start();
+    if (wasRunning) {
+        stream->start();
     }
 }
 

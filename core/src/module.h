@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <map>
+#include <vector>
 #include <json.hpp>
 #include <utils/event.h>
 
@@ -67,6 +68,14 @@ public:
         virtual void enable() = 0;
         virtual void disable() = 0;
         virtual bool isEnabled() = 0;
+        virtual void* getInterface(const char* name) {
+            return NULL;
+        }
+        virtual std::string handleDebugCommand(const std::string& cmd, const std::string& args) {
+            (void)cmd;
+            (void)args;
+            return "{}";
+        }
     };
 
     struct Module_t {
@@ -121,6 +130,37 @@ public:
     std::string getInstanceModuleName(std::string name);
 
     int countModuleInstances(std::string module);
+
+    template <typename T>
+    std::vector<T*> getAllInterfaces(const std::string& interfaceName) {
+        std::vector<T*> retval;
+        for (auto x : instances) {
+            if (x.second.instance == NULL) { continue; }
+            void* rv = x.second.instance->getInterface(interfaceName.c_str());
+            if (rv != NULL) {
+                retval.emplace_back((T*)rv);
+            }
+        }
+        return retval;
+    }
+
+    void* getInterface(const std::string& name, const std::string& interfaceName) {
+        if (name != "") {
+            auto it = instances.find(name);
+            if (it == instances.end() || it->second.instance == NULL) {
+                return NULL;
+            }
+            return it->second.instance->getInterface(interfaceName.c_str());
+        }
+        for (auto x : instances) {
+            if (x.second.instance == NULL) { continue; }
+            void* rv = x.second.instance->getInterface(interfaceName.c_str());
+            if (rv != NULL) {
+                return rv;
+            }
+        }
+        return NULL;
+    }
 
     void doPostInitAll();
 

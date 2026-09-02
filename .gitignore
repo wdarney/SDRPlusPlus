@@ -31,3 +31,4 @@ misc_modules/modulation_monitor
 /build-ios-*/
 /build-integration-*/
 /build-rx888-recovery-macos/
+/build-brown-dsd/

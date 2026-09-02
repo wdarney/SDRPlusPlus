@@ -36,6 +36,7 @@ cmake -S "$script_dir" -B "$build_dir" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DOPT_BUILD_RX888_SOURCE=ON \
     -DOPT_BUILD_CHANNEL_BANK=ON \
+    -DOPT_BUILD_CH_EXTRAVHF_DECODER=ON \
     -DOPT_BUILD_VDL2_DECODER=ON \
     -DOPT_BUILD_SELCAL_DECODER=ON \
     -DOPT_BUILD_PLUTOSDR_SOURCE=OFF
@@ -43,7 +44,7 @@ cmake --build "$build_dir" --target \
     sdrpp \
     airspy_source airspyhf_source file_source network_source \
     rtl_sdr_source rtl_tcp_source sdrpp_server_source rx888_source \
-    audio_sink network_sink radio vdl2_decoder selcal_decoder \
+    audio_sink network_sink radio ch_extravhf_decoder vdl2_decoder selcal_decoder \
     channel_bank frequency_manager recorder rigctl_client rigctl_server scanner \
     -- -j"$jobs"
 
