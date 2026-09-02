@@ -50,6 +50,16 @@ const char* demodModeList[] = {
 
 const char* demodModeListTxt = "NFM\0WFM\0AM\0DSB\0USB\0CW\0LSB\0RAW\0";
 
+static constexpr int DEMOD_MODE_COUNT = sizeof(demodModeList) / sizeof(demodModeList[0]);
+static constexpr int DEMOD_MODE_BROWN_DSD = 0x1301;
+static constexpr int DEMOD_MODE_BROWN_OLD_DSD = 0x1302;
+
+static std::string getDemodModeName(int mode) {
+    if (mode >= 0 && mode < DEMOD_MODE_COUNT) { return demodModeList[mode]; }
+    if (mode == DEMOD_MODE_BROWN_DSD || mode == DEMOD_MODE_BROWN_OLD_DSD) { return "DSD"; }
+    return "Custom (" + std::to_string(mode) + ")";
+}
+
 enum {
     BOOKMARK_DISP_MODE_OFF,
     BOOKMARK_DISP_MODE_TOP,
@@ -222,7 +232,18 @@ private:
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(200);
 
-            ImGui::Combo(("##freq_manager_edit_mode" + name).c_str(), &editedBookmark.mode, demodModeListTxt);
+            if (editedBookmark.mode >= 0 && editedBookmark.mode < DEMOD_MODE_COUNT) {
+                ImGui::Combo(("##freq_manager_edit_mode" + name).c_str(), &editedBookmark.mode, demodModeListTxt);
+            }
+            else {
+                std::string modeName = getDemodModeName(editedBookmark.mode);
+                if (ImGui::BeginCombo(("##freq_manager_edit_mode" + name).c_str(), modeName.c_str())) {
+                    for (int mode = 0; mode < DEMOD_MODE_COUNT; mode++) {
+                        if (ImGui::Selectable(demodModeList[mode], false)) { editedBookmark.mode = mode; }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
 
             ImGui::EndTable();
 
@@ -566,7 +587,8 @@ private:
                 }
 
                 ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%s %s", utils::formatFreq(bm.frequency).c_str(), demodModeList[bm.mode]);
+                std::string modeName = getDemodModeName(bm.mode);
+                ImGui::Text("%s %s", utils::formatFreq(bm.frequency).c_str(), modeName.c_str());
                 ImVec2 max = ImGui::GetCursorPos();
             }
             ImGui::EndTable();
@@ -799,7 +821,8 @@ private:
         ImGui::Text("List: %s", hoveredBookmark.listName.c_str());
         ImGui::Text("Frequency: %s", utils::formatFreq(hoveredBookmark.bookmark.frequency).c_str());
         ImGui::Text("Bandwidth: %s", utils::formatFreq(hoveredBookmark.bookmark.bandwidth).c_str());
-        ImGui::Text("Mode: %s", demodModeList[hoveredBookmark.bookmark.mode]);
+        std::string modeName = getDemodModeName(hoveredBookmark.bookmark.mode);
+        ImGui::Text("Mode: %s", modeName.c_str());
         ImGui::EndTooltip();
     }
 
@@ -920,4 +943,3 @@ MOD_EXPORT void _END_() {
     config.disableAutoSave();
     config.save();
 }
-
