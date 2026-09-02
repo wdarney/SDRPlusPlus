@@ -61,6 +61,7 @@ option(OPT_BUILD_DAB_DECODER "Build the DAB/DAB+ decoder (no dependencies requir
 option(OPT_BUILD_FALCON9_DECODER "Build the falcon9 live decoder (Dependencies: ffplay)" OFF)
 option(OPT_BUILD_KG_SSTV_DECODER "Build the KG SSTV (KG-STV) decoder module (no dependencies required)" OFF)
 option(OPT_BUILD_M17_DECODER "Build the M17 decoder module (Dependencies: codec2)" OFF)
+option(OPT_BUILD_CH_EXTRAVHF_DECODER "Build the extra VHF/DSD decoder module (Dependencies: fftw3, mbelib, itpp)" ON)
 option(OPT_BUILD_METEOR_DEMODULATOR "Build the meteor demodulator module (no dependencies required)" ON)
 option(OPT_BUILD_PAGER_DECODER "Build the pager decoder module (no dependencies required)" ON)
 option(OPT_BUILD_RADIO "Main audio modulation decoder (AM, FM, SSB, etc...)" ON)
@@ -305,6 +306,10 @@ endif (OPT_BUILD_KG_SSTV_DECODER)
 if (OPT_BUILD_M17_DECODER)
 add_subdirectory("decoder_modules/m17_decoder")
 endif (OPT_BUILD_M17_DECODER)
+
+if (OPT_BUILD_CH_EXTRAVHF_DECODER)
+add_subdirectory("decoder_modules/ch_extravhf_decoder")
+endif (OPT_BUILD_CH_EXTRAVHF_DECODER)
 
 if (OPT_BUILD_METEOR_DEMODULATOR)
 add_subdirectory("decoder_modules/meteor_demodulator")
