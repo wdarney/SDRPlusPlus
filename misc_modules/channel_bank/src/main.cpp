@@ -8687,6 +8687,19 @@ self.addEventListener("fetch", event => {
                     ImGui::PopStyleColor();
                 }
             }
+
+            int queuedTranscriptions = _this->queuedTranscriptionCount();
+            ImGui::Text("Transcription queue: %d waiting", queuedTranscriptions);
+            if (queuedTranscriptions > 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton(CONCAT("Flush waiting##_cb_txflush_", _this->name))) {
+                    _this->flushQueuedTranscriptionJobs();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Discard all waiting transcription jobs.\n"
+                                      "The transcription currently running is not interrupted.");
+                }
+            }
         }
 
         // M4A encoding toggle (AudioToolbox on macOS, ffmpeg on Windows)
@@ -10269,6 +10282,66 @@ self.addEventListener("fetch", event => {
             [&](const TranscriptionJob& job) { return job.path == path; });
         if (pending) transcriptionDeleteAfter.insert(path);
         return pending;
+    }
+
+    int queuedTranscriptionCount() {
+        std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+        return (int)std::count_if(transcriptionJobs.begin(), transcriptionJobs.end(),
+            [](const TranscriptionJob& job) { return job.handle == nullptr; });
+    }
+
+    void flushQueuedTranscriptionJobs() {
+        struct FlushedJob {
+            std::string path;
+            bool deleteAfter = false;
+        };
+        std::vector<FlushedJob> flushed;
+        {
+            std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+            for (auto it = transcriptionJobs.begin(); it != transcriptionJobs.end();) {
+                if (it->handle) {
+                    ++it;
+                    continue;
+                }
+                flushed.push_back({it->path, transcriptionDeleteAfter.erase(it->path) > 0});
+                it = transcriptionJobs.erase(it);
+            }
+        }
+
+        for (const auto& job : flushed) {
+            bool canEncode = false;
+            EncodeTask encodeTask;
+            {
+                std::lock_guard<std::mutex> elk(pendingEncodesMtx);
+                auto it = pendingEncodes.find(job.path);
+                if (it != pendingEncodes.end()) {
+                    if (!m4aEnabled || !recordingEnabled) {
+                        pendingEncodes.erase(it);
+                    } else {
+                        it->second.transcriptionDone = true;
+                        it->second.transcript.clear();
+                        if (it->second.playbackDone) {
+                            canEncode = true;
+                            encodeTask = {it->first, it->second.finalM4APath, {},
+                                          it->second.avgSnrDb, 0};
+                            pendingEncodes.erase(it);
+                        }
+                    }
+                }
+            }
+            if (canEncode) {
+                triggerEncode(encodeTask.wavPath, encodeTask.finalM4APath,
+                              encodeTask.transcript, encodeTask.avgSnrDb, encodeTask.attempt);
+            }
+            if (job.deleteAfter) {
+                std::remove(job.path.c_str());
+            }
+        }
+
+        if (!flushed.empty()) {
+            flog::info("[ChannelBank] Flushed {0} waiting transcription job(s)",
+                       (int)flushed.size());
+        }
     }
 
     void cancelTranscriptionJobs() {
