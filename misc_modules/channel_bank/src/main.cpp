@@ -279,7 +279,7 @@ public:
     static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
     static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
     static constexpr int    MAX_CHANNELS_HARD_LIMIT = 64;
-    static constexpr int    MAX_TRANSCRIPTION_JOBS = 1;
+    static constexpr int    MAX_CONCURRENT_TRANSCRIPTION_JOBS = 1;
 
     ChannelBankModule(std::string name) : folderSelect("%ROOT%/channel_bank/recordings") {
         this->name = name;
@@ -5683,22 +5683,33 @@ self.addEventListener("fetch", event => {
             std::string name;
             std::string text;
             std::vector<transcription_whisper::Segment> segments;
+            bool deleteAfter = false;
         };
 
         std::vector<CompletedTranscript> completed;
         {
             std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
-            for (auto it = transcriptionJobs.begin(); it != transcriptionJobs.end();) {
-                TranscriptionJob& job = it->second;
+            while (!transcriptionJobs.empty()) {
+                TranscriptionJob& job = transcriptionJobs.front();
                 if (!job.handle) {
-                    it = transcriptionJobs.erase(it);
-                    continue;
+                    job.handle = txTranscribeFile(job.backend, job.path.c_str());
+                    if (!job.handle) {
+                        CompletedTranscript failed;
+                        failed.path = job.path;
+                        failed.name = job.name;
+                        failed.deleteAfter = transcriptionDeleteAfter.erase(job.path) > 0;
+                        completed.push_back(std::move(failed));
+                        flog::warn("[ChannelBank] Could not start queued transcription: {0}", job.path);
+                        transcriptionJobs.pop_front();
+                        continue;
+                    }
+                    flog::info("[ChannelBank] Started queued transcription ({0} waiting): {1}",
+                               (int)transcriptionJobs.size() - 1, job.path);
                 }
 
                 std::string text = txGetText(job.backend, job.handle);
                 if (!txIsFinal(job.backend, job.handle)) {
-                    ++it;
-                    continue;
+                    break;
                 }
 
                 CompletedTranscript done;
@@ -5708,9 +5719,10 @@ self.addEventListener("fetch", event => {
                 if (job.backend >= TB_WHISPER_ATC_LARGE) {
                     done.segments = transcription_whisper::getSegments(job.handle);
                 }
+                done.deleteAfter = transcriptionDeleteAfter.erase(job.path) > 0;
 
                 txDestroy(job.backend, job.handle);
-                it = transcriptionJobs.erase(it);
+                transcriptionJobs.pop_front();
                 completed.push_back(std::move(done));
             }
         }
@@ -5752,6 +5764,10 @@ self.addEventListener("fetch", event => {
                 }
                 if (canEncode) triggerEncode(encodePath, encodeFinalM4APath, encodeTranscript, encodeSnrDb);
             }
+
+            if (done.deleteAfter) {
+                std::remove(done.path.c_str());
+            }
         }
     }
 
@@ -5770,6 +5786,13 @@ self.addEventListener("fetch", event => {
             for (auto it = pendingEncodes.begin(); it != pendingEncodes.end();) {
                 EncodeState& es = it->second;
                 if (!es.transcriptionDone) {
+                    // A real FIFO backlog is intentional during busy periods.  Do
+                    // not let the M4A timeout encode (and remove) a WAV while its
+                    // transcription is still queued or running.
+                    if (isTranscriptionPending(it->first)) {
+                        ++it;
+                        continue;
+                    }
                     auto queuedAt = es.queuedAt;
                     if (queuedAt == std::chrono::steady_clock::time_point{}) {
                         queuedAt = (es.playbackDoneAt == std::chrono::steady_clock::time_point{})
@@ -6831,8 +6854,14 @@ self.addEventListener("fetch", event => {
     void completeUnplayedPlaybackEntry(PlaybackEntry& entry) {
         if (entry.deleteAfter) {
             // recordingEnabled was false at record-time — discard the WAV
-            // (matches the deleteAfter contract: the user never wanted to keep it).
+            // once a queued/running transcription no longer needs it.
+#if defined(__APPLE__) || defined(_WIN32)
+            if (!deferDeleteUntilTranscriptionComplete(entry.path)) {
+                std::remove(entry.path.c_str());
+            }
+#else
             std::remove(entry.path.c_str());
+#endif
 #if defined(__APPLE__) || defined(_WIN32)
             std::lock_guard<std::mutex> elk(pendingEncodesMtx);
             pendingEncodes.erase(entry.path);
@@ -7065,7 +7094,13 @@ self.addEventListener("fetch", event => {
                 // the final transcript — it's cleared on the next playback start.
 #endif
                 if (deleteAfter) {
+#if defined(__APPLE__) || defined(_WIN32)
+                    if (!deferDeleteUntilTranscriptionComplete(path)) {
+                        std::remove(path.c_str());
+                    }
+#else
                     std::remove(path.c_str());
+#endif
                 }
 #if defined(__APPLE__) || defined(_WIN32)
                 else if (m4aEnabled) {
@@ -10198,39 +10233,63 @@ self.addEventListener("fetch", event => {
         if (path.empty() || !transcriptionOn()) return false;
 
         int backend = transcriptionBackend;
-        {
-            std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
-            if ((int)transcriptionJobs.size() >= MAX_TRANSCRIPTION_JOBS) {
-                flog::warn("[ChannelBank] Skipping transcription; {0} job already in flight", MAX_TRANSCRIPTION_JOBS);
+        std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+        auto duplicate = std::find_if(transcriptionJobs.begin(), transcriptionJobs.end(),
+            [&](const TranscriptionJob& job) { return job.path == path; });
+        if (duplicate != transcriptionJobs.end()) return true;
+
+        transcriptionJobs.push_back(TranscriptionJob{path, name, backend, nullptr});
+        TranscriptionJob& job = transcriptionJobs.back();
+
+        // Start immediately only when this is the sole job.  Every later
+        // recording stays in FIFO order until pollTranscriptions advances it.
+        if (transcriptionJobs.size() <= MAX_CONCURRENT_TRANSCRIPTION_JOBS) {
+            job.handle = txTranscribeFile(job.backend, job.path.c_str());
+            if (!job.handle) {
+                transcriptionJobs.pop_back();
                 return false;
             }
+            flog::info("[ChannelBank] Started transcription: {0}", path);
+        } else {
+            flog::info("[ChannelBank] Queued transcription ({0} waiting): {1}",
+                       (int)transcriptionJobs.size() - MAX_CONCURRENT_TRANSCRIPTION_JOBS, path);
         }
-        void* handle = txTranscribeFile(backend, path.c_str());
-        if (!handle) return false;
-
-        std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
-        auto it = transcriptionJobs.find(path);
-        if (it != transcriptionJobs.end() && it->second.handle) {
-            txCancel(it->second.backend, it->second.handle);
-            txDestroy(it->second.backend, it->second.handle);
-        }
-        transcriptionJobs[path] = TranscriptionJob{path, name, backend, handle};
         return true;
+    }
+
+    bool isTranscriptionPending(const std::string& path) {
+        std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+        return std::any_of(transcriptionJobs.begin(), transcriptionJobs.end(),
+            [&](const TranscriptionJob& job) { return job.path == path; });
+    }
+
+    bool deferDeleteUntilTranscriptionComplete(const std::string& path) {
+        std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
+        bool pending = std::any_of(transcriptionJobs.begin(), transcriptionJobs.end(),
+            [&](const TranscriptionJob& job) { return job.path == path; });
+        if (pending) transcriptionDeleteAfter.insert(path);
+        return pending;
     }
 
     void cancelTranscriptionJobs() {
         std::vector<TranscriptionJob> jobs;
+        std::vector<std::string> deleteAfter;
         {
             std::lock_guard<std::mutex> jlk(transcriptionJobsMtx);
-            for (auto& [path, job] : transcriptionJobs) {
+            for (auto& job : transcriptionJobs) {
                 if (job.handle) jobs.push_back(job);
             }
             transcriptionJobs.clear();
+            deleteAfter.assign(transcriptionDeleteAfter.begin(), transcriptionDeleteAfter.end());
+            transcriptionDeleteAfter.clear();
         }
 
         for (auto& job : jobs) {
             txCancel(job.backend, job.handle);
             txDestroy(job.backend, job.handle);
+        }
+        for (const auto& path : deleteAfter) {
+            std::remove(path.c_str());
         }
     }
 #endif
@@ -10356,7 +10415,11 @@ self.addEventListener("fetch", event => {
     std::deque<PlaybackEntry> playbackQueue;
 #if defined(__APPLE__) || defined(_WIN32)
     std::mutex transcriptionJobsMtx;
-    std::map<std::string, TranscriptionJob> transcriptionJobs;
+    // FIFO queue; only the front entry may own a live backend handle.
+    std::deque<TranscriptionJob> transcriptionJobs;
+    // Ephemeral WAVs whose playback finished before their queued transcript.
+    // Guarded by transcriptionJobsMtx so completion cannot race deletion.
+    std::set<std::string> transcriptionDeleteAfter;
     std::mutex  lastTranscriptMtx;
     std::string lastTranscriptText;  // most recently completed transcript
     std::string lastTranscriptName;  // displayName of the transcribed freq
