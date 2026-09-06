@@ -329,6 +329,10 @@ private:
         return false;
     }
 
+    // RX888 MkII limits exposed by the paired SoapySDDC module.
+    static constexpr double ADC_MIN_FREQ = 16e6;
+    static constexpr double ADC_MAX_FREQ = 130e6;
+
     // Max useful sample rate for VHF mode — R820T2 IF bandwidth is ~8-10 MHz
     static constexpr double VHF_MAX_SR = 8e6;
 
@@ -337,8 +341,15 @@ private:
         for (double sr : sampleRates) {
             if (mode == "VHF" && sr > VHF_MAX_SR) continue;
             char buf[32];
-            if (sr >= 1e6)
-                snprintf(buf, sizeof(buf), "%.0f MHz", sr / 1e6);
+            if (sr >= 1e6) {
+                double mhz = sr / 1e6;
+                if (std::abs(mhz - std::round(mhz)) < 0.0005)
+                    snprintf(buf, sizeof(buf), "%.0f MHz", mhz);
+                else if (std::abs(mhz * 10.0 - std::round(mhz * 10.0)) < 0.0005)
+                    snprintf(buf, sizeof(buf), "%.1f MHz", mhz);
+                else
+                    snprintf(buf, sizeof(buf), "%.3f MHz", mhz);
+            }
             else
                 snprintf(buf, sizeof(buf), "%.0f kHz", sr / 1e3);
             txtSrList += std::string(buf) + '\0';
@@ -412,12 +423,28 @@ private:
     void applyModeRateCap() {
         bool changed = false;
         if (mode == "VHF" && sampleRate > VHF_MAX_SR) {
-            selectSampleRate(VHF_MAX_SR);
-            changed = true;
+            int best = -1;
+            for (int i = 0; i < (int)sampleRates.size(); ++i) {
+                if (sampleRates[i] <= VHF_MAX_SR)
+                    best = i;
+            }
+            if (best >= 0) {
+                srId = best;
+                sampleRate = sampleRates[srId];
+                core::setInputSampleRate(sampleRate);
+                changed = true;
+            }
         }
         buildSrText();
         srVisibleId = realToVisibleIdx(srId);
         if (changed) saveConfig();
+    }
+
+    void rebuildSampleRatesForAdc() {
+        double requestedSampleRate = sampleRate;
+        refreshDefaultSampleRates();
+        selectSampleRate(requestedSampleRate);
+        applyModeRateCap();
     }
 
     void selectDevice(const std::string& label) {
@@ -575,8 +602,8 @@ private:
             {"sampleRates", rates},
             {"supportsAdcFreq", supportsAdcFreq},
             {"adcClockMHz", adcFreq / 1e6},
-            {"adcMinMHz", 16.0},
-            {"adcMaxMHz", 140.0},
+            {"adcMinMHz", ADC_MIN_FREQ / 1e6},
+            {"adcMaxMHz", ADC_MAX_FREQ / 1e6},
             {"mode", mode},
             {"modes", modes},
             {"gains", gains},
@@ -634,12 +661,12 @@ private:
 
         if (req.contains("adcClockMHz")) {
             double mhz = req["adcClockMHz"].get<double>();
-            if (!std::isfinite(mhz) || mhz < 16.0 || mhz > 140.0) {
+            if (!std::isfinite(mhz) || mhz < ADC_MIN_FREQ / 1e6 || mhz > ADC_MAX_FREQ / 1e6) {
                 error = "ADC clock out of range";
                 return false;
             }
             adcFreq = mhz * 1e6;
-            applyModeRateCap();
+            rebuildSampleRatesForAdc();
         }
 
         if (req.contains("sampleRateId")) {
@@ -803,8 +830,13 @@ private:
             // actually supported by this driver instance.
             _this->refreshSettingCapabilities(_this->dev);
             _this->clampAdcToDriverRange(_this->dev);
-            if (_this->supportsAdcFreq)
-                _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
+            if (_this->supportsAdcFreq) {
+                _this->dev->writeSetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
+                std::string actualAdc = _this->dev->readSetting("adc_frequency");
+                if (actualAdc.empty())
+                    throw std::runtime_error("Driver did not report the applied ADC clock");
+                _this->adcFreq = std::stod(actualAdc);
+            }
 
             double requestedSampleRate = _this->sampleRate;
             _this->refreshSampleRates(_this->dev);
@@ -818,6 +850,11 @@ private:
             // the following STARTADC control transfer fail. Then select the
             // requested antenna explicitly and preserve it while tuning.
             _this->dev->setSampleRate(SOAPY_SDR_RX, 0, _this->sampleRate);
+            double actualSampleRate = _this->dev->getSampleRate(SOAPY_SDR_RX, 0);
+            if (!std::isfinite(actualSampleRate) || actualSampleRate <= 0.0)
+                throw std::runtime_error("Driver reported an invalid IQ sample rate");
+            _this->sampleRate = actualSampleRate;
+            core::setInputSampleRate(_this->sampleRate);
             _this->dev->setAntenna(SOAPY_SDR_RX, 0, _this->mode);
             _this->updateGainRanges();
             _this->dev->setFrequency(SOAPY_SDR_RX, 0, _this->freq);
@@ -998,9 +1035,10 @@ private:
             SmGui::LeftLabel("ADC Clock");
             SmGui::FillWidth();
             float adcMHz = (float)(_this->adcFreq / 1e6);
-            if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz, 16.0f, 140.0f, SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
+            if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz,
+                    (float)(ADC_MIN_FREQ / 1e6), (float)(ADC_MAX_FREQ / 1e6), SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
                 _this->adcFreq = adcMHz * 1e6;
-                _this->applyModeRateCap();
+                _this->rebuildSampleRatesForAdc();
                 _this->saveConfig();
             }
         }
