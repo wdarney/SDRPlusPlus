@@ -314,7 +314,7 @@ private:
                     adcFreq / 1e6, minFreq / 1e6, maxFreq / 1e6, clamped / 1e6);
                 adcFreq = clamped;
                 refreshDefaultSampleRates();
-                selectSampleRate(sampleRate);
+                selectSampleRate(preferredSampleRate, false);
                 saveConfig();
                 return true;
             }
@@ -441,9 +441,11 @@ private:
     }
 
     void rebuildSampleRatesForAdc() {
-        double requestedSampleRate = sampleRate;
         refreshDefaultSampleRates();
-        selectSampleRate(requestedSampleRate);
+        // Keep aiming at the bandwidth explicitly chosen by the user. Using
+        // the temporary nearest rate here makes a slider drag feed each
+        // intermediate result into the next step (8 -> 7.9 -> ... -> 4 MHz).
+        selectSampleRate(preferredSampleRate, false);
         applyModeRateCap();
     }
 
@@ -506,7 +508,11 @@ private:
                     uiGains[i] = savedDevice["gains"][gainList[i]].get<float>();
             }
             if (!sampleRates.empty()) {
-                double savedSr = savedDevice.contains("sampleRate") ? savedDevice["sampleRate"].get<double>() : sampleRates[0];
+                double savedSr = savedDevice.contains("preferredSampleRate")
+                               ? savedDevice["preferredSampleRate"].get<double>()
+                               : savedDevice.contains("sampleRate")
+                               ? savedDevice["sampleRate"].get<double>()
+                               : sampleRates[0];
                 selectSampleRate(savedSr);
             }
         }
@@ -524,8 +530,9 @@ private:
         applyModeRateCap();
     }
 
-    void selectSampleRate(double sr) {
+    void selectSampleRate(double sr, bool updatePreference = true) {
         if (sampleRates.empty()) return;
+        if (updatePreference) preferredSampleRate = sr;
         int best = 0;
         double bestDiff = std::abs(sampleRates[0] - sr);
         for (int i = 1; i < (int)sampleRates.size(); i++) {
@@ -543,6 +550,7 @@ private:
         json c;
         c["mode"]       = mode;
         c["sampleRate"] = sampleRate;
+        c["preferredSampleRate"] = preferredSampleRate;
         c["adcFreq"]    = adcFreq;
         c["biasTeeHF"]  = biasTeeHF;
         c["biasTeeVHF"] = biasTeeVHF;
@@ -704,6 +712,7 @@ private:
             srVisibleId = visibleId;
             srId = realId;
             sampleRate = sampleRates[srId];
+            preferredSampleRate = sampleRate;
             core::setInputSampleRate(sampleRate);
         }
         else if (req.contains("sampleRate")) {
@@ -863,11 +872,10 @@ private:
                 _this->adcFreq = std::stod(actualAdc);
             }
 
-            double requestedSampleRate = _this->sampleRate;
             _this->refreshSampleRates(_this->dev);
             if (_this->sampleRates.empty())
                 throw std::runtime_error("Driver reported no supported sample rates");
-            _this->selectSampleRate(requestedSampleRate);
+            _this->selectSampleRate(_this->preferredSampleRate, false);
             _this->applyModeRateCap();
 
             // Program the ADC while the freshly opened MkII is still in its
@@ -1051,6 +1059,7 @@ private:
         if (SmGui::Combo(CONCAT("##rx888_sr_", _this->name), &_this->srVisibleId, _this->txtSrList.c_str())) {
             _this->srId = _this->visibleToRealIdx(_this->srVisibleId);
             _this->sampleRate = _this->sampleRates[_this->srId];
+            _this->preferredSampleRate = _this->sampleRate;
             core::setInputSampleRate(_this->sampleRate);
             _this->saveConfig();
         }
@@ -1204,6 +1213,7 @@ private:
     // Settings
     std::string mode      = "HF";
     double sampleRate     = 32e6;
+    double preferredSampleRate = 32e6;
     double adcFreq        = 128e6;
     bool   biasTeeHF      = false;
     bool   biasTeeVHF     = false;
