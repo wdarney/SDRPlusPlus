@@ -450,20 +450,45 @@ private:
     void selectDevice(const std::string& label) {
         if (devList.empty()) { devId = -1; return; }
 
-        int found = 0;
+        int found = -1;
         for (int i = 0; i < (int)devList.size(); i++) {
             if (deviceLabel(devList[i]) == label) { found = i; break; }
         }
+        const bool labelRollover = found < 0 && !label.empty() && devList.size() == 1;
+        if (found < 0) found = 0;
         devId = found;
         std::string selectedLabel = deviceLabel(devList[devId]);
+
+        if (labelRollover) {
+            // The same RX888 commonly enumerates as WestBridge before its FX3
+            // firmware is loaded and as RX888mk2 afterwards. Keep the active
+            // profile across that one-device identity rollover; Refresh must
+            // not silently replace ADC, mode, or gain values with an unrelated
+            // profile stored under the newly visible USB label.
+            flog::info("RX888: Device label changed from '{}' to '{}'; preserving its active profile",
+                       label, selectedLabel);
+        }
 
         json savedDevice;
         bool hasSavedDevice = false;
         config.acquire();
         auto& dc = config.conf["devices"];
-        if (dc.contains(selectedLabel) || dc.contains(label)) {
-            savedDevice = dc.contains(selectedLabel) ? dc[selectedLabel] : dc[label];
+        // During a WestBridge/RX888mk2 rollover, the requested label is the
+        // profile the user was already operating. Prefer it, then saveConfig
+        // migrates the same values under the newly enumerated label.
+        if (labelRollover && dc.contains(label)) {
+            savedDevice = dc[label];
             hasSavedDevice = true;
+        }
+        else if (dc.contains(selectedLabel)) {
+            savedDevice = dc[selectedLabel];
+            hasSavedDevice = true;
+        }
+        else if (dc.contains(label)) {
+            savedDevice = dc[label];
+            hasSavedDevice = true;
+        }
+        if (hasSavedDevice) {
             if (savedDevice.contains("mode"))       mode       = savedDevice["mode"].get<std::string>();
             if (savedDevice.contains("adcFreq"))    adcFreq    = savedDevice["adcFreq"].get<double>();
             if (savedDevice.contains("biasTeeHF"))  biasTeeHF  = savedDevice["biasTeeHF"].get<bool>();
