@@ -333,6 +333,24 @@ private:
     static constexpr double ADC_MIN_FREQ = 16e6;
     static constexpr double ADC_MAX_FREQ = 130e6;
 
+    // These clocks preserve the familiar 1/2/4/8 MHz IQ-rate choices because
+    // the RX888 converter only supports power-of-two decimation.  Arbitrary
+    // ADC clocks remain valid through the control API, but presenting them as
+    // a continuous desktop slider was misleading: e.g. 78 MHz can produce
+    // 4.875 or 9.75 MHz, not exactly 8 MHz.
+    static double adcClockPreset(int id) {
+        static const double presets[] = { 16e6, 32e6, 64e6, 128e6 };
+        return presets[std::max(0, std::min(id, 3))];
+    }
+
+    static int adcClockPresetId(double frequency) {
+        for (int id = 0; id < 4; ++id) {
+            if (std::abs(frequency - adcClockPreset(id)) < 1.0)
+                return id;
+        }
+        return -1;
+    }
+
     // Max useful sample rate for VHF mode — R820T2 IF bandwidth is ~8-10 MHz
     static constexpr double VHF_MAX_SR = 8e6;
 
@@ -1068,10 +1086,32 @@ private:
         if (_this->supportsAdcFreq) {
             SmGui::LeftLabel("ADC Clock");
             SmGui::FillWidth();
-            float adcMHz = (float)(_this->adcFreq / 1e6);
-            if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz,
-                    (float)(ADC_MIN_FREQ / 1e6), (float)(ADC_MAX_FREQ / 1e6), SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
-                _this->adcFreq = adcMHz * 1e6;
+            int presetId = adcClockPresetId(_this->adcFreq);
+            int adcChoice = presetId;
+            int presetOffset = 0;
+            std::string adcChoices;
+
+            // Preserve and clearly identify an arbitrary value supplied by an
+            // older config or the control API instead of displaying it as one
+            // of the standard clocks.
+            if (presetId < 0) {
+                char customLabel[64];
+                snprintf(customLabel, sizeof(customLabel), "%.3f MHz (custom; bandwidth varies)",
+                         _this->adcFreq / 1e6);
+                adcChoices += customLabel;
+                adcChoices += '\0';
+                adcChoice = 0;
+                presetOffset = 1;
+            }
+            adcChoices += "16 MHz";  adcChoices += '\0';
+            adcChoices += "32 MHz";  adcChoices += '\0';
+            adcChoices += "64 MHz";  adcChoices += '\0';
+            adcChoices += "128 MHz"; adcChoices += '\0';
+
+            if (SmGui::Combo(CONCAT("##rx888_adc_", _this->name), &adcChoice, adcChoices.c_str())) {
+                int selectedPreset = adcChoice - presetOffset;
+                if (selectedPreset < 0) selectedPreset = 0;
+                _this->adcFreq = adcClockPreset(selectedPreset);
                 _this->rebuildSampleRatesForAdc();
                 _this->saveConfig();
             }
