@@ -314,7 +314,7 @@ private:
                     adcFreq / 1e6, minFreq / 1e6, maxFreq / 1e6, clamped / 1e6);
                 adcFreq = clamped;
                 refreshDefaultSampleRates();
-                selectSampleRate(sampleRate);
+                selectSampleRate(preferredSampleRate, false);
                 saveConfig();
                 return true;
             }
@@ -329,6 +329,28 @@ private:
         return false;
     }
 
+    // RX888 MkII limits exposed by the paired SoapySDDC module.
+    static constexpr double ADC_MIN_FREQ = 16e6;
+    static constexpr double ADC_MAX_FREQ = 130e6;
+
+    // These clocks preserve the familiar 1/2/4/8 MHz IQ-rate choices because
+    // the RX888 converter only supports power-of-two decimation.  Arbitrary
+    // ADC clocks remain valid through the control API, but presenting them as
+    // a continuous desktop slider was misleading: e.g. 78 MHz can produce
+    // 4.875 or 9.75 MHz, not exactly 8 MHz.
+    static double adcClockPreset(int id) {
+        static const double presets[] = { 16e6, 32e6, 64e6, 128e6 };
+        return presets[std::max(0, std::min(id, 3))];
+    }
+
+    static int adcClockPresetId(double frequency) {
+        for (int id = 0; id < 4; ++id) {
+            if (std::abs(frequency - adcClockPreset(id)) < 1.0)
+                return id;
+        }
+        return -1;
+    }
+
     // Max useful sample rate for VHF mode — R820T2 IF bandwidth is ~8-10 MHz
     static constexpr double VHF_MAX_SR = 8e6;
 
@@ -337,8 +359,15 @@ private:
         for (double sr : sampleRates) {
             if (mode == "VHF" && sr > VHF_MAX_SR) continue;
             char buf[32];
-            if (sr >= 1e6)
-                snprintf(buf, sizeof(buf), "%.0f MHz", sr / 1e6);
+            if (sr >= 1e6) {
+                double mhz = sr / 1e6;
+                if (std::abs(mhz - std::round(mhz)) < 0.0005)
+                    snprintf(buf, sizeof(buf), "%.0f MHz", mhz);
+                else if (std::abs(mhz * 10.0 - std::round(mhz * 10.0)) < 0.0005)
+                    snprintf(buf, sizeof(buf), "%.1f MHz", mhz);
+                else
+                    snprintf(buf, sizeof(buf), "%.3f MHz", mhz);
+            }
             else
                 snprintf(buf, sizeof(buf), "%.0f kHz", sr / 1e3);
             txtSrList += std::string(buf) + '\0';
@@ -412,31 +441,74 @@ private:
     void applyModeRateCap() {
         bool changed = false;
         if (mode == "VHF" && sampleRate > VHF_MAX_SR) {
-            selectSampleRate(VHF_MAX_SR);
-            changed = true;
+            int best = -1;
+            for (int i = 0; i < (int)sampleRates.size(); ++i) {
+                if (sampleRates[i] <= VHF_MAX_SR)
+                    best = i;
+            }
+            if (best >= 0) {
+                srId = best;
+                sampleRate = sampleRates[srId];
+                core::setInputSampleRate(sampleRate);
+                changed = true;
+            }
         }
         buildSrText();
         srVisibleId = realToVisibleIdx(srId);
         if (changed) saveConfig();
     }
 
+    void rebuildSampleRatesForAdc() {
+        refreshDefaultSampleRates();
+        // Keep aiming at the bandwidth explicitly chosen by the user. Using
+        // the temporary nearest rate here makes a slider drag feed each
+        // intermediate result into the next step (8 -> 7.9 -> ... -> 4 MHz).
+        selectSampleRate(preferredSampleRate, false);
+        applyModeRateCap();
+    }
+
     void selectDevice(const std::string& label) {
         if (devList.empty()) { devId = -1; return; }
 
-        int found = 0;
+        int found = -1;
         for (int i = 0; i < (int)devList.size(); i++) {
             if (deviceLabel(devList[i]) == label) { found = i; break; }
         }
+        const bool labelRollover = found < 0 && !label.empty() && devList.size() == 1;
+        if (found < 0) found = 0;
         devId = found;
         std::string selectedLabel = deviceLabel(devList[devId]);
+
+        if (labelRollover) {
+            // The same RX888 commonly enumerates as WestBridge before its FX3
+            // firmware is loaded and as RX888mk2 afterwards. Keep the active
+            // profile across that one-device identity rollover; Refresh must
+            // not silently replace ADC, mode, or gain values with an unrelated
+            // profile stored under the newly visible USB label.
+            flog::info("RX888: Device label changed from '{}' to '{}'; preserving its active profile",
+                       label, selectedLabel);
+        }
 
         json savedDevice;
         bool hasSavedDevice = false;
         config.acquire();
         auto& dc = config.conf["devices"];
-        if (dc.contains(selectedLabel) || dc.contains(label)) {
-            savedDevice = dc.contains(selectedLabel) ? dc[selectedLabel] : dc[label];
+        // During a WestBridge/RX888mk2 rollover, the requested label is the
+        // profile the user was already operating. Prefer it, then saveConfig
+        // migrates the same values under the newly enumerated label.
+        if (labelRollover && dc.contains(label)) {
+            savedDevice = dc[label];
             hasSavedDevice = true;
+        }
+        else if (dc.contains(selectedLabel)) {
+            savedDevice = dc[selectedLabel];
+            hasSavedDevice = true;
+        }
+        else if (dc.contains(label)) {
+            savedDevice = dc[label];
+            hasSavedDevice = true;
+        }
+        if (hasSavedDevice) {
             if (savedDevice.contains("mode"))       mode       = savedDevice["mode"].get<std::string>();
             if (savedDevice.contains("adcFreq"))    adcFreq    = savedDevice["adcFreq"].get<double>();
             if (savedDevice.contains("biasTeeHF"))  biasTeeHF  = savedDevice["biasTeeHF"].get<bool>();
@@ -454,7 +526,11 @@ private:
                     uiGains[i] = savedDevice["gains"][gainList[i]].get<float>();
             }
             if (!sampleRates.empty()) {
-                double savedSr = savedDevice.contains("sampleRate") ? savedDevice["sampleRate"].get<double>() : sampleRates[0];
+                double savedSr = savedDevice.contains("preferredSampleRate")
+                               ? savedDevice["preferredSampleRate"].get<double>()
+                               : savedDevice.contains("sampleRate")
+                               ? savedDevice["sampleRate"].get<double>()
+                               : sampleRates[0];
                 selectSampleRate(savedSr);
             }
         }
@@ -472,8 +548,9 @@ private:
         applyModeRateCap();
     }
 
-    void selectSampleRate(double sr) {
+    void selectSampleRate(double sr, bool updatePreference = true) {
         if (sampleRates.empty()) return;
+        if (updatePreference) preferredSampleRate = sr;
         int best = 0;
         double bestDiff = std::abs(sampleRates[0] - sr);
         for (int i = 1; i < (int)sampleRates.size(); i++) {
@@ -491,6 +568,7 @@ private:
         json c;
         c["mode"]       = mode;
         c["sampleRate"] = sampleRate;
+        c["preferredSampleRate"] = preferredSampleRate;
         c["adcFreq"]    = adcFreq;
         c["biasTeeHF"]  = biasTeeHF;
         c["biasTeeVHF"] = biasTeeVHF;
@@ -575,8 +653,8 @@ private:
             {"sampleRates", rates},
             {"supportsAdcFreq", supportsAdcFreq},
             {"adcClockMHz", adcFreq / 1e6},
-            {"adcMinMHz", 16.0},
-            {"adcMaxMHz", 140.0},
+            {"adcMinMHz", ADC_MIN_FREQ / 1e6},
+            {"adcMaxMHz", ADC_MAX_FREQ / 1e6},
             {"mode", mode},
             {"modes", modes},
             {"gains", gains},
@@ -634,12 +712,12 @@ private:
 
         if (req.contains("adcClockMHz")) {
             double mhz = req["adcClockMHz"].get<double>();
-            if (!std::isfinite(mhz) || mhz < 16.0 || mhz > 140.0) {
+            if (!std::isfinite(mhz) || mhz < ADC_MIN_FREQ / 1e6 || mhz > ADC_MAX_FREQ / 1e6) {
                 error = "ADC clock out of range";
                 return false;
             }
             adcFreq = mhz * 1e6;
-            applyModeRateCap();
+            rebuildSampleRatesForAdc();
         }
 
         if (req.contains("sampleRateId")) {
@@ -652,6 +730,7 @@ private:
             srVisibleId = visibleId;
             srId = realId;
             sampleRate = sampleRates[srId];
+            preferredSampleRate = sampleRate;
             core::setInputSampleRate(sampleRate);
         }
         else if (req.contains("sampleRate")) {
@@ -803,14 +882,18 @@ private:
             // actually supported by this driver instance.
             _this->refreshSettingCapabilities(_this->dev);
             _this->clampAdcToDriverRange(_this->dev);
-            if (_this->supportsAdcFreq)
-                _this->applySetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
+            if (_this->supportsAdcFreq) {
+                _this->dev->writeSetting("adc_frequency", std::to_string((int64_t)_this->adcFreq));
+                std::string actualAdc = _this->dev->readSetting("adc_frequency");
+                if (actualAdc.empty())
+                    throw std::runtime_error("Driver did not report the applied ADC clock");
+                _this->adcFreq = std::stod(actualAdc);
+            }
 
-            double requestedSampleRate = _this->sampleRate;
             _this->refreshSampleRates(_this->dev);
             if (_this->sampleRates.empty())
                 throw std::runtime_error("Driver reported no supported sample rates");
-            _this->selectSampleRate(requestedSampleRate);
+            _this->selectSampleRate(_this->preferredSampleRate, false);
             _this->applyModeRateCap();
 
             // Program the ADC while the freshly opened MkII is still in its
@@ -818,6 +901,11 @@ private:
             // the following STARTADC control transfer fail. Then select the
             // requested antenna explicitly and preserve it while tuning.
             _this->dev->setSampleRate(SOAPY_SDR_RX, 0, _this->sampleRate);
+            double actualSampleRate = _this->dev->getSampleRate(SOAPY_SDR_RX, 0);
+            if (!std::isfinite(actualSampleRate) || actualSampleRate <= 0.0)
+                throw std::runtime_error("Driver reported an invalid IQ sample rate");
+            _this->sampleRate = actualSampleRate;
+            core::setInputSampleRate(_this->sampleRate);
             _this->dev->setAntenna(SOAPY_SDR_RX, 0, _this->mode);
             _this->updateGainRanges();
             _this->dev->setFrequency(SOAPY_SDR_RX, 0, _this->freq);
@@ -989,6 +1077,7 @@ private:
         if (SmGui::Combo(CONCAT("##rx888_sr_", _this->name), &_this->srVisibleId, _this->txtSrList.c_str())) {
             _this->srId = _this->visibleToRealIdx(_this->srVisibleId);
             _this->sampleRate = _this->sampleRates[_this->srId];
+            _this->preferredSampleRate = _this->sampleRate;
             core::setInputSampleRate(_this->sampleRate);
             _this->saveConfig();
         }
@@ -997,10 +1086,33 @@ private:
         if (_this->supportsAdcFreq) {
             SmGui::LeftLabel("ADC Clock");
             SmGui::FillWidth();
-            float adcMHz = (float)(_this->adcFreq / 1e6);
-            if (SmGui::SliderFloat(CONCAT("##rx888_adc_", _this->name), &adcMHz, 16.0f, 140.0f, SmGui::FMT_STR_FLOAT_NO_DECIMAL)) {
-                _this->adcFreq = adcMHz * 1e6;
-                _this->applyModeRateCap();
+            int presetId = adcClockPresetId(_this->adcFreq);
+            int adcChoice = presetId;
+            int presetOffset = 0;
+            std::string adcChoices;
+
+            // Preserve and clearly identify an arbitrary value supplied by an
+            // older config or the control API instead of displaying it as one
+            // of the standard clocks.
+            if (presetId < 0) {
+                char customLabel[64];
+                snprintf(customLabel, sizeof(customLabel), "%.3f MHz (custom; bandwidth varies)",
+                         _this->adcFreq / 1e6);
+                adcChoices += customLabel;
+                adcChoices += '\0';
+                adcChoice = 0;
+                presetOffset = 1;
+            }
+            adcChoices += "16 MHz";  adcChoices += '\0';
+            adcChoices += "32 MHz";  adcChoices += '\0';
+            adcChoices += "64 MHz";  adcChoices += '\0';
+            adcChoices += "128 MHz"; adcChoices += '\0';
+
+            if (SmGui::Combo(CONCAT("##rx888_adc_", _this->name), &adcChoice, adcChoices.c_str())) {
+                int selectedPreset = adcChoice - presetOffset;
+                if (selectedPreset < 0) selectedPreset = 0;
+                _this->adcFreq = adcClockPreset(selectedPreset);
+                _this->rebuildSampleRatesForAdc();
                 _this->saveConfig();
             }
         }
@@ -1141,6 +1253,7 @@ private:
     // Settings
     std::string mode      = "HF";
     double sampleRate     = 32e6;
+    double preferredSampleRate = 32e6;
     double adcFreq        = 128e6;
     bool   biasTeeHF      = false;
     bool   biasTeeVHF     = false;
