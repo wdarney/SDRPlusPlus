@@ -66,6 +66,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -2278,6 +2279,8 @@ let monitorOutputStarted = false;
 const pendingSettingTimers = new Map();
 const pendingSettingDirty = new Set();
 const pendingSettingSeq = new Map();
+const settingSaveInFlight = new Map();
+const pendingSettingBodies = new Map();
 const pendingSourceTimers = new Map();
 const pendingSourceDirty = new Set();
 const pendingSourceSeq = new Map();
@@ -2313,7 +2316,7 @@ const sliderFormatters = {
 };
 async function post(path, body, refreshAfter = true) {
   const ctl = new AbortController();
-  const timeout = setTimeout(() => ctl.abort(), 5000);
+  const timeout = setTimeout(() => ctl.abort(), 10000);
   const r = await fetch(path, {
     method: "POST",
     headers: body ? { "Content-Type": "application/json" } : undefined,
@@ -2462,6 +2465,27 @@ async function saveSettingValue(key, value, controlId, seq) {
   if (controlId && isCurrentSave) pendingSettingDirty.delete(controlId);
   if (isCurrentSave) await refresh();
   if (ok && isCurrentSave && settingsStatus) settingsStatus.textContent = "Settings saved";
+}
+function queueSettingSave(controlId, key, value, seq) {
+  const pending = pendingSettingBodies.get(controlId);
+  if (settingSaveInFlight.get(controlId) === seq || pending?.seq === seq) return;
+  pendingSettingBodies.set(controlId, { key, value, seq });
+  flushSettingSave(controlId);
+}
+async function flushSettingSave(controlId) {
+  if (settingSaveInFlight.has(controlId)) return;
+  const pending = pendingSettingBodies.get(controlId);
+  if (!pending) return;
+  pendingSettingBodies.delete(controlId);
+  settingSaveInFlight.set(controlId, pending.seq);
+  try {
+    await saveSettingValue(pending.key, pending.value, controlId, pending.seq);
+  } finally {
+    settingSaveInFlight.delete(controlId);
+    if (pendingSettingBodies.has(controlId)) {
+      pendingSettingTimers.set(controlId, setTimeout(() => flushSettingSave(controlId), 40));
+    }
+  }
 }
 async function saveSourceControls(body, controlId, seq) {
   const status = document.getElementById("sourceSettingsStatus");
@@ -3591,7 +3615,7 @@ function saveSetting(id, key, read) {
   const queueSave = () => {
     const seq = pendingSettingSeq.get(id) || 0;
     const value = coerceSettingValue(el.value, read);
-    if (value !== undefined) saveSettingValue(key, value, id, seq);
+    if (value !== undefined) queueSettingSave(id, key, value, seq);
   };
   if (el.tagName === "INPUT") {
     el.oninput = () => {
@@ -3603,20 +3627,25 @@ function saveSetting(id, key, read) {
     };
     el.onkeydown = e => {
       if (e.key === "Enter") {
-        bumpSeq();
-        pendingSettingDirty.add(id);
+        if (!pendingSettingDirty.has(id)) {
+          bumpSeq();
+          pendingSettingDirty.add(id);
+        }
         clearTimeout(pendingSettingTimers.get(id));
         queueSave();
         el.blur();
       }
     };
     el.onblur = () => {
-      if (pendingSettingDirty.has(id)) bumpSeq();
       clearTimeout(pendingSettingTimers.get(id));
-      queueSave();
+      if (pendingSettingDirty.has(id)) queueSave();
     };
   } else {
-    el.onchange = queueSave;
+    el.onchange = () => {
+      bumpSeq();
+      pendingSettingDirty.add(id);
+      queueSave();
+    };
   }
 }
 saveSetting("cbMode", "mode");
@@ -4327,6 +4356,194 @@ self.addEventListener("fetch", event => {
         }
     }
 
+    static std::string trimHttpValue(const std::string& value) {
+        size_t first = 0;
+        while (first < value.size() && std::isspace((unsigned char)value[first])) first++;
+        size_t last = value.size();
+        while (last > first && std::isspace((unsigned char)value[last - 1])) last--;
+        return value.substr(first, last - first);
+    }
+
+    static std::string lowerHttpValue(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return (char)std::tolower(c);
+        });
+        return value;
+    }
+
+    static void setRequestReadTimeout(WebSocket fd) {
+#ifdef _WIN32
+        DWORD timeoutMs = 10000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+#else
+        timeval timeout{};
+        timeout.tv_sec = 10;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+    }
+
+    static bool receiveHttpBytes(WebSocket fd, std::string& data, size_t limit,
+                                 std::string& error) {
+        char buf[4096];
+        int n = recv(fd, buf, (int)sizeof(buf), 0);
+        if (n <= 0) {
+            error = n == 0 ? "connection closed before request completed"
+                           : socketErrorString("recv");
+            return false;
+        }
+        if (data.size() + (size_t)n > limit) {
+            error = "request is too large";
+            return false;
+        }
+        data.append(buf, (size_t)n);
+        return true;
+    }
+
+    static bool decodeChunkedRequestBody(WebSocket fd, std::string& wireBody,
+                                         std::string& decoded, std::string& error) {
+        static constexpr size_t MAX_BODY_BYTES = 64 * 1024;
+        static constexpr size_t MAX_WIRE_BYTES = MAX_BODY_BYTES + 16 * 1024;
+        size_t pos = 0;
+        decoded.clear();
+
+        for (;;) {
+            size_t lineEnd = wireBody.find("\r\n", pos);
+            while (lineEnd == std::string::npos) {
+                if (wireBody.size() - pos > 256) {
+                    error = "chunk header is too large";
+                    return false;
+                }
+                if (!receiveHttpBytes(fd, wireBody, MAX_WIRE_BYTES, error)) return false;
+                lineEnd = wireBody.find("\r\n", pos);
+            }
+            if (lineEnd - pos > 256) {
+                error = "chunk header is too large";
+                return false;
+            }
+
+            std::string sizeText = trimHttpValue(wireBody.substr(pos, lineEnd - pos));
+            size_t extension = sizeText.find(';');
+            if (extension != std::string::npos) sizeText.resize(extension);
+            sizeText = trimHttpValue(sizeText);
+            if (sizeText.empty()) {
+                error = "invalid chunk size";
+                return false;
+            }
+
+            size_t chunkSize = 0;
+            for (char c : sizeText) {
+                int digit = c >= '0' && c <= '9' ? c - '0'
+                          : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                          : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                if (digit < 0 || chunkSize > (MAX_BODY_BYTES - (size_t)digit) / 16) {
+                    error = "invalid chunk size";
+                    return false;
+                }
+                chunkSize = chunkSize * 16 + (size_t)digit;
+            }
+            if (chunkSize > MAX_BODY_BYTES - decoded.size()) {
+                error = "request body is too large";
+                return false;
+            }
+
+            pos = lineEnd + 2;
+            size_t required = pos + chunkSize + 2;
+            while (wireBody.size() < required) {
+                if (!receiveHttpBytes(fd, wireBody, MAX_WIRE_BYTES, error)) return false;
+            }
+            if (wireBody[pos + chunkSize] != '\r' || wireBody[pos + chunkSize + 1] != '\n') {
+                error = "invalid chunk terminator";
+                return false;
+            }
+            if (chunkSize == 0) return true;
+            decoded.append(wireBody, pos, chunkSize);
+            pos += chunkSize + 2;
+        }
+    }
+
+    static bool readHttpRequest(WebSocket fd, std::string& reqText, std::string& error) {
+        static constexpr size_t MAX_HEADER_BYTES = 32 * 1024;
+        static constexpr size_t MAX_BODY_BYTES = 64 * 1024;
+        reqText.clear();
+        error.clear();
+        setRequestReadTimeout(fd);
+
+        size_t headerEnd = std::string::npos;
+        while ((headerEnd = reqText.find("\r\n\r\n")) == std::string::npos) {
+            if (!receiveHttpBytes(fd, reqText, MAX_HEADER_BYTES, error)) return false;
+        }
+        if (headerEnd > MAX_HEADER_BYTES) {
+            error = "request headers are too large";
+            return false;
+        }
+
+        bool hasContentLength = false;
+        size_t contentLength = 0;
+        std::string transferEncoding;
+        std::istringstream headers(reqText.substr(0, headerEnd));
+        std::string line;
+        std::getline(headers, line); // request line
+        while (std::getline(headers, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string name = lowerHttpValue(trimHttpValue(line.substr(0, colon)));
+            std::string value = trimHttpValue(line.substr(colon + 1));
+            if (name == "content-length") {
+                if (hasContentLength || value.empty() ||
+                    !std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); })) {
+                    error = "invalid Content-Length";
+                    return false;
+                }
+                try {
+                    unsigned long long parsed = std::stoull(value);
+                    if (parsed > MAX_BODY_BYTES) {
+                        error = "request body is too large";
+                        return false;
+                    }
+                    contentLength = (size_t)parsed;
+                    hasContentLength = true;
+                }
+                catch (...) {
+                    error = "invalid Content-Length";
+                    return false;
+                }
+            }
+            else if (name == "transfer-encoding") {
+                transferEncoding = lowerHttpValue(value);
+            }
+        }
+
+        const size_t bodyStart = headerEnd + 4;
+        bool chunked = transferEncoding.find("chunked") != std::string::npos;
+        if (!transferEncoding.empty() && !chunked) {
+            error = "unsupported Transfer-Encoding";
+            return false;
+        }
+        if (chunked && hasContentLength) {
+            error = "ambiguous request framing";
+            return false;
+        }
+
+        if (chunked) {
+            std::string wireBody = reqText.substr(bodyStart);
+            std::string decoded;
+            if (!decodeChunkedRequestBody(fd, wireBody, decoded, error)) return false;
+            reqText.resize(bodyStart);
+            reqText += decoded;
+            return true;
+        }
+
+        if (hasContentLength) {
+            const size_t total = bodyStart + contentLength;
+            while (reqText.size() < total) {
+                if (!receiveHttpBytes(fd, reqText, MAX_HEADER_BYTES + MAX_BODY_BYTES, error)) return false;
+            }
+            reqText.resize(total);
+        }
+        return true;
+    }
+
     json requestJsonBody(const std::string& reqText) {
         size_t pos = reqText.find("\r\n\r\n");
         if (pos == std::string::npos) return json::object();
@@ -4363,11 +4580,16 @@ self.addEventListener("fetch", event => {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-        char buf[4096];
-        int n = recv(fd, buf, (int)sizeof(buf) - 1, 0);
-        if (n <= 0) return;
-        buf[n] = '\0';
-        std::string reqText(buf, (size_t)n);
+        std::string reqText;
+        std::string readError;
+        if (!readHttpRequest(fd, reqText, readError)) {
+            sendHttpResponse(fd, readError.find("too large") != std::string::npos
+                                     ? "413 Payload Too Large"
+                                     : "400 Bad Request",
+                             "application/json",
+                             json({{"ok", false}, {"error", readError}}).dump());
+            return;
+        }
 
         std::istringstream req(reqText);
         std::string method, path, version;
