@@ -70,7 +70,11 @@
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
+#include <crt_externs.h>
+#include <fcntl.h>
 #include <mach/mach.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #endif
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -109,6 +113,67 @@ class ChannelBankModule;
 
 static constexpr int CB_RF_STREAM_BUFFER_SAMPLES    = 262144;
 static constexpr int CB_AUDIO_STREAM_BUFFER_SAMPLES = 32768;
+
+#ifdef __APPLE__
+static int runLaunchctl(const std::vector<std::string>& arguments, bool quiet = false) {
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (const auto& argument : arguments)
+        argv.push_back(const_cast<char*>(argument.c_str()));
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_t* actionsPtr = nullptr;
+    if (quiet) {
+        if (posix_spawn_file_actions_init(&actions) == 0) {
+            posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+            posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+            actionsPtr = &actions;
+        }
+    }
+
+    pid_t pid = 0;
+    int spawnResult = posix_spawn(&pid, "/bin/launchctl", actionsPtr, nullptr,
+                                  argv.data(), *_NSGetEnviron());
+    if (actionsPtr) posix_spawn_file_actions_destroy(&actions);
+    if (spawnResult != 0) return -spawnResult;
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -errno;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void startAudioMonitorLaunchAgent() {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) {
+        flog::error("[ChannelBank] Cannot start Audio Monitor: HOME is unavailable");
+        return;
+    }
+
+    const std::string domain = "gui/" + std::to_string(getuid());
+    const std::string service = domain + "/com.audiomonitor.server";
+    const std::string plist = std::string(home) +
+                              "/Library/LaunchAgents/com.audiomonitor.server.plist";
+
+    // Bootstrap only when the service is not already registered. Kickstart is
+    // still run every time Channel Bank starts, matching the manual workflow.
+    if (runLaunchctl({"launchctl", "print", service}, true) != 0) {
+        int bootstrapResult = runLaunchctl({"launchctl", "bootstrap", domain, plist});
+        if (bootstrapResult != 0) {
+            flog::error("[ChannelBank] Audio Monitor bootstrap failed with status {0}", bootstrapResult);
+            return;
+        }
+    }
+
+    int kickstartResult = runLaunchctl({"launchctl", "kickstart", service});
+    if (kickstartResult == 0)
+        flog::info("[ChannelBank] Audio Monitor service started");
+    else
+        flog::error("[ChannelBank] Audio Monitor kickstart failed with status {0}", kickstartResult);
+}
+#endif
 
 #if defined(__APPLE__) || defined(_WIN32)
 struct TranscriptionJob {
@@ -443,6 +508,10 @@ public:
                 scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });
         if (config.conf[name].contains("autoStart"))
             autoStart = config.conf[name]["autoStart"];
+#ifdef __APPLE__
+        if (config.conf[name].contains("startAudioMonitorOnStart"))
+            startAudioMonitorOnStart = config.conf[name]["startAudioMonitorOnStart"];
+#endif
         if (config.conf[name].contains("webControlEnabled"))
             webControlEnabled = config.conf[name]["webControlEnabled"];
         if (config.conf[name].contains("webControlPort"))
@@ -620,6 +689,9 @@ public:
         playbackThread  = std::thread(&ChannelBankModule::playbackThreadFunc, this);
 
         running = true;
+#ifdef __APPLE__
+        if (startAudioMonitorOnStart) startAudioMonitorLaunchAgent();
+#endif
     }
 
     void stop() {
@@ -8827,6 +8899,17 @@ self.addEventListener("fetch", event => {
             config.release(true);
         }
 
+#ifdef __APPLE__
+        if (ImGui::Checkbox(CONCAT("Start Audio Monitor service##_cb_audio_monitor_", _this->name),
+                            &_this->startAudioMonitorOnStart)) {
+            config.acquire();
+            config.conf[_this->name]["startAudioMonitorOnStart"] = _this->startAudioMonitorOnStart;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Start com.audiomonitor.server whenever Channel Bank starts");
+#endif
+
         if (ImGui::Checkbox(CONCAT("Web Control##_cb_webctl_", _this->name),
                             &_this->webControlEnabled)) {
             if (_this->webControlEnabled) _this->startWebServer();
@@ -9787,6 +9870,9 @@ self.addEventListener("fetch", event => {
     bool         enabled       = true;
     bool         running       = false;
     bool         autoStart     = false;
+#ifdef __APPLE__
+    bool         startAudioMonitorOnStart = false;
+#endif
     std::mutex   runMtx;
     bool         webControlEnabled = false;
     int          webControlPort    = 18080;
