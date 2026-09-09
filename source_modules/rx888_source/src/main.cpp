@@ -1144,20 +1144,30 @@ private:
 
         // --- Controls that work live ---
 
-        // Gains — skip any stage whose range is zero (e.g. RF gain in HF mode = [0,0])
+        // Gain controls — skip any stage whose range is zero.
         for (int i = 0; i < (int)_this->gainList.size(); i++) {
             float gmin = (float)_this->gainRanges[i].minimum();
             float gmax = (float)_this->gainRanges[i].maximum();
             if (gmin == gmax) continue;  // nothing to control
 
-            // RF gain: 0 = minimum gain, higher values = more gain/sensitivity
-            std::string glabel = _this->gainList[i] + " Gain";
+            // SDDC represents the HF RF attenuator as negative gain
+            // (-31.5 dB through 0 dB). Present it as positive attenuation so
+            // the label, value, and direction describe the actual hardware.
+            const bool hfRfAttenuation = _this->mode == "HF" && _this->gainList[i] == "RF";
+            std::string glabel = hfRfAttenuation ? "RF Attenuation" : _this->gainList[i] + " Gain";
             SmGui::LeftLabel(glabel.c_str());
             SmGui::FillWidth();
             float step = (float)_this->gainRanges[i].step();
             bool changed;
             std::string id = std::string("##rx888_gain_") + _this->name + "_" + _this->gainList[i];
-            if (step > 0.0f) {
+            if (hfRfAttenuation) {
+                float attenuation = -_this->uiGains[i];
+                changed = SmGui::SliderFloatWithSteps(id.c_str(), &attenuation, 0.0f, 31.5f, 0.5f,
+                                                      SmGui::FMT_STR_FLOAT_DB_ONE_DECIMAL);
+                if (changed)
+                    _this->uiGains[i] = -attenuation;
+            }
+            else if (step > 0.0f) {
                 changed = SmGui::SliderFloatWithSteps(id.c_str(), &_this->uiGains[i], gmin, gmax, step);
             }
             else {
