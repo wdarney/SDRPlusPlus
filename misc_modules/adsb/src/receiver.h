@@ -1,5 +1,6 @@
 #pragma once
 #include "http_server.h"
+#include "history.h"
 #include <rtl-sdr.h>
 #include <atomic>
 #include <condition_variable>
@@ -10,7 +11,7 @@
 
 namespace adsb {
 struct Device { std::string serial, label; unsigned index; bool unique; };
-struct Settings { std::string serial; int gain=400, ppm=0; double lat=0, lon=0; bool location=false, agc=false; };
+struct Settings { std::string serial; int gain=400, ppm=0, historyHours=6; double lat=0, lon=0; bool location=false, agc=false; };
 std::vector<Device> devices();
 uint64_t nowMillis();
 class Receiver {
@@ -42,8 +43,6 @@ private:
     bool gap_=false;
     std::thread reader_, decoder_;
     std::string status_="Stopped", aircraft_;
-    std::vector<std::string> history_;
-    size_t historyNext_=0;
-    uint64_t lastHistory_=0;
+    SessionHistory history_;
 };
 }

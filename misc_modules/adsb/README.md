@@ -40,15 +40,20 @@ can be disabled using **Open map on module load**. Capture never auto-starts.
   barometric vertical rate, squawk, category, signal strength, and timestamps.
   Fields are emitted only while valid. Contacts without a position remain in
   the aircraft table. Live contacts expire after 60 seconds without messages.
-- Up to 4096 retained tracks after periodic cleanup; 120 in-memory history
-  snapshots, one every 15 seconds (up to 30 minutes). History resets on Start.
+- Up to 4096 retained tracks after periodic cleanup; in-memory history snapshots every
+  15 seconds, default six hours (1440 snapshots), adjustable from 1–24 hours
+  while stopped. A 512 MB cap may shorten retention in busy airspace.
+  History resets on Start or app exit; Stop alone preserves it.
   Reopening/reloading tar1090 reconstructs trails from available snapshots.
 - Read-only HTTP server on an OS-assigned **127.0.0.1** port. The URL appears
   in the module controls and can also be opened in a local browser. No LAN
   listening, outbound aircraft feed, or device-control HTTP endpoints.
-- Web assets and licenses are bundled. Detailed background maps need
-  internet. The test default is ESRI gray, verified in WKWebView; other
-  tar1090 layers remain selectable and depend on their providers.
+- Web assets and licenses are bundled. The default **Basic offline map** includes
+  worldwide country outlines, country labels, and city labels from Natural Earth (2.5 MB bundled).
+  It requires no tile cache, download, or internet connection. This is a
+  low-detail map, without streets or terrain. Detailed online layers remain
+  selectable using tar1090’s layer selector and need internet. Aircraft photos
+  are disabled by default to avoid an optional external dependency.
 - Aircraft metadata databases, registration/type enrichment, long-term trace
   archives, replay, MLAT, and 978 MHz UAT reception are not implemented.
   tar1090's standard legend includes other data sources even though this

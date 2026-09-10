@@ -17,8 +17,9 @@ args += [f"-D{option}=OFF" for option in options]
 args += [f"-DOPT_BUILD_{name}=ON" for name in ["ADSB", "RADIO", "RTL_SDR_SOURCE", "AUDIO_SINK"]]
 subprocess.run(args, check=True)
 subprocess.run(["cmake", "--build", str(build), "--target", "sdrpp", "adsb", "radio",
-                "rtl_sdr_source", "audio_sink", "adsb_decoder_test", "adsb_http_fixture", "-j8"], check=True)
+                "rtl_sdr_source", "audio_sink", "adsb_decoder_test", "adsb_history_test", "adsb_http_fixture", "-j8"], check=True)
 subprocess.run([str(build / "misc_modules/adsb/adsb_decoder_test")], check=True)
+subprocess.run([str(build / "misc_modules/adsb/adsb_history_test")], check=True)
 subprocess.run([str(build / "misc_modules/adsb/adsb_http_fixture"), "misc_modules/adsb/web", "--receiver-check"], check=True)
 subprocess.run(["python3", "misc_modules/adsb/tests/http_test.py", str(build / "misc_modules/adsb/adsb_http_fixture"), "misc_modules/adsb/web"], check=True)
 

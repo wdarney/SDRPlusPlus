@@ -28,6 +28,7 @@ public:
         settings_.serial=config.conf.value("serial",std::string());
         settings_.gain=config.conf.value("gain",400);
         settings_.ppm=config.conf.value("ppm",0);
+        settings_.historyHours=std::clamp(config.conf.value("history_hours",6),1,24);
         settings_.lat=config.conf.value("latitude",0.0);
         settings_.lon=config.conf.value("longitude",0.0);
         settings_.location=config.conf.value("location_valid",false);
@@ -61,7 +62,7 @@ private:
         config.acquire();
         config.conf={{"serial",settings_.serial},{"gain",settings_.gain},{"ppm",settings_.ppm},
             {"latitude",settings_.lat},{"longitude",settings_.lon},{"location_valid",settings_.location},{"tuner_agc",settings_.agc},
-            {"open_map_on_load",openOnLoad_}};
+            {"open_map_on_load",openOnLoad_},{"history_hours",settings_.historyHours}};
         config.release(true);
     }
     static void draw(void* context) {
@@ -88,6 +89,7 @@ private:
         changed|=ImGui::Checkbox("Receiver location set##adsb",&s.settings_.location);
         changed|=ImGui::InputDouble("Latitude##adsb",&s.settings_.lat,0,0,"%.6f");
         changed|=ImGui::InputDouble("Longitude##adsb",&s.settings_.lon,0,0,"%.6f");
+        changed|=ImGui::SliderInt("History (hours)##adsb",&s.settings_.historyHours,1,24);
         if(changed)s.save();
         ImGui::EndDisabled();
         if(running){if(ImGui::Button("Stop ADS-B"))s.receiver_.stop();}
@@ -103,7 +105,7 @@ private:
         ImGui::Text("Dropped buffers: %llu",static_cast<unsigned long long>(s.receiver_.dropped()));
         if(!s.error_.empty())ImGui::TextWrapped("%s",s.error_.c_str());
         if(s.server_.port())ImGui::TextWrapped("%s",s.server_.url().c_str());
-        ImGui::TextWrapped("Session history: up to 30 minutes. Map backgrounds need internet. Start/Stop is independent of the main receiver.");
+        ImGui::TextWrapped("History stays in memory until the next Start or app exit (512 MB maximum). Basic offline map is bundled; detailed map layers need internet. Start/Stop is independent of the main receiver.");
     }
     std::string name_,error_;
     bool enabled_=true;

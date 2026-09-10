@@ -19,6 +19,7 @@ function createBaseLayers() {
     });
 
     let world = new ol.Collection();
+    world.push(createSDRPPBasicMap());
     let us = new ol.Collection();
     let europe = new ol.Collection();
 

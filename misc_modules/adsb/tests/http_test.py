@@ -26,6 +26,9 @@ try:
     assert status == 200 and b"tar1090" in body and int(headers["Content-Length"]) == len(body)
     status, body, headers = request("/libs/ol-custom-10.9.0.js")
     assert status == 200 and len(body) > 100000 and int(headers["Content-Length"]) == len(body)
+    status, body, _ = request("/basic-world.geojson")
+    assert status == 200 and len(json.loads(body)["features"]) == 1493
+    assert request("/sdrpp_basic_map.js")[0] == 200
     assert request("/", "HEAD")[1] == b""
     assert request("/", "POST")[0] == 405
     assert request("/", headers={"Host": "untrusted.example"})[0] == 403

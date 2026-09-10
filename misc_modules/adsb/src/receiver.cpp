@@ -29,7 +29,7 @@ void Receiver::start(const Settings& settings) {
     if(settings.location && (!std::isfinite(settings.lat)||!std::isfinite(settings.lon)||std::abs(settings.lat)>90||std::abs(settings.lon)>180)) {
         setStatus("Receiver coordinates are outside the valid range"); return;
     }
-    { std::lock_guard<std::mutex> lock(stateMutex_); settings_=settings; history_.clear(); historyNext_=0; lastHistory_=0; aircraft_.clear(); }
+    { std::lock_guard<std::mutex> lock(stateMutex_); settings_=settings; history_.reset(settings.historyHours); aircraft_.clear(); }
     dropped_=0; messages_=0; aircraftCount_=0; gap_=true;
     stop_=false; readerDone_=false; active_=true;
     setStatus("Opening dedicated RTL-SDR...");
@@ -175,12 +175,7 @@ void Receiver::publish() {
     auto body=json({{"now",now/1000.0},{"messages",total},{"aircraft",list}}).dump();
     std::lock_guard<std::mutex> lock(stateMutex_);
     aircraft_=std::move(body);
-    // 30 minutes, one snapshot every 15 seconds, held only for this session.
-    if(now-lastHistory_>=15000) {
-        if(history_.size()<120)history_.push_back(aircraft_);
-        else {history_[historyNext_]=aircraft_;historyNext_=(historyNext_+1)%120;}
-        lastHistory_=now;
-    }
+    history_.append(now,aircraft_);
 }
 Response Receiver::data(const std::string& path) {
     std::lock_guard<std::mutex> lock(stateMutex_);
@@ -196,7 +191,7 @@ Response Receiver::data(const std::string& path) {
     const std::string prefix="/data/history_";
     if(path.rfind(prefix,0)==0 && path.size()>prefix.size()+5 && path.substr(path.size()-5)==".json") {
         auto value=path.substr(prefix.size(),path.size()-prefix.size()-5);
-        if(value.size()<=3 && value.find_first_not_of("0123456789")==std::string::npos) {
+        if(value.size()<=4 && value.find_first_not_of("0123456789")==std::string::npos) {
             auto index=std::stoul(value);if(index<history_.size())return {200,"application/json",history_[index]};
         }
     }

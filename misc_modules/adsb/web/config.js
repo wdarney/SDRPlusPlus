@@ -439,6 +439,9 @@ tableColors = {
 
 // SDR++ bundled interface defaults.
 SiteName = "SDR++ ADS-B";
-MapType_tar1090 = "esri_gray";
+MapType_tar1090 = "sdrpp_basic";
 DisplayUnits = "nautical";
 DefaultZoomLvl = 7;
+
+// Optional aircraft photos require external services.
+showPictures = false;
