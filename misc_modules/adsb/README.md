@@ -50,7 +50,9 @@ can be disabled using **Open map on module load**. Capture never auto-starts.
   listening, outbound aircraft feed, or device-control HTTP endpoints.
 - Web assets and licenses are bundled. The default **Basic offline map** includes
   worldwide country outlines, country labels, and city labels from Natural Earth (2.5 MB bundled).
-  It requires no tile cache, download, or internet connection. This is a
+  It requires no tile cache, download, or internet connection. The basemap
+  uses cached-image rendering during pan/zoom; labels sharpen after zooming
+  settles. Aircraft remain on tar1090’s separate live layers. This is a
   low-detail map, without streets or terrain. Detailed online layers remain
   selectable using tar1090’s layer selector and need internet. Aircraft photos
   are disabled by default to avoid an optional external dependency.

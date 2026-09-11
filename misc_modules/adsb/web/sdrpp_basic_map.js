@@ -4,7 +4,10 @@ function createSDRPPBasicMap() {
     const fill = new ol.style.Fill({color: '#eef0e6'});
     const stroke = new ol.style.Stroke({color: '#87958a', width: 1});
     const styles = new Map();
-    return new ol.layer.Vector({
+    // Reuse a rendered image during gestures instead of repainting every polygon.
+    // A modest margin keeps short drags inside the cached image.
+    return new ol.layer.VectorImage({
+        imageRatio: 1.5,
         name: 'sdrpp_basic', title: 'Basic offline map', type: 'base',
         visible: false, background: '#cbdfe9', declutter: true,
         source: new ol.source.Vector({
