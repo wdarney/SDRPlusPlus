@@ -57,6 +57,7 @@
 #include <memory>
 #ifdef __APPLE__
 #include "transcription.h"
+#include "bluetooth_macos.h"
 #endif
 #if defined(__APPLE__) || defined(_WIN32)
 #include "transcription_whisper.h"
@@ -512,6 +513,7 @@ public:
 #ifdef __APPLE__
         if (config.conf[name].contains("startAudioMonitorOnStart"))
             startAudioMonitorOnStart = config.conf[name]["startAudioMonitorOnStart"];
+        bluetoothEnabled = config.conf[name].value("bluetoothEnabled", false);
 #endif
         if (config.conf[name].contains("webControlEnabled"))
             webControlEnabled = config.conf[name]["webControlEnabled"];
@@ -566,6 +568,10 @@ public:
     }
 
     ~ChannelBankModule() {
+#ifdef __APPLE__
+        channel_bank_bluetooth::stop(bluetoothHandle);
+        bluetoothHandle = nullptr;
+#endif
         stopWebServer();
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
@@ -603,7 +609,21 @@ public:
             }
         }
         if (webControlEnabled) startWebServer();
+#ifdef __APPLE__
+        if (bluetoothEnabled) startBluetooth();
+#endif
     }
+#ifdef __APPLE__
+    void startBluetooth() {
+        if (bluetoothHandle) return;
+        webControlEnabled = true;
+        startWebServer();
+        if (!webServerRunning.load()) return;
+        std::string host = webDisplayBindAddress();
+        if (host == "0.0.0.0") host = "127.0.0.1";
+        bluetoothHandle = channel_bank_bluetooth::start(host, webControlPort);
+    }
+#endif
     void enable()  { enabled = true; }
     void disable() { enabled = false; restoreWaterfallVisibility(); }
     bool isEnabled() { return enabled; }
@@ -9132,6 +9152,24 @@ self.addEventListener("fetch", event => {
             ImGui::SetTooltip("Start com.audiomonitor.server whenever Channel Bank starts");
 #endif
 
+#ifdef __APPLE__
+        if (ImGui::Checkbox(CONCAT("Bluetooth iPhone control##_cb_ble_", _this->name), &_this->bluetoothEnabled)) {
+            if (_this->bluetoothEnabled) _this->startBluetooth();
+            else {
+                channel_bank_bluetooth::stop(_this->bluetoothHandle);
+                _this->bluetoothHandle = nullptr;
+            }
+            config.acquire();
+            config.conf[_this->name]["bluetoothEnabled"] = _this->bluetoothEnabled;
+            config.conf[_this->name]["webControlEnabled"] = _this->webControlEnabled;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Allow nearby iPhones with the Channel Bank app to control this radio.\nUses Web Control. Bluetooth audio and downloads are unavailable.");
+        if (_this->bluetoothEnabled)
+            ImGui::TextWrapped("%s", channel_bank_bluetooth::status(_this->bluetoothHandle).c_str());
+        if (_this->bluetoothEnabled) style::beginDisabled();
+#endif
         if (ImGui::Checkbox(CONCAT("Web Control##_cb_webctl_", _this->name),
                             &_this->webControlEnabled)) {
             if (_this->webControlEnabled) _this->startWebServer();
@@ -9143,6 +9181,9 @@ self.addEventListener("fetch", event => {
             config.conf[_this->name]["webControlEnabled"] = _this->webControlEnabled;
             config.release(true);
         }
+#ifdef __APPLE__
+        if (_this->bluetoothEnabled) style::endDisabled();
+#endif
 
         bool webControlListening = _this->webServerRunning.load();
         if (webControlListening) style::beginDisabled();
@@ -10094,6 +10135,8 @@ self.addEventListener("fetch", event => {
     bool         autoStart     = false;
 #ifdef __APPLE__
     bool         startAudioMonitorOnStart = false;
+    bool         bluetoothEnabled = false;
+    void*        bluetoothHandle = nullptr;
 #endif
     std::mutex   runMtx;
     bool         webControlEnabled = false;
