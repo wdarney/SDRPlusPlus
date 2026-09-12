@@ -19,6 +19,7 @@ bundle_is_not_to_be_installed() {
     if [ "$1" = "CoreGraphics" ]; then echo 1; fi
     if [ "$1" = "CoreServices" ]; then echo 1; fi
     if [ "$1" = "Foundation" ]; then echo 1; fi
+    if [ "$1" = "CoreBluetooth" ]; then echo 1; fi
     if [ "$1" = "CoreAudio" ]; then echo 1; fi
     if [ "$1" = "AudioToolbox" ]; then echo 1; fi
     if [ "$1" = "AudioUnit" ]; then echo 1; fi
@@ -223,6 +224,10 @@ bundle_create_plist() {
     echo '        <key>CFBundleSignature</key><string>'$5'</string>' >> $8
     echo '        <key>CFBundleExecutable</key><string>'$6'</string>' >> $8
     echo '        <key>CFBundleIconFile</key><string>'$7'</string>' >> $8
+    echo '        <key>NSBluetoothAlwaysUsageDescription</key><string>Allow your iPhone to control SDR++ Channel Bank over Bluetooth.</string>' >> $8
+    echo '        <key>NSBluetoothPeripheralUsageDescription</key><string>Allow your iPhone to control SDR++ Channel Bank over Bluetooth.</string>' >> $8
+    echo '        <key>NSLocalNetworkUsageDescription</key><string>Connect to SDR sources and the local Channel Bank control service.</string>' >> $8
+    echo '        <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>' >> $8
     echo '    </dict>' >> $8
     echo '</plist>' >> $8
 }
