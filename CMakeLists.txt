@@ -72,6 +72,7 @@ option(OPT_BUILD_VOR_RECEIVER "VOR beacon receiver" OFF)
 option(OPT_BUILD_WEATHER_SAT_DECODER "Build the HRPT decoder module (no dependencies required)" OFF)
 
 # Misc
+option(OPT_BUILD_ADSB "Build dedicated RTL-SDR ADS-B with tar1090 (macOS)" OFF)
 option(OPT_BUILD_DISCORD_PRESENCE "Build the Discord Rich Presence module" ON)
 option(OPT_BUILD_FREQUENCY_MANAGER "Build the Frequency Manager module" ON)
 option(OPT_BUILD_IQ_EXPORTER "Build the IQ Exporter module" ON)
@@ -368,6 +369,10 @@ endif (OPT_BUILD_RIGCTL_CLIENT)
 if (OPT_BUILD_RIGCTL_SERVER)
 add_subdirectory("misc_modules/rigctl_server")
 endif (OPT_BUILD_RIGCTL_SERVER)
+
+if (OPT_BUILD_ADSB)
+    add_subdirectory(misc_modules/adsb)
+endif ()
 
 if (OPT_BUILD_CHANNEL_BANK)
 add_subdirectory("misc_modules/channel_bank")

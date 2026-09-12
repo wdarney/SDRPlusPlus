@@ -32,3 +32,4 @@ misc_modules/modulation_monitor
 /build-integration-*/
 /build-rx888-recovery-macos/
 /build-brown-dsd/
+/build-adsb/

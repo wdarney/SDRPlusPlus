@@ -115,5 +115,10 @@ fi
 
 # ========================= Finalize =========================
 
+if [ -f "$BUILD_DIR/misc_modules/adsb/adsb.dylib" ]; then
+    mkdir -p "$BUNDLE/Contents/Resources/adsb"
+    cp -R "$BUILD_DIR/misc_modules/adsb/adsb-web/." "$BUNDLE/Contents/Resources/adsb/"
+fi
+
 # Sign the app
 bundle_sign $BUNDLE
