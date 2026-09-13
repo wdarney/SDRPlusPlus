@@ -191,11 +191,13 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     message.central = central;
     message.characteristic = characteristic;
     message.identifier = identifier;
-    // Audio pages use Response; don't leave them behind unsent full-state snapshots.
+    // Responses can safely interrupt a State transfer because the client assembles
+    // each characteristic independently. This keeps control and compact fallback
+    // requests responsive while a large State snapshot is still draining.
     if ([characteristic.UUID isEqual:uuid(3)]) {
         NSUInteger index = 0;
-        while (index < _outgoing.count && (_outgoing[index].offset > 0 ||
-                [_outgoing[index].characteristic.UUID isEqual:uuid(3)])) ++index;
+        while (index < _outgoing.count &&
+                [_outgoing[index].characteristic.UUID isEqual:uuid(3)]) ++index;
         [_outgoing insertObject:message atIndex:index];
     } else [_outgoing addObject:message];
     [self pump];
@@ -440,7 +442,9 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
             }
             if (subscribed && !stopping && std::chrono::steady_clock::now() >= nextSnapshot) {
                 nextSnapshot = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-                BOOL full = (_tick++ % 10) == 0;
+                // A compact Summary must arrive first. Sending the 20 KB full State
+                // at connection time starves the app's usable initial interface.
+                BOOL full = (++_tick % 20) == 0;
                 NSData* result = jsonData([self perform:@{@"v":@1, @"id":@0, @"method":@"GET",
                     @"path":full ? @"/api/state" : @"/api/state/summary"}]);
                 dispatch_sync(queue, ^{
