@@ -9,13 +9,30 @@ transport. Windows remains out of scope.
 
 ## Current State
 
+### Latest AAC Build Handoff
+
+- Mac adapter implementation: `7e241d9e` on
+  `origin/wd/channel-bank-macos-telemetry`. Apply this after the existing
+  telemetry/queue fixes, including `35cb1e43` (or its integrated equivalent).
+- iPhone implementation: `a8721904` on
+  `origin/codex/sdrpp-android-channel-bank-ble`, including UI threading fix
+  `6deebec2` and download-continuity fix `3486ccad`. Installed on the iPhone.
+- Rebuild the Mac test app with `7e241d9e`. It adds only a Bluetooth-private
+  AAC copy, preparation polling and adapter tests/documentation. Preserve the
+  local Mac Channel Bank pipeline: do not change `main.cpp`, `encoding.mm`,
+  playback, recording, transcription, or the WebUI for this feature.
+- Mac focused build and radio-free codec/lease tests passed. The ten-second
+  fixture shrank from 960,044 to 51,434 bytes and decoded at full duration.
+  All 32 Swift tests and the signed iPhone build/install passed. Physical
+  Mac-to-iPhone compressed transfer and audible playback still need testing.
+
 - Canonical shared target: `integration/main` at `c07b15c6`.
 - The packaged macOS test app at local commit `a3ae628e` is an intentionally
   layered test artifact, not the canonical source history.
-- The current macOS candidate is `origin/wd/channel-bank-macos-telemetry`.
-  Confirm its tip after the compact-frame scheduler commit is pushed.
+- The macOS candidate is `origin/wd/channel-bank-macos-telemetry`; latest
+  implementation commit is `7e241d9e` (subsequent commits may update this map).
 - The current Android/iPhone candidate is
-  `origin/codex/sdrpp-android-channel-bank-ble` at `893b2049`.
+  `origin/codex/sdrpp-android-channel-bank-ble` at `a8721904`.
 - Do not modify the dirty `docs/RX888_MACOS_KNOWN_GOOD.md` in the existing
   integration checkout. Do not stage generated build directories or the dirty
   `misc_modules/channel_bank/BLE_GATT_PROTOCOL.md` from the Android checkout.
@@ -56,18 +73,21 @@ The Mac telemetry port must retain all of the following:
 Bring the whole iPhone client series, in order, from
 `codex/sdrpp-android-channel-bank-ble`; do not select only the last two
 diagnostic commits. The range starts with `5fe3d1f2` and currently ends at
-`893b2049`:
+`a8721904`:
 
 ```text
 5fe3d1f2 aee8082b 6c46f414 1191ce26 9f6dd25a 1936084a daf56435
 4ed14785 b0a37542 653d5932 55737fee b93aa410 6c490b4a ab8a20d8
 4367baef fe5da81c 23b176ec fe401569 402000a0 747df005 a6fbbe38
 53aaeff5 40f79a58 893b2049
+6deebec2 3486ccad a8721904
 ```
 
-The last two commits preserve fresh SNR telemetry across delayed full State
+Commits `40f79a58` and `893b2049` preserve fresh SNR telemetry across delayed full State
 snapshots, add bounded receipt diagnostics, and fall back to the compact State
 Summary route rather than requesting another full State over BLE.
+The following three fixes serialize UI/request state on the main actor, finish
+leased audio before following a new clip, and support AAC preparation polling.
 
 ## Android Series
 
