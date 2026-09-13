@@ -2410,7 +2410,10 @@ static bool whisper_encode_internal(
             ggml_backend_sched_reset(sched);
 
 #if defined(WHISPER_USE_COREML)
-            whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], (float *) mel->data, (float *) wstate.embd_enc->data);
+            if (!whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], (float *) mel->data,
+                                       (float *) wstate.embd_enc->data, ggml_nelements(wstate.embd_enc))) {
+                return false;
+            }
 #elif defined(WHISPER_USE_OPENVINO)
             whisper_openvino_encode(wstate.ctx_openvino, mel, wstate.embd_enc);
 #endif
@@ -3438,12 +3441,16 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     }
 
 #ifdef WHISPER_USE_COREML
+#ifdef CB_WHISPER_COREML
+    if (ctx->params.use_coreml) {
+#endif
     const auto path_coreml = whisper_get_coreml_path_encoder(ctx->path_model);
 
     WHISPER_LOG_INFO("%s: loading Core ML model from '%s'\n", __func__, path_coreml.c_str());
     WHISPER_LOG_INFO("%s: first run on a device may take a while ...\n", __func__);
 
-    state->ctx_coreml = whisper_coreml_init(path_coreml.c_str());
+    state->ctx_coreml = whisper_coreml_init(path_coreml.c_str(), ctx->model.hparams.n_mels,
+                                           ctx->model.hparams.n_audio_ctx, ctx->model.hparams.n_audio_state);
     if (!state->ctx_coreml) {
         WHISPER_LOG_ERROR("%s: failed to load Core ML model from '%s'\n", __func__, path_coreml.c_str());
 #ifndef WHISPER_COREML_ALLOW_FALLBACK
@@ -3453,6 +3460,9 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     } else {
         WHISPER_LOG_INFO("%s: Core ML model loaded\n", __func__);
     }
+#ifdef CB_WHISPER_COREML
+    }
+#endif
 #endif
 
     state->logits.reserve(ctx->vocab.n_vocab * ctx->model.hparams.n_text_ctx);
@@ -3603,8 +3613,17 @@ int whisper_ctx_init_openvino_encoder(
     return whisper_ctx_init_openvino_encoder_with_state(ctx, ctx->state, model_path, device, cache_dir);
 }
 
+#ifdef CB_WHISPER_COREML
+bool whisper_coreml_is_active(struct whisper_context * ctx) {
+    return ctx && ctx->state && ctx->state->ctx_coreml;
+}
+#endif
+
 struct whisper_context_params whisper_context_default_params() {
     struct whisper_context_params result = {
+#ifdef CB_WHISPER_COREML
+        /*.use_coreml =*/ true,
+#endif
         /*.use_gpu              =*/ true,
         /*.flash_attn           =*/ true,
         /*.gpu_device           =*/ 0,

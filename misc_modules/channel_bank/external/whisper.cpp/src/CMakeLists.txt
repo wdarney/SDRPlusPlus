@@ -65,6 +65,12 @@ if (WHISPER_COREML)
         coreml/whisper-encoder-impl.m
         )
 
+    # Match the embedding desktop project's C/C++ language setup. Clang still
+    # recognizes Objective-C/Objective-C++ from the .m/.mm extensions.
+    set_source_files_properties(coreml/whisper-encoder.mm PROPERTIES LANGUAGE CXX)
+    set_source_files_properties(coreml/whisper-compat.m coreml/whisper-encoder-impl.m
+        PROPERTIES LANGUAGE C)
+
     include(DefaultTargetOptions)
 
     target_include_directories(${TARGET} PUBLIC

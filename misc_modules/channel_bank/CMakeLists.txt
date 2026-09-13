@@ -34,15 +34,19 @@ if (NOT MSVC)
 endif()
 
 # whisper.cpp — in-process speech-to-text (vendored under external/whisper.cpp).
-# macOS: Metal + Accelerate.  Windows: CPU-only (no CUDA/Vulkan — Intel iGPU only).
+# macOS: optional Core ML encoder + Metal + Accelerate.  Windows: CPU-only (no CUDA/Vulkan — Intel iGPU only).
 if (APPLE AND NOT ANDROID)
+    # Honor this normal-variable override on the first configure as well.
+    set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
     set(BUILD_SHARED_LIBS OFF)
     set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
     set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
     set(WHISPER_CURL           OFF CACHE BOOL "" FORCE)
     set(WHISPER_SDL2           OFF CACHE BOOL "" FORCE)
-    set(WHISPER_COREML         OFF CACHE BOOL "" FORCE)
+    option(CHANNEL_BANK_COREML "Enable optional macOS Whisper Core ML encoder" ON)
+    set(WHISPER_COREML ${CHANNEL_BANK_COREML} CACHE BOOL "" FORCE)
+    set(WHISPER_COREML_ALLOW_FALLBACK ON CACHE BOOL "" FORCE)
     set(GGML_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
     set(GGML_BUILD_EXAMPLES    OFF CACHE BOOL "" FORCE)
     set(GGML_METAL             ON  CACHE BOOL "" FORCE)
@@ -52,6 +56,10 @@ if (APPLE AND NOT ANDROID)
     set(WHISPER_ALL_WARNINGS_3RD_PARTY OFF CACHE BOOL "" FORCE)
     set(GGML_ALL_WARNINGS_3RD_PARTY    OFF CACHE BOOL "" FORCE)
     add_subdirectory(external/whisper.cpp EXCLUDE_FROM_ALL)
+    if (CHANNEL_BANK_COREML)
+        # Public so the module and static whisper library share the guarded ABI.
+        target_compile_definitions(whisper PUBLIC CB_WHISPER_COREML)
+    endif()
 elseif (MSVC)
     set(BUILD_SHARED_LIBS OFF)
     set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)

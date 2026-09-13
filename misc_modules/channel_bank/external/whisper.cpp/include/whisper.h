@@ -113,7 +113,16 @@ extern "C" {
         const whisper_ahead * heads;
     } whisper_aheads;
 
+#ifdef CB_WHISPER_COREML
+    // Reports a loaded encoder, not proof of ANE hardware placement.
+    WHISPER_API bool whisper_coreml_is_active(struct whisper_context * ctx);
+#endif
+
     struct whisper_context_params {
+#ifdef CB_WHISPER_COREML
+        // Channel Bank macOS extension; absent from other platform builds.
+        bool  use_coreml;
+#endif
         bool  use_gpu;
         bool  flash_attn;
         int   gpu_device;  // CUDA device

@@ -1,0 +1,6 @@
+# Python 3.11 on Apple Silicon; see COREML.md for the separate ANE helper install.
+numpy==1.26.4
+torch==2.5.0
+coremltools==8.3.0
+transformers==4.46.3
+openai-whisper==20240930
