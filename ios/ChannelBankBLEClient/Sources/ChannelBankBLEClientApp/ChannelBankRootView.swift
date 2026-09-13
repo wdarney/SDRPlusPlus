@@ -383,16 +383,53 @@ public struct ChannelBankRootView: View {
     }
 
     private func centerPanel(_ state: ChannelBankState) -> some View {
-        Panel("Center") {
+        let centerHz = state.centerHz ?? state.waterfallCenterHz
+        let span = SpanInfo(state: state)
+        return Panel("Center") {
+            HStack {
+                Text("Center")
+                Spacer()
+                Text(ChannelBankFormatters.mhz(centerHz))
+                    .font(.headline.monospacedDigit())
+            }
+            if let span {
+                Text("Span \(ChannelBankFormatters.mhz(span.lowHz)) to \(ChannelBankFormatters.mhz(span.highHz))  (\(ChannelBankFormatters.compactHz(span.spanHz)))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Waiting for sample-rate span")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 10) {
+                Text("-").font(.headline).foregroundStyle(.secondary)
+                Slider(
+                    value: $model.centerTuneValue,
+                    in: -100...100,
+                    step: 1,
+                    onEditingChanged: { editing in
+                        if editing {
+                            model.beginCenterTune()
+                        } else {
+                            model.endCenterTune()
+                        }
+                    }
+                )
+                .tint(.blue)
+                .onChange(of: model.centerTuneValue) { value in
+                    model.updateCenterTune(value)
+                }
+                Text("+").font(.headline).foregroundStyle(.secondary)
+            }
+            Text(model.centerTuneStatus)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
             HStack {
                 TextField("157.067450", text: $model.centerMHzText)
                     .textFieldStyle(.roundedBorder)
                 Button("Tune") { model.tuneCenter() }
                     .buttonStyle(.borderedProminent)
             }
-            Text("\(ChannelBankFormatters.mhz(state.centerHz ?? state.waterfallCenterHz)) / span \(ChannelBankFormatters.compactHz(state.usableSpanHz))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 

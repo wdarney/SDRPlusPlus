@@ -88,6 +88,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var initialStateFallbackTask: Task<Void, Never>?
     private var hasReceivedFullState = false
     private var lastResponseCompletionTime: Date?
+    private var pendingCenterTuneHz: Double?
+    private var centerTuneRequestInFlight = false
     private var playbackTask: Task<Void, Never>?
     private var activePlaybackIdentity: String?
     private var completedPlaybackIdentities: Set<String> = []
@@ -169,7 +171,22 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     public func tuneCenter(hz: Double) {
-        Task { await apply { try await self.client.setCenterHz(hz) } }
+        guard hz.isFinite, hz > 0 else { return }
+        updateLatestState {
+            $0.centerHz = hz
+            $0.waterfallCenterHz = hz
+        }
+        pendingCenterTuneHz = hz
+        guard !centerTuneRequestInFlight else { return }
+        centerTuneRequestInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            while let hz = self.pendingCenterTuneHz {
+                self.pendingCenterTuneHz = nil
+                await self.apply { try await self.client.setCenterHz(hz) }
+            }
+            self.centerTuneRequestInFlight = false
+        }
     }
 
     public func setSource(_ name: String) {
@@ -461,6 +478,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         initialStateFallbackTask = nil
         hasReceivedFullState = false
         lastResponseCompletionTime = nil
+        pendingCenterTuneHz = nil
+        centerTuneRequestInFlight = false
         playbackTask?.cancel()
         playbackTask = nil
         activePlaybackIdentity = nil

@@ -7,6 +7,8 @@ import Foundation
 @MainActor
 public final class ChannelBankViewModel: ObservableObject {
     @Published public var centerMHzText = ""
+    @Published public var centerTuneValue = 0.0
+    @Published public private(set) var centerTuneStatus = "Waiting for center"
     @Published public var serverHostText = ""
     @Published public var serverPortText = ""
     @Published public var manualOffsetHzText = "0"
@@ -16,6 +18,8 @@ public final class ChannelBankViewModel: ObservableObject {
 
     public let ble: BLECentralManager
     private var cancellables: Set<AnyCancellable> = []
+    private var centerTuneTask: Task<Void, Never>?
+    private var centerTuneCurrentHz: Double?
 
     public init(ble: BLECentralManager = BLECentralManager()) {
         self.ble = ble
@@ -27,8 +31,14 @@ public final class ChannelBankViewModel: ObservableObject {
     public func acceptStateUpdate() {
         guard let state = ble.latestState else { return }
         waterfall.append(state: state)
-        if centerMHzText.isEmpty {
-            centerMHzText = state.centerHz.map { String(format: "%.6f", $0 / 1_000_000) } ?? ""
+        let centerHz = state.centerHz ?? state.waterfallCenterHz ?? 0
+        if centerHz > 0 {
+            if centerMHzText.isEmpty || (Double(centerMHzText) ?? 0) <= 0 {
+                centerMHzText = String(format: "%.6f", centerHz / 1_000_000)
+            }
+            if centerTuneTask == nil {
+                centerTuneStatus = "Center \(ChannelBankFormatters.mhz(centerHz))"
+            }
         }
         if serverHostText.isEmpty, let host = state.sdrppServer?.host {
             serverHostText = host
@@ -44,6 +54,60 @@ public final class ChannelBankViewModel: ObservableObject {
     public func tuneCenter() {
         guard let mhz = Double(centerMHzText), mhz > 0 else { return }
         ble.tuneCenter(hz: mhz * 1_000_000)
+    }
+
+    public func beginCenterTune() {
+        guard centerTuneTask == nil else { return }
+        let centerHz = ble.latestState?.centerHz ?? ble.latestState?.waterfallCenterHz ?? 0
+        guard centerHz > 0 else {
+            centerTuneStatus = "Waiting for center"
+            return
+        }
+        centerTuneCurrentHz = centerHz
+        centerTuneStatus = "Center \(ChannelBankFormatters.mhz(centerHz))"
+        centerTuneTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.tickCenterTune()
+                try? await Task.sleep(nanoseconds: 160_000_000)
+            }
+        }
+    }
+
+    public func updateCenterTune(_ value: Double) {
+        guard abs(value) > 0 else { return }
+        if centerTuneTask == nil { beginCenterTune() }
+        tickCenterTune()
+    }
+
+    public func endCenterTune() {
+        centerTuneTask?.cancel()
+        centerTuneTask = nil
+        centerTuneValue = 0
+        if let centerTuneCurrentHz {
+            centerTuneStatus = "Center \(ChannelBankFormatters.mhz(centerTuneCurrentHz))"
+        }
+        centerTuneCurrentHz = nil
+    }
+
+    private func tickCenterTune() {
+        let value = centerTuneValue
+        guard value != 0 else { return }
+        let base = centerTuneCurrentHz ?? ble.latestState?.centerHz ?? ble.latestState?.waterfallCenterHz ?? 0
+        guard base > 0 else {
+            centerTuneStatus = "Waiting for center"
+            return
+        }
+        let hz = max(1, base + centerTuneStepHz(value))
+        centerTuneCurrentHz = hz
+        centerMHzText = String(format: "%.6f", hz / 1_000_000)
+        centerTuneStatus = "Center \(ChannelBankFormatters.mhz(hz))"
+        ble.tuneCenter(hz: hz)
+    }
+
+    private func centerTuneStepHz(_ value: Double) -> Double {
+        let magnitude = min(1, abs(value) / 100)
+        guard magnitude > 0 else { return 0 }
+        return (150 + pow(magnitude, 1.65) * 9_850) * (value < 0 ? -1 : 1)
     }
 
     public func selectSource(_ name: String) {
