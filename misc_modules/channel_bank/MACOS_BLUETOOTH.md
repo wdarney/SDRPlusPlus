@@ -37,10 +37,40 @@ source controls and offsets, SDR++ Server target/connect/disconnect, tuning,
 Channel Bank settings, frequency blocking, playback locking, recording lists,
 session creation, and WAV cleanup. Existing server validation applies.
 
-Bluetooth audio and paged recording downloads are not implemented. The Audio
-characteristic remains discoverable because the current iPhone client requires
-it during connection, but capabilities report `audio.available:false`.
-Audio/download requests return an explicit error; no PCM is published.
+Completed-transmission audio uses the Android-compatible leased playback route
+described below. The existing iPhone client's paged pull and local playback code
+can use it without changes. Live PCM notifications and arbitrary recording-library
+downloads remain unsupported. The Audio characteristic remains discoverable for
+client compatibility; `audio.available:false` refers to live PCM, while
+`playbackTransfer.available:true` advertises the completed-file path.
+
+## Buffered Audio
+
+Send `GET /api/audio/current-playback` in a BLE command with `body.offset` (default
+0) and `body.limit` (default 4096, clamped to 1..16384). The first page leases the
+current completed playback file and returns `transferId`, `offset`, `nextOffset`,
+`size`, `eof`, `name`, `contentType`, and `dataBase64`. Echo the same `transferId`
+on subsequent pages. This matches the Android client's `collectLeased` contract.
+Send `body: {"transferId":"...", "cancel":true}` to cancel.
+
+The lease holds an open read-only file descriptor, not a whole-file RAM copy.
+On macOS the descriptor remains readable after normal playback cleanup unlinks
+the recording. It closes at EOF, cancellation, disconnect, module shutdown, or
+60 seconds of idle time. Transfers are scoped to the originating Bluetooth
+central, limited to eight total and 64 MiB per file. Missing playback or expired
+leases return 404; missing IDs after offset zero return 400; past-EOF offsets
+return 416. Oversized recordings return 413; exhausted lease capacity returns 503.
+
+The existing playback queue and frequency lock select the file. Recording-disabled
+temporary WAVs work too. This does not change the web audio path or broadcast live
+VFO audio. Command pages no longer wait a fixed 500 ms between requests; state
+snapshots retain their own cadence. Responses precede unsent full-state snapshots.
+
+Device testing should include recording disabled, changing playback while a file
+is transferring, frequency lock, Monitor stop/restart, reconnect, and background
+playback. BLE throughput and the iPhone client's behavior when a newer transmission
+appears during a download still need physical testing; server-side leases alone
+do not guarantee gapless playback or delivery of every transmission.
 
 Web Control starts automatically when Bluetooth is enabled and must remain
 enabled while Bluetooth is in use. The adapter sends only allowlisted requests
@@ -68,6 +98,8 @@ seven seconds. Disabling/unloading may wait for an in-flight request to finish.
 
 CoreBluetooth delegate work stays on a dedicated serial queue. HTTP requests
 run on a separate joined worker and use the WebUI's existing SDR++ UI dispatch.
+Audio pages use a narrow module callback to open the selected playback file;
+page reads and lease cleanup run on that same worker.
 No radio/source logic is duplicated and no core ABI changes are required.
 
 ## Radio-Free Verification
@@ -81,5 +113,7 @@ build-proxy-test/bluetooth_macos_test
 
 The tests use delegate doubles without initializing a Bluetooth manager.
 They cover command reassembly, invalid offsets, payload bounds, outgoing
-backpressure/fragmentation, route rejection, and stable long-read snapshots.
+backpressure/fragmentation, route rejection, stable long-read snapshots, audio
+page bounds, owner isolation, byte-exact paging after unlink, and descriptor
+release at EOF/cancellation/expiry.
 They do not verify discovery or delivery on physical hardware.
