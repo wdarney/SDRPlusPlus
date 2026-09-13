@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Convert exact HF Whisper encoder weights to Channel Bank's whisper.cpp ABI."""
 import argparse
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -82,6 +83,10 @@ def main():
     if args.ggml_name == 'ggml-whisper-large-v3-atc-q5_0.bin' and dims != (128, 1500, 1280, 20, 32):
         raise ValueError(f'ATC Large encoder dimensions do not match large-v3: {dims}')
     source = hf.model.encoder.eval()
+    # Only encoder weights are converted. Release the decoder before allocating
+    # the reference encoder, especially for full large-v3 checkpoints.
+    del hf
+    gc.collect()
     weights = source.state_dict()
     digest = hashlib.sha256()
     mapped = {}
@@ -101,7 +106,8 @@ def main():
         hf_result = source(sample).last_hidden_state
         reference_result = reference(sample)
     torch.testing.assert_close(reference_result, hf_result, rtol=1e-3, atol=1e-3)
-    del hf, source, reference, weights, hf_result
+    del source, reference, weights, hf_result
+    gc.collect()
     encoder = AudioEncoderANE(*dims).eval()
     encoder._register_load_state_dict_pre_hook(linear_to_conv2d_map)
     encoder.load_state_dict(mapped, strict=True)
@@ -114,6 +120,8 @@ def main():
                     inputs=[ct.TensorType(name='logmel_data', shape=sample.shape, dtype=np.float32)],
                     outputs=[ct.TensorType(name='output', dtype=np.float32)],
                     compute_precision=ct.precision.FLOAT16, compute_units=ct.ComputeUnit.ALL)
+    del traced, encoder, ane_result
+    gc.collect()
     ml.user_defined_metadata['source_model'] = args.model
     ml.user_defined_metadata['source_revision'] = revision or 'local snapshot; see encoder_weights_sha256'
     ml.user_defined_metadata['encoder_weights_sha256'] = digest.hexdigest()

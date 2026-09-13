@@ -37,7 +37,9 @@ checkpoint, maps to OpenAI Whisper names, and writes an intermediate full `.pt`.
 Our tool instead directly maps the requested checkpoint's encoder tensors,
 strictly loads them, uses an encoder-only adaptation of the upstream ANE classes,
 and checks HF/reference/rewritten/Core ML output agreement. It still loads the
-full HF checkpoint initially, so allow substantial RAM and disk space for large-v3.
+full HF checkpoint initially, then releases the decoder before allocating the
+reference encoder. PyTorch models are released after conversion before the
+Core ML prediction check. Allow substantial RAM and disk space for large-v3.
 It never calls `whisper.load_model` or downloads stock OpenAI encoder weights.
 
 ## Changes and boundaries
@@ -223,3 +225,25 @@ and [compute-unit semantics](https://developer.apple.com/documentation/coreml/ml
   checks are deliberately not presented as ATC-model or hardware proof.
 - Windows/Android/iOS were not built; their branches and runtime implementations
   were not changed.
+
+## Testing on an 8 GB M1
+
+Perform full-size conversion on a higher-memory Apple Silicon Mac, then copy the
+compiled encoder to the test Mac. Conversion and runtime have different memory
+requirements; successful conversion on a larger Mac does not prove an 8 GB fit.
+
+Large-v3 Turbo retains the 32-layer, width-1280 encoder and reduces the decoder
+to four layers. Consequently a Turbo Core ML encoder is not substantially
+smaller just because the full GGML model is smaller. Use the exact fine-tuned
+Turbo checkpoint's encoder, never a stock or ATC Large encoder interchangeably.
+
+Check the GGML header/type and actual file size rather than relying on a `q5_0`
+filename. The installed ATC Large file inspected during development had an FP16
+header and was about 3.10 GB despite that suffix. The separate Turbo ATCOSIM
+file had a Q5_0 header and was about 574 MB; neither file was modified.
+
+For runtime A/B tests on the Mini, restart between model/backend selections so
+cached contexts from previous models do not accumulate. Record memory pressure
+and swap along with transcription latency and ANE activity. The current runtime
+still selects the generic Turbo GGML filename; a separate Turbo ATC encoder
+conversion alone does not change that selection.
