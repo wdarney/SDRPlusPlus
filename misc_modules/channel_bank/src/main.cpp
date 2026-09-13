@@ -53,8 +53,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cctype>
+#include <limits>
 #include <functional>
 #include <memory>
+#ifdef __ANDROID__
+#include <android_ble_gatt.h>
+#endif
 #ifdef __APPLE__
 #include "transcription.h"
 #endif
@@ -496,6 +500,14 @@ public:
     }
 
     ~ChannelBankModule() {
+#ifdef __ANDROID__
+        bleStatePublisherRunning = false;
+        bleStatePublisherCv.notify_all();
+        if (bleStatePublisherThread.joinable()) bleStatePublisherThread.join();
+        finishBleAudioTransfers();
+        android_ble_gatt::stop();
+        android_ble_gatt::unregisterRequestHandler();
+#endif
         stopWebServer();
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
@@ -533,6 +545,14 @@ public:
             }
         }
         if (webControlEnabled) startWebServer();
+#ifdef __ANDROID__
+        android_ble_gatt::registerRequestHandler(
+            [this](const std::string& request) { return handleBleGattRequest(request); });
+        android_ble_gatt::start();
+        bleStatePublisherRunning = true;
+        bleStatePublisherThread = std::thread(&ChannelBankModule::bleStatePublisherFunc, this);
+        flog::info("[ChannelBank][BLE] Paged routes enabled: /api/audio/current-playback, /api/recordings, /api/recordings/download");
+#endif
     }
     void enable()  { enabled = true; }
     void disable() { enabled = false; restoreWaterfallVisibility(); }
@@ -612,7 +632,22 @@ public:
         monitorStream.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         monitorSinkStream = new SinkManager::Stream();
         monitorSinkStream->init(&monitorStream, &monitorSrHandler, 48000.0f);
+#if defined(__ANDROID__)
+        monitorProviderRegisteredHandler.ctx = this;
+        monitorProviderRegisteredHandler.handler = [](std::string provider, void* ctx) {
+            if (provider == "Audio") {
+                ((ChannelBankModule*)ctx)->ensureAndroidMonitorAudioSink();
+            }
+        };
+        sigpath::sinkManager.onSinkProviderRegistered.bindHandler(&monitorProviderRegisteredHandler);
+        monitorProviderHandlerBound = true;
+#endif
         sigpath::sinkManager.registerStream(name + "_monitor", monitorSinkStream);
+#if defined(__ANDROID__)
+        // Android has no comfortable desktop-style sink setup flow; make preview
+        // playback audible by default instead of leaving the monitor on "None".
+        ensureAndroidMonitorAudioSink();
+#endif
         monitorSinkStream->start();
 
         // Start playback thread
@@ -655,6 +690,12 @@ public:
 
         // Tear down monitor stream
         monitorSinkStream->stop();
+#if defined(__ANDROID__)
+        if (monitorProviderHandlerBound) {
+            sigpath::sinkManager.onSinkProviderRegistered.unbindHandler(&monitorProviderRegisteredHandler);
+            monitorProviderHandlerBound = false;
+        }
+#endif
         sigpath::sinkManager.unregisterStream(name + "_monitor");
         delete monitorSinkStream;
         monitorSinkStream = nullptr;
@@ -1024,7 +1065,7 @@ public:
         std::string path = requestedWav.string();
         slot.currentFinalM4APath.clear();
 
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         // Intermediate WAVs are scratch files when recording is disabled or
         // when the final output will be M4A. Keep those off network shares.
         if (!recordingEnabled || m4aEnabled) {
@@ -1326,6 +1367,62 @@ private:
             {"transcriptionBackendName", transcriptionBackendName()}
         };
     }
+
+#ifdef __ANDROID__
+    json webStateSummarySnapshot() {
+        int activeChannelCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(channelsMtx);
+            activeChannelCount = (int)activeChannels.size();
+        }
+
+        int64_t playingKey = currentlyPlayingFreqKey.load();
+        double playingFreqHz = currentlyPlayingFreqHz.load();
+        int playbackQueued = 0;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            playbackQueued = (int)playbackQueue.size();
+        }
+        json playback = {
+            {"active", playingKey != 0},
+            {"freqKey", playingKey},
+            {"positionMs", -1},
+            {"queued", playbackQueued}
+        };
+        if (playingKey != 0) {
+            double freqHz = playingFreqHz > 0.0
+                ? playingFreqHz : (double)playingKey * 1000.0;
+            playback["freqHz"] = freqHz;
+            playback["name"] = displayName(freqHz);
+            std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
+            if (!currentPlaybackPath.empty()) {
+                playback["fileName"] = std::filesystem::path(
+                    currentPlaybackPath).filename().string();
+            }
+        }
+
+        uint64_t seq = bleSummarySequence.fetch_add(1) + 1;
+        return {
+            {"v", 1},
+            {"seq", seq},
+            {"serverTimeMs", std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()},
+            {"running", running},
+            {"radioPlaying", gui::mainWindow.isPlaying()},
+            {"selectedSource", selectedSourceName()},
+            {"centerHz", lastKnownCenter},
+            {"sampleRate", lastKnownSr},
+            {"mode", detectionModeName()},
+            {"demodMode", demodModeName(demodMode)},
+            {"snrThresholdDb", snrThreshold},
+            {"maxChannels", maxChannels},
+            {"recordingEnabled", recordingEnabled},
+            {"activeChannelCount", activeChannelCount},
+            {"playbackQueued", playbackQueued},
+            {"playback", playback}
+        };
+    }
+#endif
 
     bool applyChannelBankSettings(const json& body, std::string& error) {
         if (!body.is_object()) {
@@ -1910,6 +2007,9 @@ private:
         j["sdrppHeartbeat"] = webHeartbeat.fetch_add(1) + 1;
         j["serverTimeMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+#ifdef __ANDROID__
+        j["seq"] = bleSummarySequence.load();
+#endif
         j["selectedSource"] = selectedSourceName();
         j["sources"] = sourceNamesJson();
         j["sdrppServer"] = serverSourceStateJson();
@@ -3882,6 +3982,17 @@ self.addEventListener("fetch", event => {
         }
 
         std::set<std::filesystem::path> protectedPaths;
+#ifdef __ANDROID__
+        cleanupExpiredBleAudioTransfers();
+        {
+            std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+            for (const auto& [id, transfer] : bleAudioTransfers) {
+                std::error_code ec;
+                auto p = std::filesystem::weakly_canonical(transfer.path, ec);
+                if (!ec) protectedPaths.insert(p);
+            }
+        }
+#endif
         {
             std::lock_guard<std::mutex> lk(channelsMtx);
             for (auto& [idx, slot] : activeChannels) {
@@ -4040,7 +4151,13 @@ self.addEventListener("fetch", event => {
     }
 
     void publishLiveAudio(ChannelSlot& slot, const float* mono, int count) {
-        if (liveAudioClients.load() <= 0 || !mono || count <= 0) return;
+        if (!mono || count <= 0) return;
+#ifdef __ANDROID__
+        bool bleAudioWanted = android_ble_gatt::hasAudioSubscribers();
+#else
+        bool bleAudioWanted = false;
+#endif
+        if (liveAudioClients.load() <= 0 && !bleAudioWanted) return;
 
         std::vector<int16_t> chunk;
         chunk.resize((size_t)count);
@@ -4052,7 +4169,12 @@ self.addEventListener("fetch", event => {
     }
 
     void publishLiveAudioPcm(double freqHz, const int16_t* pcm, int count, bool forceSelect) {
-        if (liveAudioClients.load() <= 0 || !pcm || count <= 0) return;
+        if (!pcm || count <= 0) return;
+#ifdef __ANDROID__
+        if (android_ble_gatt::hasAudioSubscribers())
+            android_ble_gatt::publishAudio(pcm, (size_t)count);
+#endif
+        if (liveAudioClients.load() <= 0) return;
 
         std::unique_lock<std::mutex> lk(liveAudioMtx, std::try_to_lock);
         if (!lk.owns_lock()) {
@@ -4268,6 +4390,487 @@ self.addEventListener("fetch", event => {
         }
     }
 
+#ifdef __ANDROID__
+    static std::string base64Encode(const uint8_t* data, size_t size) {
+        static constexpr char alphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((size + 2) / 3) * 4);
+        for (size_t i = 0; i < size; i += 3) {
+            uint32_t n = (uint32_t)data[i] << 16;
+            if (i + 1 < size) n |= (uint32_t)data[i + 1] << 8;
+            if (i + 2 < size) n |= data[i + 2];
+            out.push_back(alphabet[(n >> 18) & 63]);
+            out.push_back(alphabet[(n >> 12) & 63]);
+            out.push_back(i + 1 < size ? alphabet[(n >> 6) & 63] : '=');
+            out.push_back(i + 2 < size ? alphabet[n & 63] : '=');
+        }
+        return out;
+    }
+
+    json recordingPageJson(const json& request, std::string& error, int& status) {
+        json query = request.value("query", json::object());
+        json body = request.value("body", json::object());
+        std::string rel = query.value("file", body.value("file", std::string()));
+        int64_t offset = body.value("offset", (int64_t)0);
+        int limit = std::clamp(body.value("limit", 4096), 1, 16384);
+        if (rel.empty()) { status = 400; error = "file required"; return {}; }
+        if (offset < 0) { status = 400; error = "offset must be non-negative"; return {}; }
+
+        std::filesystem::path rootPath = recordingsRootPath();
+        if (rootPath.empty()) { status = 404; error = "recordings folder not available"; return {}; }
+        std::filesystem::path relPath(rel);
+        if (relPath.is_absolute()) { status = 400; error = "absolute paths are not allowed"; return {}; }
+        std::error_code ec;
+        std::filesystem::path filePath = std::filesystem::weakly_canonical(rootPath / relPath, ec);
+        if (ec || !pathIsInside(filePath, rootPath) ||
+            !std::filesystem::is_regular_file(filePath, ec) || ec) {
+            status = 404; error = "recording not found"; return {};
+        }
+        uintmax_t fileSize = std::filesystem::file_size(filePath, ec);
+        if (ec || (uint64_t)offset > fileSize) {
+            status = 416; error = "offset is past end of recording"; return {};
+        }
+        std::ifstream file(filePath, std::ios::binary);
+        if (!file.is_open()) { status = 404; error = "recording not readable"; return {}; }
+        file.seekg(offset);
+        size_t count = (size_t)std::min<uint64_t>((uint64_t)limit, fileSize - (uint64_t)offset);
+        std::vector<uint8_t> bytes(count);
+        if (count) file.read((char*)bytes.data(), (std::streamsize)count);
+        count = (size_t)file.gcount();
+        std::string ext = filePath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return {
+            {"file", rel},
+            {"name", filePath.filename().string()},
+            {"contentType", ext == ".m4a" ? "audio/mp4" : "audio/wav"},
+            {"offset", offset},
+            {"nextOffset", offset + (int64_t)count},
+            {"size", fileSize},
+            {"eof", (uint64_t)(offset + (int64_t)count) >= fileSize},
+            {"dataBase64", base64Encode(bytes.data(), count)}
+        };
+    }
+
+    bool releaseBleAudioTransfer(const std::string& transferId, const char* reason,
+                                 bool& deleted, uintmax_t& fileSize) {
+        deleted = false;
+        fileSize = 0;
+        std::string path;
+        bool deleteAfter = false;
+        {
+            std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+            auto it = bleAudioTransfers.find(transferId);
+            if (it == bleAudioTransfers.end()) return false;
+            path = it->second.path;
+            fileSize = it->second.size;
+            deleteAfter = it->second.deleteAfter;
+            bleAudioTransfers.erase(it);
+            if (deleteAfter) {
+                for (const auto& [otherId, other] : bleAudioTransfers) {
+                    if (other.path == path) {
+                        deleteAfter = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (deleteAfter) {
+            std::error_code ec;
+            deleted = std::filesystem::remove(path, ec);
+            if (ec) {
+                flog::warn("[ChannelBank][BLE Audio] transfer={0} release={1} delete failed: {2}",
+                           transferId, reason, ec.message());
+            }
+        }
+        return true;
+    }
+
+    void cleanupExpiredBleAudioTransfers() {
+        std::vector<std::string> expired;
+        auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+            for (const auto& [id, transfer] : bleAudioTransfers) {
+                if (transfer.expiresAt <= now) expired.push_back(id);
+            }
+        }
+        for (const auto& id : expired) {
+            bool deleted = false;
+            uintmax_t fileSize = 0;
+            if (releaseBleAudioTransfer(id, "expired", deleted, fileSize)) {
+                flog::info("[ChannelBank][BLE Audio] transfer={0} offset=-1 size={1} active=0 deleted={2} status=expired",
+                           id, fileSize, deleted ? 1 : 0);
+            }
+        }
+    }
+
+    void finishBleAudioTransfers() {
+        std::vector<std::string> ids;
+        {
+            std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+            for (const auto& [id, transfer] : bleAudioTransfers) ids.push_back(id);
+        }
+        for (const auto& id : ids) {
+            bool deleted = false;
+            uintmax_t fileSize = 0;
+            releaseBleAudioTransfer(id, "shutdown", deleted, fileSize);
+        }
+    }
+
+    void deletePlaybackFileOrDefer(const std::string& path) {
+        // Serialize with first-page lease creation so playback cannot delete the
+        // file between the current-path snapshot and lease insertion.
+        std::lock_guard<std::mutex> currentLock(currentPlaybackPathMtx);
+        bool leased = false;
+        {
+            std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+            for (auto& [id, transfer] : bleAudioTransfers) {
+                if (transfer.path == path) {
+                    transfer.deleteAfter = true;
+                    leased = true;
+                }
+            }
+        }
+        if (leased) {
+            flog::info("[ChannelBank][BLE Audio] deferred delete for leased playback: {0}",
+                       std::filesystem::path(path).filename().string());
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        if (ec) flog::warn("[ChannelBank] Could not delete playback WAV: {0}", ec.message());
+    }
+
+    void logBleAudioRequest(const std::string& transferId, int64_t offset,
+                            uintmax_t fileSize, bool active, bool deleted, int status) {
+        flog::info("[ChannelBank][BLE Audio] transfer={0} offset={1} size={2} active={3} deleted={4} status={5}",
+                   transferId.empty() ? "-" : transferId, offset, fileSize,
+                   active ? 1 : 0, deleted ? 1 : 0, status);
+    }
+
+    json currentPlaybackPageJson(const json& request, std::string& error, int& status) {
+        cleanupExpiredBleAudioTransfers();
+        json body = request.value("body", json::object());
+        std::string transferId = body.value("transferId", std::string());
+        int64_t offset = body.value("offset", (int64_t)0);
+        int limit = std::clamp(body.value("limit", 4096), 1, 16384);
+        if (offset < 0) {
+            status = 400;
+            error = "offset must be non-negative";
+            logBleAudioRequest(transferId, offset, 0, false, false, status);
+            return {};
+        }
+
+        if (body.value("cancel", false)) {
+            bool deleted = false;
+            uintmax_t fileSize = 0;
+            if (transferId.empty() ||
+                !releaseBleAudioTransfer(transferId, "cancelled", deleted, fileSize)) {
+                status = 404;
+                error = "audio transfer not found or expired";
+                logBleAudioRequest(transferId, offset, fileSize, false, deleted, status);
+                return {};
+            }
+            logBleAudioRequest(transferId, offset, fileSize, false, deleted, 200);
+            return {{"transferId", transferId}, {"cancelled", true}, {"deleted", deleted}};
+        }
+
+        if (transferId.empty() && offset != 0) {
+            status = 400;
+            error = "transferId is required after the first page";
+            logBleAudioRequest({}, offset, 0, false, false, status);
+            return {};
+        }
+
+        BleAudioTransfer transfer;
+        if (transferId.empty()) {
+            std::unique_lock<std::mutex> cpk(currentPlaybackPathMtx);
+            std::string path = currentPlaybackPath;
+            bool deleteAfter = currentPlaybackDeleteAfter;
+            if (currentlyPlayingFreqKey.load() == 0 || path.empty()) {
+                status = 404;
+                error = "no active playback";
+                logBleAudioRequest({}, offset, 0, false, false, status);
+                return {};
+            }
+
+            std::error_code ec;
+            std::filesystem::path filePath = std::filesystem::weakly_canonical(path, ec);
+            if (ec || !std::filesystem::is_regular_file(filePath, ec) || ec) {
+                status = 404;
+                error = "playback file not found";
+                logBleAudioRequest({}, offset, 0, false, false, status);
+                return {};
+            }
+            uintmax_t fileSize = std::filesystem::file_size(filePath, ec);
+            if (ec) {
+                status = 404;
+                error = "playback file not readable";
+                logBleAudioRequest({}, offset, 0, false, false, status);
+                return {};
+            }
+            std::string ext = filePath.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            transferId = "cb-" + std::to_string(bleAudioTransferSequence.fetch_add(1) + 1);
+            transfer = {transferId, filePath.string(), filePath.filename().string(),
+                        ext == ".m4a" ? "audio/mp4" : "audio/wav", fileSize,
+                        std::chrono::steady_clock::now() + BLE_AUDIO_TRANSFER_TTL, deleteAfter};
+            {
+                std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+                bleAudioTransfers[transferId] = transfer;
+            }
+            cpk.unlock();
+        } else {
+            std::lock_guard<std::mutex> lk(bleAudioTransfersMtx);
+            auto it = bleAudioTransfers.find(transferId);
+            if (it == bleAudioTransfers.end()) {
+                status = 404;
+                error = "audio transfer not found or expired";
+                logBleAudioRequest(transferId, offset, 0, false, false, status);
+                return {};
+            }
+            it->second.expiresAt = std::chrono::steady_clock::now() + BLE_AUDIO_TRANSFER_TTL;
+            transfer = it->second;
+        }
+
+        if ((uint64_t)offset > transfer.size) {
+            status = 416;
+            error = "offset is past end of playback file";
+            logBleAudioRequest(transferId, offset, transfer.size, true, false, status);
+            return {};
+        }
+        std::ifstream file(transfer.path, std::ios::binary);
+        if (!file.is_open()) {
+            status = 404;
+            error = "playback file not readable";
+            logBleAudioRequest(transferId, offset, transfer.size, true, false, status);
+            return {};
+        }
+        file.seekg(offset);
+        size_t count = (size_t)std::min<uint64_t>((uint64_t)limit, transfer.size - (uint64_t)offset);
+        std::vector<uint8_t> bytes(count);
+        if (count) file.read((char*)bytes.data(), (std::streamsize)count);
+        count = (size_t)file.gcount();
+        bool eof = (uint64_t)(offset + (int64_t)count) >= transfer.size;
+        json page = {
+            {"transferId", transferId},
+            {"name", transfer.name},
+            {"contentType", transfer.contentType},
+            {"offset", offset},
+            {"nextOffset", offset + (int64_t)count},
+            {"size", transfer.size},
+            {"eof", eof},
+            {"dataBase64", base64Encode(bytes.data(), count)}
+        };
+        bool deleted = false;
+        uintmax_t releasedSize = transfer.size;
+        if (eof) releaseBleAudioTransfer(transferId, "eof", deleted, releasedSize);
+        logBleAudioRequest(transferId, offset, transfer.size, !eof, deleted, 200);
+        return page;
+    }
+
+    std::string bleEnvelope(int64_t id, int status, const json& body,
+                            const std::string& error = {}, const std::string& code = {}) {
+        json out = {{"v", 1}, {"id", id}, {"ok", error.empty()}, {"status", status}};
+        if (error.empty()) out["body"] = body;
+        else out["error"] = {{"code", code.empty() ? "request_failed" : code}, {"message", error}};
+        return out.dump();
+    }
+
+    std::string handleBleGattRequest(const std::string& text) {
+        int64_t id = 0;
+        try {
+            json request = json::parse(text);
+            id = request.value("id", (int64_t)0);
+            if (request.value("v", 0) != 1)
+                return bleEnvelope(id, 400, {}, "unsupported protocol version", "bad_version");
+            std::string method = request.value("method", std::string());
+            std::string path = request.value("path", std::string());
+            std::transform(method.begin(), method.end(), method.begin(),
+                           [](unsigned char c) { return (char)std::toupper(c); });
+
+            if (method == "GET") {
+                if (path == "/api/state" || path == "/state")
+                    return bleEnvelope(id, 200, webStateSnapshot());
+                if (path == "/api/state/summary")
+                    return bleEnvelope(id, 200, webStateSummarySnapshot());
+                if (path == "/api/sources")
+                    return bleEnvelope(id, 200, {{"selected", selectedSourceName()}, {"sources", sourceNamesJson()}});
+                if (path == "/api/sdrpp-server") return bleEnvelope(id, 200, serverSourceStateJson());
+                if (path == "/api/source-controls") return bleEnvelope(id, 200, selectedSourceControlsJson());
+                if (path == "/api/source-offset") return bleEnvelope(id, 200, sourceOffsetStateJson());
+                if (path == "/api/channel-bank/settings") return bleEnvelope(id, 200, channelBankSettingsJson());
+                if (path == "/api/recordings") return bleEnvelope(id, 200, recordingsListJson());
+                if (path == "/api/recordings/download") {
+                    std::string error; int status = 200;
+                    json page = recordingPageJson(request, error, status);
+                    return bleEnvelope(id, status, page, error, status == 416 ? "range" : "recording_error");
+                }
+                if (path == "/api/audio/current-playback") {
+                    std::string error; int status = 200;
+                    json page = currentPlaybackPageJson(request, error, status);
+                    return bleEnvelope(id, status, page, error, status == 416 ? "range" : "playback_error");
+                }
+                if (path == "/api/audio/live.pcm" || path == "/api/audio/live.wav") {
+                    return bleEnvelope(id, 200, {
+                        {"characteristic", "7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000"},
+                        {"format", "pcm_s16le"}, {"rate", 48000}, {"channels", 1},
+                        {"note", "enable notifications on the audio characteristic"}
+                    });
+                }
+            }
+
+            if (method != "POST") return bleEnvelope(id, 404, {}, "not found", "not_found");
+            json body = request.value("body", json::object());
+            json result;
+            std::string uiError;
+            auto onUi = [&](std::function<json()> fn) -> bool {
+                return runOnUiThread(std::move(fn), result, uiError);
+            };
+
+            if (path == "/api/start") {
+                onUi([this] {
+                    if (!folderSelect.pathIsValid()) return json({{"_status", 409}, {"error", "recording path is invalid"}});
+                    start(); return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/stop") {
+                onUi([this] { stop(); return webStateSummarySnapshot(); });
+            }
+            else if (path == "/api/channel-bank/settings") {
+                onUi([this, body] {
+                    std::string error;
+                    if (!applyChannelBankSettings(body, error))
+                        return json({{"_status", running ? 409 : 400}, {"error", error}});
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/frequency/block") {
+                double hz = body.value("hz", 0.0); bool blocked = body.value("blocked", true);
+                onUi([this, hz, blocked] {
+                    std::string error;
+                    if (!setFrequencyBlocked(hz, blocked, error)) return json({{"_status", 400}, {"error", error}});
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/playback-lock") {
+                double hz = body.value("hz", 0.0);
+                onUi([this, hz] {
+                    std::string error;
+                    if (!setPlaybackLock(hz, error)) return json({{"_status", 400}, {"error", error}});
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/recordings/session") {
+                std::string session = body.value("name", std::string());
+                onUi([this, session] {
+                    std::string error;
+                    if (!setRecordingSession(session, error))
+                        return json({{"_status", 400}, {"error", error}});
+                    return recordingsListJson();
+                });
+            }
+            else if (path == "/api/recordings/clear-wavs") {
+                result = clearRecordedWavsJson();
+                std::string httpStatus = result.value("_httpStatus", std::string("200 OK"));
+                result.erase("_httpStatus");
+                if (httpStatus.rfind("404", 0) == 0) result["_status"] = 404;
+                else if (httpStatus.rfind("400", 0) == 0) result["_status"] = 400;
+            }
+            else if (path == "/api/source") {
+                std::string source = body.value("name", std::string());
+                onUi([this, source] {
+                    if (gui::mainWindow.isPlaying()) return json({{"_status", 409}, {"error", "stop SDR before changing source"}});
+                    if (source.empty() || !sourceExists(source)) return json({{"_status", 404}, {"error", "source not found"}});
+                    sigpath::sourceManager.selectSource(source);
+                    core::configManager.acquire(); core::configManager.conf["source"] = source;
+                    core::configManager.release(true); return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/source-controls") {
+                onUi([this, body] {
+                    if (selectedSourceName() != "RX888")
+                        return json({{"_status", 404}, {"error", "selected source has no web controls"}});
+                    RX888SourceControlV1 req{}; std::string value = body.dump();
+                    strncpy(req.request, value.c_str(), sizeof(req.request) - 1);
+                    if (!callRX888SourceControl(RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
+                        std::string error = "RX888 source control failed";
+                        if (req.response[0]) try { error = json::parse(req.response).value("error", error); } catch (...) {}
+                        return json({{"_status", gui::mainWindow.isPlaying() ? 409 : 400}, {"error", error}});
+                    }
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/source-offset") {
+                onUi([this, body] {
+                    std::string error;
+                    if (!applySourceOffsetSettings(body, error)) return json({{"_status", 400}, {"error", error}});
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/sdrpp-server") {
+                std::string host = body.value("host", std::string()); int port = body.value("port", 0);
+                onUi([this, host, port] {
+                    if (gui::mainWindow.isPlaying()) return json({{"_status", 409}, {"error", "stop SDR before changing server target"}});
+                    if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1"))
+                        return json({{"_status", 404}, {"error", "SDR++ Server source control unavailable"}});
+                    if (host.empty() || port <= 0 || port > 65535)
+                        return json({{"_status", 400}, {"error", "host and valid port required"}});
+                    SDRPPServerSourceControlV1 req{}; strncpy(req.host, host.c_str(), sizeof(req.host) - 1); req.port = port;
+                    if (!callServerSourceControl(SERVER_SOURCE_CONTROL_SET, &req) || !req.ok)
+                        return json({{"_status", 409}, {"error", "server target is busy or invalid"}});
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/sdrpp-server/connect" || path == "/api/sdrpp-server/disconnect") {
+                bool connect = path.find("disconnect") == std::string::npos;
+                onUi([this, connect] {
+                    if (gui::mainWindow.isPlaying())
+                        return json({{"_status", 409}, {"error", connect ? "stop SDR before connecting server source" : "stop SDR before disconnecting server source"}});
+                    if (!core::modComManager.interfaceExists("sdrpp_server_source.control.v1"))
+                        return json({{"_status", 404}, {"error", "SDR++ Server source control unavailable"}});
+                    SDRPPServerSourceControlV1 state{};
+                    bool ok = callServerSourceControl(connect ? SERVER_SOURCE_CONTROL_CONNECT : SERVER_SOURCE_CONTROL_DISCONNECT, &state);
+                    if (connect && (!ok || !state.connected)) return json({{"_status", 502}, {"error", "server connection failed"}});
+                    return webStateSummarySnapshot();
+                });
+            }
+            else if (path == "/api/play") {
+                onUi([this] { gui::mainWindow.setPlayState(true); sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency()); return webStateSummarySnapshot(); });
+            }
+            else if (path == "/api/stop-radio" || path == "/api/radio/stop") {
+                onUi([this] { gui::mainWindow.setPlayState(false); return webStateSummarySnapshot(); });
+            }
+            else if (path == "/api/center") {
+                double hz = body.value("hz", 0.0);
+                if (!std::isfinite(hz) || hz <= 0.0) return bleEnvelope(id, 400, {}, "hz must be positive", "invalid_argument");
+                onUi([this, hz] {
+                    gui::waterfall.setCenterFrequency(hz); gui::waterfall.centerFreqMoved = true;
+                    sigpath::sourceManager.tune(hz); lastKnownCenter = hz; return webStateSummarySnapshot();
+                });
+            }
+            else return bleEnvelope(id, 404, {}, "not found", "not_found");
+
+            if (!uiError.empty()) return bleEnvelope(id, 503, {}, uiError, "ui_timeout");
+            int status = result.value("_status", 200);
+            if (result.contains("error")) return bleEnvelope(id, status, {}, result.value("error", "request failed"));
+            std::string response = bleEnvelope(id, status, result);
+            if (status >= 200 && status < 300 && android_ble_gatt::hasSummarySubscribers()) {
+                android_ble_gatt::notifySummary(bleEnvelope(
+                    0, 200, webStateSummarySnapshot()));
+            }
+            return response;
+        }
+        catch (const std::exception& e) {
+            return bleEnvelope(id, 400, {}, e.what(), "invalid_request");
+        }
+        catch (...) {
+            return bleEnvelope(id, 500, {}, "request failed", "internal_error");
+        }
+    }
+#endif
+
     bool sourceExists(const std::string& name) {
         auto sources = sigpath::sourceManager.getSourceNames();
         return std::find(sources.begin(), sources.end(), name) != sources.end();
@@ -4325,6 +4928,12 @@ self.addEventListener("fetch", event => {
             sendHttpResponse(fd, "200 OK", "application/json", webStateSnapshot().dump());
             return;
         }
+#ifdef __ANDROID__
+        if (method == "GET" && path == "/api/state/summary") {
+            sendHttpResponse(fd, "200 OK", "application/json", webStateSummarySnapshot().dump());
+            return;
+        }
+#endif
         if (method == "GET" && path == "/api/sources") {
             sendHttpResponse(fd, "200 OK", "application/json", json({
                 {"selected", selectedSourceName()},
@@ -6029,6 +6638,151 @@ self.addEventListener("fetch", event => {
         }
     }
 
+#ifdef __ANDROID__
+    struct BleSnrTelemetryPoint {
+        double freqHz = 0.0;
+        float snrDb = 0.0f;
+        uint8_t flags = 0;
+    };
+
+    static void appendBleU16(std::vector<uint8_t>& payload, uint16_t value) {
+        payload.push_back((uint8_t)(value & 0xFF));
+        payload.push_back((uint8_t)((value >> 8) & 0xFF));
+    }
+
+    static void appendBleU32(std::vector<uint8_t>& payload, uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8)
+            payload.push_back((uint8_t)((value >> shift) & 0xFF));
+    }
+
+    static void appendBleF64(std::vector<uint8_t>& payload, double value) {
+        uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value), "unexpected double size");
+        std::memcpy(&bits, &value, sizeof(bits));
+        for (int shift = 0; shift < 64; shift += 8)
+            payload.push_back((uint8_t)((bits >> shift) & 0xFF));
+    }
+
+    std::vector<uint8_t> bleSnrTelemetryPayload() {
+        // Version 1 can describe only a uniform grid. Manual and bookmark-scan
+        // frequencies remain available through the reliable full State payload.
+        if (manualMode || bookmarkScanMode || lastKnownSr <= 0.0 ||
+            lastKnownCenter <= 0.0 || channelSpacing <= 0.0) return {};
+
+        std::vector<float> localSnr;
+        std::set<int> localDetected;
+        std::set<int> localRawDetected;
+        {
+            // Match the fixed-grid snapshot used to construct snrOverview in
+            // webStateSnapshot(), so a telemetry frame represents the same view.
+            std::lock_guard<std::mutex> lk(detectedMtx);
+            localSnr = slotSnrDb;
+            localDetected = detectedSlots;
+            localRawDetected = rawDetectedSlots;
+        }
+        if (localSnr.empty()) return {};
+
+        std::set<int64_t> blockedKeys;
+        {
+            std::lock_guard<std::mutex> lk(freqLogMtx);
+            for (const auto& [key, entry] : freqLog)
+                if (entry.blocked) blockedKeys.insert(key);
+        }
+
+        const double usableLo = lastKnownCenter - (lastKnownSr * bwUsage) * 0.5;
+        const double usableHi = lastKnownCenter + (lastKnownSr * bwUsage) * 0.5;
+        const int numSlots = (int)localSnr.size();
+        std::vector<BleSnrTelemetryPoint> source;
+        source.reserve(localSnr.size());
+        for (int i = 0; i < numSlots; ++i) {
+            const double slotOffset =
+                ((double)i - (double)(numSlots - 1) / 2.0) * channelSpacing;
+            const double freqHz = lastKnownCenter + slotOffset;
+            if (freqHz < usableLo || freqHz > usableHi) continue;
+            uint8_t flags = 0;
+            if (localDetected.count(i)) flags |= 0x01;
+            if (localRawDetected.count(i)) flags |= 0x02;
+            if (blockedKeys.count(freqKey(freqHz))) flags |= 0x04;
+            source.push_back({freqHz, localSnr[(size_t)i], flags});
+        }
+        if (source.empty()) return {};
+
+        static constexpr size_t MAX_DISPLAY_POINTS = 160;
+        std::vector<BleSnrTelemetryPoint> display;
+        double firstFrequencyHz = source.front().freqHz;
+        double displaySpacingHz = channelSpacing;
+        if (source.size() <= MAX_DISPLAY_POINTS) {
+            display = std::move(source);
+        }
+        else {
+            display.reserve(MAX_DISPLAY_POINTS);
+            displaySpacingHz = (source.back().freqHz - source.front().freqHz) /
+                               (double)(MAX_DISPLAY_POINTS - 1);
+            for (size_t bucket = 0; bucket < MAX_DISPLAY_POINTS; ++bucket) {
+                const size_t begin = bucket * source.size() / MAX_DISPLAY_POINTS;
+                const size_t end = (bucket + 1) * source.size() / MAX_DISPLAY_POINTS;
+                float peakSnr = -std::numeric_limits<float>::infinity();
+                uint8_t flags = 0;
+                for (size_t i = begin; i < end; ++i) {
+                    if (std::isfinite(source[i].snrDb))
+                        peakSnr = std::max(peakSnr, source[i].snrDb);
+                    flags |= source[i].flags;
+                }
+                if (!std::isfinite(peakSnr)) peakSnr = 0.0f;
+                display.push_back({firstFrequencyHz + (double)bucket * displaySpacingHz,
+                                   peakSnr, flags});
+            }
+        }
+
+        std::vector<uint8_t> payload;
+        payload.reserve(23 + display.size() * 3);
+        payload.push_back(1);
+        appendBleU32(payload, bleSnrTelemetrySequence.fetch_add(1) + 1);
+        appendBleF64(payload, firstFrequencyHz);
+        appendBleF64(payload, displaySpacingHz);
+        appendBleU16(payload, (uint16_t)display.size());
+        for (const auto& point : display) {
+            const double finiteSnr = std::isfinite(point.snrDb) ? point.snrDb : 0.0;
+            const long tenths = std::lround(finiteSnr * 10.0);
+            const int16_t encoded = (int16_t)std::clamp<long>(
+                tenths, std::numeric_limits<int16_t>::min(),
+                std::numeric_limits<int16_t>::max());
+            appendBleU16(payload, (uint16_t)encoded);
+            payload.push_back(point.flags);
+        }
+        return payload;
+    }
+
+    void bleStatePublisherFunc() {
+        std::unique_lock<std::mutex> lk(bleStatePublisherMtx);
+        unsigned publisherTicks = 0;
+        while (bleStatePublisherRunning) {
+            if (bleStatePublisherCv.wait_for(lk, std::chrono::milliseconds(250), [this] {
+                    return !bleStatePublisherRunning.load();
+                })) break;
+            lk.unlock();
+            ++publisherTicks;
+            if (publisherTicks % 2 == 0) {
+                cleanupExpiredBleAudioTransfers();
+                if (android_ble_gatt::hasSummarySubscribers()) {
+                    android_ble_gatt::notifySummary(bleEnvelope(
+                        0, 200, webStateSummarySnapshot()));
+                }
+            }
+            if (publisherTicks % 20 == 0 && android_ble_gatt::hasStateSubscribers()) {
+                android_ble_gatt::notifyState(handleBleGattRequest(
+                    R"({"v":1,"id":0,"method":"GET","path":"/api/state"})"));
+            }
+            if (android_ble_gatt::hasSnrTelemetrySubscribers()) {
+                std::vector<uint8_t> payload = bleSnrTelemetryPayload();
+                if (!payload.empty())
+                    android_ble_gatt::publishSnrTelemetry(payload.data(), payload.size());
+            }
+            lk.lock();
+        }
+    }
+#endif
+
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
@@ -7026,6 +7780,9 @@ self.addEventListener("fetch", event => {
                     {
                         std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
                         currentPlaybackPath = path;
+#if defined(__ANDROID__)
+                        currentPlaybackDeleteAfter = deleteAfter;
+#endif
                     }
                 }
             }
@@ -7065,7 +7822,11 @@ self.addEventListener("fetch", event => {
                 // the final transcript — it's cleared on the next playback start.
 #endif
                 if (deleteAfter) {
+#if defined(__ANDROID__)
+                    deletePlaybackFileOrDefer(path);
+#else
                     std::remove(path.c_str());
+#endif
                 }
 #if defined(__APPLE__) || defined(_WIN32)
                 else if (m4aEnabled) {
@@ -7096,33 +7857,64 @@ self.addEventListener("fetch", event => {
 #endif
                 {
                     std::lock_guard<std::mutex> cpk(currentPlaybackPathMtx);
-                    if (currentPlaybackPath == path) currentPlaybackPath.clear();
+                    if (currentPlaybackPath == path) {
+                        currentPlaybackPath.clear();
+#if defined(__ANDROID__)
+                        currentPlaybackDeleteAfter = false;
+#endif
+                    }
                 }
             } else {
+#if !defined(__ANDROID__)
+                // Write silence to keep monitorStream continuously flowing.
+                // swap() naturally throttles to the consumer's 48 kHz read rate.
+                memcpy(monitorStream.writeBuf, silence.data(), CHUNK * sizeof(dsp::stereo_t));
+                if (!monitorStream.swap(CHUNK)) { return; }
+#else
                 std::unique_lock<std::mutex> lk(playbackMtx);
                 playbackCv.wait_for(lk, std::chrono::milliseconds(250), [this] {
                     return !playbackQueue.empty() || !playbackRunning.load();
                 });
+#endif
             }
         }
     }
 
     void playbackWavFile(const std::string& path, double playFreq) {
+#if defined(__ANDROID__)
+        ensureAndroidMonitorAudioSink();
+#endif
+        playbackStartedCount++;
         // Write one silence chunk before opening the file so the file I/O
         // happens while the consumer processes audio — prevents underrun pop.
         const int PREBUF = 1024;
         memset(monitorStream.writeBuf, 0, PREBUF * sizeof(dsp::stereo_t));
-        if (!monitorStream.swap(PREBUF)) { return; }
+        if (!monitorStream.swap(PREBUF)) {
+            playbackSwapFailCount++;
+            return;
+        }
 
         std::ifstream f(path, std::ios::binary);
-        if (!f.is_open()) { return; }
+        if (!f.is_open()) {
+            playbackOpenFailCount++;
+            flog::warn("[ChannelBank] Playback failed to open WAV: {0}", path);
+            return;
+        }
 
         // Parse minimal WAV header to find data start
         char riff[4]; f.read(riff, 4);
-        if (std::string(riff, 4) != "RIFF") { return; }
+        if (std::string(riff, 4) != "RIFF") {
+            playbackBadWavCount++;
+            flog::warn("[ChannelBank] Playback invalid WAV RIFF: {0}", path);
+            return;
+        }
         uint32_t fileSize; f.read((char*)&fileSize, 4);
         char wave[4]; f.read(wave, 4);
-        if (std::string(wave, 4) != "WAVE") { return; }
+        if (std::string(wave, 4) != "WAVE") {
+            playbackBadWavCount++;
+            flog::warn("[ChannelBank] Playback invalid WAV WAVE: {0}", path);
+            return;
+        }
 
         // Walk chunks — parse fmt for channel count, find data
         uint16_t fmtChannels = 2;
@@ -7143,7 +7935,11 @@ self.addEventListener("fetch", event => {
                 f.seekg(chunkSize, std::ios::cur);
             }
         }
-        if (dataSize == 0) { return; }
+        if (dataSize == 0) {
+            playbackNoDataCount++;
+            flog::warn("[ChannelBank] Playback WAV has no data chunk: {0}", path);
+            return;
+        }
 
         // Read int16 (mono or stereo) → float stereo_t, write to monitorStream in chunks
         const int CHUNK       = 1024;
@@ -7181,9 +7977,13 @@ self.addEventListener("fetch", event => {
             }
             publishLiveAudioPcm(playFreq, browserPcm.data(), samples, true);
             memcpy(monitorStream.writeBuf, buf.data(), samples * sizeof(dsp::stereo_t));
-            if (!monitorStream.swap(samples)) { break; }
+            if (!monitorStream.swap(samples)) {
+                playbackSwapFailCount++;
+                break;
+            }
             remaining    -= bytesRead;
             samplesRead  += samples;
+            playbackSamplesCount += samples;
 #if defined(__APPLE__) || defined(_WIN32)
             // Publish the playback cursor for the synced-transcript overlay.
             // The WAV is 48 kHz so ms = samples * 1000 / 48000.  Atomic store —
@@ -7608,7 +8408,6 @@ self.addEventListener("fetch", event => {
             config.conf[_this->name]["maxChannels"] = _this->maxChannels;
             config.release(true);
         }
-
         ImGui::LeftLabel("BW Usage");
         ImGui::FillWidth();
         {
@@ -8851,6 +9650,14 @@ self.addEventListener("fetch", event => {
             }
             ImGui::Text("Active: %d  Recording: %d", total, recording);
             ImGui::Text("Monitor queue: %d pending", queued);
+            ImGui::Text("Monitor sink: %s", sigpath::sinkManager.getStreamSink(_this->name + "_monitor").c_str());
+            ImGui::Text("Playback: start %llu openFail %llu bad %llu noData %llu swapFail %llu samples %llu",
+                        (unsigned long long)_this->playbackStartedCount.load(),
+                        (unsigned long long)_this->playbackOpenFailCount.load(),
+                        (unsigned long long)_this->playbackBadWavCount.load(),
+                        (unsigned long long)_this->playbackNoDataCount.load(),
+                        (unsigned long long)_this->playbackSwapFailCount.load(),
+                        (unsigned long long)_this->playbackSamplesCount.load());
             // Inline "Flush" button — only useful when the queue actually has items
             if (queued > 0) {
                 ImGui::SameLine();
@@ -9749,6 +10556,14 @@ self.addEventListener("fetch", event => {
     bool         cpuSampleValid = false;
     std::chrono::steady_clock::time_point lastCpuWall;
     std::clock_t lastCpuClock = 0;
+#ifdef __ANDROID__
+    std::atomic<bool> bleStatePublisherRunning { false };
+    std::thread bleStatePublisherThread;
+    std::mutex bleStatePublisherMtx;
+    std::condition_variable bleStatePublisherCv;
+    std::atomic<uint64_t> bleSummarySequence { 0 };
+    std::atomic<uint32_t> bleSnrTelemetrySequence { 0 };
+#endif
     std::atomic<bool> webServerRunning { false };
     std::thread  webServerThread;
     std::mutex   webServerMtx;
@@ -10343,6 +11158,16 @@ self.addEventListener("fetch", event => {
     // PlaybackEntry now carries the segments alongside the WAV path so the
     // playback thread can install them as `playingSegments` for the synced
     // display.  Empty segments = no sync overlay (Apple Speech / transcription off).
+#if defined(__ANDROID__)
+    void ensureAndroidMonitorAudioSink() {
+        const std::string streamName = name + "_monitor";
+        if (sigpath::sinkManager.getStreamSink(streamName) == "Audio") {
+            return;
+        }
+        sigpath::sinkManager.setStreamSink(streamName, "Audio");
+    }
+#endif
+
     struct PlaybackEntry {
         std::string path;
         double      freqHz;
@@ -10375,17 +11200,41 @@ self.addEventListener("fetch", event => {
 #endif
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
     std::atomic<double>             currentlyPlayingFreqHz { 0.0 };
-#if defined(__APPLE__) || defined(_WIN32)
     std::string                     currentPlaybackPath;
     std::mutex                      currentPlaybackPathMtx;
+#if defined(__ANDROID__)
+    struct BleAudioTransfer {
+        std::string id;
+        std::string path;
+        std::string name;
+        std::string contentType;
+        uintmax_t size = 0;
+        std::chrono::steady_clock::time_point expiresAt;
+        bool deleteAfter = false;
+    };
+    static constexpr std::chrono::seconds BLE_AUDIO_TRANSFER_TTL { 60 };
+    bool currentPlaybackDeleteAfter = false;
+    std::mutex bleAudioTransfersMtx;
+    std::map<std::string, BleAudioTransfer> bleAudioTransfers;
+    std::atomic<uint64_t> bleAudioTransferSequence { 0 };
 #endif
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
     std::thread                     playbackThread;
     std::atomic<bool>               playbackRunning { false };
+    std::atomic<uint64_t>           playbackStartedCount { 0 };
+    std::atomic<uint64_t>           playbackOpenFailCount { 0 };
+    std::atomic<uint64_t>           playbackBadWavCount { 0 };
+    std::atomic<uint64_t>           playbackNoDataCount { 0 };
+    std::atomic<uint64_t>           playbackSwapFailCount { 0 };
+    std::atomic<uint64_t>           playbackSamplesCount { 0 };
     dsp::stream<dsp::stereo_t>      monitorStream;
     SinkManager::Stream*            monitorSinkStream = nullptr;
     EventHandler<float>             monitorSrHandler;
+#if defined(__ANDROID__)
+    EventHandler<std::string>       monitorProviderRegisteredHandler;
+    bool                            monitorProviderHandlerBound = false;
+#endif
 
     // SDR state
     double lastKnownSr     = 0.0;
