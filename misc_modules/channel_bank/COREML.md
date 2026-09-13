@@ -111,8 +111,7 @@ python3.11 -m venv /tmp/cb-coreml-venv
 /tmp/cb-coreml-venv/bin/python \
   misc_modules/channel_bank/tools/convert_hf_coreml_encoder.py \
   --model jacktol/whisper-large-v3-finetuned-for-ATC \
-  --ggml-name ggml-whisper-large-v3-atc-q5_0.bin \
-  --output-dir /tmp/cb-atc-coreml
+  --ggml-name ggml-whisper-large-v3-atc-q5_0.bin
 ```
 
 The separate `--no-deps` install is intentional: ANE transformers' old package
@@ -132,9 +131,16 @@ to overwrite existing outputs. The manifest hash identifies source weights;
 it is not a claim that quantized GGML bytes have the same hash. Conversion uses
 FP16 internal arithmetic with float32 I/O, independently of GGML Q5 quantization.
 
-After conversion succeeds, copy only the `.mlmodelc` directory (and retain the
-manifest for provenance) beside the existing GGML model. Example for the default
-local profile, **only if this is the root used by your test app**:
+By default, outputs go directly to
+`~/Library/Application Support/sdrpp/channel_bank/models` (resolved with
+`Path.home()`), so no copy step is needed for the default local profile. Existing
+outputs are never overwritten. Restart the test app after successful conversion.
+
+For a different profile or a staging-only conversion, pass `--output-dir`, for
+example `--output-dir /tmp/cb-atc-coreml`. If you use that staging directory, copy
+only the `.mlmodelc` directory (and retain the manifest for provenance) beside the
+existing GGML model. Example for the default local profile, **only if this is the
+root used by your test app**:
 
 ```sh
 cb_models="$HOME/Library/Application Support/sdrpp/channel_bank/models"

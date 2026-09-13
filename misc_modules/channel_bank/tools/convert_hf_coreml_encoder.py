@@ -37,7 +37,9 @@ def main():
     ap.add_argument('--model', required=True, help='Hugging Face model ID or local snapshot directory')
     ap.add_argument('--revision', help='HF commit/tag; remote IDs are resolved to a commit before loading')
     ap.add_argument('--ggml-name', required=True, help='Existing matching GGML model basename')
-    ap.add_argument('--output-dir', type=Path, required=True, help='Staging directory; existing outputs are never replaced')
+    ap.add_argument('--output-dir', type=Path,
+                    default=Path.home() / 'Library/Application Support/sdrpp/channel_bank/models',
+                    help='Output directory (default: %(default)s); existing outputs are never replaced')
     args = ap.parse_args()
     name = encoder_name(args.ggml_name)
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
