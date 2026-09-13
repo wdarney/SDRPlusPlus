@@ -21,9 +21,11 @@ void stop();
 bool hasStateSubscribers();
 bool hasSummarySubscribers();
 bool hasAudioSubscribers();
+bool hasSnrTelemetrySubscribers();
 void notifyState(const std::string& json);
 void notifySummary(const std::string& json);
 void publishAudio(const int16_t* samples, size_t count);
+void publishSnrTelemetry(const uint8_t* payload, size_t size);
 
 }
 

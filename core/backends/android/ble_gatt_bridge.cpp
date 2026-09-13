@@ -17,6 +17,7 @@ android_ble_gatt::RequestHandler requestHandler;
 std::atomic<bool> stateSubscribers{false};
 std::atomic<bool> summarySubscribers{false};
 std::atomic<bool> audioSubscribers{false};
+std::atomic<bool> snrTelemetrySubscribers{false};
 
 template <typename Fn>
 void withActivity(Fn&& fn) {
@@ -61,6 +62,7 @@ void unregisterRequestHandler() {
     stateSubscribers.store(false);
     summarySubscribers.store(false);
     audioSubscribers.store(false);
+    snrTelemetrySubscribers.store(false);
 }
 
 void start() { callVoid("startChannelBankGatt"); }
@@ -69,6 +71,7 @@ void stop() { callVoid("stopChannelBankGatt"); }
 bool hasStateSubscribers() { return stateSubscribers.load(); }
 bool hasSummarySubscribers() { return summarySubscribers.load(); }
 bool hasAudioSubscribers() { return audioSubscribers.load(); }
+bool hasSnrTelemetrySubscribers() { return snrTelemetrySubscribers.load(); }
 
 void notifyState(const std::string& json) {
     if (!hasStateSubscribers()) return;
@@ -121,6 +124,26 @@ void publishAudio(const int16_t* samples, size_t count) {
     });
 }
 
+void publishSnrTelemetry(const uint8_t* payload, size_t size) {
+    if (!payload || size == 0 || !hasSnrTelemetrySubscribers()) return;
+    withActivity([payload, size](JNIEnv* env, jobject activity) {
+        jclass cls = env->GetObjectClass(activity);
+        jmethodID method = cls ? env->GetMethodID(
+            cls, "publishChannelBankGattSnrTelemetry", "([B)V") : nullptr;
+        if (method) {
+            jbyteArray value = env->NewByteArray(static_cast<jsize>(size));
+            if (value) {
+                env->SetByteArrayRegion(value, 0, static_cast<jsize>(size),
+                                        reinterpret_cast<const jbyte*>(payload));
+                env->CallVoidMethod(activity, method, value);
+                env->DeleteLocalRef(value);
+            }
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+    });
+}
+
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -143,10 +166,12 @@ Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattRequest(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattSubscriptionChanged(
-    JNIEnv*, jobject, jboolean state, jboolean summary, jboolean audio) {
+    JNIEnv*, jobject, jboolean state, jboolean summary, jboolean audio,
+    jboolean snrTelemetry) {
     stateSubscribers.store(state == JNI_TRUE);
     summarySubscribers.store(summary == JNI_TRUE);
     audioSubscribers.store(audio == JNI_TRUE);
+    snrTelemetrySubscribers.store(snrTelemetry == JNI_TRUE);
 }
 
 namespace android_ble_gatt {
@@ -166,7 +191,7 @@ bool registerNativeMethods() {
             },
             {
                 const_cast<char*>("nativeChannelBankGattSubscriptionChanged"),
-                const_cast<char*>("(ZZZ)V"),
+                const_cast<char*>("(ZZZZ)V"),
                 reinterpret_cast<void*>(
                     Java_org_sdrpp_sdrpp_MainActivity_nativeChannelBankGattSubscriptionChanged)
             }

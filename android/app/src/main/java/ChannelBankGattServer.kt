@@ -28,7 +28,7 @@ import org.json.JSONObject
 internal class ChannelBankGattServer(
     private val activity: MainActivity,
     private val requestHandler: (String) -> String,
-    private val subscriptionChanged: (Boolean, Boolean, Boolean) -> Unit
+    private val subscriptionChanged: (Boolean, Boolean, Boolean, Boolean) -> Unit
 ) {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("7d2f0000-8c4b-4d7a-9a61-8e3c4f2a1000")
@@ -38,6 +38,7 @@ internal class ChannelBankGattServer(
         val STATE_UUID: UUID = UUID.fromString("7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000")
         val AUDIO_UUID: UUID = UUID.fromString("7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000")
         val SUMMARY_UUID: UUID = UUID.fromString("7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000")
+        val SNR_TELEMETRY_UUID: UUID = UUID.fromString("7d2f0007-8c4b-4d7a-9a61-8e3c4f2a1000")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         const val FRAME_VERSION: Byte = 1
@@ -72,15 +73,20 @@ internal class ChannelBankGattServer(
     private val responseByAddress = ConcurrentHashMap<String, ByteArray>()
     private val stateByAddress = ConcurrentHashMap<String, ByteArray>()
     private val summaryByAddress = ConcurrentHashMap<String, ByteArray>()
+    private val snrTelemetryByAddress = ConcurrentHashMap<String, ByteArray>()
     private val stateSubscribers = ConcurrentHashMap.newKeySet<String>()
     private val summarySubscribers = ConcurrentHashMap.newKeySet<String>()
     private val audioSubscribers = ConcurrentHashMap.newKeySet<String>()
+    private val snrTelemetrySubscribers = ConcurrentHashMap.newKeySet<String>()
     private val responseOutgoing = ArrayDeque<Outgoing>()
     private val summaryOutgoing = ArrayDeque<Outgoing>()
     private val streamOutgoing = ArrayDeque<Outgoing>()
+    private val telemetryOutgoing = ArrayDeque<Outgoing>()
     private var sending: Outgoing? = null
-    private var summaryMessageInProgress = false
+    private var stateMessageInProgressAddress: String? = null
+    private var summaryMessageInProgressAddress: String? = null
     private var audioSequence = 0
+    private var snrTelemetrySequence = 0
 
     private lateinit var protocol: BluetoothGattCharacteristic
     private lateinit var command: BluetoothGattCharacteristic
@@ -88,6 +94,7 @@ internal class ChannelBankGattServer(
     private lateinit var state: BluetoothGattCharacteristic
     private lateinit var summary: BluetoothGattCharacteristic
     private lateinit var audio: BluetoothGattCharacteristic
+    private lateinit var snrTelemetry: BluetoothGattCharacteristic
 
     fun start(): Boolean {
         if (server != null) return true
@@ -109,6 +116,7 @@ internal class ChannelBankGattServer(
         state = notifyingCharacteristic(STATE_UUID, indicate = true)
         summary = notifyingCharacteristic(SUMMARY_UUID, indicate = true)
         audio = notifyingCharacteristic(AUDIO_UUID, indicate = false)
+        snrTelemetry = notifyingCharacteristic(SNR_TELEMETRY_UUID, indicate = false)
 
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         service.addCharacteristic(protocol)
@@ -117,6 +125,7 @@ internal class ChannelBankGattServer(
         service.addCharacteristic(state)
         service.addCharacteristic(summary)
         service.addCharacteristic(audio)
+        service.addCharacteristic(snrTelemetry)
 
         server = manager.openGattServer(activity, callback) ?: return false
         if (server?.addService(service) != true) {
@@ -143,17 +152,21 @@ internal class ChannelBankGattServer(
         responseByAddress.clear()
         stateByAddress.clear()
         summaryByAddress.clear()
+        snrTelemetryByAddress.clear()
         stateSubscribers.clear()
         summarySubscribers.clear()
         audioSubscribers.clear()
+        snrTelemetrySubscribers.clear()
         synchronized(streamOutgoing) {
             responseOutgoing.clear()
             summaryOutgoing.clear()
             streamOutgoing.clear()
+            telemetryOutgoing.clear()
             sending = null
-            summaryMessageInProgress = false
+            stateMessageInProgressAddress = null
+            summaryMessageInProgressAddress = null
         }
-        subscriptionChanged(false, false, false)
+        subscriptionChanged(false, false, false, false)
     }
 
     fun notifyState(json: String) {
@@ -180,6 +193,16 @@ internal class ChannelBankGattServer(
         audioSubscribers.forEach { address ->
             val device = connected[address] ?: return@forEach
             enqueueFramed(device, audio, sequence, pcmS16Le, confirm = false)
+        }
+    }
+
+    fun publishSnrTelemetry(payload: ByteArray) {
+        if (payload.isEmpty()) return
+        val sequence = snrTelemetrySequence++ and 0xffff
+        snrTelemetrySubscribers.forEach { address ->
+            val device = connected[address] ?: return@forEach
+            snrTelemetryByAddress[address] = payload
+            enqueueFramed(device, snrTelemetry, sequence, payload, confirm = false)
         }
     }
 
@@ -312,8 +335,11 @@ internal class ChannelBankGattServer(
         val partSize = frameSize - HEADER_SIZE
         val priority = when (characteristic.uuid) {
             RESPONSE_UUID -> 0
-            SUMMARY_UUID -> 1
-            else -> 2
+            STATE_UUID -> 1
+            SUMMARY_UUID -> 2
+            AUDIO_UUID -> 3
+            SNR_TELEMETRY_UUID -> 4
+            else -> 3
         }
         val frames = ArrayList<Outgoing>(maxOf(1, (payload.size + partSize - 1) / partSize))
         var offset = 0
@@ -333,13 +359,25 @@ internal class ChannelBankGattServer(
         var beforeResponses = 0
         var beforeSummaries = 0
         var beforeStreams = 0
+        var beforeTelemetry = 0
         var afterResponses = 0
         var afterSummaries = 0
         var afterStreams = 0
+        var afterTelemetry = 0
         synchronized(streamOutgoing) {
             beforeResponses = responseOutgoing.size
             beforeSummaries = summaryOutgoing.size
             beforeStreams = streamOutgoing.size
+            beforeTelemetry = telemetryOutgoing.size
+            if (characteristic.uuid != SNR_TELEMETRY_UUID) {
+                // Discard queued display telemetry as soon as higher-priority
+                // work arrives. Preserve only a fragment already handed to the
+                // Bluetooth stack; it cannot be recalled.
+                val inFlight = sending
+                telemetryOutgoing.removeAll {
+                    it.device.address == device.address && it !== inFlight
+                }
+            }
             // Keep at most one complete State snapshot queued per client. The
             // next 500 ms publisher tick supplies the newest snapshot once it
             // drains, avoiding an unbounded reliable-indication backlog.
@@ -360,28 +398,55 @@ internal class ChannelBankGattServer(
                 summaryOutgoing.addAll(frames)
                 outcome = "replaced"
             }
+            else if (characteristic.uuid == SNR_TELEMETRY_UUID) {
+                // Telemetry is display-only and must never build up behind
+                // reliable traffic. Keep at most the newest complete message;
+                // a new FIRST lets the client abandon an interrupted old frame.
+                val reliablePending = responseOutgoing.isNotEmpty() ||
+                    summaryOutgoing.isNotEmpty() || streamOutgoing.isNotEmpty()
+                if (reliablePending) {
+                    val inFlight = sending
+                    telemetryOutgoing.removeAll {
+                        it.device.address == device.address && it !== inFlight
+                    }
+                    outcome = "skipped"
+                } else {
+                    val inFlight = sending
+                    val removed = telemetryOutgoing.removeAll {
+                        it.device.address == device.address && it !== inFlight
+                    }
+                    telemetryOutgoing.addAll(frames)
+                    if (removed) outcome = "replaced"
+                }
+            }
             // Audio remains a lossy stream. Drop a complete message before it
             // enters the queue so a client never sees an unterminated partial.
             else if (!confirm && responseOutgoing.size + summaryOutgoing.size + streamOutgoing.size + frames.size > 256) {
                 outcome = "skipped"
             }
             else if (priority == 0) responseOutgoing.addAll(frames)
-            else if (priority == 1) summaryOutgoing.addAll(frames)
+            else if (characteristic.uuid == SUMMARY_UUID) summaryOutgoing.addAll(frames)
             else streamOutgoing.addAll(frames)
             afterResponses = responseOutgoing.size
             afterSummaries = summaryOutgoing.size
             afterStreams = streamOutgoing.size
+            afterTelemetry = telemetryOutgoing.size
         }
         if (characteristic.uuid == STATE_UUID) {
             Log.i(TAG, "State publish: timestamp=${System.currentTimeMillis()} payloadBytes=${payload.size} " +
                 "fragments=${frames.size} mtu=$mtu outcome=$outcome " +
                 "queueBefore=response:$beforeResponses,summary:$beforeSummaries,stream:$beforeStreams " +
-                "queueAfter=response:$afterResponses,summary:$afterSummaries,stream:$afterStreams")
+                "telemetry:$beforeTelemetry queueAfter=response:$afterResponses,summary:$afterSummaries," +
+                "stream:$afterStreams,telemetry:$afterTelemetry")
         } else if (characteristic.uuid == SUMMARY_UUID) {
             Log.i(TAG, "Summary publish: timestamp=${System.currentTimeMillis()} payloadBytes=${payload.size} " +
                 "fragments=${frames.size} mtu=$mtu outcome=$outcome " +
                 "queueBefore=response:$beforeResponses,summary:$beforeSummaries,stream:$beforeStreams " +
-                "queueAfter=response:$afterResponses,summary:$afterSummaries,stream:$afterStreams")
+                "telemetry:$beforeTelemetry queueAfter=response:$afterResponses,summary:$afterSummaries," +
+                "stream:$afterStreams,telemetry:$afterTelemetry")
+        } else if (characteristic.uuid == SNR_TELEMETRY_UUID) {
+            Log.d(TAG, "SNR telemetry publish: timestamp=${System.currentTimeMillis()} payloadBytes=${payload.size} " +
+                "fragments=${frames.size} mtu=$mtu outcome=$outcome")
         }
         if (outcome == "queued" || outcome == "replaced") sendNext()
     }
@@ -389,35 +454,41 @@ internal class ChannelBankGattServer(
     private fun sendNext() {
         val item = synchronized(streamOutgoing) {
             if (sending != null) return
-            val next = if (summaryMessageInProgress && summaryOutgoing.isNotEmpty()) summaryOutgoing.first()
-                       else if (responseOutgoing.isNotEmpty()) responseOutgoing.first()
-                       else if (summaryOutgoing.isNotEmpty()) summaryOutgoing.first()
-                       else if (streamOutgoing.isNotEmpty()) streamOutgoing.first()
-                       else return
-            sending = next
-            if (next.priority == 1 && (next.flags and FLAG_FIRST) != 0) {
-                // Once a compact summary starts, finish it before a response
-                // overtakes its remaining fragments. This lets clients apply
-                // the newer summary sequence before an older command body.
-                summaryMessageInProgress = true
+            var next: Outgoing? = responseOutgoing.firstOrNull()
+            if (next == null) {
+                stateMessageInProgressAddress?.let { address ->
+                    next = streamOutgoing.firstOrNull {
+                        it.device.address == address && it.characteristic.uuid == STATE_UUID
+                    }
+                    if (next == null) stateMessageInProgressAddress = null
+                }
             }
-            next
+            if (next == null) {
+                summaryMessageInProgressAddress?.let { address ->
+                    next = summaryOutgoing.firstOrNull { it.device.address == address }
+                    if (next == null) summaryMessageInProgressAddress = null
+                }
+            }
+            if (next == null) next = summaryOutgoing.firstOrNull()
+            if (next == null) next = streamOutgoing.firstOrNull()
+            if (next == null) next = telemetryOutgoing.firstOrNull()
+            val selected = next ?: return
+            sending = selected
+            if ((selected.flags and FLAG_FIRST) != 0) {
+                when (selected.characteristic.uuid) {
+                    STATE_UUID -> stateMessageInProgressAddress = selected.device.address
+                    SUMMARY_UUID -> summaryMessageInProgressAddress = selected.device.address
+                }
+            }
+            selected
         }
         item.characteristic.value = item.value
         val accepted = try { server?.notifyCharacteristicChanged(item.device, item.characteristic, item.confirm) == true }
                        catch (_: SecurityException) { false }
         if (!accepted) {
             synchronized(streamOutgoing) {
-                val queue = when (item.priority) {
-                    0 -> responseOutgoing
-                    1 -> summaryOutgoing
-                    else -> streamOutgoing
-                }
-                while (queue.isNotEmpty()) {
-                    val dropped = queue.removeFirst()
-                    if ((dropped.flags and FLAG_LAST) != 0) break
-                }
-                if (item.priority == 1) summaryMessageInProgress = false
+                discardMessage(item)
+                clearProgress(item)
                 sending = null
             }
             Log.w(TAG, "Fragment rejected: characteristic=${item.characteristic.uuid} id=${item.messageId} " +
@@ -426,8 +497,37 @@ internal class ChannelBankGattServer(
         }
     }
 
+    private fun queueFor(item: Outgoing): ArrayDeque<Outgoing> = when (item.characteristic.uuid) {
+        RESPONSE_UUID -> responseOutgoing
+        SUMMARY_UUID -> summaryOutgoing
+        SNR_TELEMETRY_UUID -> telemetryOutgoing
+        else -> streamOutgoing
+    }
+
+    private fun discardMessage(item: Outgoing) {
+        queueFor(item).removeAll {
+            it.device.address == item.device.address &&
+                it.characteristic.uuid == item.characteristic.uuid &&
+                it.messageId == item.messageId
+        }
+    }
+
+    private fun clearProgress(item: Outgoing) {
+        if (item.characteristic.uuid == STATE_UUID &&
+            stateMessageInProgressAddress == item.device.address) {
+            stateMessageInProgressAddress = null
+        }
+        if (item.characteristic.uuid == SUMMARY_UUID &&
+            summaryMessageInProgressAddress == item.device.address) {
+            summaryMessageInProgressAddress = null
+        }
+    }
+
     private fun updateSubscriptions() {
-        subscriptionChanged(stateSubscribers.isNotEmpty(), summarySubscribers.isNotEmpty(), audioSubscribers.isNotEmpty())
+        subscriptionChanged(
+            stateSubscribers.isNotEmpty(), summarySubscribers.isNotEmpty(),
+            audioSubscribers.isNotEmpty(), snrTelemetrySubscribers.isNotEmpty()
+        )
     }
 
     private val callback = object : BluetoothGattServerCallback() {
@@ -442,13 +542,19 @@ internal class ChannelBankGattServer(
                 stateSubscribers.remove(device.address)
                 summarySubscribers.remove(device.address)
                 audioSubscribers.remove(device.address)
+                snrTelemetrySubscribers.remove(device.address)
+                snrTelemetryByAddress.remove(device.address)
                 assemblies.keys.removeAll { it.address == device.address }
                 synchronized(streamOutgoing) {
                     responseOutgoing.removeAll { it.device.address == device.address }
                     summaryOutgoing.removeAll { it.device.address == device.address }
                     streamOutgoing.removeAll { it.device.address == device.address }
+                    telemetryOutgoing.removeAll { it.device.address == device.address }
                     if (sending?.device?.address == device.address) sending = null
-                    if (sending == null) summaryMessageInProgress = false
+                    if (stateMessageInProgressAddress == device.address)
+                        stateMessageInProgressAddress = null
+                    if (summaryMessageInProgressAddress == device.address)
+                        summaryMessageInProgressAddress = null
                 }
                 updateSubscriptions()
                 Log.i(TAG, "Client disconnected, status=$status")
@@ -472,6 +578,7 @@ internal class ChannelBankGattServer(
                     .toByteArray(Charsets.UTF_8).also { stateByAddress[device.address] = it }
                 SUMMARY_UUID -> requestHandler("""{"v":1,"id":0,"method":"GET","path":"/api/state/summary"}""")
                     .toByteArray(Charsets.UTF_8).also { summaryByAddress[device.address] = it }
+                SNR_TELEMETRY_UUID -> snrTelemetryByAddress[device.address] ?: ByteArray(0)
                 else -> ByteArray(0)
             }
             sendRead(device, requestId, offset, value)
@@ -494,6 +601,7 @@ internal class ChannelBankGattServer(
                 STATE_UUID -> stateSubscribers.contains(device.address)
                 SUMMARY_UUID -> summarySubscribers.contains(device.address)
                 AUDIO_UUID -> audioSubscribers.contains(device.address)
+                SNR_TELEMETRY_UUID -> snrTelemetrySubscribers.contains(device.address)
                 RESPONSE_UUID -> true
                 else -> false
             }
@@ -520,9 +628,11 @@ internal class ChannelBankGattServer(
                     STATE_UUID -> if (enabled) stateSubscribers.add(device.address) else stateSubscribers.remove(device.address)
                     SUMMARY_UUID -> if (enabled) summarySubscribers.add(device.address) else summarySubscribers.remove(device.address)
                     AUDIO_UUID -> if (enabled) audioSubscribers.add(device.address) else audioSubscribers.remove(device.address)
+                    SNR_TELEMETRY_UUID -> if (enabled) snrTelemetrySubscribers.add(device.address) else snrTelemetrySubscribers.remove(device.address)
                 }
                 updateSubscriptions()
-                Log.i(TAG, "Subscriptions changed: state=${stateSubscribers.size}, summary=${summarySubscribers.size}, audio=${audioSubscribers.size}")
+                Log.i(TAG, "Subscriptions changed: state=${stateSubscribers.size}, summary=${summarySubscribers.size}, " +
+                    "audio=${audioSubscribers.size}, snrTelemetry=${snrTelemetrySubscribers.size}")
             }
             if (responseNeeded) server?.sendResponse(device, requestId, status, 0, null)
         }
@@ -535,6 +645,7 @@ internal class ChannelBankGattServer(
             var responseDepth = 0
             var summaryDepth = 0
             var streamDepth = 0
+            var telemetryDepth = 0
             synchronized(streamOutgoing) {
                 val current = sending
                 if (current == null || current.device.address != device.address) {
@@ -542,37 +653,28 @@ internal class ChannelBankGattServer(
                     return
                 }
                 delivered = current
-                val queue = when (current.priority) {
-                    0 -> responseOutgoing
-                    1 -> summaryOutgoing
-                    else -> streamOutgoing
-                }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    if (queue.isNotEmpty()) queue.removeFirst()
-                    if (current.priority == 1 && (current.flags and FLAG_LAST) != 0) {
-                        summaryMessageInProgress = false
-                    }
+                    queueFor(current).remove(current)
+                    if ((current.flags and FLAG_LAST) != 0) clearProgress(current)
                 } else {
                     // The failed fragment did not reach the client. Discard the
                     // remainder of that message instead of sending fragments
                     // that can only produce missing-first/offset errors.
-                    while (queue.isNotEmpty()) {
-                        val dropped = queue.removeFirst()
-                        if (dropped.value.size >= HEADER_SIZE &&
-                            (dropped.value[1].toInt() and FLAG_LAST) != 0) break
-                    }
-                    if (current.priority == 1) summaryMessageInProgress = false
+                    discardMessage(current)
+                    clearProgress(current)
                 }
                 sending = null
                 responseDepth = responseOutgoing.size
                 summaryDepth = summaryOutgoing.size
                 streamDepth = streamOutgoing.size
+                telemetryDepth = telemetryOutgoing.size
             }
             delivered?.let {
                 Log.d(TAG, "Fragment delivered: characteristic=${it.characteristic.uuid} id=${it.messageId} " +
                     "offset=${it.offset} first=${(it.flags and FLAG_FIRST) != 0} " +
                     "last=${(it.flags and FLAG_LAST) != 0} status=$status " +
-                    "queueAfter=response:$responseDepth,summary:$summaryDepth,stream:$streamDepth")
+                    "queueAfter=response:$responseDepth,summary:$summaryDepth,stream:$streamDepth," +
+                    "telemetry:$telemetryDepth")
             }
             sendNext()
         }

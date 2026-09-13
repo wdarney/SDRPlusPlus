@@ -74,7 +74,9 @@ class MainActivity : NativeActivity() {
     private var channelBankGattWanted = false
 
     private external fun nativeChannelBankGattRequest(request: String): String
-    private external fun nativeChannelBankGattSubscriptionChanged(state: Boolean, summary: Boolean, audio: Boolean)
+    private external fun nativeChannelBankGattSubscriptionChanged(
+        state: Boolean, summary: Boolean, audio: Boolean, snrTelemetry: Boolean
+    )
 
     fun startChannelBankGatt() {
         channelBankGattWanted = true
@@ -90,7 +92,9 @@ class MainActivity : NativeActivity() {
                 channelBankGatt = ChannelBankGattServer(
                     this,
                     { request -> nativeChannelBankGattRequest(request) },
-                    { state, summary, audio -> nativeChannelBankGattSubscriptionChanged(state, summary, audio) }
+                    { state, summary, audio, snrTelemetry ->
+                        nativeChannelBankGattSubscriptionChanged(state, summary, audio, snrTelemetry)
+                    }
                 )
             }
             channelBankGatt?.start()
@@ -115,6 +119,10 @@ class MainActivity : NativeActivity() {
 
     fun publishChannelBankGattAudio(pcmS16Le: ByteArray) {
         channelBankGatt?.publishAudio(pcmS16Le)
+    }
+
+    fun publishChannelBankGattSnrTelemetry(payload: ByteArray) {
+        channelBankGatt?.publishSnrTelemetry(payload)
     }
 
     fun checkAndAsk(permission: String) {
