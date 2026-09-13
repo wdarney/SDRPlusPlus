@@ -1,6 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #include "bluetooth_macos.h"
+#include "bluetooth_audio_macos.h"
+#include <memory>
+#include <utility>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -13,6 +16,7 @@
 @interface CBMacTransfer : NSObject {
 @public
     int fd;
+    std::unique_ptr<CBMacAudioCopy> compressed;
     std::chrono::steady_clock::time_point touched;
 }
 @property NSString* name;
@@ -334,6 +338,9 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     }
     if (!transferId.length) {
         if (offset != 0) return envelope(identifier, 400, @{@"error":@"transferId is required after the first page"});
+        id encoding = body[@"encoding"];
+        if (encoding && ![encoding isEqual:@"aac"])
+            return envelope(identifier, 400, @{@"error":@"Unsupported audio encoding"});
         if (_transfers.count >= 8) return envelope(identifier, 503, @{@"error":@"Too many audio transfers"});
         std::string name;
         transfer = [CBMacTransfer new];
@@ -345,9 +352,33 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         transfer.size = info.st_size;
         transfer.name = [NSString stringWithUTF8String:name.c_str()] ?: @"playback.wav";
         transfer.owner = owner;
+        if ([encoding isEqual:@"aac"] && ![transfer.name.pathExtension.lowercaseString isEqual:@"m4a"]) {
+            transfer.name = [transfer.name.stringByDeletingPathExtension stringByAppendingPathExtension:@"m4a"];
+            transfer->compressed = std::make_unique<CBMacAudioCopy>(dup(transfer->fd));
+        }
         transferId = NSUUID.UUID.UUIDString;
         _transfers[transferId] = transfer;
     } else if (!transfer) return envelope(identifier, 404, @{@"error":@"Transfer expired or unavailable"});
+    if (transfer->compressed) {
+        transfer->touched = std::chrono::steady_clock::now();
+        if (!transfer->compressed->done.load())
+            return envelope(identifier, 202, @{@"transferId":transferId, @"preparing":@YES,
+                @"retryAfterMs":@250, @"offset":@0, @"name":transfer.name, @"contentType":@"audio/mp4"});
+        if (transfer->compressed->error != noErr || transfer->compressed->outputFD < 0) {
+            NSString* message = [NSString stringWithFormat:@"Bluetooth AAC conversion failed (AudioToolbox %d)", (int)transfer->compressed->error];
+            [_transfers removeObjectForKey:transferId];
+            return envelope(identifier, 502, @{@"error":message});
+        }
+        close(transfer->fd);
+        transfer->fd = std::exchange(transfer->compressed->outputFD, -1);
+        transfer->compressed.reset();
+        struct stat compressedInfo{};
+        if (fstat(transfer->fd, &compressedInfo) != 0 || compressedInfo.st_size <= 0) {
+            [_transfers removeObjectForKey:transferId];
+            return envelope(identifier, 502, @{@"error":@"Bluetooth AAC output is empty"});
+        }
+        transfer.size = compressedInfo.st_size;
+    }
     if (offset > transfer.size) return envelope(identifier, 416, @{@"error":@"Offset past EOF"});
     NSUInteger count = std::min<uint64_t>(limit, transfer.size - offset);
     NSMutableData* data = [NSMutableData dataWithLength:count];

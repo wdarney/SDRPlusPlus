@@ -44,6 +44,45 @@ client compatibility; `audio.available:false` refers to live PCM, while
 
 ## Buffered Audio
 
+### Bluetooth-Only AAC Copy
+
+Updated iPhone clients request `body.encoding: "aac"` on the first
+`GET /api/audio/current-playback` page. The Bluetooth adapter converts its leased
+source descriptor to a private M4A containing 24 kHz mono AAC at 32 kbps.
+Conversion runs on a separate thread, so command handling and telemetry can
+continue. The temporary output is unlinked after opening it for paged reading.
+An already-M4A source is passed through. Requests without `encoding` retain
+the original file format for older clients.
+
+While conversion runs, Response returns status 202 with `ok:true` and a body
+such as:
+
+```json
+{"transferId":"...","preparing":true,"retryAfterMs":250,"offset":0,"name":"voice.m4a","contentType":"audio/mp4"}
+```
+
+The client retains that lease and repeats offset zero until a normal 200 data
+page arrives. No new lease is created for a preparation poll. The output size
+and offsets then describe the compressed file. Cancel, idle expiry, disconnect,
+and shutdown cancel conversion and release its private descriptors. Conversion
+checks cancellation and a 15-second deadline between PCM blocks; failures return
+502 instead of silently transferring a large WAV. iOS bounds preparation waits
+and displays preparation/download progress.
+
+This feature changes only `bluetooth_macos.mm` and its private
+`bluetooth_audio_macos.h` helper. Local `main.cpp`, `encoding.mm`, playback,
+recordings, transcription, and WebUI behavior are unchanged. Compression works
+with recording-disabled temporary WAVs and does not wait for the local M4A
+recording encoder.
+
+Radio-free validation used a ten-second 48 kHz mono WAV: 960,044 bytes became
+51,434 M4A bytes, with 240,000 decoded frames at 24 kHz and nonzero audio energy.
+The test verifies original source bytes, conversion after source unlink,
+multi-page download, EOF cleanup, invalid-input failure, and cancellation.
+Build the test with `-framework AudioToolbox` in addition to Foundation and
+CoreBluetooth. A rebuilt Mac app and updated iPhone client are needed for a
+physical BLE playback test; no new Mac package is produced by this source change.
+
 Send `GET /api/audio/current-playback` in a BLE command with `body.offset` (default
 0) and `body.limit` (default 4096, clamped to 1..16384). The first page leases the
 current completed playback file and returns `transferId`, `offset`, `nextOffset`,
