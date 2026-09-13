@@ -233,6 +233,36 @@ final class ChannelBankClientTests: XCTestCase {
         XCTAssertEqual(audio.rate, 48000)
     }
 
+    func testSNRTelemetryFrameDecoding() throws {
+        var payload = Data([1])
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { payload.append(contentsOf: $0) }
+        }
+        func append(_ value: Double) {
+            append(value.bitPattern)
+        }
+
+        append(UInt32(42))
+        append(155_000_000.0)
+        append(25_000.0)
+        append(UInt16(2))
+        append(Int16(85))
+        payload.append(0x03)
+        append(Int16(-15))
+        payload.append(0x04)
+
+        let frame = try SNRTelemetryFrame(payload: payload)
+        XCTAssertEqual(frame.sequence, 42)
+        XCTAssertEqual(frame.points.count, 2)
+        XCTAssertEqual(frame.points[0].freqHz, 155_000_000)
+        XCTAssertEqual(frame.points[1].freqHz, 155_025_000)
+        XCTAssertEqual(frame.points[0].snrDb, 8.5)
+        XCTAssertTrue(frame.points[0].detected == true)
+        XCTAssertTrue(frame.points[0].rawDetected == true)
+        XCTAssertTrue(frame.points[1].blocked == true)
+    }
+
     private final class FakeTransport: ChannelBankTransport {
         var frames: [Data] = []
 

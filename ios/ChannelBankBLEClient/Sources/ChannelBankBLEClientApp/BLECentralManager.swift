@@ -53,6 +53,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private static let stateUUID = CBUUID(string: "7d2f0004-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let audioUUID = CBUUID(string: "7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let stateSummaryUUID = CBUUID(string: "7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000")
+    private static let snrTelemetryUUID = CBUUID(string: "7d2f0007-8c4b-4d7a-9a61-8e3c4f2a1000")
 
     @Published public private(set) var status: BLEConnectionStatus = .idle
     @Published public private(set) var discovered: [DiscoveredPeripheral] = []
@@ -74,9 +75,11 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var stateCharacteristic: CBCharacteristic?
     private var audioCharacteristic: CBCharacteristic?
     private var stateSummaryCharacteristic: CBCharacteristic?
+    private var snrTelemetryCharacteristic: CBCharacteristic?
     private let responseAssembler = ChannelBankFrameAssembler()
     private let stateAssembler = ChannelBankFrameAssembler()
     private let stateSummaryAssembler = ChannelBankFrameAssembler()
+    private let snrTelemetryAssembler = ChannelBankFrameAssembler()
     private let decoder = JSONDecoder()
     private lazy var client = ChannelBankClient(transport: self)
     private var broadScanFallbackTask: Task<Void, Never>?
@@ -84,6 +87,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var responseNotificationsEnabled = false
     private var stateNotificationsEnabled = false
     private var stateSummaryNotificationsEnabled = false
+    private var snrTelemetryNotificationsEnabled = false
     private var latestSequence: Int64?
     private var initialStateFallbackTask: Task<Void, Never>?
     private var hasReceivedFullState = false
@@ -466,13 +470,16 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         stateCharacteristic = nil
         audioCharacteristic = nil
         stateSummaryCharacteristic = nil
+        snrTelemetryCharacteristic = nil
         responseAssembler.reset()
         stateAssembler.reset()
         stateSummaryAssembler.reset()
+        snrTelemetryAssembler.reset()
         client.reset()
         responseNotificationsEnabled = false
         stateNotificationsEnabled = false
         stateSummaryNotificationsEnabled = false
+        snrTelemetryNotificationsEnabled = false
         latestSequence = nil
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
@@ -608,7 +615,8 @@ extension BLECentralManager: CBPeripheralDelegate {
             Self.responseUUID,
             Self.stateUUID,
             Self.audioUUID,
-            Self.stateSummaryUUID
+            Self.stateSummaryUUID,
+            Self.snrTelemetryUUID
         ], for: service)
     }
 
@@ -625,6 +633,7 @@ extension BLECentralManager: CBPeripheralDelegate {
             case Self.stateUUID: stateCharacteristic = characteristic
             case Self.audioUUID: audioCharacteristic = characteristic
             case Self.stateSummaryUUID: stateSummaryCharacteristic = characteristic
+            case Self.snrTelemetryUUID: snrTelemetryCharacteristic = characteristic
             default: break
             }
         }
@@ -646,6 +655,11 @@ extension BLECentralManager: CBPeripheralDelegate {
         } else {
             appendDiagnostic("State Summary characteristic not present")
         }
+        if let snrTelemetryCharacteristic {
+            peripheral.setNotifyValue(true, for: snrTelemetryCharacteristic)
+        } else {
+            appendDiagnostic("High-rate SNR telemetry characteristic not present")
+        }
         connectedName = peripheral.name ?? connectedName
         status = .connected(connectedName ?? "SDR++ Channel Bank")
     }
@@ -664,6 +678,9 @@ extension BLECentralManager: CBPeripheralDelegate {
         } else if characteristic.uuid == Self.stateSummaryUUID {
             stateSummaryNotificationsEnabled = characteristic.isNotifying
             appendDiagnostic("State Summary indications \(characteristic.isNotifying ? "enabled" : "disabled")")
+        } else if characteristic.uuid == Self.snrTelemetryUUID {
+            snrTelemetryNotificationsEnabled = characteristic.isNotifying
+            appendDiagnostic("High-rate SNR telemetry notifications \(characteristic.isNotifying ? "enabled" : "disabled")")
         }
         requestInitialStateIfReady()
     }
@@ -741,6 +758,16 @@ extension BLECentralManager: CBPeripheralDelegate {
                     appendDiagnostic("Ignored State Summary frame: \(userVisibleError(error))")
                 }
             }
+        } else if characteristic.uuid == Self.snrTelemetryUUID {
+            do {
+                if let complete = try snrTelemetryAssembler.push(value) {
+                    try acceptSNRTelemetryPayload(complete.payload)
+                }
+            } catch let error as ChannelBankFrameError where error.isRecoverableFragmentLoss {
+                appendDiagnostic("Dropped partial SNR telemetry frame: \(error.diagnosticLabel)")
+            } catch {
+                appendDiagnostic("Ignored SNR telemetry frame: \(userVisibleError(error))")
+            }
         }
     }
 
@@ -768,6 +795,13 @@ extension BLECentralManager: CBPeripheralDelegate {
         } else if let error = envelope.error {
             lastError = "\(envelope.status) \(error.code): \(error.message)"
         }
+    }
+
+    private func acceptSNRTelemetryPayload(_ payload: Data) throws {
+        let frame = try SNRTelemetryFrame(payload: payload)
+        var state = latestState ?? ChannelBankState()
+        state.snrOverview = frame.points
+        latestState = state
     }
 
     private func acceptFullState(_ state: ChannelBankState) {

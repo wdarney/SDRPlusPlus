@@ -527,6 +527,60 @@ public struct SNROverviewPoint: Codable, Equatable, Identifiable {
     public var blocked: Bool?
 }
 
+public enum SNRTelemetryFrameError: Error, Equatable {
+    case unsupportedVersion(UInt8)
+    case truncated
+    case invalidLength(expected: Int, got: Int)
+}
+
+/// A compact, lossy display frame for the high-rate SNR characteristic.
+public struct SNRTelemetryFrame: Equatable {
+    public let sequence: UInt32
+    public let firstFrequencyHz: Double
+    public let spacingHz: Double
+    public let points: [SNROverviewPoint]
+
+    public init(payload: Data) throws {
+        let headerSize = 23
+        guard payload.count >= headerSize else { throw SNRTelemetryFrameError.truncated }
+        guard payload[0] == 1 else { throw SNRTelemetryFrameError.unsupportedVersion(payload[0]) }
+
+        func unsigned(at offset: Int, count: Int) -> UInt64 {
+            var value: UInt64 = 0
+            for index in 0..<count {
+                value |= UInt64(payload[offset + index]) << UInt64(index * 8)
+            }
+            return value
+        }
+
+        let sequence = UInt32(unsigned(at: 1, count: 4))
+        let firstFrequencyHz = Double(bitPattern: unsigned(at: 5, count: 8))
+        let spacingHz = Double(bitPattern: unsigned(at: 13, count: 8))
+        let count = Int(unsigned(at: 21, count: 2))
+        let expectedLength = headerSize + count * 3
+        guard payload.count == expectedLength else {
+            throw SNRTelemetryFrameError.invalidLength(expected: expectedLength, got: payload.count)
+        }
+
+        let points = (0..<count).map { index in
+            let offset = headerSize + index * 3
+            let snrTenths = Int16(bitPattern: UInt16(unsigned(at: offset, count: 2)))
+            let flags = payload[offset + 2]
+            return SNROverviewPoint(
+                freqHz: firstFrequencyHz + Double(index) * spacingHz,
+                snrDb: Double(snrTenths) / 10,
+                detected: flags & 0x01 != 0,
+                rawDetected: flags & 0x02 != 0,
+                blocked: flags & 0x04 != 0
+            )
+        }
+        self.sequence = sequence
+        self.firstFrequencyHz = firstFrequencyHz
+        self.spacingHz = spacingHz
+        self.points = points
+    }
+}
+
 public struct ChannelBankSettings: Codable, Equatable {
     public var mode: String?
     public var spacingId: Int?

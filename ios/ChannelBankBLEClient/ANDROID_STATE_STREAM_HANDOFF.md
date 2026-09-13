@@ -45,6 +45,31 @@ Use a `stateMessageInProgress` flag analogous to the existing summary-progress t
 - Keep Response above all other traffic.
 - Do not put the full `snrOverview` array into State Summary; that would recreate the large-message contention under a different characteristic.
 
+## Smooth SNR telemetry characteristic
+
+For smooth SNR Overview rendering, add an optional characteristic:
+
+- UUID: `7d2f0007-8c4b-4d7a-9a61-8e3c4f2a1000`
+- Properties: Read, Notify. Notifications are intentionally lossy; the client renders only the newest complete frame.
+- Cadence: begin at 4 Hz while subscribed. Drop a frame rather than queue it behind a previous telemetry frame, Response, Summary, or State traffic.
+- Priority: below Response, State Summary, and reliable full State. It must never delay controls.
+- Framing: use the existing eight-byte GATT frame header and a monotonically increasing message ID/sequence.
+
+The reassembled binary payload is little-endian:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | `u8` | Telemetry schema version, `1` |
+| 1 | `u32` | Telemetry sequence |
+| 5 | `f64` | Frequency of point 0 in Hz |
+| 13 | `f64` | Spacing between points in Hz |
+| 21 | `u16` | Point count |
+| 23 | repeated `i16`,`u8` | SNR in tenths of dB and flags |
+
+Flags: bit 0 `detected`, bit 1 `rawDetected`, bit 2 `blocked`. In automatic fixed-grid modes this represents the complete `snrOverview` without repeating each frequency as JSON. 160 points occupy 503 bytes before outer GATT framing. For manual/nonuniform frequencies, do not publish this version; retain the reliable full State chart until a versioned nonuniform encoding is added.
+
+The iOS client already discovers, subscribes to, reassembles, validates, and renders this optional characteristic. Older Android builds remain compatible because the characteristic is optional.
+
 ## Acceptance test
 
 1. Connect iOS and enable Response, State Summary, and State indications.
