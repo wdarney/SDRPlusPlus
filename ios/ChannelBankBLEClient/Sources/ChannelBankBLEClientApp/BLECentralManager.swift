@@ -100,6 +100,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var centerTuneRequestInFlight = false
     private var playbackTask: Task<Void, Never>?
     private var activePlaybackIdentity: String?
+    private var deferredPlaybackIdentity: String?
     private var completedPlaybackIdentities: Set<String> = []
     private var audioPlayer: AVAudioPlayer?
 
@@ -260,6 +261,10 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     public func monitorCurrentPlayback() {
+        guard playbackTask == nil, audioPlayer?.isPlaying != true else {
+            appendDiagnostic("Audio monitoring already active; preserving the current clip")
+            return
+        }
         guard let state = latestState else {
             audioMonitorStatus = "Waiting for playback State"
             return
@@ -497,6 +502,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         playbackTask?.cancel()
         playbackTask = nil
         activePlaybackIdentity = nil
+        deferredPlaybackIdentity = nil
         audioPlayer?.stop()
         audioPlayer = nil
         status = .disconnected(reason)
@@ -882,7 +888,18 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
         guard let identity = playbackIdentity(for: state) else { return }
         guard identity != activePlaybackIdentity, !completedPlaybackIdentities.contains(identity) else { return }
 
+        // The server lease keeps this file readable even after playback advances.
+        // Restarting on every new filename can prevent any BLE download reaching EOF.
+        guard playbackTask == nil, audioPlayer?.isPlaying != true else {
+            if deferredPlaybackIdentity != identity {
+                deferredPlaybackIdentity = identity
+                appendDiagnostic("Audio source advanced; finishing current clip before following latest playback")
+            }
+            return
+        }
+
         playbackTask?.cancel()
+        deferredPlaybackIdentity = nil
         activePlaybackIdentity = identity
         audioMonitorStatus = "Pulling \(state.playback?.fileName ?? state.playback?.name ?? "playback")"
         appendDiagnostic("Audio pull start id=\(identity)")
@@ -902,6 +919,9 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
     }
 
     private func pullAndPlay(state: ChannelBankState, identity: String) async {
+        defer {
+            if activePlaybackIdentity == identity { playbackTask = nil }
+        }
         do {
             let download = try await pullCurrentPlaybackWithRetry()
             try Task.checkCancellation()
@@ -915,6 +935,7 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
                 }
             }
         } catch {
+            appendDiagnostic("Current playback pull failed: \(userVisibleError(error))")
             do {
                 let download = try await pullRecordingFallback(state: state)
                 try Task.checkCancellation()
@@ -972,8 +993,10 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
                 var firstPage: RecordingPage?
                 let recording = try await RecordingPaginator().collectLeased { offset, transferId in
                     let page = try await self.client.currentPlaybackPage(offset: offset, transferId: transferId)
+                    try Task.checkCancellation()
                     if let pageTransferId = page.transferId { lease.set(pageTransferId) }
                     if firstPage == nil { firstPage = page }
+                    self.updateAudioProgress(page)
                     self.appendDiagnostic("Audio page transfer=\(page.transferId ?? "missing") offset=\(page.offset ?? offset) eof=\(page.eof == true)")
                     return page
                 }
@@ -1020,10 +1043,19 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
         var firstPage: RecordingPage?
         let data = try await RecordingPaginator().collect { offset in
             let page = try await fetch(offset)
+            try Task.checkCancellation()
             if firstPage == nil { firstPage = page }
+            self.updateAudioProgress(page)
             return page
         }
         return PulledAudio(data: data, name: firstPage?.name, contentType: firstPage?.contentType)
+    }
+
+    private func updateAudioProgress(_ page: RecordingPage) {
+        let received = page.nextOffset ?? page.offset ?? 0
+        let receivedText = ByteCountFormatter.string(fromByteCount: Int64(received), countStyle: .file)
+        let totalText = page.size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
+        audioMonitorStatus = "Downloading \(page.name ?? "audio"): \(receivedText)\(totalText.map { " of \($0)" } ?? "")"
     }
 
     nonisolated private func writePlaybackFile(_ audio: PulledAudio, fallbackName: String?) async throws -> URL {
@@ -1058,13 +1090,19 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             lastError = error.localizedDescription
+            audioMonitorStatus = "Audio session failed: \(error.localizedDescription)"
+            return
         }
         #endif
         do {
             audioPlayer?.stop()
             let player = try AVAudioPlayer(contentsOf: url)
-            player.prepareToPlay()
-            player.play()
+            player.delegate = self
+            guard player.prepareToPlay(), player.play() else {
+                audioMonitorStatus = "Playback failed: unable to start the downloaded audio"
+                appendDiagnostic(audioMonitorStatus)
+                return
+            }
             audioPlayer = player
             completedPlaybackIdentities.insert(identity)
             audioMonitorStatus = "Playing \(url.lastPathComponent)"
@@ -1131,6 +1169,23 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
     private static func codingPath(_ path: [CodingKey]) -> String {
         guard !path.isEmpty else { return "$" }
         return path.map(\.stringValue).joined(separator: ".")
+    }
+}
+
+extension BLECentralManager: @preconcurrency AVAudioPlayerDelegate {
+    public func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard audioPlayer === player else { return }
+        audioPlayer = nil
+        audioMonitorStatus = flag ? "Finished" : "Playback ended with an error"
+        appendDiagnostic(audioMonitorStatus)
+        if let state = latestState { monitorPlaybackIfNeeded(state) }
+    }
+
+    public func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        guard audioPlayer === player else { return }
+        audioPlayer = nil
+        audioMonitorStatus = "Playback decode failed: \(error?.localizedDescription ?? "Invalid audio file")"
+        appendDiagnostic(audioMonitorStatus)
     }
 }
 

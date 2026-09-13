@@ -1,5 +1,35 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Audio Stuck Pulling Follow-Up (2026-09-13)
+
+Reported symptom: Monitor remains at `Pulling...` with a filename and never
+reaches local playback. Source inspection found that a changed State playback
+identity canceled the current leased download. If clips advance faster than
+Bluetooth can download them, the monitor repeatedly restarts before EOF.
+
+The client now finishes its current download and local playback before following
+the latest State playback identity. It does not accumulate a queue of old clips.
+The server's existing transfer lease preserves the open file across playback
+changes/deletion. Pressing Monitor again while busy no longer restarts the pull.
+Disconnect still cancels the transfer and releases its lease.
+
+Each returned page updates visible downloaded/total bytes. The original pull
+failure is retained in diagnostics before attempting the recordings fallback.
+AVFoundation preparation/start failures now report failure instead of claiming
+`Playing`, and its completion delegate clears the playback status and resumes
+monitoring. A Mac server still needs its existing leased-audio implementation;
+no server changes are part of this client fix.
+
+Physical acceptance: while the Mac advances through several transmissions,
+confirm one download's byte count keeps advancing to EOF, that clip is audible,
+and monitoring follows the latest clip after playback finishes. The initial
+page still needs to arrive before a total file size can be displayed. Large WAV
+files can take a long time over the reliable BLE response channel.
+
+Validation: the existing 28 core tests pass; signed iPhone build and strict
+signature verification passed; the update installed on the paired iPhone.
+Audible playback with advancing Mac transmissions remains a device test.
+
 ## iPhone UI Hang Follow-Up (2026-09-13)
 
 The user reports that tapping a control such as SNR + or - can freeze the
