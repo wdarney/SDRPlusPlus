@@ -44,6 +44,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <memory>
+#include <limits>
 #include <regex>
 #include <queue>
 #include <deque>
@@ -621,13 +622,15 @@ public:
         if (!webServerRunning.load()) return;
         std::string host = webDisplayBindAddress();
         if (host == "0.0.0.0") host = "127.0.0.1";
-        bluetoothHandle = channel_bank_bluetooth::start(host, webControlPort, [this](std::string& filename) {
-            std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
-            if (currentlyPlayingFreqKey.load() == 0 || currentPlaybackPath.empty()) return -1;
-            filename = std::filesystem::path(currentPlaybackPath).filename().string();
-            // An open macOS descriptor remains readable even after playback unlinks the file.
-            return ::open(currentPlaybackPath.c_str(), O_RDONLY | O_CLOEXEC);
-        });
+        bluetoothHandle = channel_bank_bluetooth::start(host, webControlPort,
+            [this](std::string& filename) {
+                std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
+                if (currentlyPlayingFreqKey.load() == 0 || currentPlaybackPath.empty()) return -1;
+                filename = std::filesystem::path(currentPlaybackPath).filename().string();
+                // An open macOS descriptor remains readable even after playback unlinks the file.
+                return ::open(currentPlaybackPath.c_str(), O_RDONLY | O_CLOEXEC);
+            },
+            [this] { return bleSnrTelemetryPayload(); });
     }
 #endif
     void enable()  { enabled = true; }
@@ -1839,6 +1842,118 @@ private:
         if (selectedSourceControlInterface(selected)) return jsonSourceStateJson(selected);
         return json({{"available", false}, {"source", selected}});
     }
+
+#ifdef __APPLE__
+    struct BleSnrTelemetryPoint {
+        double freqHz = 0.0;
+        float snrDb = 0.0f;
+        uint8_t flags = 0;
+    };
+
+    static void appendBleU16(std::vector<uint8_t>& payload, uint16_t value) {
+        payload.push_back((uint8_t)(value & 0xFF));
+        payload.push_back((uint8_t)((value >> 8) & 0xFF));
+    }
+
+    static void appendBleU32(std::vector<uint8_t>& payload, uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8)
+            payload.push_back((uint8_t)((value >> shift) & 0xFF));
+    }
+
+    static void appendBleF64(std::vector<uint8_t>& payload, double value) {
+        uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value), "unexpected double size");
+        std::memcpy(&bits, &value, sizeof(bits));
+        for (int shift = 0; shift < 64; shift += 8)
+            payload.push_back((uint8_t)((bits >> shift) & 0xFF));
+    }
+
+    std::vector<uint8_t> bleSnrTelemetryPayload() {
+        // Schema 1 represents a uniform fixed grid. Manual and bookmark scans
+        // remain available through the reliable full State snapshot.
+        if (manualMode || bookmarkScanMode || lastKnownSr <= 0.0 ||
+            lastKnownCenter <= 0.0 || channelSpacing <= 0.0) return {};
+
+        std::vector<float> localSnr;
+        std::set<int> localDetected;
+        std::set<int> localRawDetected;
+        {
+            std::lock_guard<std::mutex> lk(detectedMtx);
+            localSnr = slotSnrDb;
+            localDetected = detectedSlots;
+            localRawDetected = rawDetectedSlots;
+        }
+        if (localSnr.empty()) return {};
+
+        std::set<int64_t> blockedKeys;
+        {
+            std::lock_guard<std::mutex> lk(freqLogMtx);
+            for (const auto& [key, entry] : freqLog)
+                if (entry.blocked) blockedKeys.insert(key);
+        }
+
+        const double usableLo = lastKnownCenter - (lastKnownSr * bwUsage) * 0.5;
+        const double usableHi = lastKnownCenter + (lastKnownSr * bwUsage) * 0.5;
+        const int numSlots = (int)localSnr.size();
+        std::vector<BleSnrTelemetryPoint> source;
+        source.reserve(localSnr.size());
+        for (int i = 0; i < numSlots; ++i) {
+            const double slotOffset =
+                ((double)i - (double)(numSlots - 1) / 2.0) * channelSpacing;
+            const double freqHz = lastKnownCenter + slotOffset;
+            if (freqHz < usableLo || freqHz > usableHi) continue;
+            uint8_t flags = 0;
+            if (localDetected.count(i)) flags |= 0x01;
+            if (localRawDetected.count(i)) flags |= 0x02;
+            if (blockedKeys.count(freqKey(freqHz))) flags |= 0x04;
+            source.push_back({freqHz, localSnr[(size_t)i], flags});
+        }
+        if (source.empty()) return {};
+
+        static constexpr size_t MAX_DISPLAY_POINTS = 160;
+        std::vector<BleSnrTelemetryPoint> display;
+        const double firstFrequencyHz = source.front().freqHz;
+        double displaySpacingHz = channelSpacing;
+        if (source.size() <= MAX_DISPLAY_POINTS) {
+            display = std::move(source);
+        } else {
+            display.reserve(MAX_DISPLAY_POINTS);
+            displaySpacingHz = (source.back().freqHz - source.front().freqHz) /
+                (double)(MAX_DISPLAY_POINTS - 1);
+            for (size_t bucket = 0; bucket < MAX_DISPLAY_POINTS; ++bucket) {
+                const size_t begin = bucket * source.size() / MAX_DISPLAY_POINTS;
+                const size_t end = (bucket + 1) * source.size() / MAX_DISPLAY_POINTS;
+                float peakSnr = -std::numeric_limits<float>::infinity();
+                uint8_t flags = 0;
+                for (size_t i = begin; i < end; ++i) {
+                    if (std::isfinite(source[i].snrDb))
+                        peakSnr = std::max(peakSnr, source[i].snrDb);
+                    flags |= source[i].flags;
+                }
+                if (!std::isfinite(peakSnr)) peakSnr = 0.0f;
+                display.push_back({firstFrequencyHz + (double)bucket * displaySpacingHz,
+                    peakSnr, flags});
+            }
+        }
+
+        std::vector<uint8_t> payload;
+        payload.reserve(23 + display.size() * 3);
+        payload.push_back(1);
+        appendBleU32(payload, bleSnrTelemetrySequence.fetch_add(1) + 1);
+        appendBleF64(payload, firstFrequencyHz);
+        appendBleF64(payload, displaySpacingHz);
+        appendBleU16(payload, (uint16_t)display.size());
+        for (const auto& point : display) {
+            const double finiteSnr = std::isfinite(point.snrDb) ? point.snrDb : 0.0;
+            const long tenths = std::lround(finiteSnr * 10.0);
+            const int16_t encoded = (int16_t)std::clamp<long>(tenths,
+                std::numeric_limits<int16_t>::min(), std::numeric_limits<int16_t>::max());
+            appendBleU16(payload, (uint16_t)encoded);
+            payload.push_back(point.flags);
+        }
+        return payload;
+    }
+#endif
 
     json webStateSnapshot() {
         json channels = json::array();
@@ -10143,6 +10258,7 @@ self.addEventListener("fetch", event => {
     bool         startAudioMonitorOnStart = false;
     bool         bluetoothEnabled = false;
     void*        bluetoothHandle = nullptr;
+    std::atomic<uint32_t> bleSnrTelemetrySequence { 0 };
 #endif
     std::mutex   runMtx;
     bool         webControlEnabled = false;

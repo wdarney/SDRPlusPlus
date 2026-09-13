@@ -55,8 +55,10 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
 @public
     dispatch_queue_t queue;
     std::thread worker;
+    std::thread telemetryWorker;
     std::atomic<bool> stopping;
     channel_bank_bluetooth::OpenPlayback openPlayback;
+    channel_bank_bluetooth::SnrTelemetryPayload snrTelemetry;
 }
 @property NSMutableDictionary<NSString*, CBMacTransfer*>* transfers;
 @property CBPeripheralManager* manager;
@@ -69,12 +71,14 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
 @property NSMutableDictionary<NSString*, NSData*>* readCache;
 @property NSData* fullState;
 @property NSData* summary;
+@property NSData* snrTelemetryValue;
 @property NSString* baseURL;
 @property NSString* statusText;
 @property NSUInteger tick;
 @property uint64_t sequence;
 - (void)pump;
 - (void)work;
+- (void)telemetryWork;
 @end
 
 @implementation CBMacServer
@@ -91,6 +95,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         _transfers = [NSMutableDictionary new];
         _fullState = jsonData(envelope(@0, 503, @{@"error":@"Waiting for Channel Bank"}));
         _summary = _fullState;
+        _snrTelemetryValue = [NSData data];
         _statusText = @"Waiting for Bluetooth";
     }
     return self;
@@ -111,14 +116,14 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     }
     [peripheral removeAllServices];
     _characteristics = [NSMutableArray new];
-    for (unsigned n = 1; n <= 6; ++n) {
+    for (unsigned n = 1; n <= 7; ++n) {
         CBCharacteristicProperties properties = CBCharacteristicPropertyRead;
         CBAttributePermissions permissions = CBAttributePermissionsReadable;
         if (n == 2) {
             properties = CBCharacteristicPropertyWrite;
             permissions = CBAttributePermissionsWriteable;
         } else if (n >= 3) {
-            properties |= n == 5 ? CBCharacteristicPropertyNotify : CBCharacteristicPropertyIndicate;
+            properties |= (n == 5 || n == 7) ? CBCharacteristicPropertyNotify : CBCharacteristicPropertyIndicate;
         }
         [_characteristics addObject:[[CBMutableCharacteristic alloc] initWithType:uuid(n)
             properties:properties value:nil permissions:permissions]];
@@ -168,7 +173,15 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         if ([c.identifier isEqual:central.identifier]) subscribed = YES;
     if (!subscribed) return;
     // Finish messages already started; coalesce snapshots to avoid BLE backlogs.
-    if (![characteristic.UUID isEqual:uuid(3)]) {
+    if ([characteristic.UUID isEqual:uuid(7)]) {
+        // Telemetry is deliberately lossy: retain an in-flight frame, but replace
+        // every unstarted one with the newest SNR snapshot.
+        NSIndexSet* stale = [_outgoing indexesOfObjectsPassingTest:^BOOL(CBMacMessage* item, NSUInteger idx, BOOL* stop) {
+            return [item.central.identifier isEqual:central.identifier] &&
+                item.characteristic == characteristic && item.offset == 0;
+        }];
+        [_outgoing removeObjectsAtIndexes:stale];
+    } else if (![characteristic.UUID isEqual:uuid(3)]) {
         for (CBMacMessage* item in _outgoing)
             if ([item.central.identifier isEqual:central.identifier] && item.characteristic == characteristic) return;
     }
@@ -214,10 +227,13 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 @"encoding":@"json-utf8", @"maxAttributeValueBytes":@512, @"maxRequestBytes":@65536,
                 @"frameHeader":@"u8 version,u8 flags,u16le messageId,u32le offset",
                 @"summaryCharacteristic":uuid(6).UUIDString,
+                @"snrTelemetryCharacteristic":uuid(7).UUIDString,
+                @"snrTelemetry":@{@"schema":@1, @"cadenceMs":@250, @"encoding":@"binary-le"},
                 @"playbackTransfer":@{@"available":@YES, @"path":@"/api/audio/current-playback", @"maxPageBytes":@16384},
                 @"audio":@{@"available":@NO, @"format":@"pcm_s16le", @"rate":@48000, @"channels":@1}});
         else if ([request.characteristic.UUID isEqual:uuid(4)]) value = _fullState;
         else if ([request.characteristic.UUID isEqual:uuid(6)]) value = _summary;
+        else if ([request.characteristic.UUID isEqual:uuid(7)]) value = _snrTelemetryValue;
         else if ([request.characteristic.UUID isEqual:uuid(3)]) value = _readCache[key] ?: value;
         if (_readCache.count < 32 || _readCache[key]) _readCache[key] = value;
     }
@@ -428,7 +444,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 NSData* result = jsonData([self perform:@{@"v":@1, @"id":@0, @"method":@"GET",
                     @"path":full ? @"/api/state" : @"/api/state/summary"}]);
                 dispatch_sync(queue, ^{
-                    if (self->stopping || self.characteristics.count != 6) return;
+                    if (self->stopping || self.characteristics.count != 7) return;
                     if (full) self.fullState = result; else self.summary = result;
                     for (CBCentral* central in self.centrals.allValues)
                         [self enqueue:result characteristic:self.characteristics[full ? 3 : 5] central:central identifier:0];
@@ -439,12 +455,39 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     }
     [_transfers removeAllObjects];
 }
+- (void)telemetryWork {
+    auto nextTelemetry = std::chrono::steady_clock::now();
+    while (!stopping) {
+        if (std::chrono::steady_clock::now() >= nextTelemetry) {
+            nextTelemetry = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            __block BOOL subscribed = NO;
+            dispatch_sync(queue, ^{
+                subscribed = !self->stopping && self.characteristics.count == 7 &&
+                    self.characteristics[6].subscribedCentrals.count > 0;
+            });
+            if (subscribed && snrTelemetry) {
+                std::vector<uint8_t> bytes = snrTelemetry();
+                if (!bytes.empty()) {
+                    NSData* payload = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+                    dispatch_sync(queue, ^{
+                        if (self->stopping || self.characteristics.count != 7) return;
+                        self.snrTelemetryValue = payload;
+                        for (CBCentral* central in self.centrals.allValues)
+                            [self enqueue:payload characteristic:self.characteristics[6] central:central identifier:0];
+                    });
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
 @end
 
 namespace channel_bank_bluetooth {
-void* start(const std::string& host, int port, OpenPlayback openPlayback) {
+void* start(const std::string& host, int port, OpenPlayback openPlayback, SnrTelemetryPayload snrTelemetry) {
     CBMacServer* server = [CBMacServer new];
     server->openPlayback = std::move(openPlayback);
+    server->snrTelemetry = std::move(snrTelemetry);
     server.baseURL = [NSString stringWithFormat:@"http://%s:%d", host.c_str(), port];
     if (![[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSBluetoothAlwaysUsageDescription"]) {
         server.statusText = @"Rebuild app with Bluetooth permission description";
@@ -453,6 +496,7 @@ void* start(const std::string& host, int port, OpenPlayback openPlayback) {
             server.manager = [[CBPeripheralManager alloc] initWithDelegate:server queue:server->queue options:nil];
         });
         server->worker = std::thread([server] { [server work]; });
+        server->telemetryWorker = std::thread([server] { [server telemetryWork]; });
     }
     return (__bridge_retained void*)server;
 }
@@ -461,6 +505,7 @@ void stop(void* handle) {
     CBMacServer* server = (__bridge_transfer CBMacServer*)handle;
     server->stopping = true;
     if (server->worker.joinable()) server->worker.join();
+    if (server->telemetryWorker.joinable()) server->telemetryWorker.join();
     dispatch_sync(server->queue, ^{
         server.manager.delegate = nil;
         [server.manager stopAdvertising];

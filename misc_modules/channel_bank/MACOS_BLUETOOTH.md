@@ -12,11 +12,9 @@ does not require pairing or application authentication.
 
 ## Build and Test Handoff
 
-Build branch `wd/channel-bank-macos-bluetooth`. It includes the proxy-control
-fixes from `59c7399d`; those fixes are not yet on `integration/main`.
-
-Build the `channel_bank` and `sdrpp` targets using a matching build directory,
-then package the application with the repository's macOS bundling script.
+Build the `channel_bank` and `sdrpp` targets from the checkout that contains
+this module integration, then package the application with the repository's
+macOS bundling script.
 The bundle needs `NSBluetoothAlwaysUsageDescription` and
 `NSBluetoothPeripheralUsageDescription`; the bundle helper now emits both.
 Copying only the plugin into an older app will not supply these keys. A missing
@@ -83,18 +81,30 @@ Control running.
 
 The service UUID is `7d2f0000-8c4b-4d7a-9a61-8e3c4f2a1000`.
 Characteristics 0001 through 0006 match Protocol, Command, Response, State,
-Audio, and State Summary. Framing is version/flags/u16le ID/u32le offset,
-followed by UTF-8 JSON. Commands use acknowledged writes; responses and state
-use indications. Outbound fragments respect the central's maximum update
-length, capped at 512 bytes, and resume on CoreBluetooth readiness.
+Audio, and State Summary. Characteristic 0007 is optional low-latency SNR
+telemetry. Its notification payload is little-endian binary: schema `u8` (1),
+sequence `u32`, first frequency `f64`, spacing `f64`, point count `u16`, then
+up to 160 `(snrTenthsDb:i16, flags:u8)` points. Flag bits are detected (0), raw
+detected (1), and blocked (2). It is produced at 4 Hz only for fixed-grid auto
+or scan operation while a client is subscribed; manual and bookmark scans use
+the reliable full State snapshot instead.
+
+All notifications and indications use the common version/flags/u16le ID/u32le
+offset framing before their payload. Commands use acknowledged writes; Response,
+State, and Summary use indications. SNR telemetry uses lossy notifications:
+an in-flight frame is completed, while an unsent stale sample is replaced with
+the newest one. Outbound fragments respect the central's maximum update length,
+capped at 512 bytes, and resume on CoreBluetooth readiness.
 
 Limits are four subscribed clients, one 64 KiB command assembly per client,
 16 queued commands, and 32 outgoing messages (each at most 256 KiB).
 Incomplete assemblies expire after ten seconds. Snapshots coalesce while an
 earlier message is queued. The joined worker polls compact status about every
 500 ms and full state about every five seconds, independent of panel visibility;
-slow HTTP requests extend these intervals. Local HTTP requests time out after
-seven seconds. Disabling/unloading may wait for an in-flight request to finish.
+slow HTTP requests extend these intervals. A separate lightweight worker obtains
+the compact SNR payload every 250 ms, so local HTTP polling does not stall the
+overview. Local HTTP requests time out after seven seconds. Disabling/unloading
+may wait for an in-flight request to finish.
 
 CoreBluetooth delegate work stays on a dedicated serial queue. HTTP requests
 run on a separate joined worker and use the WebUI's existing SDR++ UI dispatch.
