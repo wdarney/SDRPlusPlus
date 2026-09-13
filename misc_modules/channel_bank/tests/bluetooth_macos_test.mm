@@ -2,6 +2,7 @@
 #include "../src/bluetooth_macos.mm"
 #include <cassert>
 #include <iostream>
+#include <fcntl.h>
 
 @interface TestCentral : NSObject
 @property NSUUID* identifier;
@@ -103,6 +104,69 @@ int main() {
         request.offset = 10;
         [server peripheralManager:(CBPeripheralManager*)peripheral didReceiveReadRequest:(CBATTRequest*)request];
         assert([request.value isEqual:[payload subdataWithRange:NSMakeRange(10, payload.length-10)]]);
-        std::cout << "Bluetooth framing, bounds, backpressure, routing and snapshot tests passed\n";
+        // Hold the exact file across playback advancing, unlink, and multiple BLE pages.
+        char path[] = "/tmp/channel-bank-ble-XXXXXX";
+        int file = mkstemp(path);
+        assert(file >= 0);
+        NSMutableData* recording = [NSMutableData dataWithLength:40000];
+        for (NSUInteger i = 0; i < recording.length; ++i) ((uint8_t*)recording.mutableBytes)[i] = i % 251;
+        assert(write(file, recording.bytes, recording.length) == (ssize_t)recording.length);
+        server->openPlayback = [file](std::string& name) { name = "transmission.wav"; return dup(file); };
+        auto page = [&](NSDictionary* body, NSUUID* owner) {
+            return [server perform:@{@"v":@1, @"id":@42, @"method":@"GET",
+                @"path":@"/api/audio/current-playback", @"body":body} owner:owner];
+        };
+        assert([page(@{@"offset":@1}, central.identifier)[@"status"] intValue] == 400);
+        assert([page(@{@"offset":@-1}, central.identifier)[@"status"] intValue] == 400);
+        assert([page(@{@"limit":@"bad"}, central.identifier)[@"status"] intValue] == 400);
+        NSDictionary* first = page(@{}, central.identifier)[@"body"];
+        NSString* transferId = first[@"transferId"];
+        assert(transferId.length && [first[@"nextOffset"] intValue] == 4096);
+        assert([page(@{@"transferId":transferId}, NSUUID.UUID)[@"status"] intValue] == 404);
+        assert([page(@{@"transferId":transferId, @"offset":@40001}, central.identifier)[@"status"] intValue] == 416);
+        assert(unlink(path) == 0);
+        close(file);
+        server->openPlayback = [](std::string&) { return -1; };
+        NSMutableData* audio = [[NSMutableData alloc] initWithBase64EncodedString:first[@"dataBase64"] options:0];
+        NSDictionary* next = first;
+        while (![next[@"eof"] boolValue]) {
+            next = page(@{@"transferId":transferId, @"offset":next[@"nextOffset"], @"limit":@999999}, central.identifier)[@"body"];
+            assert(next && [next[@"transferId"] isEqual:transferId]);
+            NSData* bytes = [[NSData alloc] initWithBase64EncodedString:next[@"dataBase64"] options:0];
+            assert(bytes.length <= 16384);
+            [audio appendData:bytes];
+        }
+        assert([audio isEqual:recording] && server.transfers.count == 0);
+        assert([page(@{@"transferId":transferId}, central.identifier)[@"status"] intValue] == 404);
+        assert([page(@{}, central.identifier)[@"status"] intValue] == 404);
+        // Cancellation and idle expiry release descriptors, including unlinked files.
+        CBMacTransfer* held = [CBMacTransfer new];
+        held->fd = open("/dev/null", O_RDONLY);
+        int heldFD = held->fd;
+        held.owner = central.identifier;
+        server.transfers[@"cancel"] = held;
+        held = nil;
+        assert([page(@{@"transferId":@"cancel", @"cancel":@YES}, central.identifier)[@"status"] intValue] == 200);
+        assert(fcntl(heldFD, F_GETFD) == -1 && errno == EBADF);
+        held = [CBMacTransfer new];
+        held->fd = open("/dev/null", O_RDONLY);
+        heldFD = held->fd;
+        held->touched -= std::chrono::seconds(61);
+        server.transfers[@"expired"] = held;
+        held = nil;
+        [server expireTransfers];
+        assert(server.transfers.count == 0 && fcntl(heldFD, F_GETFD) == -1);
+        for (int i = 0; i < 8; ++i) server.transfers[[@(i) stringValue]] = [CBMacTransfer new];
+        assert([page(@{}, central.identifier)[@"status"] intValue] == 503);
+        [server.transfers removeAllObjects];
+        char largePath[] = "/tmp/channel-bank-ble-large-XXXXXX";
+        int large = mkstemp(largePath);
+        assert(large >= 0 && unlink(largePath) == 0);
+        assert(ftruncate(large, 64 * 1024 * 1024 + 1) == 0);
+        server->openPlayback = [large](std::string& name) { name = "large.wav"; return dup(large); };
+        assert([page(@{}, central.identifier)[@"status"] intValue] == 413);
+        assert(server.transfers.count == 0);
+        close(large);
+        std::cout << "Bluetooth framing, bounds, backpressure, routing, snapshot and audio lease tests passed\n";
     }
 }

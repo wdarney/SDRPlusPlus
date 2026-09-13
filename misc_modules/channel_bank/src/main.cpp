@@ -621,7 +621,13 @@ public:
         if (!webServerRunning.load()) return;
         std::string host = webDisplayBindAddress();
         if (host == "0.0.0.0") host = "127.0.0.1";
-        bluetoothHandle = channel_bank_bluetooth::start(host, webControlPort);
+        bluetoothHandle = channel_bank_bluetooth::start(host, webControlPort, [this](std::string& filename) {
+            std::lock_guard<std::mutex> lk(currentPlaybackPathMtx);
+            if (currentlyPlayingFreqKey.load() == 0 || currentPlaybackPath.empty()) return -1;
+            filename = std::filesystem::path(currentPlaybackPath).filename().string();
+            // An open macOS descriptor remains readable even after playback unlinks the file.
+            return ::open(currentPlaybackPath.c_str(), O_RDONLY | O_CLOEXEC);
+        });
     }
 #endif
     void enable()  { enabled = true; }
@@ -9165,7 +9171,7 @@ self.addEventListener("fetch", event => {
             config.release(true);
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Allow nearby iPhones with the Channel Bank app to control this radio.\nUses Web Control. Bluetooth audio and downloads are unavailable.");
+            ImGui::SetTooltip("Allow nearby iPhones with the Channel Bank app to control this radio.\nUses Web Control. Completed transmissions can be downloaded over Bluetooth for playback.");
         if (_this->bluetoothEnabled)
             ImGui::TextWrapped("%s", channel_bank_bluetooth::status(_this->bluetoothHandle).c_str());
         if (_this->bluetoothEnabled) style::beginDisabled();

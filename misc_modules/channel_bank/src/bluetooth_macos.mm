@@ -5,6 +5,27 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cmath>
+
+@interface CBMacTransfer : NSObject {
+@public
+    int fd;
+    std::chrono::steady_clock::time_point touched;
+}
+@property NSString* name;
+@property NSUUID* owner;
+@property uint64_t size;
+@end
+@implementation CBMacTransfer
+- (instancetype)init {
+    if ((self = [super init])) { fd = -1; touched = std::chrono::steady_clock::now(); }
+    return self;
+}
+- (void)dealloc { if (fd >= 0) ::close(fd); }
+@end
 
 static CBUUID* uuid(unsigned n) {
     return [CBUUID UUIDWithString:[NSString stringWithFormat:@"7d2f%04x-8c4b-4d7a-9a61-8e3c4f2a1000", n]];
@@ -35,7 +56,9 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     dispatch_queue_t queue;
     std::thread worker;
     std::atomic<bool> stopping;
+    channel_bank_bluetooth::OpenPlayback openPlayback;
 }
+@property NSMutableDictionary<NSString*, CBMacTransfer*>* transfers;
 @property CBPeripheralManager* manager;
 @property NSMutableArray<CBMutableCharacteristic*>* characteristics;
 @property NSMutableDictionary<NSUUID*, CBCentral*>* centrals;
@@ -65,6 +88,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         _commands = [NSMutableArray new];
         _outgoing = [NSMutableArray new];
         _readCache = [NSMutableDictionary new];
+        _transfers = [NSMutableDictionary new];
         _fullState = jsonData(envelope(@0, 503, @{@"error":@"Waiting for Channel Bank"}));
         _summary = _fullState;
         _statusText = @"Waiting for Bluetooth";
@@ -154,7 +178,13 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     message.central = central;
     message.characteristic = characteristic;
     message.identifier = identifier;
-    [_outgoing addObject:message];
+    // Audio pages use Response; don't leave them behind unsent full-state snapshots.
+    if ([characteristic.UUID isEqual:uuid(3)]) {
+        NSUInteger index = 0;
+        while (index < _outgoing.count && (_outgoing[index].offset > 0 ||
+                [_outgoing[index].characteristic.UUID isEqual:uuid(3)])) ++index;
+        [_outgoing insertObject:message atIndex:index];
+    } else [_outgoing addObject:message];
     [self pump];
 }
 - (void)pump {
@@ -184,6 +214,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 @"encoding":@"json-utf8", @"maxAttributeValueBytes":@512, @"maxRequestBytes":@65536,
                 @"frameHeader":@"u8 version,u8 flags,u16le messageId,u32le offset",
                 @"summaryCharacteristic":uuid(6).UUIDString,
+                @"playbackTransfer":@{@"available":@YES, @"path":@"/api/audio/current-playback", @"maxPageBytes":@16384},
                 @"audio":@{@"available":@NO, @"format":@"pcm_s16le", @"rate":@48000, @"channels":@1}});
         else if ([request.characteristic.UUID isEqual:uuid(4)]) value = _fullState;
         else if ([request.characteristic.UUID isEqual:uuid(6)]) value = _summary;
@@ -240,11 +271,80 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         [peripheral respondToRequest:request withResult:CBATTErrorSuccess];
     }
 }
-- (NSDictionary*)perform:(NSDictionary*)command {
+- (void)expireTransfers {
+    auto now = std::chrono::steady_clock::now();
+    for (NSString* key in [_transfers.allKeys copy])
+        if (now - _transfers[key]->touched >= std::chrono::seconds(60)) [_transfers removeObjectForKey:key];
+}
+- (NSDictionary*)playbackPage:(NSDictionary*)body owner:(NSUUID*)owner identifier:(id)identifier {
+    [self expireTransfers];
+    if (!owner || ![body isKindOfClass:NSDictionary.class]) return envelope(identifier, 400, nil);
+    id token = body[@"transferId"];
+    if (token && ![token isKindOfClass:NSString.class]) return envelope(identifier, 400, nil);
+    NSString* transferId = token;
+    for (NSString* key in @[@"offset", @"limit"]) {
+        id value = body[key];
+        if (value && (![value isKindOfClass:NSNumber.class] || !std::isfinite([value doubleValue]) ||
+                [value doubleValue] < 0 || [value doubleValue] > 9007199254740991.0 ||
+                std::floor([value doubleValue]) != [value doubleValue])) return envelope(identifier, 400, nil);
+    }
+    id cancel = body[@"cancel"];
+    if (cancel && ![cancel isKindOfClass:NSNumber.class]) return envelope(identifier, 400, nil);
+    uint64_t offset = [body[@"offset"] unsignedLongLongValue];
+    NSUInteger limit = body[@"limit"] ? std::clamp<NSUInteger>([body[@"limit"] unsignedLongLongValue], 1, 16384) : 4096;
+    CBMacTransfer* transfer = transferId.length ? _transfers[transferId] : nil;
+    if (transfer && ![transfer.owner isEqual:owner]) transfer = nil;
+    if ([cancel boolValue]) {
+        if (!transfer) return envelope(identifier, 404, @{@"error":@"Transfer not found"});
+        [_transfers removeObjectForKey:transferId];
+        return envelope(identifier, 200, @{@"transferId":transferId, @"cancelled":@YES, @"deleted":@NO});
+    }
+    if (!transferId.length) {
+        if (offset != 0) return envelope(identifier, 400, @{@"error":@"transferId is required after the first page"});
+        if (_transfers.count >= 8) return envelope(identifier, 503, @{@"error":@"Too many audio transfers"});
+        std::string name;
+        transfer = [CBMacTransfer new];
+        transfer->fd = openPlayback ? openPlayback(name) : -1;
+        struct stat info{};
+        if (transfer->fd < 0 || fstat(transfer->fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 0)
+            return envelope(identifier, 404, @{@"error":@"No active playback file"});
+        if (info.st_size > 64 * 1024 * 1024) return envelope(identifier, 413, @{@"error":@"Playback exceeds 64 MiB transfer limit"});
+        transfer.size = info.st_size;
+        transfer.name = [NSString stringWithUTF8String:name.c_str()] ?: @"playback.wav";
+        transfer.owner = owner;
+        transferId = NSUUID.UUID.UUIDString;
+        _transfers[transferId] = transfer;
+    } else if (!transfer) return envelope(identifier, 404, @{@"error":@"Transfer expired or unavailable"});
+    if (offset > transfer.size) return envelope(identifier, 416, @{@"error":@"Offset past EOF"});
+    NSUInteger count = std::min<uint64_t>(limit, transfer.size - offset);
+    NSMutableData* data = [NSMutableData dataWithLength:count];
+    NSUInteger read = 0;
+    while (read < count) {
+        ssize_t n = pread(transfer->fd, (uint8_t*)data.mutableBytes + read, count - read, offset + read);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            [_transfers removeObjectForKey:transferId];
+            return envelope(identifier, 404, @{@"error":@"Playback file no longer readable"});
+        }
+        read += n;
+    }
+    transfer->touched = std::chrono::steady_clock::now();
+    BOOL eof = offset + count == transfer.size;
+    NSDictionary* result = @{@"transferId":transferId, @"offset":@(offset), @"nextOffset":@(offset + count),
+        @"size":@(transfer.size), @"eof":@(eof), @"name":transfer.name,
+        @"contentType":[transfer.name.pathExtension.lowercaseString isEqual:@"m4a"] ? @"audio/mp4" : @"audio/wav",
+        @"dataBase64":[data base64EncodedStringWithOptions:0]};
+    if (eof) [_transfers removeObjectForKey:transferId];
+    return envelope(identifier, 200, result);
+}
+- (NSDictionary*)perform:(NSDictionary*)command { return [self perform:command owner:nil]; }
+- (NSDictionary*)perform:(NSDictionary*)command owner:(NSUUID*)owner {
     if (![command isKindOfClass:NSDictionary.class]) return envelope(@0, 400, nil);
     id identifier = [command[@"id"] isKindOfClass:NSNumber.class] ? command[@"id"] : @0;
     NSString* method = command[@"method"];
     NSString* path = command[@"path"];
+    if ([command[@"v"] isEqual:@1] && [method isEqual:@"GET"] && [path isEqual:@"/api/audio/current-playback"])
+        return [self playbackPage:command[@"body"] ?: @{} owner:owner identifier:identifier];
     NSArray* gets = @[@"/api/state", @"/state", @"/api/state/summary", @"/api/sources",
         @"/api/source-controls", @"/api/source-offset", @"/api/sdrpp-server", @"/api/channel-bank/settings", @"/api/recordings"];
     NSArray* posts = @[@"/api/start", @"/api/stop", @"/api/play", @"/api/stop-radio", @"/api/radio/stop",
@@ -254,7 +354,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         @"/api/recordings/session", @"/api/recordings/clear-wavs"];
     if (![command[@"v"] isEqual:@1] || ![path isKindOfClass:NSString.class] ||
         !(([method isEqual:@"GET"] && [gets containsObject:path]) || ([method isEqual:@"POST"] && [posts containsObject:path])))
-        return envelope(identifier, 400, @{@"error":@"Unsupported Bluetooth request (audio and file downloads are not available)"});
+        return envelope(identifier, 400, @{@"error":@"Unsupported Bluetooth request (live PCM and recording-library downloads are not available)"});
     BOOL summary = [path isEqual:@"/api/state/summary"];
     NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:
         [NSURL URLWithString:[_baseURL stringByAppendingString:summary ? @"/api/state" : path]]
@@ -292,21 +392,29 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     return envelope(identifier, code, body);
 }
 - (void)work {
+    auto nextSnapshot = std::chrono::steady_clock::now();
     while (!stopping) {
         @autoreleasepool {
             __block NSDictionary* command = nil;
             __block BOOL subscribed = NO;
+            __block NSSet* owners;
             dispatch_sync(queue, ^{
                 if (self.commands.count) { command = self.commands.firstObject; [self.commands removeObjectAtIndex:0]; }
                 subscribed = self.centrals.count > 0;
+                owners = [NSSet setWithArray:self.centrals.allKeys];
                 for (NSString* key in [self.assemblyTimes.allKeys copy])
                     if (-[self.assemblyTimes[key] timeIntervalSinceNow] > 10) {
                         [self.assemblies removeObjectForKey:key]; [self.assemblyTimes removeObjectForKey:key];
                     }
             });
+            [self expireTransfers];
+            for (NSString* key in [_transfers.allKeys copy])
+                if (![owners containsObject:_transfers[key].owner]) [_transfers removeObjectForKey:key];
             if (command) {
                 NSDictionary* input = [NSJSONSerialization JSONObjectWithData:command[@"payload"] options:0 error:nil];
-                NSData* result = jsonData([self perform:input]);
+                CBCentral* sender = command[@"central"];
+                if (![owners containsObject:sender.identifier]) continue;
+                NSData* result = jsonData([self perform:input owner:sender.identifier]);
                 dispatch_sync(queue, ^{
                     if (self->stopping) return;
                     CBCentral* central = command[@"central"];
@@ -314,7 +422,8 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                     [self enqueue:result characteristic:self.characteristics[2] central:central identifier:[command[@"id"] unsignedShortValue]];
                 });
             }
-            if (subscribed && !stopping) {
+            if (subscribed && !stopping && std::chrono::steady_clock::now() >= nextSnapshot) {
+                nextSnapshot = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
                 BOOL full = (_tick++ % 10) == 0;
                 NSData* result = jsonData([self perform:@{@"v":@1, @"id":@0, @"method":@"GET",
                     @"path":full ? @"/api/state" : @"/api/state/summary"}]);
@@ -326,14 +435,16 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 });
             }
         }
-        for (int i = 0; i < 10 && !stopping; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    [_transfers removeAllObjects];
 }
 @end
 
 namespace channel_bank_bluetooth {
-void* start(const std::string& host, int port) {
+void* start(const std::string& host, int port, OpenPlayback openPlayback) {
     CBMacServer* server = [CBMacServer new];
+    server->openPlayback = std::move(openPlayback);
     server.baseURL = [NSString stringWithFormat:@"http://%s:%d", host.c_str(), port];
     if (![[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSBluetoothAlwaysUsageDescription"]) {
         server.statusText = @"Rebuild app with Bluetooth permission description";
