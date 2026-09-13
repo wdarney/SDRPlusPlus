@@ -93,14 +93,18 @@ All notifications and indications use the common version/flags/u16le ID/u32le
 offset framing before their payload. Commands use acknowledged writes; Response,
 State, and Summary use indications. SNR telemetry uses lossy notifications:
 an in-flight frame is completed, while an unsent stale sample is replaced with
-the newest one. Outbound fragments respect the central's maximum update length,
-capped at 512 bytes, and resume on CoreBluetooth readiness.
+the newest one. Response indications have first priority, State Summary
+indications next, telemetry notifications third, and full-State indications
+last. A compact frame may pause a full-State transfer between fragments; clients
+resume it using independent assemblers for each characteristic. Outbound
+fragments respect the central's maximum update length, capped at 512 bytes, and
+resume on CoreBluetooth readiness.
 
 Limits are four subscribed clients, one 64 KiB command assembly per client,
 16 queued commands, and 32 outgoing messages (each at most 256 KiB).
 Incomplete assemblies expire after ten seconds. Snapshots coalesce while an
 earlier message is queued. The joined worker polls compact status about every
-500 ms and full state about every five seconds, independent of panel visibility;
+500 ms and full state about every ten seconds, independent of panel visibility;
 slow HTTP requests extend these intervals. A separate lightweight worker obtains
 the compact SNR payload every 250 ms, so local HTTP polling does not stall the
 overview. Local HTTP requests time out after seven seconds. Disabling/unloading
