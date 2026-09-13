@@ -88,6 +88,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var stateNotificationsEnabled = false
     private var stateSummaryNotificationsEnabled = false
     private var snrTelemetryNotificationsEnabled = false
+    private var latestSnrTelemetry: SNRTelemetryFrame?
+    private var latestSnrTelemetryAt: Date?
+    private var snrTelemetryFrameCount = 0
     private var latestSequence: Int64?
     private var initialStateFallbackTask: Task<Void, Never>?
     private var hasReceivedFullState = false
@@ -480,6 +483,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         stateNotificationsEnabled = false
         stateSummaryNotificationsEnabled = false
         snrTelemetryNotificationsEnabled = false
+        latestSnrTelemetry = nil
+        latestSnrTelemetryAt = nil
+        snrTelemetryFrameCount = 0
         latestSequence = nil
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
@@ -799,9 +805,22 @@ extension BLECentralManager: CBPeripheralDelegate {
 
     private func acceptSNRTelemetryPayload(_ payload: Data) throws {
         let frame = try SNRTelemetryFrame(payload: payload)
+        latestSnrTelemetry = frame
+        latestSnrTelemetryAt = Date()
+        snrTelemetryFrameCount += 1
         var state = latestState ?? ChannelBankState()
         state.snrOverview = frame.points
         latestState = state
+        if snrTelemetryFrameCount == 1 || snrTelemetryFrameCount.isMultiple(of: 20) {
+            appendDiagnostic("RX high-rate SNR telemetry seq=\(frame.sequence) points=\(frame.points.count) frames=\(snrTelemetryFrameCount)")
+        }
+    }
+
+    private func preserveFreshSNRTelemetry(in state: inout ChannelBankState) {
+        guard let frame = latestSnrTelemetry,
+              let receivedAt = latestSnrTelemetryAt,
+              Date().timeIntervalSince(receivedAt) < 3 else { return }
+        state.snrOverview = frame.points
     }
 
     private func acceptFullState(_ state: ChannelBankState) {
@@ -813,6 +832,7 @@ extension BLECentralManager: CBPeripheralDelegate {
             if let latestSequence, seq < latestSequence {
                 var merged = latestState ?? ChannelBankState()
                 merged.mergeTelemetry(from: state)
+                preserveFreshSNRTelemetry(in: &merged)
                 latestState = merged
                 hasReceivedFullState = true
                 appendDiagnostic("Merged delayed State telemetry seq=\(seq) latest=\(latestSequence)")
@@ -822,10 +842,12 @@ extension BLECentralManager: CBPeripheralDelegate {
             latestSequence = seq
         }
         hasReceivedFullState = true
-        latestState = state
+        var merged = state
+        preserveFreshSNRTelemetry(in: &merged)
+        latestState = merged
         initialStateFallbackTask?.cancel()
         initialStateFallbackTask = nil
-        monitorPlaybackIfNeeded(state)
+        monitorPlaybackIfNeeded(merged)
     }
 
     private func acceptCommandStateResponse(_ state: ChannelBankState) {
