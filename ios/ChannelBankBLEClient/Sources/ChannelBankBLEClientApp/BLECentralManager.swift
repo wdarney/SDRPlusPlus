@@ -202,6 +202,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 
     public func setChannelBankSettings(_ body: [String: JSONValue]) {
+        applyOptimisticChannelBankSettings(body)
         Task { await apply { try await self.client.setChannelBankSettings(body) } }
     }
 
@@ -338,6 +339,56 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         guard var state = latestState else { return }
         update(&state)
         latestState = state
+    }
+
+    private func applyOptimisticChannelBankSettings(_ body: [String: JSONValue]) {
+        updateLatestState { state in
+            var settings = state.settings ?? ChannelBankSettings()
+            for (key, json) in body {
+                switch (key, json.value) {
+                case ("mode", .string(let value)):
+                    settings.mode = value
+                    state.mode = value
+                case ("demodMode", .string(let value)):
+                    settings.demodMode = value
+                    state.demodMode = value
+                case ("spacingId", .number(let value)):
+                    settings.spacingId = Int(value)
+                case ("snrThresholdDb", .number(let value)):
+                    settings.snrThresholdDb = value
+                    state.snrThresholdDb = value
+                case ("maxChannels", .number(let value)):
+                    let channels = Int(value)
+                    settings.maxChannels = channels
+                    state.maxChannels = channels
+                case ("bwUsage", .number(let value)):
+                    settings.bwUsage = value
+                    state.bwUsage = value
+                case ("recordingEnabled", .bool(let value)):
+                    settings.recordingEnabled = value
+                    state.recordingEnabled = value
+                case ("manualLocalSnrEnabled", .bool(let value)):
+                    settings.manualLocalSnrEnabled = value
+                case ("manualStormGuardEnabled", .bool(let value)):
+                    settings.manualStormGuardEnabled = value
+                case ("minTransmissionMs", .number(let value)):
+                    settings.minTransmissionMs = Int(value)
+                case ("signalHoldMs", .number(let value)):
+                    settings.signalHoldMs = Int(value)
+                case ("tailMs", .number(let value)):
+                    settings.tailMs = Int(value)
+                case ("scanQuietSec", .number(let value)):
+                    settings.scanQuietSec = value
+                case ("scanNoSignalSec", .number(let value)):
+                    settings.scanNoSignalSec = value
+                case ("transcriptionBackend", .number(let value)):
+                    settings.transcriptionBackend = Int(value)
+                default:
+                    continue
+                }
+            }
+            state.settings = settings
+        }
     }
 
     private func userVisibleError(_ error: Error) -> String {

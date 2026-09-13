@@ -514,6 +514,29 @@ public struct ChannelBankSettings: Codable, Equatable {
     public var scanNoSignalSec: Double?
     public var transcriptionBackend: Int?
     public var transcriptionBackendName: String?
+
+    public init(
+        mode: String? = nil, spacingId: Int? = nil, demodMode: String? = nil,
+        snrThresholdDb: Double? = nil, manualLocalSnrEnabled: Bool? = nil,
+        manualStormGuardEnabled: Bool? = nil, maxChannels: Int? = nil,
+        bwUsage: Double? = nil, recordingEnabled: Bool? = nil,
+        channelSpacingHz: Double? = nil, minTransmissionMs: Int? = nil,
+        signalHoldMs: Int? = nil, tailMs: Int? = nil, scanQuietSec: Double? = nil,
+        scanNoSignalSec: Double? = nil, transcriptionBackend: Int? = nil,
+        transcriptionBackendName: String? = nil
+    ) {
+        self.mode = mode; self.spacingId = spacingId; self.demodMode = demodMode
+        self.snrThresholdDb = snrThresholdDb
+        self.manualLocalSnrEnabled = manualLocalSnrEnabled
+        self.manualStormGuardEnabled = manualStormGuardEnabled
+        self.maxChannels = maxChannels; self.bwUsage = bwUsage
+        self.recordingEnabled = recordingEnabled; self.channelSpacingHz = channelSpacingHz
+        self.minTransmissionMs = minTransmissionMs; self.signalHoldMs = signalHoldMs
+        self.tailMs = tailMs; self.scanQuietSec = scanQuietSec
+        self.scanNoSignalSec = scanNoSignalSec
+        self.transcriptionBackend = transcriptionBackend
+        self.transcriptionBackendName = transcriptionBackendName
+    }
 }
 
 public struct RX888SourceControls: Codable, Equatable {
