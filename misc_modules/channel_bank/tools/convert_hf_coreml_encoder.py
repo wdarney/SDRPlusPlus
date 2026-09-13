@@ -41,7 +41,12 @@ def main():
     ap.add_argument('--output-dir', type=Path,
                     default=Path.home() / 'Library/Application Support/sdrpp/channel_bank/models',
                     help='Output directory (default: %(default)s); existing outputs are never replaced')
+    ap.add_argument('--max-relative-l2-error', type=float, default=0.02,
+                    help='Maximum random-input Core ML/FP32 encoder error (default: 0.02); '
+                         'override only with model-specific accuracy validation')
     args = ap.parse_args()
+    if not 0 < args.max_relative_l2_error <= 1:
+        ap.error('--max-relative-l2-error must be greater than zero and at most one')
     name = encoder_name(args.ggml_name)
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         ap.error('Run conversion/compilation on an Apple Silicon Mac with Xcode installed')
@@ -119,9 +124,11 @@ def main():
     ml = ct.convert(traced, convert_to='mlprogram', minimum_deployment_target=ct.target.macOS13,
                     inputs=[ct.TensorType(name='logmel_data', shape=sample.shape, dtype=np.float32)],
                     outputs=[ct.TensorType(name='output', dtype=np.float32)],
-                    compute_precision=ct.precision.FLOAT16, compute_units=ct.ComputeUnit.ALL)
+                    compute_precision=ct.precision.FLOAT16,
+                    compute_units=ct.ComputeUnit.ALL, skip_model_load=True)
     del traced, encoder, ane_result
     gc.collect()
+    ml.user_defined_metadata['precision'] = 'float16'
     ml.user_defined_metadata['source_model'] = args.model
     ml.user_defined_metadata['source_revision'] = revision or 'local snapshot; see encoder_weights_sha256'
     ml.user_defined_metadata['encoder_weights_sha256'] = digest.hexdigest()
@@ -135,7 +142,9 @@ def main():
         raise ValueError(f'Invalid Core ML output: {result.shape}')
     ref = reference_result.numpy()
     relative_error = float(np.linalg.norm(result - ref) / max(np.linalg.norm(ref), 1e-12))
-    if relative_error > 0.02:
+    print(f'Core ML/FP32 random-input relative L2 error: {relative_error:.6f}; '
+          f'acceptance limit: {args.max_relative_l2_error:.6f}', flush=True)
+    if relative_error > args.max_relative_l2_error:
         raise ValueError(f'Core ML relative L2 error too large: {relative_error}')
     with tempfile.TemporaryDirectory(dir=args.output_dir) as tmp:
         subprocess.run(['xcrun', 'coremlc', 'compile', str(package.resolve()), tmp], check=True)
@@ -143,7 +152,8 @@ def main():
     manifest.write_text(json.dumps(dict(source_model=args.model, source_revision=revision,
         encoder_weights_sha256=digest.hexdigest(), whisper_cpp_revision=VENDOR,
         matching_ggml_name=args.ggml_name, encoder_dimensions=dims,
-        coreml_relative_l2_error=relative_error, torch=torch.__version__, coremltools=ct.__version__), indent=2) + '\n')
+        coreml_relative_l2_error=relative_error,
+        validation_max_relative_l2_error=args.max_relative_l2_error, precision='float16', torch=torch.__version__, coremltools=ct.__version__), indent=2) + '\n')
     print(f'Validated encoder: {compiled}\nProvenance: {manifest}')
 
 

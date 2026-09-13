@@ -51,9 +51,9 @@ It never calls `whisper.load_model` or downloads stock OpenAI encoder weights.
 - A macOS-only `CB_WHISPER_COREML` definition guards a vendored context selection
   field and active-state query. It is propagated to the module and whisper
   together. Other platform builds keep their original context structure/API.
-- The existing macOS loader requests Core ML only for ATC Large, only when the
+- The existing macOS loader requests Core ML for ATC Large and Turbo ATCOSIM, only when the
   expected directory exists, and only when not disabled by environment.
-  Medium/Turbo stay on ggml/Metal. No public Channel Bank transcription API,
+  Medium stays on ggml/Metal. No public Channel Bank transcription API,
   queue, detached worker, cancellation, or context-cache redesign is involved.
 - The Core ML wrapper validates input/output dimensions and types on load;
   failed/incompatible loads use the existing fallback. Prediction failures or
@@ -220,8 +220,9 @@ and [compute-unit semantics](https://developer.apple.com/documentation/coreml/ml
   encoder succeeds; prediction also succeeds through the vendored native bridge.
 - Actual installed ATC Q5 file loads with Core ML disabled and falls back for
   missing, malformed, and wrong-dimension Core ML encoders.
-- Full fine-tuned ATC conversion, live Channel Bank transcription, ANE placement,
-  performance/accuracy A/B and deployment are **not yet validated**. Synthetic
+- Full ATC Large conversion, live Channel Bank transcription, measured ANE
+  execution, performance/accuracy A/B and deployment are **not yet validated**.
+  Turbo ATCOSIM has additional validation recorded below. Synthetic
   checks are deliberately not presented as ATC-model or hardware proof.
 - Windows/Android/iOS were not built; their branches and runtime implementations
   were not changed.
@@ -244,6 +245,81 @@ file had a Q5_0 header and was about 574 MB; neither file was modified.
 
 For runtime A/B tests on the Mini, restart between model/backend selections so
 cached contexts from previous models do not accumulate. Record memory pressure
-and swap along with transcription latency and ANE activity. The current runtime
-still selects the generic Turbo GGML filename; a separate Turbo ATC encoder
-conversion alone does not change that selection.
+and swap along with transcription latency and ANE activity. On macOS, the Turbo selection now uses the ATCOSIM GGML filename below; the
+Windows Turbo selection still uses the original generic filename.
+
+## Turbo ATCOSIM candidate
+
+The macOS **Whisper Turbo** selection now uses
+`ggml-large-v3-turbo-atcosim-q5_0.bin` and optionally loads
+`ggml-large-v3-turbo-atcosim-encoder.mlmodelc` beside it. It does not rename or
+replace the generic Turbo file. Metal fallback and `CB_WHISPER_DISABLE_COREML=1`
+still work. No Windows selection or Medium behavior was changed.
+
+The selected source is `tclin/whisper-large-v3-turbo-atcosim-finetune`, revision
+`94db4b4d66b6e6ed1cd8d971135d47a34418c329`. A comparison against the local ATCOSIM
+GGML found all 587 encoder/decoder tensors match after reproducing FP16 rounding
+and Q5_0 quantization with the vendored ggml quantizer. The GGML SHA-256 is
+`3244b6b568389cd50ed40b4b1c7d27993f31c987bd8e054402e3aa86f913f963`.
+The generic Turbo file has the same size but a different hash; they are not
+interchangeable.
+
+After the dependency setup above, use:
+
+```sh
+/tmp/cb-coreml-venv/bin/python \
+  misc_modules/channel_bank/tools/convert_hf_coreml_encoder.py \
+  --model tclin/whisper-large-v3-turbo-atcosim-finetune \
+  --revision 94db4b4d66b6e6ed1cd8d971135d47a34418c329 \
+  --ggml-name ggml-large-v3-turbo-atcosim-q5_0.bin \
+  --max-relative-l2-error 0.05
+```
+
+The explicit 5% random-input error limit is specific to this tested candidate;
+the converter retains its conservative 2% default for other conversions and
+records the chosen limit in the manifest. Full FP16 conversion measured about
+4.2% relative L2 difference from the original FP32 encoder on the random input.
+Reconstructing the existing Q5 encoder measured about 9.0% on that input. On
+speech, both FP16 Core ML and reconstructed Q5 were about 20% from FP32, showing
+why this hidden-state metric alone cannot establish transcription quality.
+
+The FP32 Core ML diagnostic passed at roughly 0.0003%, but its compute plan had
+no ANE-supported operations on the test Mac. Keeping only normalization or
+convolutions in mixed precision did not meet the original 2% threshold. The
+selected full-FP16 candidate instead has native speech-transcription agreement
+with the existing Metal/Q5 path and an ANE-capable compute plan. These checks
+justify a proof of concept, not a broad ATC accuracy claim. Do not increase the
+limit for an unfamiliar model merely to bypass a validation failure.
+
+Core ML conversion now skips the automatic model load during export; numerical
+validation still explicitly loads and runs the CPU Core ML model. This avoids a
+redundant hardware-specialization pass and reduces conversion overhead.
+
+To inspect planned devices on the target Mac (macOS 14.4+, matching Xcode SDK):
+
+```sh
+clang -fobjc-arc -framework Foundation -framework CoreML \
+  misc_modules/channel_bank/tools/inspect_coreml_plan.m -o /tmp/cb-coreml-plan
+/tmp/cb-coreml-plan \
+  "$HOME/Library/Application Support/sdrpp/channel_bank/models/ggml-large-v3-turbo-atcosim-encoder.mlmodelc"
+```
+
+The M3 Max test compute plan preferred ANE for all 2,443 reported operations.
+This is anticipated placement, **not an Instruments trace proving execution on
+the M1**. Use the Instruments procedure above to verify that on the Mini.
+
+The native smoke helper also accepts `infer` and `metal-infer`. Without a fourth
+argument these run synthetic silence; an optional fourth argument supplies raw
+mono 16 kHz float32 PCM. On the vendored whisper.cpp `samples/jfk.wav` speech
+fixture, both paths produced identical text. This is a general-speech regression
+check, not an ATC corpus test. Full live Channel Bank/session tests and M1 8 GB
+memory, latency and accuracy measurements remain pending.
+
+The validated compiled encoder was installed into the local models directory
+with its JSON manifest; it is about 1.2 GiB on disk. The installed-copy native
+speech smoke test passed and matched Metal/Q5 text exactly. The standalone
+helper's maximum resident size was about 3.35 GB on the 128 GB M3 Max; that does
+not include the full SDR++ application or establish the Mini's memory budget.
+The initial rejected export was preserved separately under `/tmp`; the existing
+GGML files were not replaced. A matching patched SDR++ application is still
+required on the Mini; updating model files alone does not update the app.
