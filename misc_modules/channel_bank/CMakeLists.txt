@@ -13,8 +13,8 @@ if (ANDROID)
     list(FILTER SRC EXCLUDE REGEX "src/transcription_whisper\\.cpp$")
 endif()
 if (APPLE AND NOT ANDROID)
-    list(APPEND SRC src/transcription.mm src/encoding.mm src/transcription_whisper.mm)
-    set_source_files_properties(src/transcription.mm src/encoding.mm src/transcription_whisper.mm PROPERTIES
+    list(APPEND SRC src/transcription.mm src/encoding.mm src/transcription_whisper.mm src/bluetooth_macos.mm)
+    set_source_files_properties(src/transcription.mm src/encoding.mm src/transcription_whisper.mm src/bluetooth_macos.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
 endif()
@@ -128,6 +128,7 @@ if (APPLE AND NOT ANDROID)
         "-framework AudioToolbox"
         "-framework AVFoundation"
         "-framework Foundation"
+        "-framework CoreBluetooth"
         "-framework AppKit"
         "-framework Metal"
         "-framework MetalKit"
