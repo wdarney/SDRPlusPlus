@@ -8,30 +8,50 @@ public enum ChannelBankClientError: Error, Equatable {
     case missingBody
 }
 
+@MainActor
 public protocol ChannelBankTransport: AnyObject {
     func maximumCommandFrameLength() -> Int
     func writeCommandFrame(_ data: Data) async throws
 }
 
+@MainActor
 public final class ChannelBankClient {
     private let transport: ChannelBankTransport
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var nextID: Int64 = 1
-    private var pending: [Int64: CheckedContinuation<Data, Error>] = [:]
+    private struct PendingRequest {
+        let continuation: CheckedContinuation<Data, Error>
+        var writer: Task<Void, Never>?
+        var timeout: Task<Void, Never>?
+    }
+
+    private struct ResponseIdentity: Decodable {
+        let id: Int64
+    }
+
+    private var pending: [Int64: PendingRequest] = [:]
 
     public init(transport: ChannelBankTransport) {
         self.transport = transport
     }
 
     public func reset() {
-        pending.values.forEach { $0.resume(throwing: ChannelBankClientError.requestTimedOut(-1)) }
-        pending.removeAll()
+        for id in Array(pending.keys) {
+            finish(id, with: .failure(ChannelBankClientError.requestTimedOut(-1)))
+        }
     }
 
     public func receiveResponsePayload(_ payload: Data) {
-        guard let envelope = try? decoder.decode(ChannelBankResponse<JSONValue>.self, from: payload) else { return }
-        pending.removeValue(forKey: envelope.id)?.resume(returning: payload)
+        guard let envelope = try? decoder.decode(ResponseIdentity.self, from: payload) else { return }
+        finish(envelope.id, with: .success(payload))
+    }
+
+    private func finish(_ id: Int64, with result: Result<Data, Error>) {
+        guard let request = pending.removeValue(forKey: id) else { return }
+        request.writer?.cancel()
+        request.timeout?.cancel()
+        request.continuation.resume(with: result)
     }
 
     @discardableResult
@@ -43,6 +63,7 @@ public final class ChannelBankClient {
         responseBody: Body.Type = Body.self,
         timeoutNanoseconds: UInt64 = 20_000_000_000
     ) async throws -> Body {
+        try Task.checkCancellation()
         let id = nextID
         nextID += 1
         guard id <= Int64(UInt16.max) else { throw ChannelBankClientError.requestIDOutOfRange(id) }
@@ -52,41 +73,48 @@ public final class ChannelBankClient {
         let framer = ChannelBankFramer(maximumFrameLength: transport.maximumCommandFrameLength())
         let frames = try framer.frames(for: payload, messageID: UInt16(id))
 
-        return try await withThrowingTaskGroup(of: Data.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    self.pending[id] = continuation
-                    Task {
-                        do {
-                            for frame in frames {
-                                try await self.transport.writeCommandFrame(frame)
-                            }
-                        } catch {
-                            self.pending.removeValue(forKey: id)?.resume(throwing: error)
+        // Registration, writes, replies and completion all share the main actor.
+        // Cancellation must resume the waiter even when no BLE response arrives.
+        let raw: Data = try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                pending[id] = PendingRequest(continuation: continuation)
+                pending[id]?.timeout = Task { [weak self] in
+                    do {
+                        try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    } catch {
+                        return
+                    }
+                    self?.finish(id, with: .failure(ChannelBankClientError.requestTimedOut(id)))
+                }
+                pending[id]?.writer = Task { [weak self] in
+                    guard let self else { return }
+                    do {
+                        for frame in frames {
+                            try Task.checkCancellation()
+                            try await self.transport.writeCommandFrame(frame)
                         }
+                    } catch {
+                        self.finish(id, with: .failure(error))
                     }
                 }
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                if let continuation = self.pending.removeValue(forKey: id) {
-                    continuation.resume(throwing: ChannelBankClientError.requestTimedOut(id))
-                }
-                throw ChannelBankClientError.requestTimedOut(id)
+        }, onCancel: { [weak self] in
+            Task { @MainActor in
+                self?.finish(id, with: .failure(CancellationError()))
             }
-            guard let raw = try await group.next() else { throw ChannelBankClientError.requestTimedOut(id) }
-            group.cancelAll()
-            let envelope = try decoder.decode(ChannelBankResponse<Body>.self, from: raw)
-            guard envelope.id == id else { throw ChannelBankClientError.mismatchedResponse(expected: id, got: envelope.id) }
-            if !envelope.ok {
-                throw ChannelBankClientError.server(envelope.error ?? ChannelBankErrorBody(code: "request_failed", message: "Request failed"), status: envelope.status)
-            }
-            guard let body = envelope.body else {
-                if Body.self == EmptyBody.self { return EmptyBody() as! Body }
-                throw ChannelBankClientError.missingBody
-            }
-            return body
+        })
+        try Task.checkCancellation()
+        let envelope = try decoder.decode(ChannelBankResponse<Body>.self, from: raw)
+        guard envelope.id == id else { throw ChannelBankClientError.mismatchedResponse(expected: id, got: envelope.id) }
+        if !envelope.ok {
+            throw ChannelBankClientError.server(envelope.error ?? ChannelBankErrorBody(code: "request_failed", message: "Request failed"), status: envelope.status)
         }
+        guard let body = envelope.body else {
+            if Body.self == EmptyBody.self { return EmptyBody() as! Body }
+            throw ChannelBankClientError.missingBody
+        }
+        return body
     }
 
     public func getState() async throws -> ChannelBankState {

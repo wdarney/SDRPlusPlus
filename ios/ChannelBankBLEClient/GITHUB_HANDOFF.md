@@ -1,5 +1,38 @@
 # Channel Bank BLE iOS Client Handoff
 
+## iPhone UI Hang Follow-Up (2026-09-13)
+
+The user reports that tapping a control such as SNR + or - can freeze the
+iPhone interface itself, including scrolling. This is distinct from a chart
+that pauses while a large Bluetooth State or Response message is transferring.
+
+Source inspection found that command tasks called `writeCommandFrame` and its
+`@Published` diagnostics from a background executor while CoreBluetooth and
+SwiftUI were publishing on the main thread. Request registration, response
+delivery, and timeouts also accessed the same pending-request dictionary from
+different executors. This provides a plausible UI deadlock/data-race cause;
+a device hang stack was not captured.
+
+The iOS fix:
+
+- Isolates BLE UI state, command transport, and request tracking to the main
+  actor, matching CoreBluetooth's explicitly configured main delegate queue.
+- Completes each request once and cancels its writer and timeout task on
+  response, cancellation, timeout, or disconnect.
+- Routes responses using only their ID before decoding the typed body, avoiding
+  a redundant decode of the entire State into generic JSON.
+- Keeps assembled audio file writes off the main actor.
+
+The core suite passes 28 tests, including immediate replies, 24 concurrent
+commands with out-of-order replies, cancellation without a server response,
+timeout during a fragmented write, and disconnect followed by a late reply.
+The signed Debug iOS build succeeded and installed on the paired iPhone.
+Strict signature verification passed on a metadata-free copy under `/private/tmp`;
+Finder kept reattaching disallowed extended attributes to the Documents build.
+Physical acceptance remains: connect to the Mac server, repeatedly adjust SNR,
+and verify scrolling and other controls remain responsive during replies.
+Mac/Android server rebuilds are not required for this iOS threading fix.
+
 ## Summary
 
 This branch now contains an Android Channel Bank BLE GATT server and a native

@@ -21,7 +21,8 @@ public final class ChannelBankViewModel: ObservableObject {
     private var centerTuneTask: Task<Void, Never>?
     private var centerTuneCurrentHz: Double?
 
-    public init(ble: BLECentralManager = BLECentralManager()) {
+    public init(ble: BLECentralManager? = nil) {
+        let ble = ble ?? BLECentralManager()
         self.ble = ble
         ble.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }

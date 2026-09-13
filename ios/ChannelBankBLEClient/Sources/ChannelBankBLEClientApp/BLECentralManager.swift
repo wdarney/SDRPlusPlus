@@ -45,6 +45,7 @@ public enum BLEConnectionStatus: Equatable {
     }
 }
 
+@MainActor
 public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTransport {
     public static let serviceUUID = CBUUID(string: "7d2f0000-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let protocolUUID = CBUUID(string: "7d2f0001-8c4b-4d7a-9a61-8e3c4f2a1000")
@@ -67,7 +68,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     @Published public private(set) var broadScanActive = false
     @Published public private(set) var scanDiagnostics: [String] = []
 
-    private lazy var central = CBCentralManager(delegate: self, queue: nil)
+    private lazy var central = CBCentralManager(delegate: self, queue: .main)
     private var peripheral: CBPeripheral?
     private var protocolCharacteristic: CBCharacteristic?
     private var commandCharacteristic: CBCharacteristic?
@@ -532,7 +533,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     }
 }
 
-extension BLECentralManager: CBCentralManagerDelegate {
+// CoreBluetooth delivers these Objective-C delegate calls on the configured main queue.
+extension BLECentralManager: @preconcurrency CBCentralManagerDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
@@ -605,7 +607,7 @@ private extension CBManagerState {
     }
 }
 
-extension BLECentralManager: CBPeripheralDelegate {
+extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error {
             lastError = error.localizedDescription
@@ -903,7 +905,7 @@ extension BLECentralManager: CBPeripheralDelegate {
         do {
             let download = try await pullCurrentPlaybackWithRetry()
             try Task.checkCancellation()
-            let url = try writePlaybackFile(download, fallbackName: state.playback?.fileName ?? state.playback?.name)
+            let url = try await writePlaybackFile(download, fallbackName: state.playback?.fileName ?? state.playback?.name)
             try Task.checkCancellation()
             await play(url: url, identity: identity, bytes: download.data.count)
         } catch is CancellationError {
@@ -916,7 +918,7 @@ extension BLECentralManager: CBPeripheralDelegate {
             do {
                 let download = try await pullRecordingFallback(state: state)
                 try Task.checkCancellation()
-                let url = try writePlaybackFile(download, fallbackName: state.playback?.fileName ?? state.playback?.name)
+                let url = try await writePlaybackFile(download, fallbackName: state.playback?.fileName ?? state.playback?.name)
                 try Task.checkCancellation()
                 await play(url: url, identity: identity, bytes: download.data.count)
             } catch is CancellationError {
@@ -936,7 +938,7 @@ extension BLECentralManager: CBPeripheralDelegate {
         }
     }
 
-    private struct PulledAudio {
+    private struct PulledAudio: Sendable {
         var data: Data
         var name: String?
         var contentType: String?
@@ -1024,7 +1026,7 @@ extension BLECentralManager: CBPeripheralDelegate {
         return PulledAudio(data: data, name: firstPage?.name, contentType: firstPage?.contentType)
     }
 
-    private func writePlaybackFile(_ audio: PulledAudio, fallbackName: String?) throws -> URL {
+    nonisolated private func writePlaybackFile(_ audio: PulledAudio, fallbackName: String?) async throws -> URL {
         let rawName = audio.name ?? fallbackName ?? "channel-bank-playback"
         let ext = playbackFileExtension(contentType: audio.contentType, name: rawName)
         let safeName = rawName
@@ -1039,7 +1041,7 @@ extension BLECentralManager: CBPeripheralDelegate {
         return url
     }
 
-    private func playbackFileExtension(contentType: String?, name: String) -> String {
+    nonisolated private func playbackFileExtension(contentType: String?, name: String) -> String {
         let lowerName = name.lowercased()
         if lowerName.hasSuffix(".m4a") { return "m4a" }
         if lowerName.hasSuffix(".wav") { return "wav" }

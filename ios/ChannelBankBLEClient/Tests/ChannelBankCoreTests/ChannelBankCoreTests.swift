@@ -73,6 +73,7 @@ final class ChannelBankFramerTests: XCTestCase {
 }
 
 final class ChannelBankClientTests: XCTestCase {
+    @MainActor
     func testRequestTimeoutHandling() async throws {
         let transport = FakeTransport()
         let client = ChannelBankClient(transport: transport)
@@ -84,6 +85,115 @@ final class ChannelBankClientTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error \(error)")
         }
+    }
+
+    @MainActor
+    func testImmediateResponseDuringCommandWrite() async throws {
+        let transport = FakeTransport()
+        let client = ChannelBankClient(transport: transport)
+        transport.onWrite = { data in
+            let frame = try ChannelBankFrame(data: data)
+            client.receiveResponsePayload(Data("{\"v\":1,\"id\":\(frame.messageID),\"ok\":true,\"status\":200,\"body\":{\"snrThresholdDb\":8.5}}".utf8))
+        }
+        let state = try await client.setChannelBankSettings(["snrThresholdDb": JSONValue(.number(8.5))])
+        XCTAssertEqual(state.snrThresholdDb, 8.5)
+    }
+
+    @MainActor
+    func testConcurrentCommandsCompleteWithOutOfOrderReplies() async throws {
+        let transport = FakeTransport()
+        let client = ChannelBankClient(transport: transport)
+        transport.onWrite = { data in
+            let frame = try ChannelBankFrame(data: data)
+            let request = try JSONDecoder().decode(ChannelBankRequest.self, from: frame.payload)
+            let body = try JSONEncoder().encode(request.body ?? [:])
+            let response = Data("{\"v\":1,\"id\":\(request.id),\"ok\":true,\"status\":200,\"body\":\(String(decoding: body, as: UTF8.self))}".utf8)
+            Task { @MainActor in
+                try await Task.sleep(nanoseconds: UInt64(25 - request.id) * 1_000_000)
+                client.receiveResponsePayload(response)
+            }
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for value in 1...24 {
+                group.addTask {
+                    let state: ChannelBankState = try await client.request(
+                        method: "POST", path: "/api/channel-bank/settings",
+                        body: ["snrThresholdDb": JSONValue(.number(Double(value)))],
+                        timeoutNanoseconds: 2_000_000_000)
+                    XCTAssertEqual(state.snrThresholdDb, Double(value))
+                }
+            }
+            try await group.waitForAll()
+        }
+        XCTAssertEqual(transport.frames.count, 24)
+    }
+
+    @MainActor
+    func testCancellationReturnsWithoutWaitingForServerOrTimeout() async throws {
+        let transport = FakeTransport()
+        let client = ChannelBankClient(transport: transport)
+        let written = expectation(description: "Command written")
+        let canceled = expectation(description: "Canceled request released")
+        transport.onWrite = { _ in written.fulfill() }
+        let request = Task { @MainActor in
+            do {
+                _ = try await client.getState()
+                XCTFail("Expected cancellation")
+            } catch is CancellationError {
+                canceled.fulfill()
+            } catch {
+                XCTFail("Unexpected error \(error)")
+            }
+        }
+        await fulfillment(of: [written], timeout: 1)
+        request.cancel()
+        await fulfillment(of: [canceled], timeout: 1)
+        client.reset()
+        await request.value
+    }
+
+    @MainActor
+    func testTimeoutCancelsRemainingCommandFragments() async throws {
+        let transport = FakeTransport()
+        transport.frameLength = 16
+        let client = ChannelBankClient(transport: transport)
+        let writerCanceled = expectation(description: "Suspended writer canceled")
+        transport.onWrite = { _ in
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000_000)
+            } catch {
+                writerCanceled.fulfill()
+                throw error
+            }
+        }
+        do {
+            let _: ChannelBankState = try await client.request(
+                method: "GET", path: "/api/state", timeoutNanoseconds: 50_000_000)
+            XCTFail("Expected timeout")
+        } catch ChannelBankClientError.requestTimedOut {
+            await fulfillment(of: [writerCanceled], timeout: 1)
+            XCTAssertEqual(transport.frames.count, 1)
+        }
+    }
+
+    @MainActor
+    func testResetReleasesRequestAndLateReplyDoesNotAffectNextRequest() async throws {
+        let transport = FakeTransport()
+        let client = ChannelBankClient(transport: transport)
+        transport.onWrite = { _ in client.reset() }
+        do {
+            _ = try await client.getState()
+            XCTFail("Expected disconnect error")
+        } catch ChannelBankClientError.requestTimedOut(let id) {
+            XCTAssertEqual(id, -1)
+        }
+        transport.onWrite = { data in
+            let frame = try ChannelBankFrame(data: data)
+            client.receiveResponsePayload(Data(#"{"v":1,"id":1,"ok":true,"status":200,"body":{"snrThresholdDb":1}}"#.utf8))
+            client.receiveResponsePayload(Data("{\"v\":1,\"id\":\(frame.messageID),\"ok\":true,\"status\":200,\"body\":{\"snrThresholdDb\":9}}".utf8))
+        }
+        let state = try await client.getState()
+        XCTAssertEqual(state.snrThresholdDb, 9)
     }
 
     func testJSONResponseDecodingAndStructuredErrors() throws {
@@ -265,11 +375,15 @@ final class ChannelBankClientTests: XCTestCase {
 
     private final class FakeTransport: ChannelBankTransport {
         var frames: [Data] = []
+        var frameLength = 256
+        var onWrite: ((Data) async throws -> Void)?
 
-        func maximumCommandFrameLength() -> Int { 256 }
+        func maximumCommandFrameLength() -> Int { frameLength }
 
         func writeCommandFrame(_ data: Data) async throws {
+            XCTAssertTrue(Thread.isMainThread, "Command writes and their UI diagnostics must run on the main thread")
             frames.append(data)
+            try await onWrite?(data)
         }
     }
 }
