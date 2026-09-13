@@ -727,6 +727,8 @@ public struct Diagnostics: Codable, Equatable {
 
 public struct RecordingPage: Codable, Equatable {
     public var transferId: String? = nil
+    public var preparing: Bool? = nil
+    public var retryAfterMs: Int? = nil
     public var dataBase64: String?
     public var offset: Int?
     public var nextOffset: Int?

@@ -100,6 +100,21 @@ final class ChannelBankClientTests: XCTestCase {
     }
 
     @MainActor
+    func testCurrentPlaybackRequestsAACAndAcceptsPreparationResponse() async throws {
+        let transport = FakeTransport()
+        let client = ChannelBankClient(transport: transport)
+        transport.onWrite = { data in
+            let frame = try ChannelBankFrame(data: data)
+            let request = try JSONDecoder().decode(ChannelBankRequest.self, from: frame.payload)
+            XCTAssertEqual(request.body?["encoding"], JSONValue(.string("aac")))
+            client.receiveResponsePayload(Data("{\"v\":1,\"id\":\(frame.messageID),\"ok\":true,\"status\":202,\"body\":{\"transferId\":\"compressed\",\"preparing\":true,\"retryAfterMs\":250,\"offset\":0,\"name\":\"voice.m4a\",\"contentType\":\"audio/mp4\"}}".utf8))
+        }
+        let page = try await client.currentPlaybackPage(offset: 0)
+        XCTAssertEqual(page.preparing, true)
+        XCTAssertEqual(page.transferId, "compressed")
+    }
+
+    @MainActor
     func testConcurrentCommandsCompleteWithOutOfOrderReplies() async throws {
         let transport = FakeTransport()
         let client = ChannelBankClient(transport: transport)
@@ -435,6 +450,54 @@ final class WaterfallTests: XCTestCase {
 }
 
 final class RecordingPaginatorTests: XCTestCase {
+    func testPreparationKeepsLeaseAndOffsetUntilAudioIsReady() async throws {
+        var calls = 0
+        let result = try await RecordingPaginator().collectLeased { offset, token in
+            XCTAssertEqual(offset, 0)
+            calls += 1
+            if calls == 1 {
+                XCTAssertNil(token)
+                return RecordingPage(transferId: "aac-1", preparing: true, retryAfterMs: 100, offset: 0)
+            }
+            XCTAssertEqual(token, "aac-1")
+            return RecordingPage(transferId: "aac-1", dataBase64: Data([1, 2, 3]).base64EncodedString(),
+                offset: 0, nextOffset: 3, size: 3, eof: true, name: "voice.m4a", contentType: "audio/mp4")
+        }
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(result.data, Data([1, 2, 3]))
+        XCTAssertEqual(result.transferId, "aac-1")
+    }
+
+    func testPreparationRejectsChangedLease() async throws {
+        var calls = 0
+        do {
+            _ = try await RecordingPaginator().collectLeased { _, _ in
+                calls += 1
+                return RecordingPage(transferId: calls == 1 ? "first" : "other", preparing: true, retryAfterMs: 100, offset: 0)
+            }
+            XCTFail("Expected changed lease")
+        } catch RecordingPaginationError.transferIDChanged(let expected, let actual) {
+            XCTAssertEqual(expected, "first")
+            XCTAssertEqual(actual, "other")
+        }
+    }
+
+    func testPreparationWaitIsCancelable() async throws {
+        let preparing = expectation(description: "Preparing response received")
+        let task = Task {
+            try await RecordingPaginator().collectLeased { _, _ in
+                preparing.fulfill()
+                return RecordingPage(transferId: "aac-1", preparing: true, retryAfterMs: 1000, offset: 0)
+            }
+        }
+        await fulfillment(of: [preparing], timeout: 1)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+    }
+
     func testRecordingPagination() async throws {
         let pages = [
             RecordingPage(dataBase64: Data("hello ".utf8).base64EncodedString(), offset: 0, nextOffset: 6, size: 11, eof: false, name: "a.m4a", contentType: "audio/mp4"),

@@ -255,6 +255,8 @@ public final class ChannelBankClient {
         ]
         if let transferId, !transferId.isEmpty {
             body["transferId"] = JSONValue(.string(transferId))
+        } else {
+            body["encoding"] = JSONValue(.string("aac"))
         }
         return try await request(
             method: "GET",

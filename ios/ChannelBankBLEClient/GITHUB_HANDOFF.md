@@ -1,5 +1,30 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Bluetooth AAC/M4A Transfer (2026-09-13)
+
+The iPhone now requests `body.encoding: "aac"` when creating a current-playback
+lease. The updated Mac Bluetooth adapter prepares a private AAC/M4A copy on a
+background thread and can return 202 with `preparing:true`, `transferId`,
+`offset:0`, and `retryAfterMs`. The client preserves the lease, shows preparation
+status, and retries the same offset until normal Base64 audio pages arrive.
+Preparation sleeps are cancelable and waits are bounded. WAV responses from
+older servers remain accepted. Existing M4A playback uses AVFoundation.
+
+The Mac implementation is commit `7e241d9e` on `wd/channel-bank-macos-telemetry`, in
+`bluetooth_macos.mm` and `bluetooth_audio_macos.h`. It leaves the local Mac
+Channel Bank, recording encoder, playback, transcription and WebUI unchanged.
+Its synthetic ten-second audio test reduced 960,044 WAV bytes to 51,434 M4A
+bytes and decoded all 240,000 output frames at 24 kHz. Actual BLE latency and
+audible playback still require a rebuilt Mac server and the updated iPhone app.
+
+The iOS core suite now passes 32 tests, covering the AAC request, 202 decoding,
+stable lease and offset through preparation, lease mismatch, and cancellation.
+The signed iPhone build and strict signature verification passed, and the app
+was installed on the paired iPhone. The Mac build session must integrate
+`7e241d9e` on top of its existing Bluetooth/telemetry adapter and rebuild the
+test app before compressed transfer is available. Do not modify `main.cpp` or
+the local recording encoder when integrating this change.
+
 ## Audio Stuck Pulling Follow-Up (2026-09-13)
 
 Reported symptom: Monitor remains at `Pulling...` with a filename and never

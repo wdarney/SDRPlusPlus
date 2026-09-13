@@ -995,7 +995,7 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
                     let page = try await self.client.currentPlaybackPage(offset: offset, transferId: transferId)
                     try Task.checkCancellation()
                     if let pageTransferId = page.transferId { lease.set(pageTransferId) }
-                    if firstPage == nil { firstPage = page }
+                    if firstPage == nil, page.preparing != true { firstPage = page }
                     self.updateAudioProgress(page)
                     self.appendDiagnostic("Audio page transfer=\(page.transferId ?? "missing") offset=\(page.offset ?? offset) eof=\(page.eof == true)")
                     return page
@@ -1052,6 +1052,10 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
     }
 
     private func updateAudioProgress(_ page: RecordingPage) {
+        if page.preparing == true {
+            audioMonitorStatus = "Preparing compressed audio: \(page.name ?? "audio")"
+            return
+        }
         let received = page.nextOffset ?? page.offset ?? 0
         let receivedText = ByteCountFormatter.string(fromByteCount: Int64(received), countStyle: .file)
         let totalText = page.size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }

@@ -7,6 +7,8 @@ public enum RecordingPaginationError: Error, Equatable {
     case didNotAdvance
     case missingTransferID
     case transferIDChanged(expected: String, got: String)
+    case preparationTimedOut
+    case unexpectedPreparation
 }
 
 public struct RecordingPaginator {
@@ -45,6 +47,7 @@ public struct RecordingPaginator {
         var output = Data()
         var next = offset
         var transferId: String?
+        var preparationStarted: Date?
         while true {
             try Task.checkCancellation()
             let page = try await fetch(next, transferId)
@@ -58,6 +61,15 @@ public struct RecordingPaginator {
                 throw RecordingPaginationError.transferIDChanged(expected: transferId, got: pageTransferId)
             }
             transferId = pageTransferId
+            if page.preparing == true {
+                guard output.isEmpty, next == 0 else { throw RecordingPaginationError.unexpectedPreparation }
+                let started = preparationStarted ?? Date()
+                preparationStarted = started
+                guard Date().timeIntervalSince(started) < 20 else { throw RecordingPaginationError.preparationTimedOut }
+                let delayMs = min(1000, max(100, page.retryAfterMs ?? 250))
+                try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                continue
+            }
             guard let base64 = page.dataBase64 else { throw RecordingPaginationError.missingData }
             guard let data = Data(base64Encoded: base64) else { throw RecordingPaginationError.invalidBase64 }
             output.append(data)
