@@ -318,8 +318,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         initialStateFallbackTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 8_000_000_000)
             guard let self, self.latestState == nil else { return }
-            self.appendDiagnostic("Fallback requesting /api/state")
-            await self.performStateRefresh(suppressTimeoutError: true)
+            self.appendDiagnostic("Fallback requesting /api/state/summary")
+            await self.performStateSummaryRefresh()
         }
     }
 
