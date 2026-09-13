@@ -257,6 +257,37 @@ public struct ChannelBankState: Codable, Equatable {
         settings = nextSettings
     }
 
+    /// Keeps display-only data from a delayed full State without rolling current controls back.
+    public mutating func mergeTelemetry(from fullState: ChannelBankState) {
+        module = fullState.module ?? module
+        enabled = fullState.enabled ?? enabled
+        waterfallCenterHz = fullState.waterfallCenterHz ?? waterfallCenterHz
+        usableSpanHz = fullState.usableSpanHz ?? usableSpanHz
+        bwUsage = fullState.bwUsage ?? bwUsage
+        sdrppHeartbeat = fullState.sdrppHeartbeat ?? sdrppHeartbeat
+        sources = fullState.sources ?? sources
+        sdrppServer = fullState.sdrppServer ?? sdrppServer
+        sourceControls = fullState.sourceControls ?? sourceControls
+        sourceOffset = fullState.sourceOffset ?? sourceOffset
+        if settings == nil { settings = fullState.settings }
+
+        activeChannels = fullState.activeChannels ?? activeChannels
+        recentChannels = fullState.recentChannels ?? recentChannels
+        detectedSlots = fullState.detectedSlots ?? detectedSlots
+        manualDetected = fullState.manualDetected ?? manualDetected
+        snrOverview = fullState.snrOverview ?? snrOverview
+        playbackLock = fullState.playbackLock ?? playbackLock
+        currentlyPlayingFreqKey = fullState.currentlyPlayingFreqKey ?? currentlyPlayingFreqKey
+        history = fullState.history ?? history
+        diagnostics = fullState.diagnostics ?? diagnostics
+        scanStopIndex = fullState.scanStopIndex ?? scanStopIndex
+        scanStopCount = fullState.scanStopCount ?? scanStopCount
+        bookmarkScanStopIndex = fullState.bookmarkScanStopIndex ?? bookmarkScanStopIndex
+        bookmarkScanStopCount = fullState.bookmarkScanStopCount ?? bookmarkScanStopCount
+        lastTranscriptName = fullState.lastTranscriptName ?? lastTranscriptName
+        lastTranscriptText = fullState.lastTranscriptText ?? lastTranscriptText
+    }
+
     public var isSummaryShaped: Bool {
         guard hasSummaryFields else { return false }
         return module == nil &&

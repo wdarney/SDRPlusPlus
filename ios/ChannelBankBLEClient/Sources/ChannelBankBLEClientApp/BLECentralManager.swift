@@ -758,7 +758,12 @@ extension BLECentralManager: CBPeripheralDelegate {
         }
         if let seq = state.seq {
             if let latestSequence, seq < latestSequence {
-                appendDiagnostic("Ignored stale State seq=\(seq) latest=\(latestSequence)")
+                var merged = latestState ?? ChannelBankState()
+                merged.mergeTelemetry(from: state)
+                latestState = merged
+                hasReceivedFullState = true
+                appendDiagnostic("Merged delayed State telemetry seq=\(seq) latest=\(latestSequence)")
+                monitorPlaybackIfNeeded(merged)
                 return
             }
             latestSequence = seq

@@ -163,6 +163,34 @@ final class ChannelBankClientTests: XCTestCase {
         XCTAssertFalse(state.isSummaryShaped)
     }
 
+    func testDelayedFullStateMergesTelemetryWithoutRollingBackSummaryControls() {
+        var current = ChannelBankState()
+        current.seq = 12
+        current.running = true
+        current.snrThresholdDb = 9
+        current.recordingEnabled = false
+
+        var delayed = ChannelBankState()
+        delayed.seq = 11
+        delayed.running = false
+        delayed.snrThresholdDb = 6
+        delayed.usableSpanHz = 800_000
+        delayed.snrOverview = [SNROverviewPoint(freqHz: 155_000_000, snrDb: 12)]
+        delayed.activeChannels = [ChannelBankChannel(freqHz: 155_000_000, signalPresent: true)]
+        delayed.history = [HistoryEntry(freqHz: 155_000_000, name: "Fire", count: 1)]
+
+        current.mergeTelemetry(from: delayed)
+
+        XCTAssertEqual(current.seq, 12)
+        XCTAssertTrue(current.running == true)
+        XCTAssertEqual(current.snrThresholdDb, 9)
+        XCTAssertTrue(current.recordingEnabled == false)
+        XCTAssertEqual(current.usableSpanHz, 800_000)
+        XCTAssertEqual(current.snrOverview?.first?.snrDb, 12)
+        XCTAssertEqual(current.activeChannels?.first?.freqHz, 155_000_000)
+        XCTAssertEqual(current.history?.first?.name, "Fire")
+    }
+
     func testParityStateDecoding() throws {
         let raw = Data(#"""
         {
