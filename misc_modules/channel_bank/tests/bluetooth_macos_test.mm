@@ -39,6 +39,105 @@ static NSData* frame(uint8_t flags, uint16_t identifier, uint32_t offset, NSData
     [result appendData:payload];
     return result;
 }
+static void testCompressedPlayback(CBMacServer* server, NSUUID* owner) {
+    // Ten seconds of 48 kHz mono PCM, independent of the local recording pipeline.
+    NSMutableData* wav = [NSMutableData new];
+    auto bytes = [&](const char* text) { [wav appendBytes:text length:4]; };
+    auto u16 = [&](uint16_t n) { uint8_t b[] = {(uint8_t)n, (uint8_t)(n >> 8)}; [wav appendBytes:b length:2]; };
+    auto u32 = [&](uint32_t n) { uint8_t b[] = {(uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24)}; [wav appendBytes:b length:4]; };
+    bytes("RIFF"); u32(36 + 480000 * 2); bytes("WAVE"); bytes("fmt "); u32(16);
+    u16(1); u16(1); u32(48000); u32(96000); u16(2); u16(16); bytes("data"); u32(480000 * 2);
+    for (int i = 0; i < 480000; ++i) u16(static_cast<int16_t>(12000 * std::sin(i * 2 * 3.141592653589793 * 440 / 48000)));
+    char sourcePath[] = "/tmp/cb-ble-aac-source-XXXXXX";
+    int source = mkstemp(sourcePath);
+    assert(source >= 0 && write(source, wav.bytes, wav.length) == (ssize_t)wav.length);
+    server->openPlayback = [source](std::string& name) { name = "voice.wav"; return dup(source); };
+    auto page = [&](NSDictionary* body) {
+        return [server perform:@{@"v":@1, @"id":@42, @"method":@"GET",
+            @"path":@"/api/audio/current-playback", @"body":body} owner:owner];
+    };
+    NSDictionary* response = page(@{@"encoding":@"aac", @"offset":@0});
+    assert([response[@"status"] intValue] == 202 || [response[@"status"] intValue] == 200);
+    NSString* token = response[@"body"][@"transferId"];
+    assert(token.length);
+    NSMutableData* unchanged = [NSMutableData dataWithLength:wav.length];
+    assert(pread(source, unchanged.mutableBytes, unchanged.length, 0) == (ssize_t)unchanged.length);
+    assert([unchanged isEqual:wav]);
+    assert(unlink(sourcePath) == 0);
+    close(source);
+    server->openPlayback = [](std::string&) { return -1; };
+    NSMutableData* compressed = [NSMutableData new];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (true) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        NSDictionary* body = response[@"body"];
+        if (!body) std::cerr << response.description.UTF8String << '\n';
+        assert([body[@"transferId"] isEqual:token]);
+        assert([body[@"name"] isEqual:@"voice.m4a"] && [body[@"contentType"] isEqual:@"audio/mp4"]);
+        if ([body[@"preparing"] boolValue]) {
+            assert([response[@"status"] intValue] == 202 && !body[@"dataBase64"]);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } else {
+            assert([response[@"status"] intValue] == 200);
+            assert([body[@"offset"] unsignedLongLongValue] == compressed.length);
+            [compressed appendData:[[NSData alloc] initWithBase64EncodedString:body[@"dataBase64"] options:0]];
+            if ([body[@"eof"] boolValue]) { assert(compressed.length == [body[@"size"] unsignedLongLongValue]); break; }
+        }
+        response = page(@{@"transferId":token, @"offset":@(compressed.length), @"limit":@4096});
+    }
+    assert(server.transfers.count == 0 && compressed.length < wav.length / 5);
+    char outputPath[] = "/tmp/cb-ble-aac-decode-XXXXXX";
+    int output = mkstemp(outputPath);
+    assert(output >= 0 && write(output, compressed.bytes, compressed.length) == (ssize_t)compressed.length);
+    close(output);
+    NSURL* url = [NSURL fileURLWithFileSystemRepresentation:outputPath isDirectory:NO relativeToURL:nil];
+    ExtAudioFileRef decoded = nullptr;
+    assert(ExtAudioFileOpenURL((__bridge CFURLRef)url, &decoded) == noErr);
+    AudioStreamBasicDescription format{};
+    UInt32 size = sizeof(format);
+    assert(ExtAudioFileGetProperty(decoded, kExtAudioFileProperty_FileDataFormat, &size, &format) == noErr);
+    assert(format.mFormatID == kAudioFormatMPEG4AAC && format.mChannelsPerFrame == 1 && format.mSampleRate == 24000);
+    format = {24000, kAudioFormatLinearPCM, kAudioFormatFlagsNativeFloatPacked, 4, 1, 4, 1, 32, 0};
+    assert(ExtAudioFileSetProperty(decoded, kExtAudioFileProperty_ClientDataFormat, sizeof(format), &format) == noErr);
+    uint64_t totalFrames = 0;
+    double energy = 0;
+    while (true) {
+        float samples[4096];
+        AudioBufferList buffer{1, {{1, sizeof(samples), samples}}};
+        UInt32 count = 4096;
+        assert(ExtAudioFileRead(decoded, &count, &buffer) == noErr);
+        if (!count) break;
+        totalFrames += count;
+        for (UInt32 i = 0; i < count; ++i) energy += samples[i] * samples[i];
+    }
+    assert(totalFrames >= 239000 && totalFrames < 243000 && energy / totalFrames > 0.01);
+    ExtAudioFileDispose(decoded);
+    unlink(outputPath);
+    std::cout << "AAC fixture: " << wav.length << " WAV bytes -> " << compressed.length
+              << " M4A bytes; decoded " << totalFrames << " frames\n";
+
+    char badPath[] = "/tmp/cb-ble-aac-invalid-XXXXXX";
+    int bad = mkstemp(badPath);
+    assert(bad >= 0 && write(bad, "invalid", 7) == 7 && unlink(badPath) == 0);
+    server->openPlayback = [bad](std::string& name) { name = "bad.wav"; return dup(bad); };
+    response = page(@{@"encoding":@"aac"});
+    token = response[@"body"][@"transferId"];
+    while ([response[@"status"] intValue] == 202) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        response = page(@{@"transferId":token});
+    }
+    assert([response[@"status"] intValue] == 502 && server.transfers.count == 0);
+    response = page(@{@"encoding":@"aac"});
+    if ([response[@"status"] intValue] == 202) {
+        token = response[@"body"][@"transferId"];
+        assert([page(@{@"transferId":token, @"cancel":@YES})[@"status"] intValue] == 200);
+    }
+    assert(server.transfers.count == 0);
+    close(bad);
+    server->openPlayback = [](std::string&) { return -1; };
+}
+
 int main() {
     @autoreleasepool {
         CBMacServer* server = [CBMacServer new];
@@ -167,6 +266,7 @@ int main() {
         assert([page(@{}, central.identifier)[@"status"] intValue] == 413);
         assert(server.transfers.count == 0);
         close(large);
+        testCompressedPlayback(server, central.identifier);
         std::cout << "Bluetooth framing, bounds, backpressure, routing, snapshot and audio lease tests passed\n";
     }
 }
