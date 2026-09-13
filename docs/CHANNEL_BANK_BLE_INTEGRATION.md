@@ -12,8 +12,8 @@ transport. Windows remains out of scope.
 - Canonical shared target: `integration/main` at `c07b15c6`.
 - The packaged macOS test app at local commit `a3ae628e` is an intentionally
   layered test artifact, not the canonical source history.
-- The current macOS candidate is `origin/wd/channel-bank-macos-telemetry` at
-  `7c4a962a`.
+- The current macOS candidate is `origin/wd/channel-bank-macos-telemetry`.
+  Confirm its tip after the compact-frame scheduler commit is pushed.
 - The current Android/iPhone candidate is
   `origin/codex/sdrpp-android-channel-bank-ble` at `893b2049`.
 - Do not modify the dirty `docs/RX888_MACOS_KNOWN_GOOD.md` in the existing
@@ -35,9 +35,10 @@ telemetry behavior.
 
 Instead, use `e4a5fcd3` and `fe6cd1b9` as the adapter base, then port only the
 characteristic-0007 telemetry additions from `625f6345` into the resulting
-integration candidate. Apply `7c4a962a` after that port. It changes only
-`bluetooth_macos.mm` and supplies the startup/queue behavior needed for a
-usable Summary before the large full State transfer.
+integration candidate. Apply `7c4a962a` after that port, then the compact-frame
+scheduler follow-up from this branch. Together they supply startup and queue
+behavior needed for a usable Summary before the large full State transfer and
+ensure current SNR telemetry can pass a paused full-State transfer.
 
 The Mac telemetry port must retain all of the following:
 
@@ -45,7 +46,8 @@ The Mac telemetry port must retain all of the following:
 - The schema-1 compact binary payload at 4 Hz, capped at 160 points.
 - The `bleSnrTelemetryPayload()` fixed-grid producer in Channel Bank.
 - Lossy coalescing for unsent telemetry frames.
-- Completion of a started State frame, while allowing Response priority.
+- Completion of a started frame on each characteristic, while allowing Response,
+  Summary, and current telemetry to pass a paused full-State transfer.
 - Initial Summary before periodic full State, and full State at the reduced
   cadence from `7c4a962a`.
 
@@ -87,7 +89,8 @@ JNI, Gradle, or package changes into Windows builds.
    an ancestor of the selected target.
 3. Apply the macOS adapter base (`e4a5fcd3`, then `fe6cd1b9`).
 4. Port the telemetry-only delta from `625f6345`, resolve it against the
-   current Channel Bank WebUI authority, then apply `7c4a962a`.
+   current Channel Bank WebUI authority, then apply `7c4a962a` and the
+   compact-frame scheduler follow-up from this branch.
 5. Apply the ordered iPhone series and the Android BLE series, resolving only
    within their platform ownership boundaries.
 6. Update `BLE_GATT_PROTOCOL.md` manually from the final source behavior;

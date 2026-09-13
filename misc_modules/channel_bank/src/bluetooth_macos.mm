@@ -172,16 +172,19 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     for (CBCentral* c in characteristic.subscribedCentrals)
         if ([c.identifier isEqual:central.identifier]) subscribed = YES;
     if (!subscribed) return;
-    // Finish messages already started; coalesce snapshots to avoid BLE backlogs.
-    if ([characteristic.UUID isEqual:uuid(7)]) {
-        // Telemetry is deliberately lossy: retain an in-flight frame, but replace
-        // every unstarted one with the newest SNR snapshot.
+    const BOOL isResponse = [characteristic.UUID isEqual:uuid(3)];
+    const BOOL isSummary = [characteristic.UUID isEqual:uuid(6)];
+    const BOOL isTelemetry = [characteristic.UUID isEqual:uuid(7)];
+
+    // Finish messages already started. Compact snapshots are replaceable while
+    // waiting, so stale Summary and telemetry frames never build a backlog.
+    if (isSummary || isTelemetry) {
         NSIndexSet* stale = [_outgoing indexesOfObjectsPassingTest:^BOOL(CBMacMessage* item, NSUInteger idx, BOOL* stop) {
             return [item.central.identifier isEqual:central.identifier] &&
                 item.characteristic == characteristic && item.offset == 0;
         }];
         [_outgoing removeObjectsAtIndexes:stale];
-    } else if (![characteristic.UUID isEqual:uuid(3)]) {
+    } else if (!isResponse) {
         for (CBMacMessage* item in _outgoing)
             if ([item.central.identifier isEqual:central.identifier] && item.characteristic == characteristic) return;
     }
@@ -191,13 +194,25 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     message.central = central;
     message.characteristic = characteristic;
     message.identifier = identifier;
-    // Responses can safely interrupt a State transfer because the client assembles
-    // each characteristic independently. This keeps control and compact fallback
-    // requests responsive while a large State snapshot is still draining.
-    if ([characteristic.UUID isEqual:uuid(3)]) {
+    // Characteristic-specific assemblers let compact, current information pass a
+    // paused full-State transfer. Keep an already-started frame of the same
+    // characteristic ahead of its replacement so its fragment stream remains sane.
+    if (isResponse) {
         NSUInteger index = 0;
         while (index < _outgoing.count &&
                 [_outgoing[index].characteristic.UUID isEqual:uuid(3)]) ++index;
+        [_outgoing insertObject:message atIndex:index];
+    } else if (isSummary || isTelemetry) {
+        NSUInteger index = 0;
+        while (index < _outgoing.count &&
+                [_outgoing[index].characteristic.UUID isEqual:uuid(3)]) ++index;
+        if (isTelemetry) {
+            while (index < _outgoing.count &&
+                    [_outgoing[index].characteristic.UUID isEqual:uuid(6)]) ++index;
+        }
+        while (index < _outgoing.count &&
+                _outgoing[index].characteristic == characteristic &&
+                _outgoing[index].offset > 0) ++index;
         [_outgoing insertObject:message atIndex:index];
     } else [_outgoing addObject:message];
     [self pump];
