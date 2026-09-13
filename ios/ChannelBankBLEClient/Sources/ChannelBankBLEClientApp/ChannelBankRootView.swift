@@ -228,7 +228,11 @@ public struct ChannelBankRootView: View {
                     ("Device", controls.deviceId.map(String.init) ?? "-"),
                     ("Telemetry", controls.telemetryIntervalSec.map { "\($0)s" } ?? "-")
                 ])
-                sourceControlMenus(controls, running: state.radioPlaying == true || controls.running == true)
+                sourceControlMenus(
+                    controls,
+                    running: state.radioPlaying == true || controls.running == true,
+                    selectedSource: state.selectedSource
+                )
                 sourceControlLiveToggles(controls)
                 sourceControlGains(controls)
             } else {
@@ -239,7 +243,7 @@ public struct ChannelBankRootView: View {
     }
 
     @ViewBuilder
-    private func sourceControlMenus(_ controls: RX888SourceControls, running: Bool) -> some View {
+    private func sourceControlMenus(_ controls: RX888SourceControls, running: Bool, selectedSource: String?) -> some View {
         HStack {
             if let devices = controls.devices, !devices.isEmpty {
                 Menu {
@@ -273,12 +277,14 @@ public struct ChannelBankRootView: View {
                 }
                 .disabled(running)
             }
-            Button {
-                model.ble.setSourceControls(["refresh": JSONValue(.bool(true))])
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+            if (controls.source ?? selectedSource ?? "").localizedCaseInsensitiveContains("RX888") {
+                Button {
+                    model.ble.refreshRX888Source()
+                } label: {
+                    Label("Refresh RX888", systemImage: "arrow.clockwise")
+                }
+                .disabled(running)
             }
-            .disabled(running)
         }
         .buttonStyle(.bordered)
 

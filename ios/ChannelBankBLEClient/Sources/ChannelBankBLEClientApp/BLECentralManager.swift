@@ -194,6 +194,14 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         Task { await apply { try await self.client.setSourceControls(body) } }
     }
 
+    public func refreshRX888Source() {
+        guard latestState?.radioPlaying != true, latestState?.sourceControls?.running != true else {
+            lastError = "Stop RX888 before refreshing it."
+            return
+        }
+        Task { await apply { try await self.client.setSourceControls(["refresh": JSONValue(.bool(true))]) } }
+    }
+
     public func setChannelBankSettings(_ body: [String: JSONValue]) {
         Task { await apply { try await self.client.setChannelBankSettings(body) } }
     }
