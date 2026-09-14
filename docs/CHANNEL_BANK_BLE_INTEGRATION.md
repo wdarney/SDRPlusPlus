@@ -9,6 +9,32 @@ transport. Windows remains out of scope.
 
 ## Current State
 
+### Consolidation Approved 2026-09-14
+
+The user reported the combined system looking good and authorized merging.
+The integration candidate combines these exact source trees:
+
+- Shared baseline: `c07b15c6` on `integration/main`.
+- Tested Mac build history: `06ffde2f` on `wd/macos-0eab6454`, merged with
+  history. This already includes the proxy controls, Mac build fixes, Bluetooth
+  adapter, SNR telemetry, queue fixes, and Bluetooth-only AAC conversion.
+- Native iPhone client: the exact tracked `ios/ChannelBankBLEClient` tree from
+  `a8721904`, imported as `82b96532`. The divergent Android branch itself is
+  not merged; its server changes and physical validation remain separately owned.
+
+All desktop source and build files are identical to `06ffde2f`. In particular,
+local Channel Bank `main.cpp` and `encoding.mm` are unchanged relative to the
+tested Mac build. The client tree is identical to `a8721904`. No generated
+artifacts or dirty protocol/known-good documents from other worktrees are included.
+
+The historical porting instructions below describe provenance, not steps to
+repeat after this consolidation. Future Mac and iPhone work should start from
+the resulting `integration/main`; do not reapply those historical patches.
+The user has performed live testing; this merge adds no claim of exhaustive
+hardware, audio-quality, or throughput validation. Existing Mac package and
+signed iPhone installation evidence applies because their implementation trees
+are preserved. Focused Swift and Mac codec/lease tests are rerun on the candidate.
+
 ### Latest AAC Build Handoff
 
 - Mac adapter implementation: `7e241d9e` on
