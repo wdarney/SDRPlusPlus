@@ -1,5 +1,15 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Blocked SNR Display (2026-09-14)
+
+The iPhone SNR chart now combines blocked history frequencies with telemetry
+block flags using the server's rounded-kHz identity. It draws red frequency
+markers even when a sampled SNR bucket is absent or near zero, and matching
+bars remain red with a three-pixel minimum height. This is an iOS-only display
+change; no Mac or Android server rebuild is needed for it. All 40 core tests
+pass, including blocked history with absent/unflagged telemetry and low-SNR
+telemetry-only blocks. Live chart appearance still needs iPhone confirmation.
+
 ## Binary Audio Trial (2026-09-14)
 
 The optional macOS/iPhone binary notification transfer is on `wd/ble-binary-audio`.

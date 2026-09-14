@@ -518,6 +518,17 @@ public struct HistoryEntry: Codable, Equatable, Identifiable {
     }
 }
 
+extension ChannelBankState {
+    // Match the server's rounded-kHz block identity, independently of sampled
+    // SNR buckets: a downsampled bucket need not land on a blocked frequency.
+    public var snrBlockedFrequencyKeys: Set<Double> {
+        let historyHz = (history ?? []).filter { $0.blocked == true }.map(\.freqHz)
+        let telemetryHz = (snrOverview ?? []).filter { $0.blocked == true }.map(\.freqHz)
+        return Set((historyHz + telemetryHz).filter { $0.isFinite && $0 > 0 }
+            .map { ($0 / 1000).rounded() })
+    }
+}
+
 public struct SNROverviewPoint: Codable, Equatable, Identifiable {
     public var id: Double { freqHz }
     public var freqHz: Double

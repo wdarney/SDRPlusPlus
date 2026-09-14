@@ -13,6 +13,7 @@ public struct SNRChartView: View {
     public var body: some View {
         Panel("SNR Overview") {
             let points = state.snrOverview ?? []
+            let blockedKeys = state.snrBlockedFrequencyKeys
             let threshold = state.snrThresholdDb ?? state.settings?.snrThresholdDb ?? 0
             let peak = points.map(\.snrDb).max() ?? 0
             let above = points.filter { $0.snrDb >= threshold }.count
@@ -40,14 +41,23 @@ public struct SNRChartView: View {
                     plot.minY + (1 - ((db - minDb) / (maxDb - minDb))) * plot.height
                 }
                 let baseY = y(0)
+                for key in blockedKeys.sorted() {
+                    let hz = key * 1000
+                    guard span.contains(hz) else { continue }
+                    let x = plot.minX + span.x(for: hz, width: plot.width)
+                    context.fill(Path(CGRect(x: x - 1, y: plot.minY, width: 2, height: plot.height)), with: .color(.red.opacity(0.35)))
+                    context.fill(Path(CGRect(x: x - 3, y: baseY - 3, width: 6, height: 3)), with: .color(.red))
+                }
                 let barWidth = max(1, min(8, plot.width / Double(max(1, points.count)) * 0.82))
                 for point in points {
                     guard span.contains(point.freqHz) else { continue }
                     let x = plot.minX + span.x(for: point.freqHz, width: plot.width)
                     let db = max(minDb, min(maxDb, point.snrDb))
                     let top = y(max(0, db))
-                    let color: Color = point.blocked == true ? .red : point.detected == true ? .green : point.rawDetected == true ? .orange : db >= threshold ? .blue : Color(red: 0.20, green: 0.30, blue: 0.42)
-                    context.fill(Path(CGRect(x: x - barWidth / 2, y: min(baseY, top), width: barWidth, height: max(1, abs(baseY - top)))), with: .color(color))
+                    let blocked = blockedKeys.contains((point.freqHz / 1000).rounded())
+                    let color: Color = blocked ? .red : point.detected == true ? .green : point.rawDetected == true ? .orange : db >= threshold ? .blue : Color(red: 0.20, green: 0.30, blue: 0.42)
+                    let height = max(blocked ? 3 : 1, abs(baseY - top))
+                    context.fill(Path(CGRect(x: x - barWidth / 2, y: baseY - height, width: barWidth, height: height)), with: .color(color))
                 }
                 var thresholdLine = Path()
                 thresholdLine.move(to: CGPoint(x: plot.minX, y: y(threshold)))
