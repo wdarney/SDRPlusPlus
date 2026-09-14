@@ -8,7 +8,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     return()
 endif ()
 
-project(sdrpp)
+project(sdrpp LANGUAGES C CXX OBJC OBJCXX)
 
 # Backends
 option(OPT_BACKEND_GLFW "Use the GLFW backend" ON)
