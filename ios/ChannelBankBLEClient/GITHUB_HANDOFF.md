@@ -1,5 +1,15 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Binary Audio Trial (2026-09-14)
+
+The optional macOS/iPhone binary notification transfer is on `wd/ble-binary-audio`.
+It sends bounded, checksum-validated windows instead of Base64 Response pages,
+with retries and same-lease paged fallback. Both endpoints need rebuilding;
+an old Mac server continues using paged audio. See
+[BINARY_AUDIO_HANDOFF.md](BINARY_AUDIO_HANDOFF.md) for the exact protocol, build
+boundary, tests and physical-device throughput checklist. Local Mac Channel Bank
+playback/recording and Android are unchanged. Live speed is not yet validated.
+
 ## Bluetooth AAC/M4A Transfer (2026-09-13)
 
 The iPhone now requests `body.encoding: "aac"` when creating a current-playback

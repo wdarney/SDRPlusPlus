@@ -55,6 +55,7 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private static let audioUUID = CBUUID(string: "7d2f0005-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let stateSummaryUUID = CBUUID(string: "7d2f0006-8c4b-4d7a-9a61-8e3c4f2a1000")
     private static let snrTelemetryUUID = CBUUID(string: "7d2f0007-8c4b-4d7a-9a61-8e3c4f2a1000")
+    private static let audioFileUUID = CBUUID(string: "7d2f0008-8c4b-4d7a-9a61-8e3c4f2a1000")
 
     @Published public private(set) var status: BLEConnectionStatus = .idle
     @Published public private(set) var discovered: [DiscoveredPeripheral] = []
@@ -77,6 +78,9 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
     private var audioCharacteristic: CBCharacteristic?
     private var stateSummaryCharacteristic: CBCharacteristic?
     private var snrTelemetryCharacteristic: CBCharacteristic?
+    private var audioFileCharacteristic: CBCharacteristic?
+    private var audioFileNotificationsEnabled = false
+    private let binaryAudioTransfer = BinaryAudioTransfer()
     private let responseAssembler = ChannelBankFrameAssembler()
     private let stateAssembler = ChannelBankFrameAssembler()
     private let stateSummaryAssembler = ChannelBankFrameAssembler()
@@ -480,6 +484,8 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         audioCharacteristic = nil
         stateSummaryCharacteristic = nil
         snrTelemetryCharacteristic = nil
+        audioFileCharacteristic = nil
+        audioFileNotificationsEnabled = false
         responseAssembler.reset()
         stateAssembler.reset()
         stateSummaryAssembler.reset()
@@ -630,7 +636,8 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
             Self.stateUUID,
             Self.audioUUID,
             Self.stateSummaryUUID,
-            Self.snrTelemetryUUID
+            Self.snrTelemetryUUID,
+            Self.audioFileUUID
         ], for: service)
     }
 
@@ -648,6 +655,7 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
             case Self.audioUUID: audioCharacteristic = characteristic
             case Self.stateSummaryUUID: stateSummaryCharacteristic = characteristic
             case Self.snrTelemetryUUID: snrTelemetryCharacteristic = characteristic
+            case Self.audioFileUUID: audioFileCharacteristic = characteristic
             default: break
             }
         }
@@ -674,6 +682,11 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
         } else {
             appendDiagnostic("High-rate SNR telemetry characteristic not present")
         }
+        if let audioFileCharacteristic {
+            peripheral.setNotifyValue(true, for: audioFileCharacteristic)
+        } else {
+            appendDiagnostic("Binary Audio File unavailable; using paged audio")
+        }
         connectedName = peripheral.name ?? connectedName
         status = .connected(connectedName ?? "SDR++ Channel Bank")
     }
@@ -695,6 +708,9 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
         } else if characteristic.uuid == Self.snrTelemetryUUID {
             snrTelemetryNotificationsEnabled = characteristic.isNotifying
             appendDiagnostic("High-rate SNR telemetry notifications \(characteristic.isNotifying ? "enabled" : "disabled")")
+        } else if characteristic.uuid == Self.audioFileUUID {
+            audioFileNotificationsEnabled = characteristic.isNotifying
+            appendDiagnostic("Binary Audio File notifications \(characteristic.isNotifying ? "enabled" : "disabled")")
         }
         requestInitialStateIfReady()
     }
@@ -705,6 +721,10 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
             return
         }
         guard let value = characteristic.value else { return }
+        if characteristic.uuid == Self.audioFileUUID {
+            binaryAudioTransfer.receive(value)
+            return
+        }
         if characteristic.uuid == Self.protocolUUID {
             protocolDocument = String(data: value, encoding: .utf8)
             return
@@ -991,8 +1011,65 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
         return try await withTaskCancellationHandler(operation: {
             do {
                 var firstPage: RecordingPage?
+                var cachedPage: RecordingPage?
+                if audioFileNotificationsEnabled {
+                    let preparingSince = Date()
+                    var page: RecordingPage
+                    repeat {
+                        try Task.checkCancellation()
+                        page = try await client.currentPlaybackPage(offset: 0, transferId: lease.value(), binary: true)
+                        if let token = page.transferId {
+                            if let previous = lease.value(), previous != token {
+                                throw RecordingPaginationError.transferIDChanged(expected: previous, got: token)
+                            }
+                            lease.set(token)
+                        }
+                        guard lease.value() != nil else { throw RecordingPaginationError.missingTransferID }
+                        if page.preparing == true {
+                            updateAudioProgress(page)
+                            guard Date().timeIntervalSince(preparingSince) < 20 else {
+                                throw RecordingPaginationError.preparationTimedOut
+                            }
+                            try await Task.sleep(nanoseconds: UInt64(min(1000, max(100, page.retryAfterMs ?? 250))) * 1_000_000)
+                        }
+                    } while page.preparing == true
+                    if let streamID = page.streamId, let size = page.size, let token = lease.value() {
+                        let started = Date()
+                        appendDiagnostic("Binary audio start size=\(size) preparationMs=\(Int(started.timeIntervalSince(preparingSince) * 1000))")
+                        do {
+                            let data = try await binaryAudioTransfer.collect(
+                                transferId: token, streamId: streamID, size: size,
+                                request: { offset, windowID in
+                                    try await self.client.audioWindow(transferId: token, offset: offset, windowId: windowID)
+                                }, progress: { received, total in
+                                    var progress = page
+                                    progress.nextOffset = received
+                                    self.updateAudioProgress(progress)
+                                })
+                            let seconds = max(0.001, Date().timeIntervalSince(started))
+                            appendDiagnostic(String(format: "Binary audio complete bytes=%d seconds=%.2f KB/s=%.1f retries=%d", data.count, seconds, Double(data.count) / seconds / 1024, binaryAudioTransfer.retryCount))
+                            cancelLease()
+                            return PulledAudio(data: data, name: page.name, contentType: page.contentType)
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            try Task.checkCancellation()
+                            appendDiagnostic("Binary audio failed; falling back on same lease: \(userVisibleError(error))")
+                        }
+                    } else if page.dataBase64 != nil {
+                        cachedPage = page
+                    }
+                }
+                let fallbackToken = lease.value()
+                let started = Date()
                 let recording = try await RecordingPaginator().collectLeased { offset, transferId in
-                    let page = try await self.client.currentPlaybackPage(offset: offset, transferId: transferId)
+                    let page: RecordingPage
+                    if let cached = cachedPage {
+                        page = cached
+                        cachedPage = nil
+                    } else {
+                        page = try await self.client.currentPlaybackPage(offset: offset, transferId: transferId ?? fallbackToken)
+                    }
                     try Task.checkCancellation()
                     if let pageTransferId = page.transferId { lease.set(pageTransferId) }
                     if firstPage == nil, page.preparing != true { firstPage = page }
@@ -1000,6 +1077,8 @@ extension BLECentralManager: @preconcurrency CBPeripheralDelegate {
                     self.appendDiagnostic("Audio page transfer=\(page.transferId ?? "missing") offset=\(page.offset ?? offset) eof=\(page.eof == true)")
                     return page
                 }
+                let seconds = max(0.001, Date().timeIntervalSince(started))
+                appendDiagnostic(String(format: "Paged audio complete bytes=%d seconds=%.2f KB/s=%.1f", recording.data.count, seconds, Double(recording.data.count) / seconds / 1024))
                 return PulledAudio(data: recording.data, name: firstPage?.name, contentType: firstPage?.contentType)
             } catch {
                 cancelLease()

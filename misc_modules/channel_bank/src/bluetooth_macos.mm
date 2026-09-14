@@ -22,6 +22,7 @@
 @property NSString* name;
 @property NSUUID* owner;
 @property uint64_t size;
+@property uint32_t streamID;
 @end
 @implementation CBMacTransfer
 - (instancetype)init {
@@ -51,6 +52,13 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
 @property NSData* payload;
 @property NSUInteger offset;
 @property uint16_t identifier;
+@property BOOL binaryAudio;
+@property NSString* transferToken;
+@property uint32_t streamID;
+@property uint32_t windowID;
+@property uint32_t fileOffset;
+@property NSUInteger chunkBytes;
+@property NSDate* expires;
 @end
 @implementation CBMacMessage
 @end
@@ -120,14 +128,14 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     }
     [peripheral removeAllServices];
     _characteristics = [NSMutableArray new];
-    for (unsigned n = 1; n <= 7; ++n) {
+    for (unsigned n = 1; n <= 8; ++n) {
         CBCharacteristicProperties properties = CBCharacteristicPropertyRead;
         CBAttributePermissions permissions = CBAttributePermissionsReadable;
         if (n == 2) {
             properties = CBCharacteristicPropertyWrite;
             permissions = CBAttributePermissionsWriteable;
         } else if (n >= 3) {
-            properties |= (n == 5 || n == 7) ? CBCharacteristicPropertyNotify : CBCharacteristicPropertyIndicate;
+            properties |= (n == 5 || n == 7 || n == 8) ? CBCharacteristicPropertyNotify : CBCharacteristicPropertyIndicate;
         }
         [_characteristics addObject:[[CBMutableCharacteristic alloc] initWithType:uuid(n)
             properties:properties value:nil permissions:permissions]];
@@ -225,6 +233,26 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     while (_outgoing.count && !stopping) {
         CBMacMessage* message = _outgoing.firstObject;
         NSUInteger mtu = std::min<NSUInteger>(512, message.central.maximumUpdateValueLength);
+        if (message.binaryAudio) {
+            if (message.expires.timeIntervalSinceNow <= 0 || mtu < message.chunkBytes + 16) {
+                [_outgoing removeObjectAtIndex:0];
+                continue;
+            }
+            NSUInteger count = std::min(message.chunkBytes, message.payload.length - message.offset);
+            uint32_t offset = message.fileOffset + (uint32_t)message.offset;
+            uint8_t header[16] = {1, 0, 0, 0};
+            for (unsigned i = 0; i < 4; ++i) {
+                header[4 + i] = message.streamID >> (8 * i);
+                header[8 + i] = message.windowID >> (8 * i);
+                header[12 + i] = offset >> (8 * i);
+            }
+            NSMutableData* packet = [NSMutableData dataWithBytes:header length:16];
+            [packet appendData:[message.payload subdataWithRange:NSMakeRange(message.offset, count)]];
+            if (![_manager updateValue:packet forCharacteristic:message.characteristic onSubscribedCentrals:@[message.central]]) return;
+            message.offset += count;
+            if (message.offset == message.payload.length) [_outgoing removeObjectAtIndex:0];
+            continue;
+        }
         if (mtu <= 8) { [_outgoing removeObjectAtIndex:0]; continue; }
         NSUInteger count = std::min(mtu - 8, message.payload.length - message.offset);
         uint32_t offset = (uint32_t)message.offset;
@@ -249,6 +277,8 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 @"frameHeader":@"u8 version,u8 flags,u16le messageId,u32le offset",
                 @"summaryCharacteristic":uuid(6).UUIDString,
                 @"snrTelemetryCharacteristic":uuid(7).UUIDString,
+                @"audioFileCharacteristic":uuid(8).UUIDString,
+                @"audioFileTransfer":@{@"schema":@1, @"windowPackets":@16, @"headerBytes":@16, @"checksum":@"crc32-ieee"},
                 @"snrTelemetry":@{@"schema":@1, @"cadenceMs":@250, @"encoding":@"binary-le"},
                 @"playbackTransfer":@{@"available":@YES, @"path":@"/api/audio/current-playback", @"maxPageBytes":@16384},
                 @"audio":@{@"available":@NO, @"format":@"pcm_s16le", @"rate":@48000, @"channels":@1}});
@@ -313,6 +343,14 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     for (NSString* key in [_transfers.allKeys copy])
         if (now - _transfers[key]->touched >= std::chrono::seconds(60)) [_transfers removeObjectForKey:key];
 }
+- (void)dropAudioForTransfer:(NSString*)token {
+    dispatch_sync(queue, ^{
+        NSIndexSet* stale = [self.outgoing indexesOfObjectsPassingTest:^BOOL(CBMacMessage* item, NSUInteger idx, BOOL* stop) {
+            return item.binaryAudio && [item.transferToken isEqual:token];
+        }];
+        [self.outgoing removeObjectsAtIndexes:stale];
+    });
+}
 - (NSDictionary*)playbackPage:(NSDictionary*)body owner:(NSUUID*)owner identifier:(id)identifier {
     [self expireTransfers];
     if (!owner || ![body isKindOfClass:NSDictionary.class]) return envelope(identifier, 400, nil);
@@ -333,6 +371,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     if (transfer && ![transfer.owner isEqual:owner]) transfer = nil;
     if ([cancel boolValue]) {
         if (!transfer) return envelope(identifier, 404, @{@"error":@"Transfer not found"});
+        [self dropAudioForTransfer:transferId];
         [_transfers removeObjectForKey:transferId];
         return envelope(identifier, 200, @{@"transferId":transferId, @"cancelled":@YES, @"deleted":@NO});
     }
@@ -352,6 +391,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         transfer.size = info.st_size;
         transfer.name = [NSString stringWithUTF8String:name.c_str()] ?: @"playback.wav";
         transfer.owner = owner;
+        do { transfer.streamID = arc4random(); } while (!transfer.streamID);
         if ([encoding isEqual:@"aac"] && ![transfer.name.pathExtension.lowercaseString isEqual:@"m4a"]) {
             transfer.name = [transfer.name.stringByDeletingPathExtension stringByAppendingPathExtension:@"m4a"];
             transfer->compressed = std::make_unique<CBMacAudioCopy>(dup(transfer->fd));
@@ -380,6 +420,13 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
         transfer.size = compressedInfo.st_size;
     }
     if (offset > transfer.size) return envelope(identifier, 416, @{@"error":@"Offset past EOF"});
+    if ([body[@"transport"] isEqual:@"binary-v1"]) {
+        transfer->touched = std::chrono::steady_clock::now();
+        return envelope(identifier, 200, @{@"transferId":transferId, @"streamId":@(transfer.streamID),
+            @"size":@(transfer.size), @"offset":@0, @"name":transfer.name,
+            @"contentType":[transfer.name.pathExtension.lowercaseString isEqual:@"m4a"] ? @"audio/mp4" : @"audio/wav"});
+    }
+    [self dropAudioForTransfer:transferId];
     NSUInteger count = std::min<uint64_t>(limit, transfer.size - offset);
     NSMutableData* data = [NSMutableData dataWithLength:count];
     NSUInteger read = 0;
@@ -401,6 +448,87 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     if (eof) [_transfers removeObjectForKey:transferId];
     return envelope(identifier, 200, result);
 }
+
+// Each request acknowledges the previous contiguous window by advancing offset.
+// Repeating an offset with a new window ID retransmits it without changing the lease.
+- (NSDictionary*)audioWindow:(NSDictionary*)body owner:(NSUUID*)owner identifier:(id)identifier {
+    if (![body isKindOfClass:NSDictionary.class] || ![body[@"transferId"] isKindOfClass:NSString.class])
+        return envelope(identifier, 400, nil);
+    for (NSString* key in @[@"offset", @"windowId"]) {
+        id value = body[key];
+        if (![value isKindOfClass:NSNumber.class] || !std::isfinite([value doubleValue]) ||
+            [value doubleValue] < 0 || [value doubleValue] > UINT32_MAX ||
+            std::floor([value doubleValue]) != [value doubleValue]) return envelope(identifier, 400, nil);
+    }
+    [self expireTransfers];
+    NSString* token = body[@"transferId"];
+    CBMacTransfer* transfer = _transfers[token];
+    if (!transfer || ![transfer.owner isEqual:owner]) return envelope(identifier, 404, nil);
+    if (transfer->compressed) return envelope(identifier, 409, @{@"error":@"Audio preparation is not complete"});
+    uint32_t offset = [body[@"offset"] unsignedIntValue];
+    uint32_t windowID = [body[@"windowId"] unsignedIntValue];
+    if (!windowID || offset >= transfer.size) return envelope(identifier, 416, nil);
+    __block CBCentral* central = nil;
+    __block CBMutableCharacteristic* characteristic = nil;
+    dispatch_sync(queue, ^{
+        if (self.characteristics.count < 8) return;
+        characteristic = self.characteristics[7];
+        for (CBCentral* candidate in characteristic.subscribedCentrals)
+            if ([candidate.identifier isEqual:owner]) central = candidate;
+    });
+    NSUInteger mtu = central ? std::min<NSUInteger>(512, central.maximumUpdateValueLength) : 0;
+    if (mtu <= 16) return envelope(identifier, 409, @{@"error":@"Subscribe to binary Audio File notifications first"});
+    NSUInteger chunk = mtu - 16;
+    NSUInteger count = std::min<uint64_t>(chunk * 16, transfer.size - offset);
+    NSMutableData* data = [NSMutableData dataWithLength:count];
+    NSUInteger read = 0;
+    while (read < count) {
+        ssize_t n = pread(transfer->fd, (uint8_t*)data.mutableBytes + read, count - read, offset + read);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return envelope(identifier, 404, @{@"error":@"Audio file no longer readable"});
+        read += n;
+    }
+    uint32_t crc = UINT32_MAX;
+    for (NSUInteger i = 0; i < count; ++i) {
+        crc ^= ((const uint8_t*)data.bytes)[i];
+        for (unsigned bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1)));
+    }
+    CBMacMessage* message = [CBMacMessage new];
+    message.binaryAudio = YES;
+    message.transferToken = token;
+    message.streamID = transfer.streamID;
+    message.windowID = windowID;
+    message.fileOffset = offset;
+    message.chunkBytes = chunk;
+    message.expires = [NSDate dateWithTimeIntervalSinceNow:5];
+    message.central = central;
+    message.characteristic = characteristic;
+    message.payload = data;
+    __block BOOL queued = NO;
+    dispatch_sync(queue, ^{
+        if (self->stopping || !self.centrals[owner]) return;
+        NSIndexSet* stale = [self.outgoing indexesOfObjectsPassingTest:^BOOL(CBMacMessage* item, NSUInteger idx, BOOL* stop) {
+            return item.binaryAudio && [item.central.identifier isEqual:owner];
+        }];
+        [self.outgoing removeObjectsAtIndexes:stale];
+        if (self.outgoing.count >= 32) return;
+        NSUInteger index = 0;
+        // Commands and compact live state precede audio; large State follows it.
+        while (index < self.outgoing.count) {
+            CBUUID* type = self.outgoing[index].characteristic.UUID;
+            if (![type isEqual:uuid(3)] && ![type isEqual:uuid(6)] && ![type isEqual:uuid(7)]) break;
+            ++index;
+        }
+        [self.outgoing insertObject:message atIndex:index];
+        queued = YES;
+        // work() enqueues the compact descriptor Response before pumping packets.
+    });
+    if (!queued) return envelope(identifier, 503, nil);
+    transfer->touched = std::chrono::steady_clock::now();
+    return envelope(identifier, 200, @{@"transferId":token, @"streamId":@(transfer.streamID), @"windowId":@(windowID),
+        @"offset":@(offset), @"nextOffset":@(offset + count), @"size":@(transfer.size),
+        @"chunkBytes":@(chunk), @"crc32":@(~crc)});
+}
 - (NSDictionary*)perform:(NSDictionary*)command { return [self perform:command owner:nil]; }
 - (NSDictionary*)perform:(NSDictionary*)command owner:(NSUUID*)owner {
     if (![command isKindOfClass:NSDictionary.class]) return envelope(@0, 400, nil);
@@ -409,6 +537,8 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
     NSString* path = command[@"path"];
     if ([command[@"v"] isEqual:@1] && [method isEqual:@"GET"] && [path isEqual:@"/api/audio/current-playback"])
         return [self playbackPage:command[@"body"] ?: @{} owner:owner identifier:identifier];
+    if ([command[@"v"] isEqual:@1] && [method isEqual:@"GET"] && [path isEqual:@"/api/audio/window"])
+        return [self audioWindow:command[@"body"] owner:owner identifier:identifier];
     NSArray* gets = @[@"/api/state", @"/state", @"/api/state/summary", @"/api/sources",
         @"/api/source-controls", @"/api/source-offset", @"/api/sdrpp-server", @"/api/channel-bank/settings", @"/api/recordings"];
     NSArray* posts = @[@"/api/start", @"/api/stop", @"/api/play", @"/api/stop-radio", @"/api/radio/stop",
@@ -494,7 +624,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 NSData* result = jsonData([self perform:@{@"v":@1, @"id":@0, @"method":@"GET",
                     @"path":full ? @"/api/state" : @"/api/state/summary"}]);
                 dispatch_sync(queue, ^{
-                    if (self->stopping || self.characteristics.count != 7) return;
+                    if (self->stopping || self.characteristics.count < 7) return;
                     if (full) self.fullState = result; else self.summary = result;
                     for (CBCentral* central in self.centrals.allValues)
                         [self enqueue:result characteristic:self.characteristics[full ? 3 : 5] central:central identifier:0];
@@ -512,7 +642,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
             nextTelemetry = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
             __block BOOL subscribed = NO;
             dispatch_sync(queue, ^{
-                subscribed = !self->stopping && self.characteristics.count == 7 &&
+                subscribed = !self->stopping && self.characteristics.count >= 7 &&
                     self.characteristics[6].subscribedCentrals.count > 0;
             });
             if (subscribed && snrTelemetry) {
@@ -520,7 +650,7 @@ static NSDictionary* envelope(id identifier, NSInteger code, id body) {
                 if (!bytes.empty()) {
                     NSData* payload = [NSData dataWithBytes:bytes.data() length:bytes.size()];
                     dispatch_sync(queue, ^{
-                        if (self->stopping || self.characteristics.count != 7) return;
+                        if (self->stopping || self.characteristics.count < 7) return;
                         self.snrTelemetryValue = payload;
                         for (CBCentral* central in self.centrals.allValues)
                             [self enqueue:payload characteristic:self.characteristics[6] central:central identifier:0];
