@@ -6,6 +6,7 @@ import SwiftUI
 public struct ChannelBankRootView: View {
     @StateObject private var model = ChannelBankViewModel()
     @State private var confirmClearWavs = false
+    @State private var bluetoothLogExpanded = false
 
     public init() {}
 
@@ -17,9 +18,10 @@ public struct ChannelBankRootView: View {
                     if let state = model.ble.latestState {
                         radioPanel(state)
                         sourcePanel(state)
-                        sdrppServerPanel(state)
+                        if state.selectedSource == "SDR++ Server" {
+                            sdrppServerPanel(state)
+                        }
                         sourceOffsetPanel(state)
-                        sourceControlsPanel(state)
                         centerPanel(state)
                         channelBankPanel(state)
                         settingsPanel(state)
@@ -92,27 +94,29 @@ public struct ChannelBankRootView: View {
                     }
                 }
             }
-            if let protocolDocument = model.ble.protocolDocument {
-                Text("Protocol: \(protocolDocument.prefix(80))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            if !model.ble.scanDiagnostics.isEmpty {
-                ScrollView(.vertical) {
-                    LazyVStack(alignment: .leading, spacing: 3) {
-                        ForEach(model.ble.scanDiagnostics, id: \.self) { line in
-                            Text(line)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(.vertical, 2)
+            DisclosureGroup("Bluetooth Log", isExpanded: $bluetoothLogExpanded) {
+                if let protocolDocument = model.ble.protocolDocument {
+                    Text("Protocol: \(protocolDocument.prefix(80))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
-                .frame(maxHeight: 170)
-                .scrollIndicators(.visible)
+                if !model.ble.scanDiagnostics.isEmpty {
+                    ScrollView(.vertical) {
+                        LazyVStack(alignment: .leading, spacing: 3) {
+                            ForEach(model.ble.scanDiagnostics, id: \.self) { line in
+                                Text(line)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(maxHeight: 170)
+                    .scrollIndicators(.visible)
+                }
             }
             if let lastError = model.ble.lastError {
                 Text(lastError)
@@ -164,6 +168,7 @@ public struct ChannelBankRootView: View {
                 .buttonStyle(.bordered)
                 .disabled(state.radioPlaying == true)
             }
+            sourceControlsContent(state)
         }
     }
 
@@ -219,9 +224,10 @@ public struct ChannelBankRootView: View {
         }
     }
 
-    private func sourceControlsPanel(_ state: ChannelBankState) -> some View {
-        Panel("Source Controls") {
+    private func sourceControlsContent(_ state: ChannelBankState) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
             if let controls = state.sourceControls, controls.available == true {
+                Divider()
                 MetricGrid(items: [
                     ("Source", controls.source ?? state.selectedSource ?? "-"),
                     ("Mode", controls.mode ?? "-"),
@@ -235,8 +241,8 @@ public struct ChannelBankRootView: View {
                 )
                 sourceControlLiveToggles(controls)
                 sourceControlGains(controls)
-            } else {
-                Text(state.selectedSource == "SDR++ Server" ? "Use the SDR++ Server panel above." : "No source controls exposed for this source.")
+            } else if state.selectedSource != "SDR++ Server" {
+                Text("No source controls exposed for this source.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -493,33 +499,107 @@ public struct ChannelBankRootView: View {
 
     private func activityHistoryPanel(_ state: ChannelBankState) -> some View {
         Panel("Activity History") {
-            let rows = (state.history ?? []).sorted { ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
+            let rows = activityHistoryRows(state)
             if rows.isEmpty {
                 Text("No history yet").foregroundStyle(.secondary)
             } else {
-                ForEach(rows.prefix(16)) { row in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(ChannelBankFormatters.mhz(row.freqHz)).monospacedDigit()
-                            Text(row.name ?? "-").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                ForEach(rows) { row in
+                    let playing = isPlayingFrequency(row.freqHz, state: state)
+                    let recording = isRecordingFrequency(row.freqHz, state: state)
+                    let color: Color = playing ? .blue : recording ? .green : .primary
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(ChannelBankFormatters.mhz(row.freqHz))
+                                    .monospacedDigit()
+                                    .foregroundStyle(color)
+                                Text(row.name ?? "-").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("\(row.count ?? 0) hits")
+                                Text(row.lastSeenDisplay).font(.caption).foregroundStyle(.secondary)
+                            }
                         }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Text("\(row.count ?? 0) hits")
-                            Text(row.lastSeenDisplay).font(.caption).foregroundStyle(.secondary)
+                        ViewThatFits(in: .horizontal) {
+                            HStack {
+                                activityHistoryStatus(playing: playing, recording: recording, blocked: row.blocked == true)
+                                Spacer()
+                                activityHistoryActions(row)
+                            }
+                            VStack(alignment: .leading, spacing: 6) {
+                                activityHistoryStatus(playing: playing, recording: recording, blocked: row.blocked == true)
+                                activityHistoryActions(row)
+                            }
                         }
-                        if row.blocked == true { Text("Blocked").foregroundStyle(.red).font(.caption) }
-                        Button("Lock") { model.ble.setPlaybackLock(hz: row.freqHz) }
-                            .buttonStyle(.bordered)
-                        Button(row.blocked == true ? "Unblock" : "Block") {
-                            model.ble.setFrequency(row.freqHz, blocked: row.blocked != true)
-                        }
-                        .buttonStyle(.bordered)
                     }
                     .font(.callout)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(playing ? Color.blue.opacity(0.12) : recording ? Color.green.opacity(0.12) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
         }
+    }
+
+    private func isPlayingFrequency(_ hz: Double, state: ChannelBankState) -> Bool {
+        guard state.playback?.active == true, let playingHz = state.playback?.freqHz else { return false }
+        return hz.rounded() == playingHz.rounded()
+    }
+
+    private func isRecordingFrequency(_ hz: Double, state: ChannelBankState) -> Bool {
+        (state.activeChannels ?? []).contains {
+            $0.recording == true && (hz.rounded() == ($0.gridFreqHz ?? $0.freqHz).rounded() || hz.rounded() == $0.freqHz.rounded())
+        }
+    }
+
+    private func activityHistoryRows(_ state: ChannelBankState) -> [HistoryEntry] {
+        var rows = state.history ?? []
+        func add(_ hz: Double, name: String?, blocked: Bool?) {
+            guard !rows.contains(where: { $0.freqHz.rounded() == hz.rounded() }) else { return }
+            rows.append(HistoryEntry(freqHz: hz, name: name, blocked: blocked))
+        }
+        for channel in state.activeChannels ?? [] where channel.recording == true {
+            add(channel.gridFreqHz ?? channel.freqHz, name: channel.name, blocked: channel.blocked)
+        }
+        if state.playback?.active == true, let hz = state.playback?.freqHz {
+            add(hz, name: state.playback?.name, blocked: nil)
+        }
+        func priority(_ row: HistoryEntry) -> Int {
+            isPlayingFrequency(row.freqHz, state: state) ? 2 : isRecordingFrequency(row.freqHz, state: state) ? 1 : 0
+        }
+        rows.sort {
+            let left = priority($0), right = priority($1)
+            if left != right { return left > right }
+            if $0.lastSeen != $1.lastSeen { return ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
+            return $0.freqHz < $1.freqHz
+        }
+        let live = rows.filter { priority($0) > 0 }
+        return live + Array(rows.filter { priority($0) == 0 }.prefix(16))
+    }
+
+    private func activityHistoryStatus(playing: Bool, recording: Bool, blocked: Bool) -> some View {
+        HStack(spacing: 8) {
+            if playing { Label("Playing", systemImage: "speaker.wave.2.fill").foregroundStyle(.blue) }
+            if recording { Label("Recording", systemImage: "record.circle").foregroundStyle(.green) }
+            if blocked { Text("Blocked").foregroundStyle(.red) }
+        }
+        .font(.caption)
+    }
+
+    private func activityHistoryActions(_ row: HistoryEntry) -> some View {
+        HStack {
+            Button { model.ble.setPlaybackLock(hz: row.freqHz) } label: {
+                Image(systemName: "lock")
+            }
+            .accessibilityLabel("Lock playback to \(ChannelBankFormatters.mhz(row.freqHz))")
+            .help("Lock playback")
+            Button(row.blocked == true ? "Unblock" : "Block") {
+                model.ble.setFrequency(row.freqHz, blocked: row.blocked != true)
+            }
+        }
+        .buttonStyle(.bordered)
     }
 
     private func frequencyHeatMapPanel(_ state: ChannelBankState) -> some View {
