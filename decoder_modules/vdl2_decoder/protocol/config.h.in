@@ -1,0 +1,2 @@
+#pragma once
+#cmakedefine IS_BIG_ENDIAN 1

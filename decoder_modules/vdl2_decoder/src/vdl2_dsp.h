@@ -6,6 +6,7 @@
 #include <string>
 #include <mutex>
 #include <functional>
+#include "vdl2_protocol.h"
 
 // ============================================================================
 // VDL2 Constants (from ICAO Annex 10 Vol III / dumpvdl2)
@@ -50,6 +51,8 @@
 // ============================================================================
 
 struct VDL2Message {
+    uint32_t src_addr = 0;      // complete decoded 28-bit AVLC source address
+    uint32_t dst_addr = 0;      // complete decoded 28-bit AVLC destination address
     double timestamp;           // time of reception
     uint32_t freq;              // channel frequency
     float snr;                  // signal-to-noise ratio estimate
@@ -234,6 +237,7 @@ enum class DemodState { INIT, SYNC };
 enum class DecoderState { HEADER, DATA, IDLE };
 
 class VDL2Channel {
+    friend struct VDL2ChannelTestAccess;
 public:
     VDL2Channel();
     ~VDL2Channel();
@@ -323,6 +327,8 @@ private:
     // Linear regression precomputed values for sync
     float lr_X[VDL2_PREAMBLE_SYMS] = {};
     float lr_denom = 0;
+
+    VDL2ProtocolDecoder protocolDecoder;
 
     // Message callback
     std::function<void(const VDL2Message&)> msgCallback;
