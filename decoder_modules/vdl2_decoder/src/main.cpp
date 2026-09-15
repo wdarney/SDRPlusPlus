@@ -8,6 +8,7 @@
 #include <dsp/sink/handler_sink.h>
 
 #include "vdl2_dsp.h"
+#include "aviation_jsonl.h"
 #include "acars_dsp.h"
 #include "adsb_dsp.h"
 
@@ -20,6 +21,7 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <atomic>
 #include <sqlite3.h>
 
 // UDP
@@ -103,49 +105,6 @@ static const float ADSB_VFO_SAMPLERATE = 2000000.f;
 static const int DEFAULT_UDP_PORT = 5555;
 
 static ConfigManager config;
-
-// ============================================================================
-// JSON builder for output
-// ============================================================================
-
-static std::string msgToJSON(const VDL2Message& msg) {
-    // Build JSON manually (no external JSON lib needed in hot path)
-    char buf[4096];
-    char timebuf[64];
-    time_t t = (time_t)msg.timestamp;
-    struct tm* tm_info = gmtime(&t);
-    strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
-
-    // Escape the text for JSON
-    std::string escaped;
-    for (char c : msg.formatted_text) {
-        switch (c) {
-            case '"':  escaped += "\\\""; break;
-            case '\\': escaped += "\\\\"; break;
-            case '\n': escaped += "\\n"; break;
-            case '\r': escaped += "\\r"; break;
-            case '\t': escaped += "\\t"; break;
-            default:
-                if ((unsigned char)c < 0x20) {
-                    char hex[8];
-                    snprintf(hex, sizeof(hex), "\\u%04x", (unsigned char)c);
-                    escaped += hex;
-                } else {
-                    escaped += c;
-                }
-        }
-    }
-
-    snprintf(buf, sizeof(buf),
-        "{\"timestamp\":\"%s\",\"freq\":%.3f,\"type\":\"%s\","
-        "\"snr\":%.1f,\"fec\":%d,\"ppm\":%.1f,"
-        "\"text\":\"%s\"}",
-        timebuf, (double)msg.freq / 1e6,
-        msg.is_acars ? "ACARS" : "VDL2",
-        msg.snr, msg.num_fec_corrections, msg.ppm_error,
-        escaped.c_str());
-    return buf;
-}
 
 // ============================================================================
 // UDP sender
@@ -353,10 +312,8 @@ public:
                 newMessage = true;
             }
 
-            // Build JSON once for all outputs
-            std::string j;
-            bool needJSON = (udpEnabled && udpSender.isActive()) || fileEnabled || (dbEnabled && messageDB.isActive());
-            if (needJSON) j = msgToJSON(msg);
+            // The decoder owns serialization; outputs consume it unchanged.
+            const std::string& j = msg.json_text;
 
             // UDP output
             if (udpEnabled && udpSender.isActive()) {
@@ -364,10 +321,9 @@ public:
             }
 
             // File output
-            if (fileEnabled && !filePath.empty()) {
+            {
                 std::lock_guard<std::mutex> lock(fileMtx);
-                std::ofstream f(filePath, std::ios::app);
-                if (f.is_open()) f << j << "\n";
+                if (fileEnabled && !filePath.empty() && !appendAviationJSONL(filePath, j)) ++fileWriteErrors;
             }
 
             // SQLite output
@@ -543,23 +499,27 @@ private:
             }
 
             // File
-            bool fileChanged = false;
-            if (ImGui::Checkbox(CONCAT("JSON File##file_", _this->name), &_this->fileEnabled)) fileChanged = true;
-            if (_this->fileEnabled) {
-                char pathBuf[512];
-                strncpy(pathBuf, _this->filePath.c_str(), sizeof(pathBuf) - 1);
-                pathBuf[sizeof(pathBuf) - 1] = 0;
-                ImGui::SetNextItemWidth(menuWidth - 10);
-                if (ImGui::InputText(CONCAT("##file_path_", _this->name), pathBuf, sizeof(pathBuf))) {
-                    _this->filePath = pathBuf;
-                    fileChanged = true;
+            {
+                std::lock_guard<std::mutex> fileSettingsLock(_this->fileMtx);
+                bool fileChanged = false;
+                if (ImGui::Checkbox(CONCAT("JSON File##file_", _this->name), &_this->fileEnabled)) fileChanged = true;
+                if (_this->fileEnabled) {
+                    char pathBuf[512];
+                    strncpy(pathBuf, _this->filePath.c_str(), sizeof(pathBuf) - 1);
+                    pathBuf[sizeof(pathBuf) - 1] = 0;
+                    ImGui::SetNextItemWidth(menuWidth - 10);
+                    if (ImGui::InputText(CONCAT("##file_path_", _this->name), pathBuf, sizeof(pathBuf))) {
+                        _this->filePath = pathBuf;
+                        fileChanged = true;
+                    }
                 }
-            }
-            if (fileChanged) {
-                config.acquire();
-                config.conf[_this->name]["fileEnabled"] = _this->fileEnabled;
-                config.conf[_this->name]["filePath"] = _this->filePath;
-                config.release(true);
+                if (fileChanged) {
+                    config.acquire();
+                    config.conf[_this->name]["fileEnabled"] = _this->fileEnabled;
+                    config.conf[_this->name]["filePath"] = _this->filePath;
+                    config.release(true);
+                }
+
             }
 
             // SQLite database (always on)
@@ -638,6 +598,7 @@ private:
             _this->totalMessages, _this->countActiveChannels());
 
         if (ImGui::CollapsingHeader(CONCAT("Debug Stats##debug_", _this->name))) {
+            ImGui::Text("JSONL write errors: %llu", (unsigned long long)_this->fileWriteErrors.load());
             for (int i = 0; i < ALL_CHANNEL_COUNT; i++) {
                 if (!_this->channelEnabled[i] || !_this->slots[i].active) continue;
                 auto& s = _this->slots[i];
@@ -656,6 +617,12 @@ private:
                         s.vdl2Decoder.getRsFailCount(),
                         s.vdl2Decoder.getCrcFailCount(),
                         s.vdl2Decoder.getMessageCount());
+                    auto p=s.vdl2Decoder.getProtocolCounters();
+                    ImGui::Text("  ACARS %llu | FANS CPDLC %llu | ATN X.25 %llu | CLNP %llu | CPDLC %llu | ADS-C %llu | CM %llu",
+                        (unsigned long long)p.acars, (unsigned long long)p.fansCpdlc,
+                        (unsigned long long)p.atnX25, (unsigned long long)p.atnClnp,
+                        (unsigned long long)p.atnCpdlc, (unsigned long long)p.atnAdsc,
+                        (unsigned long long)p.atnCm);
                 }
                 else if (ALL_CHANNELS[i].mode == MODE_ACARS) {
                     ImGui::Text("%.3f: Samp %lldK | Sync %d | Msg %d",
@@ -757,6 +724,7 @@ private:
     bool fileEnabled = false;
     std::string filePath = "/tmp/aviation_messages.jsonl";
     std::mutex fileMtx;
+    std::atomic<uint64_t> fileWriteErrors{0};
     bool dbEnabled = true;  // always on
     std::string dbPath = "/tmp/aviation_messages.db";
     int dbRetentionDays = 4;

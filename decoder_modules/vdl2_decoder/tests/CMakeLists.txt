@@ -19,7 +19,7 @@ include_directories("${REPO}/core/libacars")
 add_subdirectory("${REPO}/core/libacars/libacars" libacars)
 add_subdirectory("${REPO}/core/libcorrect" libcorrect)
 add_subdirectory(../protocol protocol)
-add_executable(protocol_tests protocol_tests.cpp ../src/vdl2_protocol.cpp ../src/vdl2_dsp.cpp)
+add_executable(protocol_tests protocol_tests.cpp ../src/vdl2_protocol.cpp ../src/vdl2_dsp.cpp ../src/vdl2_message_json.cpp ../src/aviation_jsonl.cpp ../src/acars_dsp.cpp ../src/adsb_dsp.cpp)
 target_include_directories(protocol_tests PRIVATE ../src ../protocol
     "${CMAKE_CURRENT_BINARY_DIR}/protocol" "${REPO}/core/libacars/libacars/asn1" "${REPO}/core/src" "${REPO}/core/libcorrect/include")
 target_link_libraries(protocol_tests PRIVATE vdl2_protocol correct_static)

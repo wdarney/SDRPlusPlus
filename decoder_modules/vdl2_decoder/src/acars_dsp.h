@@ -54,6 +54,7 @@ enum class AcarsState {
 };
 
 class ACARSChannel {
+    friend struct ACARSChannelTestAccess;
 public:
     ACARSChannel();
     ~ACARSChannel() = default;
@@ -72,6 +73,7 @@ public:
     long long getSamplesProcessed() const { return samplesProcessed; }
 
 private:
+    VDL2ProtocolDecoder protocolDecoder;
     // MSK demodulator
     void demodMSK(float sample);
     void putBit(float v);

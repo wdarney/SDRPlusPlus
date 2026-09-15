@@ -13,7 +13,8 @@ if(NOT TARGET acars_static)
 endif()
 add_subdirectory(protocol)
 target_link_libraries(vdl2_decoder PRIVATE vdl2_protocol)
-target_include_directories(vdl2_decoder PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/protocol")
+target_include_directories(vdl2_decoder PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/protocol"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../core/libacars/libacars/asn1")
 
 # SQLite for message history
 find_library(SQLITE3_LIB sqlite3)

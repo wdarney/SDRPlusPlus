@@ -9,7 +9,7 @@ extern "C" {
 
 #include <cstdio>
 #include <ctime>
-#include <json.hpp>
+#include "vdl2_message_json.h"
 
 // ============================================================================
 // Static tables
@@ -734,29 +734,16 @@ void VDL2Channel::parseAVLC(const uint8_t* data, int len, float snr) {
         dst_is_ground ? "GND" : "AIR", dst_addr & 0xFFFFFF);
     msg.formatted_text = hdr;
 
-    nlohmann::json output = {
-        {"schema_version", 1}, {"timestamp", msg.timestamp}, {"frequency_hz", msg.freq},
-        {"snr_db", msg.snr}, {"fec_corrections", msg.num_fec_corrections},
-        {"ppm_error", msg.ppm_error},
-        {"avlc", {{"src", src_addr}, {"dst", dst_addr},
-                  {"src_type", (src_addr >> 24) & 7}, {"dst_type", (dst_addr >> 24) & 7},
-                  {"control", control},
-                  {"frame_type", (control & 1) == 0 ? "I" : (control & 3) == 3 ? "U" : "S"}}},
-        {"protocols", nlohmann::json::object()}
-    };
+    msg.avlc_control = control;
+    VDL2ProtocolDecoder::Result decoded;
     if ((control & 0x01) == 0) {
         const uint8_t* info = data + 9;
         int info_len = len - 9;
         msg.is_acars = info_len >= 3 && info[0] == 0xFF && info[1] == 0xFF && info[2] == 0x01;
         if (msg.is_acars) { info += 3; info_len -= 3; }
-        auto decoded = protocolDecoder.decode(info, info_len, src_addr, dst_addr,
-                                             src_is_ground, msg.timestamp, msg.is_acars);
+        decoded = protocolDecoder.decode(info, info_len, src_addr, dst_addr,
+                                         src_is_ground, msg.timestamp, msg.is_acars);
         if (!decoded.text.empty()) msg.formatted_text += "\n" + decoded.text;
-        if (!decoded.json.empty()) {
-            auto tree = nlohmann::json::parse(decoded.json, nullptr, false);
-            if (!tree.is_discarded()) output["protocols"] = std::move(tree);
-            else output["serialization_error"] = "Invalid protocol JSON";
-        }
     }
     else if ((control & 0x03) == 0x03) {
         // U-frame
@@ -775,8 +762,7 @@ void VDL2Channel::parseAVLC(const uint8_t* data, int len, float snr) {
         msg.formatted_text += "]";
     }
 
-    output["is_acars"] = msg.is_acars;
-    msg.json_text = output.dump();
+    populateMessageJSON(msg, decoded, true);
 
     messageCount++;
 

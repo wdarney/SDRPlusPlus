@@ -1,3 +1,4 @@
+#include "vdl2_message_json.h"
 #include "acars_dsp.h"
 
 extern "C" {
@@ -66,6 +67,7 @@ void ACARSChannel::init(uint32_t _freq) {
 }
 
 void ACARSChannel::reset() {
+    protocolDecoder.reset();
     vcoPhase = 0;
     mskDf = 0;
     mskDphi = 0;
@@ -407,16 +409,15 @@ void ACARSChannel::buildMessage() {
 
     // Also try libacars for deeper parsing
     la_msg_dir dir = (bid >= '0' && bid <= '9') ? LA_MSG_DIR_AIR2GND : LA_MSG_DIR_GND2AIR;
-    la_proto_node* node = la_acars_parse(msgBuf.data(), (int)msgBuf.size(), dir);
-    if (node) {
-        la_vstring* vstr = la_proto_tree_format_text(NULL, node);
-        if (vstr && vstr->str && strlen(vstr->str) > 0) {
-            msg.formatted_text += "\n";
-            msg.formatted_text += vstr->str;
-            la_vstring_destroy(vstr, true);
-        }
-        la_proto_tree_destroy(node);
-    }
+    // The native demodulator keeps the BCS separately and consumes DEL. Restore
+    // the libacars wire frame without changing the DSP/CRC acceptance path.
+    auto wire = msgBuf;
+    wire.push_back(crcBytes[0]); wire.push_back(crcBytes[1]); wire.push_back(0x7f);
+    auto decoded = protocolDecoder.decode(wire.data(), wire.size(), 0, 0,
+        dir == LA_MSG_DIR_GND2AIR, msg.timestamp, true);
+    if (!decoded.text.empty()) msg.formatted_text += "\n" + decoded.text;
+    populateMessageJSON(msg, decoded, false,
+        dir == LA_MSG_DIR_AIR2GND ? "AIR2GND" : "GND2AIR");
 
     messageCount++;
     if (msgCallback) {

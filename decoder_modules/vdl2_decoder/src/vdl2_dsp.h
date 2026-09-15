@@ -53,13 +53,14 @@
 struct VDL2Message {
     uint32_t src_addr = 0;      // complete decoded 28-bit AVLC source address
     uint32_t dst_addr = 0;      // complete decoded 28-bit AVLC destination address
+    uint8_t avlc_control = 0;
     double timestamp;           // time of reception
     uint32_t freq;              // channel frequency
     float snr;                  // signal-to-noise ratio estimate
     int num_fec_corrections;    // RS corrections applied
     float ppm_error;            // frequency error in ppm
     std::string formatted_text; // human-readable decoded message
-    std::string json_text;      // JSON format (from libacars)
+    std::string json_text;      // structured aviation envelope with complete decoded tree
     bool is_acars;              // true if ACARS, false if other
 };
 
@@ -255,6 +256,7 @@ public:
     float getNoiseFloor() const { return mag_nf; }
     float getSNR() const;
     int getMessageCount() const { return messageCount; }
+    VDL2ProtocolDecoder::Counters getProtocolCounters() const { return protocolDecoder.counters(); }
     int getSyncCount() const { return syncCount; }
     int getHeaderOkCount() const { return headerOkCount; }
     int getHeaderFailCount() const { return headerFailCount; }
