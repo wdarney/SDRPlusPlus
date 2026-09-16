@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SDR++ Aviation</title><link rel="stylesheet" href="/static/style.css"><script defer src="/static/app.js"></script></head>
+<body><header><div class="eyebrow">SDR++ / AVIATION RECEIVER</div><h1>Messages over the air<span class="badge">VDL2 · ACARS · ATN</span></h1>
+<p>Live reception, decoded protocols, and the complete message beneath each transmission.</p></header>
+<section class="stats" aria-label="Reception summary"><div><span>Stored messages</span><strong id="total">—</strong></div><div><span>Protocol / transport</span><strong id="paths">—</strong></div><div><span>JSONL reader</span><strong id="reader">Connecting…</strong></div></section>
+<form id="filters" class="toolbar"><label>Protocol<select name="protocol"><option value="">All protocols</option><option>CPDLC</option><option>ADS-C</option><option>CM</option><option>ACARS</option><option>VDL2</option><option>ADS-B</option></select></label>
+<label>Transport<select name="transport"><option value="">All transports</option><option>ATN</option><option>ACARS</option></select></label>
+<label>Direction<select name="direction"><option value="">Both directions</option><option>AIR2GND</option><option>GND2AIR</option></select></label>
+<label>Tail<input name="tail" placeholder="N795UA" autocomplete="off"></label><label>Flight<input name="flight" placeholder="UA0884" autocomplete="off"></label>
+<label>Frequency<select name="freq" id="freq"><option value="">All frequencies</option></select></label>
+<label>UTC day<input name="day" type="date"></label><button type="submit">Apply filters</button><button type="reset" class="secondary">Reset</button></form>
+<div class="feedbar"><h2>Reception log</h2><span id="status" role="status">Connecting to dashboard…</span><button id="delete-all" class="secondary danger">Delete all messages</button><button id="live" class="secondary">Pause live</button></div>
+<div class="tablewrap"><table><thead><tr><th>Received / UTC</th><th>Protocol / transport</th><th>Aircraft / flight</th><th>Route</th><th>MHz / signal</th><th>Message</th></tr></thead><tbody id="messages"></tbody></table></div>
+<p id="empty" hidden>No matching messages yet. Enable JSONL output in the VDL2 module and start reception.</p><button id="older" class="secondary" hidden>Older messages</button>
+<footer>Read-only JSONL consumer · No radio controls · Interface adapted from <a href="https://github.com/anthonyborriello/acars-pi-dashboard">acars-pi-dashboard</a></footer>
+</body></html>

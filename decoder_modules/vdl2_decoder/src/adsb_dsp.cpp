@@ -1,3 +1,5 @@
+#include "vdl2_message_json.h"
+#include <json.hpp>
 #include "adsb_dsp.h"
 #include <cstdio>
 #include <ctime>
@@ -315,6 +317,10 @@ void ADSBChannel::parseMessage(const uint8_t* msg, int len) {
         vmsg.ppm_error = 0;
         vmsg.is_acars = false;
         vmsg.formatted_text = formatMessage(msg, len, df, icao);
+        VDL2ProtocolDecoder::Result structured;
+        structured.protocol="Mode S"; structured.transport="Mode S";
+        structured.json=nlohmann::json({{"mode_s",{{"df",df},{"raw",std::vector<uint8_t>(msg,msg+len)}}}}).dump();
+        populateMessageJSON(vmsg, structured, false);
         if (msgCallback) msgCallback(vmsg);
     }
 }
@@ -340,6 +346,15 @@ void ADSBChannel::parseDF17(const uint8_t* msg, uint32_t icao) {
     vmsg.ppm_error = 0;
     vmsg.is_acars = false;
     vmsg.formatted_text = formatMessage(msg, 14, (msg[0] >> 3) & 0x1F, icao);
+    VDL2ProtocolDecoder::Result structured;
+    structured.protocol="ADS-B"; structured.transport="1090ES";
+    structured.flight=ac.callsign;
+    nlohmann::json data={{"df",(msg[0]>>3)&31},{"type_code",tc},
+        {"address",icao},{"raw",std::vector<uint8_t>(msg,msg+14)}};
+    if(ac.posValid) { data["lat"]=ac.lat; data["lon"]=ac.lon; }
+    if(ac.velValid) { data["speed_knots"]=ac.speed; data["heading_deg"]=ac.heading; data["vertical_rate_fpm"]=ac.vertRate; }
+    structured.json=nlohmann::json({{"adsb",data}}).dump();
+    populateMessageJSON(vmsg, structured, false);
     if (msgCallback) msgCallback(vmsg);
 }
 

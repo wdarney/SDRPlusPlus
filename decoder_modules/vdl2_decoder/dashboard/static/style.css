@@ -1,0 +1,21 @@
+/* Table/toolbar foundation adapted from acars-pi-dashboard by Antonio Borriello (MIT).
+   See ../THIRD_PARTY.md. SDR++ layout and styles are GPL-3.0. */
+:root { --bg:#091019; --fg:#dce7f2; --dim:#91a5b9; --red:#ff8791; --blue:#79caff; --green:#72dfba; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--fg); font-family:system-ui,sans-serif; font-size:14px; padding:32px; max-width:1800px; margin:auto; }
+header { margin-bottom:28px; } .eyebrow { color:var(--green); font:11px monospace; letter-spacing:2px; margin-bottom:12px; }
+h1 { font-size:30px; font-weight:550; letter-spacing:-1px; } header p { color:var(--dim); margin-top:10px; }
+.badge { display:inline-block; padding:5px 9px; border-radius:4px; font:10px monospace; letter-spacing:1px; margin-left:18px; vertical-align:middle; background:#12262a; border:1px solid #26443f; color:var(--green); }
+.stats { display:grid; grid-template-columns:1fr 2fr 1fr; gap:1px; background:#233242; border:1px solid #233242; border-radius:8px; overflow:hidden; margin-bottom:24px; }
+.stats div { background:#101b28; padding:18px; } .stats span { display:block; color:var(--dim); font-size:11px; margin-bottom:8px; text-transform:uppercase; letter-spacing:1px; }.stats strong { font-size:16px; font-weight:500; }
+.toolbar { display:flex; gap:10px; align-items:end; flex-wrap:wrap; padding:18px; background:#101b28; border:1px solid #233242; border-radius:8px; }
+label { display:flex; flex-direction:column; gap:7px; color:var(--dim); font-size:11px; }
+select,input,button { background:#0a1420; color:var(--fg); border:1px solid #33495c; padding:9px 11px; font:12px system-ui; border-radius:4px; } input { width:120px; } input[type=date] { width:145px; color-scheme:dark; }
+button { cursor:pointer; background:var(--green); color:#081812; font-weight:600; } button.secondary { background:transparent; color:var(--fg); } button:hover { filter:brightness(1.2); } :focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+.feedbar { display:flex; align-items:center; gap:16px; margin:26px 0 12px; }h2 {font-size:16px;font-weight:500;} #status { color:var(--dim); font-size:12px; flex:1; }#status.error {color:var(--red);}
+.tablewrap {overflow:auto;border:1px solid #233242;border-radius:8px;} table { width:100%; border-collapse:collapse; } thead th { background:#101b28; padding:12px; text-align:left; color:var(--dim); font-size:11px; font-weight:500; white-space:nowrap; }
+tbody tr td { border-top:1px solid #233242; padding:12px; vertical-align:top; font:12px/1.5 monospace; } tbody tr:hover td { background:#101e2b; } td small {display:block;color:var(--dim);font-size:11px;} td:nth-child(-n+5) {white-space:nowrap;} td:last-child {min-width:300px;width:48%;}
+.protocol {color:var(--green);} .adsc .protocol {color:var(--blue);} details summary { cursor:pointer; overflow-wrap:anywhere; } pre {white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 monospace;} .detail {padding:16px 0;} .detail h3 {font:12px system-ui;color:var(--blue);margin:14px 0 8px;} .tree {padding-left:16px;border-left:1px solid #33495c;margin:5px 0;} .leaf {overflow-wrap:anywhere;white-space:pre-wrap;color:#b7cde0;padding:3px 0;} .key {color:var(--green);} .detail a, footer a {color:var(--blue);} #empty {padding:32px;color:var(--dim);} #older {margin-top:16px;} footer {color:var(--dim);font-size:11px;margin:32px 0;} [hidden] {display:none!important;}
+@media(max-width:800px) {body {padding:16px;}h1{font-size:24px;}.badge{margin:10px 0;display:table;}.stats{grid-template-columns:1fr;}.feedbar{flex-wrap:wrap;}}
+
+button.danger {color:var(--red);border-color:#7c3d49;} button:disabled {opacity:.5;cursor:wait;}

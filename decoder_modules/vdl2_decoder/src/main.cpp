@@ -8,6 +8,8 @@
 #include <dsp/sink/handler_sink.h>
 
 #include "vdl2_dsp.h"
+#include "aviation_jsonl.h"
+#include "channel_input.h"
 #include "acars_dsp.h"
 #include "adsb_dsp.h"
 
@@ -20,6 +22,7 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <atomic>
 #include <sqlite3.h>
 
 // UDP
@@ -103,49 +106,6 @@ static const float ADSB_VFO_SAMPLERATE = 2000000.f;
 static const int DEFAULT_UDP_PORT = 5555;
 
 static ConfigManager config;
-
-// ============================================================================
-// JSON builder for output
-// ============================================================================
-
-static std::string msgToJSON(const VDL2Message& msg) {
-    // Build JSON manually (no external JSON lib needed in hot path)
-    char buf[4096];
-    char timebuf[64];
-    time_t t = (time_t)msg.timestamp;
-    struct tm* tm_info = gmtime(&t);
-    strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
-
-    // Escape the text for JSON
-    std::string escaped;
-    for (char c : msg.formatted_text) {
-        switch (c) {
-            case '"':  escaped += "\\\""; break;
-            case '\\': escaped += "\\\\"; break;
-            case '\n': escaped += "\\n"; break;
-            case '\r': escaped += "\\r"; break;
-            case '\t': escaped += "\\t"; break;
-            default:
-                if ((unsigned char)c < 0x20) {
-                    char hex[8];
-                    snprintf(hex, sizeof(hex), "\\u%04x", (unsigned char)c);
-                    escaped += hex;
-                } else {
-                    escaped += c;
-                }
-        }
-    }
-
-    snprintf(buf, sizeof(buf),
-        "{\"timestamp\":\"%s\",\"freq\":%.3f,\"type\":\"%s\","
-        "\"snr\":%.1f,\"fec\":%d,\"ppm\":%.1f,"
-        "\"text\":\"%s\"}",
-        timebuf, (double)msg.freq / 1e6,
-        msg.is_acars ? "ACARS" : "VDL2",
-        msg.snr, msg.num_fec_corrections, msg.ppm_error,
-        escaped.c_str());
-    return buf;
-}
 
 // ============================================================================
 // UDP sender
@@ -275,13 +235,16 @@ private:
 // ============================================================================
 
 struct ChannelSlot {
+    ~ChannelSlot() { input.stop(); } // join before decoder members are destroyed
     VFOManager::VFO* vfo = nullptr;
-    dsp::sink::Handler<dsp::complex_t> sink;
+    VDL2ChannelInput input;
+    std::mutex decoderMtx;
     VDL2Channel vdl2Decoder;
     ACARSChannel acarsDecoder;
     ADSBChannel adsbDecoder;
     ChannelMode mode = MODE_VDL2;
-    bool active = false;
+    bool stopping = false; // lifecycle thread only
+    bool active = false; // lifecycle thread only; workers use input.accepting()
     std::string vfoName;
 
     int getMessageCount() const {
@@ -343,7 +306,9 @@ public:
         config.release(false);
 
         // Set up message callback
-        auto msgCb = [this](const VDL2Message& msg) {
+        auto msgCb = [this](ChannelSlot& slot, const VDL2Message& msg) {
+            std::lock_guard<std::mutex> callbackLock(callbackMtx);
+            if (!acceptingCallbacks || !slot.input.accepting()) return;
             // Add to display buffer
             {
                 std::lock_guard<std::mutex> lock(msgMtx);
@@ -353,10 +318,8 @@ public:
                 newMessage = true;
             }
 
-            // Build JSON once for all outputs
-            std::string j;
-            bool needJSON = (udpEnabled && udpSender.isActive()) || fileEnabled || (dbEnabled && messageDB.isActive());
-            if (needJSON) j = msgToJSON(msg);
+            // The decoder owns serialization; outputs consume it unchanged.
+            const std::string& j = msg.json_text;
 
             // UDP output
             if (udpEnabled && udpSender.isActive()) {
@@ -364,10 +327,9 @@ public:
             }
 
             // File output
-            if (fileEnabled && !filePath.empty()) {
+            {
                 std::lock_guard<std::mutex> lock(fileMtx);
-                std::ofstream f(filePath, std::ios::app);
-                if (f.is_open()) f << j << "\n";
+                if (fileEnabled && !filePath.empty() && !appendAviationJSONL(filePath, j)) ++fileWriteErrors;
             }
 
             // SQLite output
@@ -382,28 +344,32 @@ public:
 
         for (int i = 0; i < ALL_CHANNEL_COUNT; i++) {
             slots[i].vfoName = name + "_ch" + std::to_string(i);
-            slots[i].vdl2Decoder.setMessageCallback(msgCb);
-            slots[i].acarsDecoder.setMessageCallback(msgCb);
-            slots[i].adsbDecoder.setMessageCallback(msgCb);
+            auto cb = [this, i, msgCb](const VDL2Message& msg) { msgCb(slots[i], msg); };
+            slots[i].vdl2Decoder.setMessageCallback(cb);
+            slots[i].acarsDecoder.setMessageCallback(cb);
+            slots[i].adsbDecoder.setMessageCallback(cb);
         }
 
         gui::menu.registerEntry(name, menuHandler, this, this);
     }
 
     ~VDL2DecoderModule() {
-        if (enabled) disable();
+        stop(); // unconditional: also cleans up a partially started module
         udpSender.closeSocket();
         gui::menu.removeEntry(name);
     }
 
     void postInit() override {}
-    void enable() override { enabled = true; }
-    void disable() override { stop(); enabled = false; }
-    bool isEnabled() override { return enabled; }
+    void enable() override { std::lock_guard<std::recursive_mutex> lock(lifecycleMtx); enabled = true; }
+    void disable() override { std::lock_guard<std::recursive_mutex> lock(lifecycleMtx); stop(); enabled = false; }
+    bool isEnabled() override { std::lock_guard<std::recursive_mutex> lock(lifecycleMtx); return enabled; }
 
 private:
     static void sinkHandler(dsp::complex_t* data, int count, void* ctx) {
         ChannelSlot* slot = (ChannelSlot*)ctx;
+        if (!slot->input.accepting()) return;
+        std::lock_guard<std::mutex> decoderLock(slot->decoderMtx);
+        if (!slot->input.accepting()) return;
         if (slot->mode == MODE_VDL2) {
             slot->vdl2Decoder.processIQ((const float*)data, count);
         } else if (slot->mode == MODE_ACARS) {
@@ -415,6 +381,7 @@ private:
 
     // Reposition all active VFOs to match current SDR center frequency
     void repositionVFOs() {
+        std::lock_guard<std::recursive_mutex> lock(lifecycleMtx);
         double sdrCenter = gui::waterfall.getCenterFrequency();
         for (int i = 0; i < ALL_CHANNEL_COUNT; i++) {
             if (slots[i].active && slots[i].vfo) {
@@ -425,8 +392,10 @@ private:
     }
 
     void startChannel(int idx) {
+        std::lock_guard<std::recursive_mutex> lock(lifecycleMtx);
+        if (stopping) return;
         if (idx < 0 || idx >= ALL_CHANNEL_COUNT) return;
-        if (slots[idx].active) return;
+        if (slots[idx].active || slots[idx].stopping || slots[idx].vfo) return;
 
         double bw = gui::waterfall.getBandwidth();
         double sdrCenter = gui::waterfall.getCenterFrequency();
@@ -456,42 +425,84 @@ private:
         if (ALL_CHANNELS[idx].bwOverride > 0) vfoBw = ALL_CHANNELS[idx].bwOverride;
         if (ALL_CHANNELS[idx].srOverride > 0) sampleRate = ALL_CHANNELS[idx].srOverride;
 
-        slots[idx].vfo = sigpath::vfoManager.createVFO(
-            slots[idx].vfoName, ImGui::WaterfallVFO::REF_CENTER,
-            channelOffset, vfoBw, sampleRate, vfoBw, vfoBw, true);
-        slots[idx].sink.init(slots[idx].vfo->output, sinkHandler, &slots[idx]);
-        slots[idx].sink.start();
-        slots[idx].active = true;
+        try {
+            slots[idx].vfo = sigpath::vfoManager.createVFO(
+                slots[idx].vfoName, ImGui::WaterfallVFO::REF_CENTER,
+                channelOffset, vfoBw, sampleRate, vfoBw, vfoBw, true);
+            if (!slots[idx].vfo) throw std::runtime_error("VDL2 VFO name already registered");
+            slots[idx].input.start(slots[idx].vfo->output, sinkHandler, &slots[idx]);
+            slots[idx].active = true;
+        } catch (...) {
+            // Cleanup, then propagate startup failures. Never ignore stop errors.
+            stopChannel(idx);
+            throw;
+        }
+    }
+
+    void releaseChannel(ChannelSlot& slot) {
+        // The Handler is already joined/destroyed. VFO deletion now stops/joins
+        // the producer and removes its registration before freeing its stream.
+        if (!slot.vfo && !slot.active) { slot.stopping = false; return; }
+        if (slot.vfo) {
+            auto* vfo = slot.vfo;
+            slot.vfo = nullptr;
+            sigpath::vfoManager.deleteVFO(vfo);
+        }
+        slot.vdl2Decoder.reset();
+        slot.acarsDecoder.reset();
+        slot.adsbDecoder.reset();
+        slot.active = false;
+        slot.stopping = false;
     }
 
     void stopChannel(int idx) {
+        std::lock_guard<std::recursive_mutex> lock(lifecycleMtx);
         if (idx < 0 || idx >= ALL_CHANNEL_COUNT) return;
-        if (!slots[idx].active) return;
-        slots[idx].sink.stop();
-        sigpath::vfoManager.deleteVFO(slots[idx].vfo);
-        slots[idx].vfo = nullptr;
-        slots[idx].vdl2Decoder.reset();
-        slots[idx].acarsDecoder.reset();
-        slots[idx].adsbDecoder.reset();
-        slots[idx].active = false;
+        if (slots[idx].stopping) return;
+        slots[idx].stopping = true;
+        // No active-only guard: partial startup can own a VFO/Handler already.
+        slots[idx].input.rejectWork();
+        slots[idx].input.stop();
+        releaseChannel(slots[idx]);
     }
 
     void start() {
-        if (running || !enabled) return;
-        if (udpEnabled) udpSender.open("127.0.0.1", udpPort);
-        if (!dbPath.empty()) messageDB.open(dbPath);
-        for (int i = 0; i < ALL_CHANNEL_COUNT; i++) {
-            if (channelEnabled[i]) startChannel(i);
+        std::lock_guard<std::recursive_mutex> lock(lifecycleMtx);
+        if (running || stopping || !enabled) return;
+        try {
+            {
+                std::lock_guard<std::mutex> callbackLock(callbackMtx);
+                if (udpEnabled) udpSender.open("127.0.0.1", udpPort);
+                if (!dbPath.empty()) messageDB.open(dbPath);
+                acceptingCallbacks = true;
+            }
+            for (int i = 0; i < ALL_CHANNEL_COUNT; i++) {
+                if (channelEnabled[i]) startChannel(i);
+            }
+            running = true;
+        } catch (...) {
+            stop(); // roll back every previously started channel, too
+            throw;
         }
-        running = true;
     }
 
     void stop() {
-        if (!running) return;
-        for (int i = 0; i < ALL_CHANNEL_COUNT; i++) stopChannel(i);
-        udpSender.closeSocket();
-        messageDB.closeDB();
+        std::lock_guard<std::recursive_mutex> lock(lifecycleMtx);
+        if (stopping) return;
+        stopping = true;
+        // Reject all channels first, including those whose workers are still
+        // finishing a decode. They cannot publish another message.
+        stopVDL2Channels(slots, [this] {
+            std::lock_guard<std::mutex> callbackLock(callbackMtx);
+            acceptingCallbacks = false; // waits for any admitted output callback
+        }, [this](ChannelSlot& slot) { releaseChannel(slot); });
+        {
+            std::lock_guard<std::mutex> callbackLock(callbackMtx);
+            udpSender.closeSocket();
+            messageDB.closeDB();
+        }
         running = false;
+        stopping = false;
     }
 
     int countActiveChannels() {
@@ -502,6 +513,7 @@ private:
 
     static void menuHandler(void* ctx) {
         VDL2DecoderModule* _this = (VDL2DecoderModule*)ctx;
+        std::lock_guard<std::recursive_mutex> lifecycleLock(_this->lifecycleMtx);
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         if (!_this->enabled) { style::beginDisabled(); }
@@ -521,6 +533,7 @@ private:
         // ---- Output settings ----
         ImGui::Spacing();
         if (ImGui::CollapsingHeader(CONCAT("Output##output_hdr_", _this->name))) {
+            std::lock_guard<std::mutex> callbackLock(_this->callbackMtx);
             // UDP
             bool udpChanged = false;
             if (ImGui::Checkbox(CONCAT("UDP JSON##udp_", _this->name), &_this->udpEnabled)) udpChanged = true;
@@ -543,23 +556,27 @@ private:
             }
 
             // File
-            bool fileChanged = false;
-            if (ImGui::Checkbox(CONCAT("JSON File##file_", _this->name), &_this->fileEnabled)) fileChanged = true;
-            if (_this->fileEnabled) {
-                char pathBuf[512];
-                strncpy(pathBuf, _this->filePath.c_str(), sizeof(pathBuf) - 1);
-                pathBuf[sizeof(pathBuf) - 1] = 0;
-                ImGui::SetNextItemWidth(menuWidth - 10);
-                if (ImGui::InputText(CONCAT("##file_path_", _this->name), pathBuf, sizeof(pathBuf))) {
-                    _this->filePath = pathBuf;
-                    fileChanged = true;
+            {
+                std::lock_guard<std::mutex> fileSettingsLock(_this->fileMtx);
+                bool fileChanged = false;
+                if (ImGui::Checkbox(CONCAT("JSON File##file_", _this->name), &_this->fileEnabled)) fileChanged = true;
+                if (_this->fileEnabled) {
+                    char pathBuf[512];
+                    strncpy(pathBuf, _this->filePath.c_str(), sizeof(pathBuf) - 1);
+                    pathBuf[sizeof(pathBuf) - 1] = 0;
+                    ImGui::SetNextItemWidth(menuWidth - 10);
+                    if (ImGui::InputText(CONCAT("##file_path_", _this->name), pathBuf, sizeof(pathBuf))) {
+                        _this->filePath = pathBuf;
+                        fileChanged = true;
+                    }
                 }
-            }
-            if (fileChanged) {
-                config.acquire();
-                config.conf[_this->name]["fileEnabled"] = _this->fileEnabled;
-                config.conf[_this->name]["filePath"] = _this->filePath;
-                config.release(true);
+                if (fileChanged) {
+                    config.acquire();
+                    config.conf[_this->name]["fileEnabled"] = _this->fileEnabled;
+                    config.conf[_this->name]["filePath"] = _this->filePath;
+                    config.release(true);
+                }
+
             }
 
             // SQLite database (always on)
@@ -620,6 +637,7 @@ private:
                 if (wasActive) {
                     ImGui::PopStyleColor();
                     ImGui::SameLine();
+                    std::lock_guard<std::mutex> decoderLock(_this->slots[i].decoderMtx);
                     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(%d)", _this->slots[i].getMessageCount());
                 }
             }
@@ -635,12 +653,14 @@ private:
         // ---- Stats ----
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%d messages | %d channels",
-            _this->totalMessages, _this->countActiveChannels());
+            _this->totalMessages.load(), _this->countActiveChannels());
 
         if (ImGui::CollapsingHeader(CONCAT("Debug Stats##debug_", _this->name))) {
+            ImGui::Text("JSONL write errors: %llu", (unsigned long long)_this->fileWriteErrors.load());
             for (int i = 0; i < ALL_CHANNEL_COUNT; i++) {
                 if (!_this->channelEnabled[i] || !_this->slots[i].active) continue;
                 auto& s = _this->slots[i];
+                std::lock_guard<std::mutex> decoderLock(s.decoderMtx);
                 ImVec4 chColor;
                 if (ALL_CHANNELS[i].mode == MODE_VDL2) chColor = ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
                 else if (ALL_CHANNELS[i].mode == MODE_ACARS) chColor = ImVec4(1.0f, 0.8f, 0.3f, 1.0f);
@@ -656,6 +676,12 @@ private:
                         s.vdl2Decoder.getRsFailCount(),
                         s.vdl2Decoder.getCrcFailCount(),
                         s.vdl2Decoder.getMessageCount());
+                    auto p=s.vdl2Decoder.getProtocolCounters();
+                    ImGui::Text("  ACARS %llu | FANS CPDLC %llu | ATN X.25 %llu | CLNP %llu | CPDLC %llu | ADS-C %llu | CM %llu",
+                        (unsigned long long)p.acars, (unsigned long long)p.fansCpdlc,
+                        (unsigned long long)p.atnX25, (unsigned long long)p.atnClnp,
+                        (unsigned long long)p.atnCpdlc, (unsigned long long)p.atnAdsc,
+                        (unsigned long long)p.atnCm);
                 }
                 else if (ALL_CHANNELS[i].mode == MODE_ACARS) {
                     ImGui::Text("%.3f: Samp %lldK | Sync %d | Msg %d",
@@ -742,13 +768,17 @@ private:
         if (!_this->enabled) { style::endDisabled(); }
     }
 
+    std::recursive_mutex lifecycleMtx; // UI/control only; workers never acquire it
+    std::mutex callbackMtx;
+    bool acceptingCallbacks = false; // callbackMtx
+    bool stopping = false; // lifecycleMtx
     std::string name;
     bool enabled = false;
     bool running = false;
     bool autoScroll = true;
-    bool newMessage = false;
+    std::atomic<bool> newMessage{false};
     char searchBuf[128] = {};
-    int totalMessages = 0;
+    std::atomic<int> totalMessages{0};
 
     // Output
     bool udpEnabled = true;
@@ -757,6 +787,7 @@ private:
     bool fileEnabled = false;
     std::string filePath = "/tmp/aviation_messages.jsonl";
     std::mutex fileMtx;
+    std::atomic<uint64_t> fileWriteErrors{0};
     bool dbEnabled = true;  // always on
     std::string dbPath = "/tmp/aviation_messages.db";
     int dbRetentionDays = 4;

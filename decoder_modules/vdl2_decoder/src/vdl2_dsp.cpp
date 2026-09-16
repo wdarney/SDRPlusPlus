@@ -10,6 +10,7 @@ extern "C" {
 #include <cstdio>
 #include <chrono>
 #include <ctime>
+#include "vdl2_message_json.h"
 
 // ============================================================================
 // Static tables
@@ -227,6 +228,7 @@ void VDL2Channel::init(uint32_t _freq, uint32_t _sample_rate) {
 }
 
 void VDL2Channel::reset() {
+    protocolDecoder.reset();
     demod_state = DemodState::INIT;
     decoder_state = DecoderState::IDLE;
     memset(syncbuf, 0, sizeof(syncbuf));
@@ -715,8 +717,12 @@ void VDL2Channel::parseAVLC(const uint8_t* data, int len, float snr) {
         ((data[4] >> 1) | (data[5] << 6) | (data[6] << 13) | ((data[7] & 0xFE) << 20))
         & 0x0FFFFFFF, 28);
 
-    bool dst_is_ground = (data[0] & 1) == 0;
-    bool src_is_ground = (data[4] & 1) == 0;
+    msg.src_addr = src_addr;
+    msg.dst_addr = dst_addr;
+    // The address type is in decoded bits 24..26; the wire low bit is EA,
+    // not an air/ground flag. ATN ASN.1 decoding requires the right direction.
+    bool dst_is_ground = ((dst_addr >> 24) & 7) != 1;
+    bool src_is_ground = ((src_addr >> 24) & 7) != 1;
     uint8_t control = data[8];
 
     // Format header
@@ -729,41 +735,16 @@ void VDL2Channel::parseAVLC(const uint8_t* data, int len, float snr) {
         dst_is_ground ? "GND" : "AIR", dst_addr & 0xFFFFFF);
     msg.formatted_text = hdr;
 
-    // Check for ACARS payload (I-frame with FF FF 01 marker)
-    if ((control & 0x01) == 0 && len > 12) {
-        // I-frame
-        int info_start = 9;  // after addresses + control
-        int info_len = len - info_start;
-        const uint8_t* info = data + info_start;
-
-        if (info_len >= 3 && info[0] == 0xFF && info[1] == 0xFF && info[2] == 0x01) {
-            // ACARS message — feed to libacars
-            msg.is_acars = true;
-            const uint8_t* acars_data = info + 3;
-            int acars_len = info_len - 3;
-
-            la_msg_dir dir = src_is_ground ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
-            la_proto_node* node = la_acars_parse(acars_data, acars_len, dir);
-
-            if (node) {
-                la_vstring* vstr = la_proto_tree_format_text(NULL, node);
-                if (vstr) {
-                    msg.formatted_text += "\n";
-                    msg.formatted_text += vstr->str;
-                    la_vstring_destroy(vstr, true);
-                }
-                la_proto_tree_destroy(node);
-            }
-        }
-        else {
-            // Non-ACARS I-frame (X.25/CLNP/CPDLC/ADS-C)
-            // For now, hex-dump the info field
-            msg.formatted_text += "\n  [Non-ACARS I-frame, ";
-            msg.formatted_text += std::to_string(info_len) + " bytes]";
-
-            // Try to format with libacars anyway (X.25 path)
-            // TODO: Add X.25 -> CLNP -> CPDLC path when we add the shim
-        }
+    msg.avlc_control = control;
+    VDL2ProtocolDecoder::Result decoded;
+    if ((control & 0x01) == 0) {
+        const uint8_t* info = data + 9;
+        int info_len = len - 9;
+        msg.is_acars = info_len >= 3 && info[0] == 0xFF && info[1] == 0xFF && info[2] == 0x01;
+        if (msg.is_acars) { info += 3; info_len -= 3; }
+        decoded = protocolDecoder.decode(info, info_len, src_addr, dst_addr,
+                                         src_is_ground, msg.timestamp, msg.is_acars);
+        if (!decoded.text.empty()) msg.formatted_text += "\n" + decoded.text;
     }
     else if ((control & 0x03) == 0x03) {
         // U-frame
@@ -781,6 +762,8 @@ void VDL2Channel::parseAVLC(const uint8_t* data, int len, float snr) {
         msg.formatted_text += ctlhex;
         msg.formatted_text += "]";
     }
+
+    populateMessageJSON(msg, decoded, true);
 
     messageCount++;
 

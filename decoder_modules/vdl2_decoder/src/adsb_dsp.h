@@ -27,6 +27,7 @@
 // ============================================================================
 
 class ADSBChannel {
+    friend struct ADSBChannelTestAccess;
 public:
     ADSBChannel();
     ~ADSBChannel() = default;
