@@ -10,7 +10,7 @@
 <label>Tail<input name="tail" placeholder="N795UA" autocomplete="off"></label><label>Flight<input name="flight" placeholder="UA0884" autocomplete="off"></label>
 <label>Frequency<select name="freq" id="freq"><option value="">All frequencies</option></select></label>
 <label>UTC day<input name="day" type="date"></label><button type="submit">Apply filters</button><button type="reset" class="secondary">Reset</button></form>
-<div class="feedbar"><h2>Reception log</h2><span id="status" role="status">Connecting to dashboard…</span><button id="live" class="secondary">Pause live</button></div>
+<div class="feedbar"><h2>Reception log</h2><span id="status" role="status">Connecting to dashboard…</span><button id="delete-all" class="secondary danger">Delete all messages</button><button id="live" class="secondary">Pause live</button></div>
 <div class="tablewrap"><table><thead><tr><th>Received / UTC</th><th>Protocol / transport</th><th>Aircraft / flight</th><th>Route</th><th>MHz / signal</th><th>Message</th></tr></thead><tbody id="messages"></tbody></table></div>
 <p id="empty" hidden>No matching messages yet. Enable JSONL output in the VDL2 module and start reception.</p><button id="older" class="secondary" hidden>Older messages</button>
 <footer>Read-only JSONL consumer · No radio controls · Interface adapted from <a href="https://github.com/anthonyborriello/acars-pi-dashboard">acars-pi-dashboard</a></footer>

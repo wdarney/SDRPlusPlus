@@ -116,6 +116,59 @@ class DashboardTests(unittest.TestCase):
             thread.join(5)
         self.assertFalse(thread.is_alive())
 
+    def delete(self):
+        token = self.client.get('/api/status').get_json()['delete_token']
+        return self.client.post('/api/messages/delete-all', json={'confirm':True},
+                                headers={'X-Dashboard-Token':token})
+
+    def test_delete_skips_backlog_and_retains_future_messages(self):
+        self.write(*[{'text':str(i)} for i in range(600)])
+        self.assertEqual(self.reader.poll(), 500)
+        original = self.source.read_bytes()
+        generation = self.client.get('/api/messages').get_json()['generation']
+        self.assertEqual(self.delete().get_json()['deleted'], 500)
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertEqual(self.records(), [])
+        self.assertEqual(Reader(self.source, self.database).poll(), 0)
+        self.assertGreater(self.client.get('/api/messages').get_json()['generation'], generation)
+        self.write({'text':'new reception'})
+        self.assertEqual(self.reader.poll(), 1)
+        self.assertEqual(self.records()[0]['message']['text'], 'new reception')
+
+    def test_delete_partial_missing_and_repeat(self):
+        self.source.write_bytes(b'{"text":"partial')
+        self.assertEqual(self.delete().status_code, 200)
+        with self.source.open('ab') as f: f.write(b'"}\n')
+        self.write({'text':'after partial'})
+        self.assertEqual(self.reader.poll(), 1)
+        self.source.unlink()
+        self.assertEqual(self.delete().get_json()['deleted'], 1)
+        self.assertEqual(self.delete().get_json()['deleted'], 0)
+        self.write({'text':'recreated'})
+        self.assertEqual(self.reader.poll(), 1)
+
+    def test_delete_requires_confirmation_and_token(self):
+        self.write({'text':'keep'})
+        self.reader.poll()
+        self.assertEqual(self.client.get('/api/messages/delete-all').status_code, 405)
+        self.assertEqual(self.client.post('/api/messages/delete-all', json={'confirm':True}).status_code, 403)
+        token = self.client.get('/api/status').get_json()['delete_token']
+        self.assertEqual(self.client.post('/api/messages/delete-all', json={'confirm':False},
+                         headers={'X-Dashboard-Token':token}).status_code, 400)
+        self.assertEqual(len(self.records()), 1)
+
+    def test_delete_failure_rolls_back_history_and_cursor(self):
+        self.write({'text':'keep'})
+        self.reader.poll()
+        self.write({'text':'unread'})
+        with connect(self.database) as db:
+            db.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'injected'); END")
+        with self.assertLogs('server', level='ERROR'):
+            self.assertEqual(self.delete().status_code, 500)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.reader.poll(), 1)
+        self.assertEqual(len(self.records()), 2)
+
     def test_legacy_frequency_and_large_numbers(self):
         legacy = {'timestamp':'2026-09-15T22:57:19Z', 'freq':136.975, 'type':'ACARS', 'text':'old'}
         huge = {'timestamp':10**400, 'freq':10**400, 'schema_version':2}

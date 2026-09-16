@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 const form = $('filters');
 let live = true, busy = false, next = null, revision = 0;
+let deleting = false, deleteToken = null, generation = null;
 let filters = new URLSearchParams();
 const shown = new Set();
 function el(tag, text, cls) { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; }
@@ -36,11 +37,17 @@ function row(entry) {
 }
 async function get(url) {const r=await fetch(url);if(!r.ok)throw Error(`HTTP ${r.status}`);return r.json();}
 async function refresh(older=false) {
-  if(busy)return; busy=true;const version=revision;
+  if(busy || deleting)return; busy=true;const version=revision;
   try {
     const q=new URLSearchParams(filters); if(older && next)q.set('before',next);
     const [data,stats]=await Promise.all([get('/api/messages?'+q),get('/api/status')]);
     if(version!==revision)return;
+    deleteToken=stats.delete_token;
+    if(generation !== null && generation !== data.generation) {
+      shown.clear();$('messages').replaceChildren();next=null;
+      if(older){revision++;setTimeout(()=>refresh(),0);generation=data.generation;return;}
+    }
+    generation=data.generation;
     if(!older) { // Refresh the live window while preserving expanded existing rows.
       const existing=new Map([...$('messages').children].map(n=>[Number(n.dataset.id),n]));
       shown.clear();const fragment=document.createDocumentFragment();
@@ -76,3 +83,24 @@ form.addEventListener('reset',()=>setTimeout(apply,0));
 $('live').onclick=()=>{live=!live;$('live').textContent=live?'Pause live':'Resume live';if(live)refresh();else $('status').textContent='Paused · reception continues in background';};
 $('older').onclick=()=>{live=false;$('live').textContent='Resume live';refresh(true);};
 setInterval(()=>{if(live)refresh();},3000);refresh();
+
+$('delete-all').onclick=async()=>{
+  if(deleting || !deleteToken)return;
+  if(!window.confirm('Delete ALL stored dashboard messages, including those hidden by filters? This cannot be undone. Existing JSONL contents will be skipped; the source file stays intact. New messages will continue to appear.'))return;
+  deleting=true;revision++;$('delete-all').disabled=true;
+  try {
+    const response=await fetch('/api/messages/delete-all',{
+      method:'POST',headers:{'Content-Type':'application/json','X-Dashboard-Token':deleteToken},
+      body:JSON.stringify({confirm:true})
+    });
+    const result=await response.json();
+    if(!response.ok)throw Error(result.error || 'Delete failed');
+    shown.clear();$('messages').replaceChildren();next=null;
+    $('total').textContent='0';$('paths').textContent='Awaiting reception';
+    $('older').hidden=true;$('empty').hidden=false;
+    $('status').textContent=`Deleted ${result.deleted} stored messages. Waiting for new reception.`;
+    // Refresh even when paused, after any older request has drained.
+    const reload=()=>busy?setTimeout(reload,50):refresh();setTimeout(reload,0);
+  } catch(e) {$('status').textContent=e.message;$('status').className='error';}
+  finally {deleting=false;$('delete-all').disabled=false;}
+};

@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import secrets
 import threading
 import time
 
@@ -39,6 +40,9 @@ def initialize(path):
                 raw TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS message_time ON messages(timestamp);
             CREATE INDEX IF NOT EXISTS message_protocol ON messages(protocol, transport);
+            CREATE TABLE IF NOT EXISTS dashboard_state (
+                id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL);
+            INSERT OR IGNORE INTO dashboard_state VALUES (1,0);
             CREATE TABLE IF NOT EXISTS cursor (
                 source TEXT PRIMARY KEY, device INTEGER, inode INTEGER,
                 offset INTEGER, anchor TEXT, skipping INTEGER, invalid INTEGER);
@@ -71,6 +75,7 @@ class Reader:
         self.source = str(Path(source).resolve())
         self.database = str(database)
         initialize(database)
+        self.ingest_lock = threading.Lock()
         self.lock = threading.Lock()
         self.state = {'source': self.source, 'state': 'waiting', 'error': None}
 
@@ -84,7 +89,8 @@ class Reader:
 
     def poll(self):
         try:
-            count = self._poll()
+            with self.ingest_lock:
+                count = self._poll()
             with self.lock:
                 self.state.update(state='watching', error=None, checked_at=time.time())
             return count
@@ -146,6 +152,32 @@ class Reader:
                 self.state['last_received_at'] = time.time()
         return count
 
+    def delete_all(self):
+        # Serialize with ingestion; history and the skip cursor commit together.
+        with self.ingest_lock, connect(self.database) as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                with open(self.source, 'rb') as file:
+                    stat = os.fstat(file.fileno())
+                    offset = stat.st_size
+                    file.seek(max(0, offset - 1))
+                    skipping = offset > 0 and file.read(1) != b'\n'
+                    anchor = self.fingerprint(file, offset)
+                    db.execute('INSERT OR REPLACE INTO cursor VALUES (?,?,?,?,?,?,?)',
+                               (self.source, stat.st_dev, stat.st_ino, offset, anchor, skipping, 0))
+            except FileNotFoundError:
+                offset = 0
+                db.execute('DELETE FROM cursor WHERE source=?', (self.source,))
+            deleted = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
+            db.execute('DELETE FROM messages')
+            db.execute('UPDATE dashboard_state SET generation=generation+1 WHERE id=1')
+            # Commit before publishing status. On error both changes roll back.
+            db.commit()
+            with self.lock:
+                self.state.update(offset=offset, invalid_lines=0)
+                self.state.pop('last_received_at', None)
+            return deleted
+
     def run(self, stop):
         while not stop.is_set():
             count = self.poll()
@@ -155,6 +187,7 @@ class Reader:
 
 def create_app(database, reader):
     app = Flask(__name__, static_folder='static', static_url_path='/static')
+    delete_token = secrets.token_urlsafe(32)
 
     @app.after_request
     def headers(response):
@@ -166,6 +199,20 @@ def create_app(database, reader):
     @app.get('/')
     def index():
         return app.send_static_file('index.html')
+
+    @app.post('/api/messages/delete-all')
+    def delete_all():
+        # Browser callers must read this instance's token through same-origin JSON.
+        # No CORS is enabled; a cross-site form cannot supply this custom header.
+        if not secrets.compare_digest(request.headers.get('X-Dashboard-Token', ''), delete_token):
+            return jsonify(error='Reload the dashboard before deleting messages'), 403
+        if not request.is_json or request.get_json(silent=True) != {'confirm': True}:
+            return jsonify(error='Explicit confirmation required'), 400
+        try:
+            return jsonify(deleted=reader.delete_all())
+        except (OSError, sqlite3.Error):
+            app.logger.exception('Unable to clear dashboard history')
+            return jsonify(error='Could not clear history; please try again'), 500
 
     @app.get('/api/messages')
     def messages():
@@ -197,10 +244,12 @@ def create_app(database, reader):
             params.append(before)
         where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
         with connect(database) as db:
+            db.execute('BEGIN')
+            generation = db.execute('SELECT generation FROM dashboard_state WHERE id=1').fetchone()[0]
             rows = db.execute('SELECT id,raw FROM messages' + where + ' ORDER BY id DESC LIMIT ?',
                               (*params, limit + 1)).fetchall()
         page = rows[:limit]
-        return jsonify(messages=[{'id': r['id'], 'message': json.loads(r['raw'])} for r in page],
+        return jsonify(generation=generation, messages=[{'id': r['id'], 'message': json.loads(r['raw'])} for r in page],
                        next_before=page[-1]['id'] if len(rows) > limit else None)
 
     @app.get('/api/status')
@@ -209,7 +258,7 @@ def create_app(database, reader):
             count = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
             paths = [dict(r) for r in db.execute('SELECT protocol,transport,COUNT(*) AS count FROM messages GROUP BY protocol,transport')]
             frequencies = [r[0] for r in db.execute('SELECT DISTINCT freq FROM messages WHERE freq IS NOT NULL ORDER BY freq')]
-        return jsonify(reader=reader.status(), total=count, paths=paths, frequencies=frequencies)
+        return jsonify(delete_token=delete_token, reader=reader.status(), total=count, paths=paths, frequencies=frequencies)
 
     return app
 

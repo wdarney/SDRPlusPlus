@@ -40,6 +40,18 @@ autostart service, or packaged-app launcher in this change.
   ingestion continues. Older messages pauses live mode and pages backward. Resume
   returns to the newest window. Header counts cover the entire stored archive.
 
+## Clear history
+
+Use **Delete all messages** beside Pause live and confirm the dialog. This deletes
+all dashboard records, including records hidden by filters, and advances the reader
+to the current end of the JSONL file in the same transaction. A partial line already
+in progress is skipped through its newline. New messages continue to be stored.
+The source JSONL file is preserved; this does not delete SDR++ logs or its database.
+The operation cannot be undone in the dashboard. Replacing/replaying the source
+file later can import those records again. Other open dashboard tabs refresh when
+live polling resumes. The backend requires an instance token and explicit JSON
+confirmation; GET requests cannot delete data.
+
 ## Ingestion behavior and limits
 
 Whole records and the byte cursor commit in one SQLite WAL transaction. Restarting
