@@ -47,3 +47,8 @@ target_compile_definitions(lifecycle_tests PRIVATE VDL2_CONFIGURED_CHANNELS=${CO
 target_link_libraries(lifecycle_tests PRIVATE PkgConfig::VOLK)
 add_test(NAME vdl2_lifecycle COMMAND lifecycle_tests)
 set_tests_properties(vdl2_lifecycle PROPERTIES TIMEOUT 120)
+
+add_executable(dashboard_service_tests dashboard_service_tests.cpp)
+target_include_directories(dashboard_service_tests PRIVATE ../src)
+add_test(NAME vdl2_dashboard_service COMMAND dashboard_service_tests)
+set_tests_properties(vdl2_dashboard_service PROPERTIES TIMEOUT 30)

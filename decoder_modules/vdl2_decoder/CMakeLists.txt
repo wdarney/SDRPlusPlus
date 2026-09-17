@@ -25,3 +25,6 @@ else()
     find_library(SQLITE3_LIB sqlite3 REQUIRED)
     target_link_libraries(vdl2_decoder PRIVATE ${SQLITE3_LIB})
 endif ()
+
+# Development default; users can select a relocated dashboard and Python in UI.
+target_compile_definitions(vdl2_decoder PRIVATE VDL2_DASHBOARD_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/dashboard")

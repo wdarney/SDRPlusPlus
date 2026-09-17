@@ -10,6 +10,8 @@
 #include "vdl2_dsp.h"
 #include "aviation_jsonl.h"
 #include "channel_input.h"
+#include "dashboard_service.h"
+#include <filesystem>
 #include "acars_dsp.h"
 #include "adsb_dsp.h"
 
@@ -271,6 +273,11 @@ struct ChannelSlot {
 class VDL2DecoderModule : public ModuleManager::Instance {
 public:
     VDL2DecoderModule(std::string name) : name(name) {
+        dashboardScript = std::string(VDL2_DASHBOARD_SOURCE) + "/server.py";
+        auto installedDashboard = core::args["root"].s() + "/vdl2-dashboard/server.py";
+        if (std::filesystem::exists(installedDashboard)) dashboardScript = installedDashboard;
+        dashboardPython = (std::filesystem::path(dashboardScript).parent_path() / ".venv/bin/python").string();
+        dashboardLog = core::args["root"].s() + "/vdl2-dashboard.log";
         // Load config
         config.acquire();
         if (!config.conf.contains(name)) {
@@ -303,6 +310,10 @@ public:
         if (config.conf[name].contains("dbEnabled")) dbEnabled = config.conf[name]["dbEnabled"];
         if (config.conf[name].contains("dbPath")) dbPath = config.conf[name]["dbPath"].get<std::string>();
         if (config.conf[name].contains("dbRetentionDays")) dbRetentionDays = config.conf[name]["dbRetentionDays"];
+        if (config.conf[name].contains("dashboardPython")) dashboardPython = config.conf[name]["dashboardPython"].get<std::string>();
+        if (config.conf[name].contains("dashboardScript")) dashboardScript = config.conf[name]["dashboardScript"].get<std::string>();
+        if (config.conf[name].contains("dashboardPort")) dashboardPort = config.conf[name]["dashboardPort"];
+        dashboardPort = std::clamp(dashboardPort, 1024, 65535);
         config.release(false);
 
         // Set up message callback
@@ -355,6 +366,7 @@ public:
 
     ~VDL2DecoderModule() {
         stop(); // unconditional: also cleans up a partially started module
+        dashboard.stop();
         udpSender.closeSocket();
         gui::menu.removeEntry(name);
     }
@@ -529,6 +541,51 @@ private:
             if (ImGui::Button(CONCAT("Start All##startstop_", _this->name), ImVec2(menuWidth, 0)))
                 _this->start();
         }
+
+        _this->dashboard.poll();
+        ImGui::PushID(_this->name.c_str());
+        if (ImGui::CollapsingHeader(CONCAT("Web dashboard##dashboard_", _this->name))) {
+            bool active = _this->dashboard.active();
+            if (active) style::beginDisabled();
+            bool changed = false;
+            auto pathField = [&](const char* label, std::string& value) {
+                char buffer[4096];
+                snprintf(buffer, sizeof(buffer), "%s", value.c_str());
+                if (ImGui::InputText(label, buffer, sizeof(buffer))) { value = buffer; changed = true; }
+            };
+            pathField("Python executable", _this->dashboardPython);
+            pathField("Dashboard server.py", _this->dashboardScript);
+            if (ImGui::InputInt("Dashboard port", &_this->dashboardPort)) {
+                _this->dashboardPort = std::clamp(_this->dashboardPort, 1024, 65535);
+                changed = true;
+            }
+            if (active) style::endDisabled();
+            if (changed) {
+                config.acquire();
+                config.conf[_this->name]["dashboardPython"] = _this->dashboardPython;
+                config.conf[_this->name]["dashboardScript"] = _this->dashboardScript;
+                config.conf[_this->name]["dashboardPort"] = _this->dashboardPort;
+                config.release(true);
+            }
+            if (active) {
+                if (ImGui::Button("Stop dashboard")) _this->dashboard.stop();
+            } else if (ImGui::Button("Start dashboard")) {
+                std::lock_guard<std::mutex> lock(_this->fileMtx);
+                if (_this->dashboard.start(_this->dashboardPython,
+                        _this->dashboardScript, _this->filePath, _this->dashboardPort, _this->dashboardLog)) {
+                    _this->fileEnabled = true;
+                    config.acquire();
+                    config.conf[_this->name]["fileEnabled"] = true;
+                    config.release(true);
+                }
+            }
+            ImGui::TextWrapped("%s", _this->dashboard.status().c_str());
+            ImGui::Text("http://127.0.0.1:%d/", _this->dashboardPort);
+            ImGui::TextWrapped("Log: %s", _this->dashboardLog.c_str());
+            ImGui::TextWrapped("Requires Python with dashboard requirements installed. Start enables JSON File output. Restart dashboard after changing the JSONL path.");
+        }
+
+        ImGui::PopID();
 
         // ---- Output settings ----
         ImGui::Spacing();
@@ -784,6 +841,9 @@ private:
     bool udpEnabled = true;
     int udpPort = DEFAULT_UDP_PORT;
     UDPSender udpSender;
+    DashboardService dashboard;
+    std::string dashboardPython, dashboardScript, dashboardLog;
+    int dashboardPort = 5057;
     bool fileEnabled = false;
     std::string filePath = "/tmp/aviation_messages.jsonl";
     std::mutex fileMtx;

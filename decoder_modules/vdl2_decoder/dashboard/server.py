@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import secrets
+import sys
 import threading
 import time
 
@@ -268,13 +269,36 @@ def main():
     parser.add_argument('--source', default='/tmp/aviation_messages.jsonl')
     parser.add_argument('--database', default=str(Path.home() / '.sdrpp/aviation-dashboard.sqlite3'))
     parser.add_argument('--port', type=int, default=5050)
+    parser.add_argument('--managed', action='store_true',
+                        help='Stop when the launching module closes stdin')
     args = parser.parse_args()
     reader = Reader(args.source, args.database)
     stop = threading.Event()
     thread = threading.Thread(target=reader.run, args=(stop,), name='aviation-jsonl')
     thread.start()
     try:
-        create_app(args.database, reader).run(host='127.0.0.1', port=args.port, threaded=True, use_reloader=False)
+        app = create_app(args.database, reader)
+        if args.managed:
+            # Bind before announcing readiness; a port collision fails without
+            # touching the service already listening there.
+            from werkzeug.serving import make_server
+            server = make_server('127.0.0.1', args.port, app, threaded=True)
+            server.timeout = 0.25
+
+            def watch_parent():
+                while sys.stdin.buffer.read(1):
+                    pass
+                stop.set()
+
+            threading.Thread(target=watch_parent, daemon=True, name='dashboard-parent').start()
+            print(f'Dashboard ready at http://127.0.0.1:{args.port}/', flush=True)
+            try:
+                while not stop.is_set():
+                    server.handle_request()
+            finally:
+                server.server_close()
+        else:
+            app.run(host='127.0.0.1', port=args.port, threaded=True, use_reloader=False)
     finally:
         stop.set()
         thread.join()

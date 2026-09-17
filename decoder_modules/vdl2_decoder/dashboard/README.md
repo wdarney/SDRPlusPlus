@@ -86,3 +86,27 @@ rollback. Protocol-class fixtures here test consumption, not decoding accuracy;
 the parent module's C++ suite tests decoding and reassembly.
 
 See [THIRD_PARTY.md](THIRD_PARTY.md) for upstream revision and licensing.
+
+## Launch from the VDL2 module (macOS/Linux)
+
+Expand **Web dashboard** in the VDL2 module. Select the Python executable in
+this dashboard's virtual environment and this directory's `server.py`, then
+press **Start dashboard**. The default port is 5057; open the displayed URL in
+your browser. The module enables JSON File output and passes its current JSONL
+path to the server. Restart the dashboard after changing that path.
+
+Create the virtual environment and install `requirements.txt` once using the
+setup instructions above. The module does not install Python or packages.
+Paths and port are saved in the module configuration. Development builds default
+to the source dashboard directory; a relocated installation must select its own
+paths (or place the dashboard at `<SDR++ config root>/vdl2-dashboard/`). Python
+and dashboard assets are not bundled automatically.
+
+**Stop dashboard** stops only the process launched by this module. Radio
+Start/Stop leaves it available for browsing history; unloading the module or
+exiting SDR++ stops its child server. Closing the parent process also closes a
+private lifetime pipe so the server exits. Shutdown has a bounded fallback for
+an unresponsive child. Manually launched servers are never terminated: a port
+conflict is reported in `<SDR++ config root>/vdl2-dashboard.log`. The UI reports
+process state; the log confirms HTTP readiness and includes Python errors.
+Windows users can continue launching `server.py` manually.
