@@ -1,5 +1,29 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Simple Scanner Interface (2026-09-17)
+
+Branch: `wd/iphone-simple-mode`, based on the tested binary-audio/client branch.
+The saved Simple/Advanced switch changes layout only; it never starts/stops a
+radio or changes Channel Bank's operating mode. Simple is the initial default.
+Advanced retains the existing controls. Simple contains source selection/power,
+collapsed source controls and connection details, current playback/center,
+Channel Bank start/stop, modulation, SNR threshold/overview, Record, audio monitor,
+activity history with playback lock and block/unblock, and the blocked list.
+
+Frequency Range uses existing center and bandwidth commands. It is a fixed live
+span, NOT a new scan-range endpoint. From/To are MHz; width must be 50-100% of
+the current source sample rate (the existing server's bandwidth limits).
+Changes are disabled while Channel Bank runs or in scan/bookmark-scan mode.
+Bandwidth is acknowledged before center tuning; either failure is shown, and
+the live span remains visible because the two server operations are not atomic.
+Text edits are not overwritten by telemetry; the refresh icon loads live bounds.
+Editing arbitrary server scan start/end ranges requires a separate server
+contract, which was not changed in this iOS-only task.
+
+All 42 Swift tests pass, including range conversion, limit endpoints, reversed,
+empty, nonfinite and unsupported bounds. Device interaction remains to be tested.
+No Mac/Android source changes or builds are needed for this layout.
+
 ## Blocked SNR Display (2026-09-14)
 
 The iPhone SNR chart now combines blocked history frequencies with telemetry

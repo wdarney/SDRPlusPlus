@@ -202,6 +202,14 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         }
     }
 
+    public func applyTuningRange(_ range: ScannerTuningRange) async throws {
+        let settings = try await client.setChannelBankSettings(["bwUsage": JSONValue(.number(range.bandwidthUsage))])
+        acceptCommandStateResponse(settings)
+        let tuned = try await client.setCenterHz(range.centerHz)
+        acceptCommandStateResponse(tuned)
+        lastError = nil
+    }
+
     public func setSource(_ name: String) {
         updateLatestState { $0.selectedSource = name }
         Task { await apply { try await self.client.setSource(name) } }

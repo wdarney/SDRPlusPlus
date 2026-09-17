@@ -14,6 +14,10 @@ public final class ChannelBankViewModel: ObservableObject {
     @Published public var manualOffsetHzText = "0"
     @Published public var recordingSessionText = ""
     @Published public var pendingBlockPoint: WaterfallPoint?
+    @Published public var rangeLowMHzText = ""
+    @Published public var rangeHighMHzText = ""
+    @Published public private(set) var rangeApplying = false
+    @Published public private(set) var rangeError: String?
     @Published public private(set) var waterfall = ActivityWaterfallStore()
 
     public let ble: BLECentralManager
@@ -32,6 +36,7 @@ public final class ChannelBankViewModel: ObservableObject {
     public func acceptStateUpdate() {
         guard let state = ble.latestState else { return }
         waterfall.append(state: state)
+        if rangeLowMHzText.isEmpty && rangeHighMHzText.isEmpty { loadCurrentRange() }
         let centerHz = state.centerHz ?? state.waterfallCenterHz ?? 0
         if centerHz > 0 {
             if centerMHzText.isEmpty || (Double(centerMHzText) ?? 0) <= 0 {
@@ -55,6 +60,37 @@ public final class ChannelBankViewModel: ObservableObject {
     public func tuneCenter() {
         guard let mhz = Double(centerMHzText), mhz > 0 else { return }
         ble.tuneCenter(hz: mhz * 1_000_000)
+    }
+
+    public func loadCurrentRange() {
+        guard let state = ble.latestState, let span = SpanInfo(state: state) else { return }
+        rangeLowMHzText = String(format: "%.6f", span.lowHz / 1_000_000)
+        rangeHighMHzText = String(format: "%.6f", span.highHz / 1_000_000)
+        rangeError = nil
+    }
+
+    public func applySimpleRange() {
+        guard !rangeApplying else { return }
+        guard let state = ble.latestState, state.running != true,
+              state.mode != "scan", state.mode != "bookmark_scan" else {
+            rangeError = "Stop Channel Bank and select Auto or Manual before tuning a fixed range."
+            return
+        }
+        do {
+            let range = try ScannerTuningRange(lowMHz: rangeLowMHzText, highMHz: rangeHighMHzText, sampleRate: state.sampleRate)
+            rangeError = nil
+            rangeApplying = true
+            Task {
+                defer { rangeApplying = false }
+                do {
+                    try await ble.applyTuningRange(range)
+                } catch {
+                    rangeError = error.localizedDescription
+                }
+            }
+        } catch {
+            rangeError = error.localizedDescription
+        }
     }
 
     public func beginCenterTune() {
