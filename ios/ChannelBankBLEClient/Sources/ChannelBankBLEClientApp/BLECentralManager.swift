@@ -210,6 +210,34 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         lastError = nil
     }
 
+    public func applyScannerBand(lowMHz: String, highMHz: String, airband: Bool, start: Bool) async throws -> ScannerBandPlan {
+        var summary = try await client.getStateSummary()
+        acceptStateSummary(summary)
+        guard summary.running == false else { throw ScannerBandPlan.PlanError.alreadyRunning }
+        let settings = try await client.getChannelBankSettings()
+        // Validate before starting the source or changing configuration.
+        var plan = try ScannerBandPlan(lowMHz: lowMHz, highMHz: highMHz,
+            sampleRate: summary.sampleRate, settings: settings, airband: airband)
+        if start && summary.radioPlaying != true {
+            acceptCommandStateResponse(try await client.setRadioRunning(true))
+            summary = try await client.getStateSummary()
+            acceptStateSummary(summary)
+            guard summary.radioPlaying == true else { throw ScannerBandPlan.PlanError.missingBandwidth }
+            plan = try ScannerBandPlan(lowMHz: lowMHz, highMHz: highMHz,
+                sampleRate: summary.sampleRate, settings: settings, airband: airband)
+        }
+        try Task.checkCancellation()
+        acceptCommandStateResponse(try await client.setChannelBankSettings(plan.settingsBody))
+        try Task.checkCancellation()
+        acceptCommandStateResponse(try await client.setCenterHz(plan.centerHz))
+        if start {
+            try Task.checkCancellation()
+            acceptCommandStateResponse(try await client.setChannelBankRunning(true))
+        }
+        lastError = nil
+        return plan
+    }
+
     public func setSource(_ name: String) {
         updateLatestState { $0.selectedSource = name }
         Task { await apply { try await self.client.setSource(name) } }

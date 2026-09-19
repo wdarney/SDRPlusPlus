@@ -1,5 +1,37 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Airband Preset And Scan Ranges (2026-09-19)
+
+The iPhone now consumes server feature `843e60e8` / integration merge `6e7572e2`:
+`settings.supportsScanRanges` and `settings.scanRanges[{start,stop}]` (Hz).
+Simple mode includes Custom / Airband (US). Airband selects 118-137 MHz coverage,
+AM, and spacing preset 2 (25 kHz). Selecting the preset edits the draft only;
+Play fetches fresh Summary/settings, validates, starts the source if needed,
+rechecks its sample rate, applies settings, tunes, and starts Channel Bank in
+acknowledged order. A failed request aborts the sequence and shows an error.
+Channel Bank must be stopped before configuring; recording, blocking, SNR and
+bandwidth preferences are not written by the preset.
+
+Planning uses reported sampleRate * settings.bwUsage. A fitting range selects
+Auto and its midpoint. Otherwise Scan uses the submitted range; position count
+and initial center match the existing server's evenly divided scan windows.
+The server owns all subsequent retunes. More than 4,096 positions is rejected.
+Scan requests require supportsScanRanges:true; old servers can still use Auto
+when the band fits. A missing/invalid sample rate or bandwidth produces an error
+rather than guessing; the user may need to power on/configure the source first.
+
+The range checkmark also supports custom scan ranges now, replacing the earlier
+fixed-span-only restriction. Custom preserves modulation and spacing. Play with
+Custom selected starts the existing configuration; apply custom edits first.
+Auto leaves stored scan ranges intact. A wide SDR may cover frequencies outside
+the preset: this uses the existing engine and does not add an RF bandpass filter.
+
+47 Swift tests pass, covering scan/Auto selection, exact-fit boundaries, initial
+center, capability handling, limits, preserved settings and schema compatibility.
+No server source, Mac build or Android build was changed here. Physical iPhone
+testing requires a running Mac build containing the server extension; a pushed
+server commit alone does not update the installed Mac app.
+
 ## Simple Scanner Interface (2026-09-17)
 
 Branch: `wd/iphone-simple-mode`, based on the tested binary-audio/client branch.

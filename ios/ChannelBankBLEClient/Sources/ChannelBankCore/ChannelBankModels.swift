@@ -593,6 +593,8 @@ public struct SNRTelemetryFrame: Equatable {
 }
 
 public struct ChannelBankSettings: Codable, Equatable {
+    public var supportsScanRanges: Bool?
+    public var scanRanges: [ChannelBankScanRange]?
     public var mode: String?
     public var spacingId: Int?
     public var demodMode: String?
@@ -632,6 +634,16 @@ public struct ChannelBankSettings: Codable, Equatable {
         self.scanNoSignalSec = scanNoSignalSec
         self.transcriptionBackend = transcriptionBackend
         self.transcriptionBackendName = transcriptionBackendName
+    }
+}
+
+public struct ChannelBankScanRange: Codable, Equatable {
+    public var start: Double
+    public var stop: Double
+
+    public init(start: Double, stop: Double) {
+        self.start = start
+        self.stop = stop
     }
 }
 

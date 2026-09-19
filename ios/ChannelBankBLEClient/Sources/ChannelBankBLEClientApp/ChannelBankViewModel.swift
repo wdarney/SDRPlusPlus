@@ -16,6 +16,8 @@ public final class ChannelBankViewModel: ObservableObject {
     @Published public var pendingBlockPoint: WaterfallPoint?
     @Published public var rangeLowMHzText = ""
     @Published public var rangeHighMHzText = ""
+    @Published public private(set) var selectedBand = "custom"
+    @Published public private(set) var bandStatus: String?
     @Published public private(set) var rangeApplying = false
     @Published public private(set) var rangeError: String?
     @Published public private(set) var waterfall = ActivityWaterfallStore()
@@ -67,29 +69,44 @@ public final class ChannelBankViewModel: ObservableObject {
         rangeLowMHzText = String(format: "%.6f", span.lowHz / 1_000_000)
         rangeHighMHzText = String(format: "%.6f", span.highHz / 1_000_000)
         rangeError = nil
+        selectedBand = "custom"
+        bandStatus = nil
     }
 
-    public func applySimpleRange() {
+    public func selectBand(_ band: String) {
+        selectedBand = band
+        bandStatus = nil
+        rangeError = nil
+        if band == "airbandUS" {
+            rangeLowMHzText = "118.000"
+            rangeHighMHzText = "137.000"
+        }
+    }
+
+    public func startSimpleScanner() {
+        if selectedBand == "airbandUS" { applySimpleRange(start: true) }
+        else { ble.setChannelBankRunning(true) }
+    }
+
+    public func applySimpleRange(start: Bool = false) {
         guard !rangeApplying else { return }
-        guard let state = ble.latestState, state.running != true,
-              state.mode != "scan", state.mode != "bookmark_scan" else {
-            rangeError = "Stop Channel Bank and select Auto or Manual before tuning a fixed range."
+        guard let state = ble.latestState, state.running != true else {
+            rangeError = "Stop Channel Bank before applying a band or range."
             return
         }
-        do {
-            let range = try ScannerTuningRange(lowMHz: rangeLowMHzText, highMHz: rangeHighMHzText, sampleRate: state.sampleRate)
-            rangeError = nil
-            rangeApplying = true
-            Task {
-                defer { rangeApplying = false }
-                do {
-                    try await ble.applyTuningRange(range)
-                } catch {
-                    rangeError = error.localizedDescription
-                }
+        let low = rangeLowMHzText, high = rangeHighMHzText
+        let airband = selectedBand == "airbandUS"
+        rangeError = nil
+        bandStatus = nil
+        rangeApplying = true
+        Task {
+            defer { rangeApplying = false }
+            do {
+                let plan = try await ble.applyScannerBand(lowMHz: low, highMHz: high, airband: airband, start: start)
+                bandStatus = plan.mode == "scan" ? "Scan - \(plan.stopCount) tuning positions" : "Auto - single tuning position"
+            } catch {
+                rangeError = error.localizedDescription
             }
-        } catch {
-            rangeError = error.localizedDescription
         }
     }
 

@@ -22,6 +22,7 @@ public struct ChannelBankRootView: View {
                         Text("Advanced").tag(false)
                     }
                     .pickerStyle(.segmented)
+                    .disabled(model.rangeApplying)
                     if simpleInterface && connected {
                         DisclosureGroup(isExpanded: $connectionExpanded) {
                             connectionPanel
@@ -38,6 +39,7 @@ public struct ChannelBankRootView: View {
                     if let state = model.ble.latestState {
                         if simpleInterface {
                             simpleContent(state)
+                                .disabled(model.rangeApplying)
                         } else {
                         radioPanel(state)
                         sourcePanel(state)
@@ -98,6 +100,7 @@ public struct ChannelBankRootView: View {
         simpleRange(state)
         activityHistoryPanel(state)
         blockedFrequenciesPanel(state)
+            .disabled(model.rangeApplying)
     }
 
     private func simpleSource(_ state: ChannelBankState) -> some View {
@@ -138,6 +141,12 @@ public struct ChannelBankRootView: View {
 
     private func simpleScanner(_ state: ChannelBankState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
+            Picker("Band", selection: Binding(get: { model.selectedBand }, set: { model.selectBand($0) })) {
+                Text("Custom").tag("custom")
+                Text("Airband (US)").tag("airbandUS")
+            }
+            .pickerStyle(.menu)
+            .disabled(state.running == true || model.rangeApplying)
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(state.playback?.active == true ? (state.playback?.name ?? "Playback") : "Channel Bank")
@@ -148,19 +157,20 @@ public struct ChannelBankRootView: View {
                 }
                 Spacer()
                 Button {
-                    model.ble.setChannelBankRunning(state.running != true)
+                    if state.running == true { model.ble.setChannelBankRunning(false) }
+                    else { model.startSimpleScanner() }
                 } label: {
                     Image(systemName: state.running == true ? "stop.fill" : "play.fill")
                         .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(state.running == true ? .red : .green)
-                .disabled(!connected || (state.running != true && state.radioPlaying != true) || model.rangeApplying)
+                .disabled(!connected || (state.running != true && state.radioPlaying != true && model.selectedBand != "airbandUS") || model.rangeApplying)
                 .accessibilityLabel(state.running == true ? "Stop Channel Bank" : "Start Channel Bank")
                 .help(state.running == true ? "Stop Channel Bank" : "Start Channel Bank")
             }
             HStack {
-                Text(state.running == true ? "Listening" : "Stopped")
+                Text(state.running == true ? (state.mode == "scan" ? "Scanning" : "Monitoring") : "Stopped")
                 Spacer()
                 Text(state.mode ?? "-")
                 Text("\(state.activeChannelCount ?? state.activeChannels?.count ?? 0) active")
@@ -217,7 +227,7 @@ public struct ChannelBankRootView: View {
                 Text("\(ChannelBankFormatters.mhz(span.lowHz)) - \(ChannelBankFormatters.mhz(span.highHz))")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
-            if state.running == true || state.mode == "scan" || state.mode == "bookmark_scan" {
+            if state.running == true {
                 Label("Range locked", systemImage: "lock.fill")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -229,8 +239,16 @@ public struct ChannelBankRootView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .accessibilityLabel("Apply frequency range").help("Apply frequency range")
-                .disabled(state.running == true || state.mode == "scan" || state.mode == "bookmark_scan" || model.rangeApplying || !connected)
+                .disabled(state.running == true || model.rangeApplying || !connected)
             }
+            .disabled(state.running == true || model.rangeApplying)
+            .onChange(of: model.rangeLowMHzText) { value in
+                if model.selectedBand == "airbandUS", Double(value) != 118 { model.selectBand("custom") }
+            }
+            .onChange(of: model.rangeHighMHzText) { value in
+                if model.selectedBand == "airbandUS", Double(value) != 137 { model.selectBand("custom") }
+            }
+            if let status = model.bandStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
             if let error = model.rangeError { Text(error).font(.caption).foregroundStyle(.red) }
             if model.rangeApplying { ProgressView().frame(maxWidth: .infinity, alignment: .leading) }
             Divider()
