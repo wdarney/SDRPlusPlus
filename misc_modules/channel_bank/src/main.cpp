@@ -272,6 +272,9 @@ public:
 private:
     struct PlaybackEntry;
     struct WebClientThread;
+    struct ScanRange { double startHz, stopHz; };
+    static constexpr size_t MAX_SCAN_RANGES = 64;
+    static constexpr size_t MAX_SCAN_STOPS = 4096;
 
 public:
 
@@ -564,6 +567,14 @@ public:
 
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
+        if (scanMode) {
+            size_t stopCount = 0;
+            if (!scanStopCount(scanRanges, lastKnownSr, bwUsage, stopCount)) {
+                flog::error("[ChannelBank] Cannot start Scan: ranges are invalid for the current {0:.0f} Hz source sample rate",
+                            lastKnownSr);
+                return;
+            }
+        }
         fftBufPos = 0;
         specSamplesUntilFFT = 0;    // trigger first spectrum analysis immediately
         avgPower.clear();           // reset spectrum averaging on start
@@ -1347,7 +1358,12 @@ private:
     }
 
     json channelBankSettingsJson() {
+        json ranges = json::array();
+        for (const auto& range : scanRanges) {
+            ranges.push_back({{"start", range.startHz}, {"stop", range.stopHz}});
+        }
         return {
+            {"supportsScanRanges", true},
             {"mode", detectionModeName()},
             {"spacingId", spacingId},
             {"channelSpacingHz", channelSpacing},
@@ -1363,6 +1379,7 @@ private:
             {"tailMs", tailMs},
             {"scanQuietSec", scanQuietSec},
             {"scanNoSignalSec", scanNoSignalSec},
+            {"scanRanges", ranges},
             {"transcriptionBackend", transcriptionBackend},
             {"transcriptionBackendName", transcriptionBackendName()}
         };
@@ -1429,49 +1446,25 @@ private:
             error = "settings payload must be an object";
             return false;
         }
-        bool structural = body.contains("mode") || body.contains("spacingId") || body.contains("demodMode");
+        bool structural = body.contains("mode") || body.contains("spacingId") ||
+                          body.contains("demodMode") || body.contains("scanRanges");
         if (running && structural) {
-            error = "stop Channel Bank before changing mode, spacing, or demod";
+            error = "stop Channel Bank before changing mode, spacing, demod, or scan ranges";
             return false;
         }
 
+        std::string nextMode = detectionModeName();
         if (body.contains("mode")) {
             if (!body["mode"].is_string()) {
                 error = "mode must be a string";
                 return false;
             }
-            std::string mode = body["mode"].get<std::string>();
-            if (mode == "auto") {
-                if (manualMode || bookmarkScanMode) restoreWaterfallVisibility();
-                manualMode = false;
-                scanMode = false;
-                bookmarkScanMode = false;
-            }
-            else if (mode == "manual") {
-                manualMode = true;
-                scanMode = false;
-                bookmarkScanMode = false;
-                if (!boundBookmarkLists.empty()) applyWaterfallVisibility();
-            }
-            else if (mode == "scan") {
-                if (manualMode || bookmarkScanMode) restoreWaterfallVisibility();
-                manualMode = false;
-                scanMode = true;
-                bookmarkScanMode = false;
-            }
-            else if (mode == "bookmark_scan") {
-                if (manualMode) restoreWaterfallVisibility();
-                manualMode = false;
-                scanMode = false;
-                bookmarkScanMode = true;
-                if (!boundBookmarkLists.empty()) applyWaterfallVisibility();
-            }
-            else {
+            nextMode = body["mode"].get<std::string>();
+            if (nextMode != "auto" && nextMode != "manual" && nextMode != "scan" &&
+                nextMode != "bookmark_scan") {
                 error = "invalid Channel Bank mode";
                 return false;
             }
-            saveManualConfig();
-            saveScanConfig();
         }
 
         if (body.contains("spacingId") && !body["spacingId"].is_number_integer()) {
@@ -1531,75 +1524,144 @@ private:
             return false;
         }
 
+        auto finiteNumber = [&](const char* key, const char* message) {
+            if (!body.contains(key)) return true;
+            double value = body[key].get<double>();
+            if (std::isfinite(value)) return true;
+            error = message;
+            return false;
+        };
+        if (!finiteNumber("snrThresholdDb", "snr threshold must be finite") ||
+            !finiteNumber("bwUsage", "frequency span must be finite") ||
+            !finiteNumber("scanQuietSec", "scan quiet must be finite") ||
+            !finiteNumber("scanNoSignalSec", "no-signal skip must be finite")) {
+            return false;
+        }
+
+        int nextDemodMode = demodMode;
+        if (body.contains("demodMode")) {
+            nextDemodMode = demodModeFromName(body["demodMode"].get<std::string>());
+            if (nextDemodMode < 0) {
+                error = "invalid demod mode";
+                return false;
+            }
+        }
+        float nextBwUsage = body.contains("bwUsage")
+            ? std::clamp(body["bwUsage"].get<float>(), 0.5f, 1.0f) : bwUsage;
+        auto clampedInteger = [&](const char* key, int current, int minimum, int maximum) {
+            if (!body.contains(key)) return current;
+            const double value = body[key].get<double>();
+            return (int)std::clamp(value, (double)minimum, (double)maximum);
+        };
+        const int nextSpacingId = clampedInteger("spacingId", spacingId, 0, 5);
+        const float nextSnrThreshold = body.contains("snrThresholdDb")
+            ? std::clamp(body["snrThresholdDb"].get<float>(), 1.0f, 30.0f) : snrThreshold;
+        const bool nextManualLocalSnrEnabled = body.value("manualLocalSnrEnabled", manualLocalSnrEnabled);
+        const bool nextManualStormGuardEnabled = body.value("manualStormGuardEnabled", manualStormGuardEnabled);
+        const int nextMaxChannels = clampedInteger("maxChannels", maxChannels, 1, MAX_CHANNELS_HARD_LIMIT);
+        const bool nextRecordingEnabled = body.value("recordingEnabled", recordingEnabled);
+        const int nextMinTransmissionMs = clampedInteger("minTransmissionMs", minTransmissionMs, 0, 10000);
+        const int nextSignalHoldMs = clampedInteger("signalHoldMs", signalHoldMs, 0, 5000);
+        const int nextTailMs = clampedInteger("tailMs", tailMs, 100, 2000);
+        const float nextScanQuietSec = body.contains("scanQuietSec")
+            ? std::clamp(body["scanQuietSec"].get<float>(), 1.0f, 30.0f) : scanQuietSec;
+        const float nextScanNoSignalSec = body.contains("scanNoSignalSec")
+            ? std::clamp(body["scanNoSignalSec"].get<float>(), 0.1f, 5.0f) : scanNoSignalSec;
+        int nextTranscriptionBackend = clampedInteger(
+            "transcriptionBackend", transcriptionBackend, (int)TB_OFF, (int)TB_WHISPER_TURBO);
+#ifndef __APPLE__
+        if (nextTranscriptionBackend == TB_APPLE_SPEECH) nextTranscriptionBackend = TB_OFF;
+#endif
+        std::vector<ScanRange> nextScanRanges = scanRanges;
+        if (body.contains("scanRanges") &&
+            !validateApiScanRanges(body["scanRanges"], nextBwUsage, nextScanRanges, error)) {
+            return false;
+        }
+
+        // All fields have now been validated. From here onward the update is a
+        // single in-memory/config commit with no validation failure exits.
+        if (body.contains("mode")) {
+            if ((nextMode == "auto" || nextMode == "scan") &&
+                (manualMode || bookmarkScanMode)) restoreWaterfallVisibility();
+            if (nextMode == "bookmark_scan" && manualMode) restoreWaterfallVisibility();
+            manualMode = nextMode == "manual";
+            scanMode = nextMode == "scan";
+            bookmarkScanMode = nextMode == "bookmark_scan";
+            if ((manualMode || bookmarkScanMode) && !boundBookmarkLists.empty())
+                applyWaterfallVisibility();
+        }
+        if (body.contains("scanRanges")) scanRanges = std::move(nextScanRanges);
+
         bool transcriptionTurnedOff = false;
         config.acquire();
         if (body.contains("spacingId")) {
-            spacingId = std::clamp(body["spacingId"].get<int>(), 0, 5);
+            spacingId = nextSpacingId;
             channelSpacing = SPACINGS[spacingId];
             config.conf[name]["spacingId"] = spacingId;
         }
         if (body.contains("demodMode")) {
-            int next = demodModeFromName(body["demodMode"].get<std::string>());
-            if (next < 0) {
-                config.release();
-                error = "invalid demod mode";
-                return false;
-            }
-            demodMode = next;
+            demodMode = nextDemodMode;
             config.conf[name]["demodMode"] = demodMode;
         }
         if (body.contains("snrThresholdDb")) {
-            snrThreshold = std::clamp(body["snrThresholdDb"].get<float>(), 1.0f, 30.0f);
+            snrThreshold = nextSnrThreshold;
             config.conf[name]["snrThreshold"] = snrThreshold;
         }
         if (body.contains("manualLocalSnrEnabled")) {
-            manualLocalSnrEnabled = body["manualLocalSnrEnabled"].get<bool>();
+            manualLocalSnrEnabled = nextManualLocalSnrEnabled;
             config.conf[name]["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
         }
         if (body.contains("manualStormGuardEnabled")) {
-            manualStormGuardEnabled = body["manualStormGuardEnabled"].get<bool>();
+            manualStormGuardEnabled = nextManualStormGuardEnabled;
             config.conf[name]["manualStormGuardEnabled"] = manualStormGuardEnabled;
         }
         if (body.contains("maxChannels")) {
-            maxChannels = std::clamp(body["maxChannels"].get<int>(), 1, MAX_CHANNELS_HARD_LIMIT);
+            maxChannels = nextMaxChannels;
             config.conf[name]["maxChannels"] = maxChannels;
         }
         if (body.contains("bwUsage")) {
-            bwUsage = std::clamp(body["bwUsage"].get<float>(), 0.5f, 1.0f);
+            bwUsage = nextBwUsage;
             config.conf[name]["bwUsage"] = bwUsage;
         }
         if (body.contains("recordingEnabled")) {
-            recordingEnabled = body["recordingEnabled"].get<bool>();
+            recordingEnabled = nextRecordingEnabled;
             config.conf[name]["recordingEnabled"] = recordingEnabled;
         }
         if (body.contains("minTransmissionMs")) {
-            minTransmissionMs = std::clamp(body["minTransmissionMs"].get<int>(), 0, 10000);
+            minTransmissionMs = nextMinTransmissionMs;
             config.conf[name]["minTransmissionMs"] = minTransmissionMs;
         }
         if (body.contains("signalHoldMs")) {
-            signalHoldMs = std::clamp(body["signalHoldMs"].get<int>(), 0, 5000);
+            signalHoldMs = nextSignalHoldMs;
             config.conf[name]["signalHoldMs"] = signalHoldMs;
         }
         if (body.contains("tailMs")) {
-            tailMs = std::clamp(body["tailMs"].get<int>(), 100, 2000);
+            tailMs = nextTailMs;
             config.conf[name]["tailMs"] = tailMs;
         }
         if (body.contains("scanQuietSec")) {
-            scanQuietSec = std::clamp(body["scanQuietSec"].get<float>(), 1.0f, 30.0f);
+            scanQuietSec = nextScanQuietSec;
             config.conf[name]["scanQuietSec"] = scanQuietSec;
         }
         if (body.contains("scanNoSignalSec")) {
-            scanNoSignalSec = std::clamp(body["scanNoSignalSec"].get<float>(), 0.1f, 5.0f);
+            scanNoSignalSec = nextScanNoSignalSec;
             config.conf[name]["scanNoSignalSec"] = scanNoSignalSec;
         }
         if (body.contains("transcriptionBackend")) {
-            int next = std::clamp(body["transcriptionBackend"].get<int>(), (int)TB_OFF, (int)TB_WHISPER_TURBO);
-#ifndef __APPLE__
-            if (next == TB_APPLE_SPEECH) next = TB_OFF;
-#endif
-            transcriptionTurnedOff = transcriptionOn() && next == TB_OFF;
-            transcriptionBackend = next;
+            transcriptionTurnedOff = transcriptionOn() && nextTranscriptionBackend == TB_OFF;
+            transcriptionBackend = nextTranscriptionBackend;
             config.conf[name]["transcriptionBackend"] = transcriptionBackend;
+        }
+        if (body.contains("mode")) {
+            config.conf[name]["manualMode"] = manualMode;
+            config.conf[name]["scanMode"] = scanMode;
+            config.conf[name]["bookmarkScanMode"] = bookmarkScanMode;
+        }
+        if (body.contains("scanRanges")) {
+            auto& ranges = config.conf[name]["scanRanges"];
+            ranges = json::array();
+            for (const auto& range : scanRanges)
+                ranges.push_back({{"start", range.startHz}, {"stop", range.stopHz}});
         }
         config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
         config.conf[name]["activeProfile"] = activeProfileName;
@@ -10041,9 +10103,87 @@ self.addEventListener("fetch", event => {
 
     // ── Scan mode helpers ────────────────────────────────────────────────────
 
+    bool scanStopCount(const std::vector<ScanRange>& ranges, double sampleRate,
+                       float usableFraction, size_t& count) const {
+        count = 0;
+        if (ranges.empty()) return true;
+        if (!std::isfinite(sampleRate) || sampleRate <= 0.0 ||
+            !std::isfinite(usableFraction) || usableFraction <= 0.0f) return false;
+        const double step = sampleRate * usableFraction;
+        for (const auto& range : ranges) {
+            if (!std::isfinite(range.startHz) || !std::isfinite(range.stopHz) ||
+                range.startHz <= 0.0 || range.stopHz <= range.startHz) return false;
+            const double required = std::ceil((range.stopHz - range.startHz) / step);
+            if (!std::isfinite(required) || required > (double)MAX_SCAN_STOPS) return false;
+            count += (size_t)std::max(1.0, required);
+            if (count > MAX_SCAN_STOPS) return false;
+        }
+        return true;
+    }
+
+    bool validateApiScanRanges(const json& value, float usableFraction,
+                               std::vector<ScanRange>& validated,
+                               std::string& error) const {
+        if (!value.is_array()) {
+            error = "scanRanges must be an array";
+            return false;
+        }
+        if (value.size() > MAX_SCAN_RANGES) {
+            error = "too many scan ranges";
+            return false;
+        }
+
+        std::vector<ScanRange> next;
+        next.reserve(value.size());
+        for (const auto& item : value) {
+            if (!item.is_object()) {
+                error = "each scan range must be an object";
+                return false;
+            }
+            if (!item.contains("start") || !item["start"].is_number() ||
+                !item.contains("stop") || !item["stop"].is_number()) {
+                error = "each scan range requires numeric start and stop";
+                return false;
+            }
+            const double startHz = item["start"].get<double>();
+            const double stopHz = item["stop"].get<double>();
+            if (!std::isfinite(startHz) || !std::isfinite(stopHz) ||
+                startHz <= 0.0 || stopHz <= 0.0) {
+                error = "scan range frequencies must be finite and positive";
+                return false;
+            }
+            if (startHz >= stopHz) {
+                error = "scan range start must be below stop";
+                return false;
+            }
+            next.push_back({startHz, stopHz});
+        }
+
+        if (!next.empty()) {
+            double sampleRate = sigpath::iqFrontEnd.getSampleRate();
+            if (!std::isfinite(sampleRate) || sampleRate <= 0.0) sampleRate = lastKnownSr;
+            size_t stopCount = 0;
+            if (!scanStopCount(next, sampleRate, usableFraction, stopCount)) {
+                error = (!std::isfinite(sampleRate) || sampleRate <= 0.0)
+                    ? "source sample rate is unavailable"
+                    : "scan ranges generate too many scan stops";
+                return false;
+            }
+        }
+        validated = std::move(next);
+        return true;
+    }
+
     void computeScanStops() {
         scanStops.clear();
         if (lastKnownSr <= 0.0) return;
+        size_t stopCount = 0;
+        if (!scanStopCount(scanRanges, lastKnownSr, bwUsage, stopCount)) {
+            flog::error("[ChannelBank] Scan ranges are invalid or exceed the {0}-stop limit",
+                        (int)MAX_SCAN_STOPS);
+            return;
+        }
+        scanStops.reserve(stopCount);
         double step = lastKnownSr * bwUsage;
         for (auto& r : scanRanges) {
             if (r.stopHz <= r.startHz) continue;
@@ -10681,7 +10821,6 @@ self.addEventListener("fetch", event => {
     float        rnVoiceGateQuarantineSec = 60.0f;
 
     // Scan mode
-    struct ScanRange { double startHz, stopHz; };
     bool scanMode = false;
     std::vector<ScanRange> scanRanges;
     float scanQuietSec    = 3.0f;
