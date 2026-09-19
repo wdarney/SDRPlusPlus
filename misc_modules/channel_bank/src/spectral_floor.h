@@ -8,6 +8,44 @@
 
 namespace channel_bank_detector {
 
+// Slide the existing energy window through an Auto slot rather than inspecting
+// only its center. A sharper FFT must not leave narrow signals in the gaps
+// between fixed windows. Prefix sums keep the full-slot search linear in the
+// number of spectrum bins, without introducing a carrier/peak classifier.
+class AutoEnergyWindows {
+public:
+    explicit AutoEnergyWindows(const std::vector<float>& power) : prefix_(power.size() + 1, 0.0) {
+        for (std::size_t i = 0; i < power.size(); ++i)
+            prefix_[i + 1] = prefix_[i] + power[i];
+    }
+
+    float mean(int center, int halfWidth) const {
+        if (prefix_.size() < 2) return 0.0f;
+        const int last = static_cast<int>(prefix_.size()) - 2;
+        center = std::clamp(center, 0, last);
+        halfWidth = std::max(0, halfWidth);
+        const int lo = std::max(0, center - halfWidth);
+        const int hi = std::min(last, center + halfWidth);
+        return static_cast<float>((prefix_[hi + 1] - prefix_[lo]) / (hi - lo + 1));
+    }
+
+    int strongestCenter(int nominalCenter, int halfSlot, int halfWidth) const {
+        if (prefix_.size() < 2) return 0;
+        const int last = static_cast<int>(prefix_.size()) - 2;
+        int best = std::clamp(nominalCenter, 0, last);
+        float bestMean = mean(best, halfWidth);
+        for (int center = std::max(0, nominalCenter - halfSlot);
+             center <= std::min(last, nominalCenter + halfSlot); ++center) {
+            float candidate = mean(center, halfWidth);
+            if (candidate > bestMean) { best = center; bestMean = candidate; }
+        }
+        return best;
+    }
+
+private:
+    std::vector<double> prefix_;
+};
+
 // Bound CPU/memory use while retaining ~250 Hz bins through 64 MS/s.
 inline int fftSizeForRate(double sampleRate) {
     int size = 8192;

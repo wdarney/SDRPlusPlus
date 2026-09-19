@@ -1388,6 +1388,20 @@ private:
             std::lock_guard<std::mutex> lk(liveAudioMtx);
             liveQueued = liveAudioQueuedSamples;
         }
+        json detector;
+        {
+            std::lock_guard<std::mutex> lk(displayMtx);
+            const auto& snap = displaySnap;
+            const auto ageMs = snap.detectorFrames == 0 ? int64_t(-1) :
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - snap.detectorUpdatedAt).count();
+            detector = {
+                {"frames", snap.detectorFrames},
+                {"ageMs", ageMs},
+                {"binHz", snap.detectorBinHz},
+                {"widebandEvent", snap.detectorWidebandEvent}
+            };
+        }
         return {
             {"rssBytes", processResidentBytes()},
             {"cpuPercent", processCpuPercent()},
@@ -1398,7 +1412,8 @@ private:
             {"transcriptionJobs", transcriptionCount},
             {"pendingEncodes", pendingEncodeCount},
             {"liveAudioClients", liveAudioClients.load()},
-            {"liveAudioQueuedSamples", liveQueued}
+            {"liveAudioQueuedSamples", liveQueued},
+            {"detector", detector}
         };
     }
 
@@ -5254,6 +5269,9 @@ self.addEventListener("fetch", event => {
 
     // Called under displayMtx. Limit the floor trace to display resolution.
     void snapshotNoiseFloor() {
+        ++displaySnap.detectorFrames;
+        displaySnap.detectorUpdatedAt = std::chrono::steady_clock::now();
+        displaySnap.detectorWidebandEvent = widebandEvent;
         displaySnap.noiseFloorDb.clear();
         displaySnap.detectorBinHz = lastKnownSr / fftSize;
         if (!manualLocalSnrEnabled) return;
@@ -5480,12 +5498,26 @@ self.addEventListener("fetch", event => {
         std::vector<float> slotMeans(numSlots);
         std::vector<float> instSlotMeans(numSlots);
         std::vector<float> slotNoiseFloors(numSlots);
+        std::vector<float> gridMeans(numSlots);
+        std::vector<float> instGridMeans(numSlots);
+        std::vector<float> gridNoiseFloors(numSlots);
+        const channel_bank_detector::AutoEnergyWindows energyWindows(power);
+        const channel_bank_detector::AutoEnergyWindows instantWindows(instPower);
+        const int halfSlotBins = std::max(1, (int)std::ceil(channelSpacing * 0.5 / binHz));
         std::vector<float> slotFlatness(numSlots, 1.0f);  // spectral flatness per slot: ~1 flat/noise, ~0 peaky/carrier
         std::vector<float> slotCentroidHz(numSlots, 0.0f);// carrier centroid relative to slot center (Hz) — for drift gate
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
             double slotOffset = ((double)s - (double)(numSlots - 1) / 2.0) * channelSpacing;
             int centerBin = (int)std::round((slotOffset / lastKnownSr) * fftSize) + fftSize / 2;
+            // Keep the original fixed-window statistics for floor calibration
+            // and broadband occupancy, so searching does not bias their noise
+            // reference upward. Only Auto/Scan signal measurement moves.
+            gridMeans[s] = energyWindows.mean(centerBin, halfBins);
+            instGridMeans[s] = instantWindows.mean(centerBin, halfBins);
+            gridNoiseFloors[s] = spectralFloor.mean(centerBin - halfBins, centerBin + halfBins);
+            if (!manualMode && !bookmarkScanMode)
+                centerBin = energyWindows.strongestCenter(centerBin, halfSlotBins, halfBins);
             int lo = std::clamp(centerBin - halfBins, 0, fftSize - 1);
             int hi = std::clamp(centerBin + halfBins, 0, fftSize - 1);
             // Single pass over bins: accumulate mean, instantaneous mean, log-sum
@@ -5546,9 +5578,9 @@ self.addEventListener("fetch", event => {
                     if (manualPassbandMask[b]) centerMeans.push_back(power[b]);
             } else {
                 for (int s = leftSkip; s < numSlots - rightSkip; s++)
-                    centerMeans.push_back(slotMeans[s]);
+                    centerMeans.push_back(gridMeans[s]);
             }
-            if (centerMeans.empty()) centerMeans = {slotMeans[numSlots / 2]};
+            if (centerMeans.empty()) centerMeans = {gridMeans[numSlots / 2]};
             std::sort(centerMeans.begin(), centerMeans.end());
             float floorPct = manualPassbandMask.empty() ? 0.20f : 0.25f;
             float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * floorPct) - 1)];
@@ -5575,8 +5607,10 @@ self.addEventListener("fetch", event => {
             }
             displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
         }
-        if (!manualLocalSnrEnabled)
+        if (!manualLocalSnrEnabled) {
             std::fill(slotNoiseFloors.begin(), slotNoiseFloors.end(), globalNoiseFloor);
+            std::fill(gridNoiseFloors.begin(), gridNoiseFloors.end(), globalNoiseFloor);
+        }
 
         // Wideband noise event detection — lightning, power-line QRM, solar events, etc.
         //
@@ -5611,7 +5645,7 @@ self.addEventListener("fetch", event => {
                 widebandEvent = (wbCenter > 0 && wbAbove > wbCenter * 4 / 5);  // >80% of allowed passbands
             } else {
                 for (int s = wbLeftEdge; s < numSlots - wbRightEdge; s++)
-                    if (instSlotMeans[s] > slotNoiseFloors[s] * snrLinear) wbAbove++;
+                    if (instGridMeans[s] > gridNoiseFloors[s] * snrLinear) wbAbove++;
                 widebandEvent = (wbAbove > wbCenter * 2 / 5);  // >40%
             }
         }
@@ -11125,6 +11159,9 @@ self.addEventListener("fetch", event => {
         std::vector<float>  power;          // per-bin dB  (fftSize)
         std::vector<float>  noiseFloorDb;   // 512-point continuous floor trace
         double              detectorBinHz = 0.0;
+        uint64_t            detectorFrames = 0;
+        std::chrono::steady_clock::time_point detectorUpdatedAt{};
+        bool                detectorWidebandEvent = false;
         float               threshDb = -120.0f; // global threshold line in dB
         std::vector<int>    slotCenterBin;  // pixel-mapping helper (auto mode)
         std::set<int>       detected;

@@ -27,6 +27,32 @@ use that reference. The existing vote counts, hold hysteresis, miss limits,
 AM/SSB interference gates, audio hold/tail, and recording logic are retained.
 There is no new AM carrier classifier or additional signal trigger.
 
+### Auto window coverage correction
+
+The initial version retained fixed Auto windows centered on a grid relative
+to the receiver center. At 8.333 kHz spacing each window covered only about
+6.67 kHz, leaving gaps. Increasing FFT resolution reduced spectral leakage
+into those windows and made narrow carriers in the gaps easier to miss, with
+either noise-floor mode selected.
+
+For the reported 133.500 MHz transmission, the running receiver center was
+133.374816641 MHz at 2.4 MS/s. The nearest detector center was
+133.503978141 MHz, approximately 3.978 kHz away, outside its roughly 3.369 kHz
+half-window. The adjacent detector window also excluded that carrier.
+Read-only status snapshots confirmed that detector measurements were updating.
+This establishes a window-coverage defect, not RF validation of its correction.
+
+Auto and range scanning now slide the same energy window through each entire
+grid cell, selecting the strongest averaged-energy window. Instantaneous power,
+SNR, spectral statistics, and frequency centroid use that selected window.
+Fixed-window statistics remain the reference for the shared-floor estimator
+and wideband guard, avoiding search bias in those background measurements.
+The energy threshold, votes, hysteresis, and recording rules are unchanged.
+The correction does not add the previously deferred AM carrier classifier.
+
+`/api/state` diagnostics now include `detector.frames`, `ageMs`, `binHz`, and
+`widebandEvent` to distinguish stale analysis from live threshold/guard rejection.
+
 The existing wideband-event test uses the corresponding local floor in adaptive
 mode; its occupancy thresholds are unchanged. Manual storm detection retains
 its existing shoulder estimator and decisions separately from the new curve.
