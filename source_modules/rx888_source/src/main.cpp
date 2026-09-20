@@ -205,16 +205,30 @@ private:
         // Detect which settings keys this driver version supports without
         // replacing the saved gain values.
         auto settingInfo = dev->getSettingInfo();
+        biasTeeHFKey.clear();
+        biasTeeVHFKey.clear();
+        ditheringKey.clear();
+        randomizationKey.clear();
+        pgaKey.clear();
         supportsNewBiasTee = false;
         supportsAdcFreq    = false;
         supportsBiasTee    = false;
         supportsDithering  = false;
+        supportsRandomization = false;
+        supportsPga = false;
         for (const auto& s : settingInfo) {
-            if (s.key == "UpdBiasT_HF" || s.key == "UpdBiasT_VHF") supportsNewBiasTee = true;
+            if (s.key == "SetBiasT_HF" || s.key == "UpdBiasT_HF") biasTeeHFKey = s.key;
+            if (s.key == "SetBiasT_VHF" || s.key == "UpdBiasT_VHF") biasTeeVHFKey = s.key;
             if (s.key == "adc_frequency") supportsAdcFreq = true;
             if (s.key == "biastee")       supportsBiasTee = true;
-            if (s.key == "dithering")     supportsDithering = true;
+            if (s.key == "SetDither" || s.key == "dithering") ditheringKey = s.key;
+            if (s.key == "SetRand" || s.key == "randomization") randomizationKey = s.key;
+            if (s.key == "SetPGA" || s.key == "pga") pgaKey = s.key;
         }
+        supportsNewBiasTee = !biasTeeHFKey.empty() || !biasTeeVHFKey.empty();
+        supportsDithering = !ditheringKey.empty();
+        supportsRandomization = !randomizationKey.empty();
+        supportsPga = !pgaKey.empty();
     }
 
     void setDefaultCapabilities() {
@@ -231,10 +245,17 @@ private:
             uiGains.push_back((float)def);
         }
 
+        biasTeeHFKey    = "SetBiasT_HF";
+        biasTeeVHFKey   = "SetBiasT_VHF";
+        ditheringKey    = "SetDither";
+        randomizationKey = "SetRand";
+        pgaKey          = "SetPGA";
         supportsNewBiasTee = true;
         supportsAdcFreq    = true;
         supportsBiasTee    = false;
-        supportsDithering  = false;
+        supportsDithering  = true;
+        supportsRandomization = true;
+        supportsPga = true;
         refreshDefaultSampleRates();
     }
 
@@ -514,6 +535,14 @@ private:
             if (savedDevice.contains("biasTeeHF"))  biasTeeHF  = savedDevice["biasTeeHF"].get<bool>();
             if (savedDevice.contains("biasTeeVHF")) biasTeeVHF = savedDevice["biasTeeVHF"].get<bool>();
             if (savedDevice.contains("dithering"))  dithering  = savedDevice["dithering"].get<bool>();
+            // Older profiles coupled digital randomization to the Dithering
+            // checkbox. Preserve that behavior until the user chooses a
+            // separate value with the new control.
+            if (savedDevice.contains("randomization"))
+                randomization = savedDevice["randomization"].get<bool>();
+            else if (savedDevice.contains("dithering"))
+                randomization = savedDevice["dithering"].get<bool>();
+            if (savedDevice.contains("pga")) pga = savedDevice["pga"].get<bool>();
         }
         config.release();
 
@@ -541,6 +570,8 @@ private:
             biasTeeHF  = false;
             biasTeeVHF = false;
             dithering  = true;
+            randomization = true;
+            pga = false;
             if (!sampleRates.empty()) selectSampleRate(sampleRates[0]);
         }
 
@@ -573,6 +604,8 @@ private:
         c["biasTeeHF"]  = biasTeeHF;
         c["biasTeeVHF"] = biasTeeVHF;
         c["dithering"]  = dithering;
+        c["randomization"] = randomization;
+        c["pga"] = pga;
         for (int i = 0; i < (int)gainList.size(); i++)
             c["gains"][gainList[i]] = uiGains[i];
         config.acquire();
@@ -665,7 +698,13 @@ private:
             {"biasTeeLiveMutable", true},
             {"supportsDithering", supportsDithering},
             {"dithering", dithering},
-            {"ditheringLiveMutable", true}
+            {"ditheringLiveMutable", true},
+            {"supportsRandomization", supportsRandomization},
+            {"randomization", randomization},
+            {"randomizationLiveMutable", true},
+            {"supportsPga", supportsPga},
+            {"pga", pga},
+            {"pgaLiveMutable", true}
         });
     }
 
@@ -757,20 +796,25 @@ private:
 
         if (req.contains("biasTeeHF")) {
             biasTeeHF = req["biasTeeHF"].get<bool>();
-            if (supportsNewBiasTee) applySetting("UpdBiasT_HF", biasTeeHF ? "true" : "false");
+            if (!biasTeeHFKey.empty()) applySetting(biasTeeHFKey, biasTeeHF ? "true" : "false");
             else if (supportsBiasTee && mode == "HF") applySetting("biastee", biasTeeHF ? "true" : "false");
         }
         if (req.contains("biasTeeVHF")) {
             biasTeeVHF = req["biasTeeVHF"].get<bool>();
-            if (supportsNewBiasTee) applySetting("UpdBiasT_VHF", biasTeeVHF ? "true" : "false");
+            if (!biasTeeVHFKey.empty()) applySetting(biasTeeVHFKey, biasTeeVHF ? "true" : "false");
             else if (supportsBiasTee && mode == "VHF") applySetting("biastee", biasTeeVHF ? "true" : "false");
         }
         if (req.contains("dithering")) {
             dithering = req["dithering"].get<bool>();
-            if (supportsDithering) {
-                applySetting("dithering", dithering ? "true" : "false");
-                applySetting("randomization", dithering ? "true" : "false");
-            }
+            if (!ditheringKey.empty()) applySetting(ditheringKey, dithering ? "true" : "false");
+        }
+        if (req.contains("randomization")) {
+            randomization = req["randomization"].get<bool>();
+            if (!randomizationKey.empty()) applySetting(randomizationKey, randomization ? "true" : "false");
+        }
+        if (req.contains("pga")) {
+            pga = req["pga"].get<bool>();
+            if (!pgaKey.empty()) applySetting(pgaKey, pga ? "true" : "false");
         }
 
         saveConfig();
@@ -916,19 +960,22 @@ private:
 
             // Bias tees (driver version–aware)
             if (_this->supportsNewBiasTee) {
-                _this->applySetting("UpdBiasT_HF",  _this->biasTeeHF  ? "true" : "false");
-                _this->applySetting("UpdBiasT_VHF", _this->biasTeeVHF ? "true" : "false");
+                if (!_this->biasTeeHFKey.empty())
+                    _this->applySetting(_this->biasTeeHFKey, _this->biasTeeHF ? "true" : "false");
+                if (!_this->biasTeeVHFKey.empty())
+                    _this->applySetting(_this->biasTeeVHFKey, _this->biasTeeVHF ? "true" : "false");
             }
             else if (_this->supportsBiasTee) {
                 bool biasOn = (_this->mode == "HF") ? _this->biasTeeHF : _this->biasTeeVHF;
                 _this->applySetting("biastee", biasOn ? "true" : "false");
             }
 
-            // Dithering / randomization (old driver)
-            if (_this->supportsDithering) {
-                _this->applySetting("dithering",     _this->dithering ? "true" : "false");
-                _this->applySetting("randomization", _this->dithering ? "true" : "false");
-            }
+            if (!_this->ditheringKey.empty())
+                _this->applySetting(_this->ditheringKey, _this->dithering ? "true" : "false");
+            if (!_this->randomizationKey.empty())
+                _this->applySetting(_this->randomizationKey, _this->randomization ? "true" : "false");
+            if (!_this->pgaKey.empty())
+                _this->applySetting(_this->pgaKey, _this->pga ? "true" : "false");
 
             _this->devStream = _this->dev->setupStream(SOAPY_SDR_RX, "CF32");
             _this->dev->activateStream(_this->devStream);
@@ -1182,16 +1229,17 @@ private:
 
         // Bias Tee — new driver has independent HF/VHF controls
         if (_this->supportsNewBiasTee) {
-            if (_this->hasHF) {
+            if (_this->hasHF && !_this->biasTeeHFKey.empty()) {
                 if (SmGui::Checkbox(CONCAT("HF Bias Tee##rx888_bt_hf_", _this->name), &_this->biasTeeHF)) {
-                    _this->applySetting("UpdBiasT_HF", _this->biasTeeHF ? "true" : "false");
+                    _this->applySetting(_this->biasTeeHFKey, _this->biasTeeHF ? "true" : "false");
                     _this->saveConfig();
                 }
             }
-            if (_this->hasHF && _this->hasVHF) SmGui::SameLine();
-            if (_this->hasVHF) {
+            if (_this->hasHF && !_this->biasTeeHFKey.empty() &&
+                _this->hasVHF && !_this->biasTeeVHFKey.empty()) SmGui::SameLine();
+            if (_this->hasVHF && !_this->biasTeeVHFKey.empty()) {
                 if (SmGui::Checkbox(CONCAT("VHF Bias Tee##rx888_bt_vhf_", _this->name), &_this->biasTeeVHF)) {
-                    _this->applySetting("UpdBiasT_VHF", _this->biasTeeVHF ? "true" : "false");
+                    _this->applySetting(_this->biasTeeVHFKey, _this->biasTeeVHF ? "true" : "false");
                     _this->saveConfig();
                 }
             }
@@ -1205,11 +1253,21 @@ private:
             }
         }
 
-        // Dithering (old driver only)
         if (_this->supportsDithering) {
-            if (SmGui::Checkbox(CONCAT("Dithering##rx888_dith_", _this->name), &_this->dithering)) {
-                _this->applySetting("dithering",     _this->dithering ? "true" : "false");
-                _this->applySetting("randomization", _this->dithering ? "true" : "false");
+            if (SmGui::Checkbox(CONCAT("ADC Dither##rx888_dith_", _this->name), &_this->dithering)) {
+                _this->applySetting(_this->ditheringKey, _this->dithering ? "true" : "false");
+                _this->saveConfig();
+            }
+        }
+        if (_this->supportsRandomization) {
+            if (SmGui::Checkbox(CONCAT("ADC Randomization##rx888_rand_", _this->name), &_this->randomization)) {
+                _this->applySetting(_this->randomizationKey, _this->randomization ? "true" : "false");
+                _this->saveConfig();
+            }
+        }
+        if (_this->supportsPga) {
+            if (SmGui::Checkbox(CONCAT("ADC PGA##rx888_pga_", _this->name), &_this->pga)) {
+                _this->applySetting(_this->pgaKey, _this->pga ? "true" : "false");
                 _this->saveConfig();
             }
         }
@@ -1259,6 +1317,13 @@ private:
     bool supportsAdcFreq    = false;
     bool supportsBiasTee    = false;
     bool supportsDithering  = false;
+    bool supportsRandomization = false;
+    bool supportsPga = false;
+    std::string biasTeeHFKey;
+    std::string biasTeeVHFKey;
+    std::string ditheringKey;
+    std::string randomizationKey;
+    std::string pgaKey;
 
     // Settings
     std::string mode      = "HF";
@@ -1268,6 +1333,8 @@ private:
     bool   biasTeeHF      = false;
     bool   biasTeeVHF     = false;
     bool   dithering      = true;
+    bool   randomization  = true;
+    bool   pga            = false;
 
     // Sample rates
     std::vector<double> sampleRates;
