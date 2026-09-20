@@ -28,6 +28,7 @@
 #include <core.h>
 #include <utils/wav.h>
 #include <fftw3.h>
+#include "spectral_floor.h"
 #ifndef CB_NO_RNNOISE
 #include <rnnoise.h>
 #endif
@@ -345,7 +346,7 @@ public:
     static constexpr double SPACINGS[] = {
         8333.0, 12500.0, 25000.0, 50000.0, 100000.0, 200000.0
     };
-    static constexpr int FFT_SIZE    = 8192;
+    int fftSize = 8192; // DSP-owned while running; chosen from the source rate
     static constexpr int    SPAWN_VOTES      = 3;    // FFT frames above threshold before spawning
     static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
     static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
@@ -542,27 +543,7 @@ public:
         // Populate cached freqs from all bound lists
         rebuildBoundFreqs();
 
-        // Allocate FFTW buffers
-        fftIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
-        fftOut = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
-        fftPlan = fftwf_plan_dft_1d(FFT_SIZE, fftIn, fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
-
-        // Precompute 4-term Blackman-Harris window.
-        // Sidelobes: -92 dB vs Hann's -31.5 dB.  For a 40 dB strong signal,
-        // Hann sidelobes sit at 8.5 dB above noise (above any detection threshold);
-        // Blackman-Harris sidelobes sit at -52 dB — completely invisible.
-        // This prevents strong SELCAL / HFDL carriers from leaking into adjacent
-        // bookmark detection windows and showing wide spikes in the mini-spectrum.
-        hannWindow.resize(FFT_SIZE);
-        for (int i = 0; i < FFT_SIZE; i++) {
-            float phi = 2.0f * M_PI * i / (float)(FFT_SIZE - 1);
-            hannWindow[i] = 0.35875f
-                          - 0.48829f * cosf(phi)
-                          + 0.14128f * cosf(2.0f * phi)
-                          - 0.01168f * cosf(3.0f * phi);
-        }
-        fftAccum.resize(FFT_SIZE);
-        fftBufPos = 0;
+        configureDetectorFFT(0.0);
 
         retuneHandler.ctx     = this;
         retuneHandler.handler = retuneHandlerFunc;
@@ -592,7 +573,8 @@ public:
         // Calling shutdown() here gives whisper.cpp a clean teardown window.
         transcription_whisper::shutdown();
 #endif
-        fftwf_destroy_plan(fftPlan);
+        std::lock_guard<std::mutex> fftLock(detectorPlannerMutex());
+        if (fftPlan) fftwf_destroy_plan(fftPlan);
         fftwf_free(fftIn);
         fftwf_free(fftOut);
     }
@@ -654,8 +636,9 @@ public:
                 return;
             }
         }
-        fftBufPos = 0;
-        specSamplesUntilFFT = 0;    // trigger first spectrum analysis immediately
+        if (!configureDetectorFFT(lastKnownSr)) return;
+        frameCollector.reset();
+        spectralFloor.reset();
         avgPower.clear();           // reset spectrum averaging on start
         instPower.clear();
         rawSlotMisses.clear();
@@ -686,6 +669,7 @@ public:
             bookmarkScanStopIdx   = 0;
             bookmarkScanHadSignal = false;
             lastSignalTime        = std::chrono::steady_clock::now();
+            publishBookmarkDetectorStop();
             if (!bookmarkScanStops.empty()) {
                 gui::waterfall.setCenterFrequency(bookmarkScanStops[0].centerHz);
                 gui::waterfall.centerFreqMoved = true;
@@ -1404,6 +1388,20 @@ private:
             std::lock_guard<std::mutex> lk(liveAudioMtx);
             liveQueued = liveAudioQueuedSamples;
         }
+        json detector;
+        {
+            std::lock_guard<std::mutex> lk(displayMtx);
+            const auto& snap = displaySnap;
+            const auto ageMs = snap.detectorFrames == 0 ? int64_t(-1) :
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - snap.detectorUpdatedAt).count();
+            detector = {
+                {"frames", snap.detectorFrames},
+                {"ageMs", ageMs},
+                {"binHz", snap.detectorBinHz},
+                {"widebandEvent", snap.detectorWidebandEvent}
+            };
+        }
         return {
             {"rssBytes", processResidentBytes()},
             {"cpuPercent", processCpuPercent()},
@@ -1414,7 +1412,8 @@ private:
             {"transcriptionJobs", transcriptionCount},
             {"pendingEncodes", pendingEncodeCount},
             {"liveAudioClients", liveAudioClients.load()},
-            {"liveAudioQueuedSamples", liveQueued}
+            {"liveAudioQueuedSamples", liveQueued},
+            {"detector", detector}
         };
     }
 
@@ -2073,14 +2072,15 @@ private:
                 std::set<int> localRawDetected;
                 std::map<int, float> localSnr;
                 std::map<int, float> localThresholds;
+                std::vector<double> localFreqs;
                 {
                     std::lock_guard<std::mutex> lk(manualDetectedMtx);
                     localDetected = manualDetected;
                     localRawDetected = rawManualDetected;
                     localSnr = manualSnrDb;
                     localThresholds = manualThresholdDb;
+                    localFreqs = manualDetectedFreqs;
                 }
-                std::vector<double> localFreqs = getActiveManualFreqs();
                 for (auto& [idx, snrDb] : localSnr) {
                     if (idx < 0 || idx >= (int)localFreqs.size()) continue;
                     double freqHz = localFreqs[idx];
@@ -2379,7 +2379,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
 <label class="control"><span class="label">Transcribe</span><select id="cbTranscribe"><option value="0">Off</option><option value="1">Apple Speech</option><option value="2">Whisper ATC Large</option><option value="3">Whisper ATC Medium</option><option value="4">Whisper Turbo</option></select></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
-<label class="control"><span class="label">Local SNR floors</span><button class="secondary" id="cbLocalSnrToggle" type="button">-</button></label>
+<label class="control"><span class="label">Adaptive noise floor</span><button class="secondary" id="cbLocalSnrToggle" type="button">-</button></label>
 <label class="control"><span class="label">Storm guard</span><button class="secondary" id="cbStormGuardToggle" type="button">-</button></label>
 </div>
 </section>
@@ -3721,7 +3721,7 @@ async function refresh(force = false) {
     recToggle.className = currentRecordingEnabled ? "primary" : "danger";
     currentLocalSnrEnabled = settings.manualLocalSnrEnabled !== false;
     const localSnrToggle = document.getElementById("cbLocalSnrToggle");
-    localSnrToggle.textContent = currentLocalSnrEnabled ? "On - per frequency" : "Off - shared floor";
+    localSnrToggle.textContent = currentLocalSnrEnabled ? "On - across spectrum" : "Off - shared floor";
     localSnrToggle.className = currentLocalSnrEnabled ? "primary" : "danger";
     currentStormGuardEnabled = settings.manualStormGuardEnabled !== false;
     const stormToggle = document.getElementById("cbStormGuardToggle");
@@ -5267,45 +5267,84 @@ self.addEventListener("fetch", event => {
 
     // ── Spectrum analysis ────────────────────────────────────────────────────
 
-    static void spectrumHandler(dsp::complex_t* data, int count, void* ctx) {
-        ChannelBankModule* _this = (ChannelBankModule*)ctx;
-
-        // Rate-limit spectrum analysis to SPEC_ANALYSIS_HZ regardless of sample rate.
-        // At 64 MHz SR the naive approach (FFT every 8192 samples) runs ~7,800 FFTs/sec,
-        // saturates a CPU core, and creates backpressure on the DSP Splitter chain that
-        // starves the waterfall's own FFT thread — causing visual choppiness.
-        // Returning early here still lets the Handler sink flush the buffer immediately,
-        // so the Splitter never blocks.
-        _this->specSamplesUntilFFT -= count;
-        if (_this->specSamplesUntilFFT > 0) return;
-
-        double sr = _this->lastKnownSr;
-        _this->specSamplesUntilFFT = (sr > 0.0)
-            ? (int64_t)(sr / SPEC_ANALYSIS_HZ)
-            : (int64_t)(FFT_SIZE);
-
-        // Fill fftAccum from this block; zero-pad if the block is smaller than FFT_SIZE
-        // (only possible at very low sample rates — typical HF/SDR blocks are much larger).
-        int fill = std::min(count, FFT_SIZE);
-        std::copy(data, data + fill, _this->fftAccum.data());
-        if (fill < FFT_SIZE) {
-            std::fill(_this->fftAccum.begin() + fill, _this->fftAccum.end(),
-                      dsp::complex_t{0.0f, 0.0f});
+    // Called under displayMtx. Limit the floor trace to display resolution.
+    void snapshotNoiseFloor() {
+        ++displaySnap.detectorFrames;
+        displaySnap.detectorUpdatedAt = std::chrono::steady_clock::now();
+        displaySnap.detectorWidebandEvent = widebandEvent;
+        displaySnap.noiseFloorDb.clear();
+        displaySnap.detectorBinHz = lastKnownSr / fftSize;
+        if (!manualLocalSnrEnabled) return;
+        const auto& curve = spectralFloor.curve();
+        if (curve.empty()) return;
+        constexpr int points = 512;
+        displaySnap.noiseFloorDb.reserve(points);
+        for (int i = 0; i < points; ++i) {
+            size_t b = (curve.size() - 1) * i / (points - 1);
+            displaySnap.noiseFloorDb.push_back(10.0f * log10f(curve[b]));
         }
-        _this->fftBufPos = 0;
-        _this->analyzeSpectrum();
     }
 
-    void analyzeSpectrum() {
+    static std::mutex& detectorPlannerMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    bool configureDetectorFFT(double rate) {
+        int size = channel_bank_detector::fftSizeForRate(rate);
+        if (fftPlan && size == fftSize) return true;
+        std::lock_guard<std::mutex> lock(detectorPlannerMutex());
+        auto* in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * size);
+        auto* out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * size);
+        fftwf_plan plan = (in && out)
+            ? fftwf_plan_dft_1d(size, in, out, FFTW_FORWARD, FFTW_ESTIMATE) : nullptr;
+        if (!plan) {
+            fftwf_free(in);
+            fftwf_free(out);
+            flog::error("[ChannelBank] Could not allocate detector FFT ({0} bins)", size);
+            return false;
+        }
+        if (fftPlan) fftwf_destroy_plan(fftPlan);
+        fftwf_free(fftIn);
+        fftwf_free(fftOut);
+        fftIn = in; fftOut = out; fftPlan = plan; fftSize = size;
+        fftAccum.resize(size);
+        fftWindowFill = 0;
+        frameCollector.reset();
+        spectralFloor.reset();
+        avgPower.clear();
+        instPower.clear();
+        flog::info("[ChannelBank] Detector FFT: {0} bins, {1:.1f} Hz/bin", size, rate / size);
+        return true;
+    }
+
+    static void spectrumHandler(dsp::complex_t* data, int count, void* ctx) {
+        ChannelBankModule* _this = (ChannelBankModule*)ctx;
+        // Consume a deferred retune before collecting; discard the source block
+        // straddling it so a transform cannot mix different tuning/rate epochs.
+        if (_this->retuneFlag.load()) { _this->analyzeSpectrum(true); return; }
+        if (!_this->fftPlan || !(_this->lastKnownSr > 0.0) || count <= 0) return;
+        _this->frameCollector.feed(data, count, _this->fftAccum.data(), _this->fftSize,
+            _this->lastKnownSr, [_this](int fill) {
+                _this->fftRealSamples = fill;
+                // A retune arriving mid-buffer is handled on the next callback.
+                if (!_this->retuneFlag.load()) _this->analyzeSpectrum();
+            });
+    }
+
+    void analyzeSpectrum(bool consumeRetune = false) {
+        if (retuneFlag.load() && !consumeRetune) return;
         // Refresh center frequency every frame — free (single double load) and ensures
         // PPM changes or other mid-session corrections are picked up without a full retune.
         lastKnownCenter = gui::waterfall.getCenterFrequency();
 
         // Check for deferred retune — safely reset DSP-owned state on the DSP thread
-        if (retuneFlag.load()) {
+        if (consumeRetune) {
             lastKnownSr     = pendingRetuneSr;
             lastKnownCenter = pendingRetuneCenter;
-            fftBufPos        = 0;
+            if (!configureDetectorFFT(lastKnownSr)) return;
+            frameCollector.reset();
+            spectralFloor.reset();
             avgPower.clear();
             instPower.clear();
             rawSlotMisses.clear();
@@ -5321,6 +5360,7 @@ self.addEventListener("fetch", event => {
         }
 
         if (detectorFloorResetRequested.exchange(false)) {
+            spectralFloor.reset();
             globalNoiseFloor  = 0.0f;
             displayNoiseFloor = 0.0f;
             floorHistory.clear();
@@ -5352,31 +5392,29 @@ self.addEventListener("fetch", event => {
         }
 
         // Determine how many real samples are in fftAccum this frame.
-        // At low sample rates (< FFT_SIZE * SPEC_ANALYSIS_HZ ≈ 164 kHz) the DSP block
-        // is shorter than FFT_SIZE, so the remainder was zero-padded in the DSP callback.
-        // Applying the full FFT_SIZE BH window to this truncated data leaves it at ~0.14
+        // At low sample rates (< fftSize * SPEC_ANALYSIS_HZ ≈ 164 kHz) the DSP block
+        // is shorter than fftSize, so the remainder was zero-padded in the DSP callback.
+        // Applying the full fftSize BH window to this truncated data leaves it at ~0.14
         // at the cut point — far from zero — which reintroduces sidelobes almost as bad
         // as Hann.  The fix: build a BH window sized to the actual fill, zero-padded to
-        // FFT_SIZE, and cache it so we only recompute on sample-rate changes.
-        int fill = (lastKnownSr > 0.0)
-            ? std::min((int)(lastKnownSr / SPEC_ANALYSIS_HZ), FFT_SIZE)
-            : FFT_SIZE;
+        // fftSize, and cache it so we only recompute on sample-rate changes.
+        int fill = fftRealSamples;
         if (fill != fftWindowFill) {
-            fftWindow.resize(FFT_SIZE, 0.0f);
+            fftWindow.resize(fftSize, 0.0f);
             int n = fill > 1 ? fill : 1;
             for (int i = 0; i < fill; i++) {
-                float phi = 2.0f * M_PI * i / (float)(n - 1);
+                float phi = n > 1 ? 2.0f * M_PI * i / (float)(n - 1) : 0.0f;
                 fftWindow[i] = 0.35875f
                              - 0.48829f * cosf(phi)
                              + 0.14128f * cosf(2.0f * phi)
                              - 0.01168f * cosf(3.0f * phi);
             }
-            for (int i = fill; i < FFT_SIZE; i++) fftWindow[i] = 0.0f;
+            for (int i = fill; i < fftSize; i++) fftWindow[i] = 0.0f;
             fftWindowFill = fill;
         }
 
         // Apply window and copy to FFTW input
-        for (int i = 0; i < FFT_SIZE; i++) {
+        for (int i = 0; i < fftSize; i++) {
             fftIn[i][0] = fftAccum[i].re * fftWindow[i];
             fftIn[i][1] = fftAccum[i].im * fftWindow[i];
         }
@@ -5384,7 +5422,7 @@ self.addEventListener("fetch", event => {
         fftwf_execute(fftPlan);
 
         // Compute linear power per bin (FFT-shifted, normalised)
-        float scale = 1.0f / (float)(FFT_SIZE * FFT_SIZE);
+        float scale = 1.0f / ((float)fftSize * (float)fftSize);
 
         // Two power arrays:
         //   avgPower  (alpha=0.15) — slow EMA: voting/spawning/NMS/noise floor
@@ -5400,11 +5438,11 @@ self.addEventListener("fetch", event => {
         constexpr float alpha = 0.15f;
         bool firstFrame = avgPower.empty();
         if (firstFrame) {
-            avgPower.resize(FFT_SIZE);
-            instPower.resize(FFT_SIZE);
+            avgPower.resize(fftSize);
+            instPower.resize(fftSize);
         }
-        for (int i = 0; i < FFT_SIZE; i++) {
-            int k = (i + FFT_SIZE / 2) % FFT_SIZE;
+        for (int i = 0; i < fftSize; i++) {
+            int k = (i + fftSize / 2) % fftSize;
             float re = fftOut[k][0], im = fftOut[k][1];
             float inst = (re * re + im * im) * scale;
             avgPower[i]  = firstFrame ? inst : (alpha * inst + (1.0f - alpha) * avgPower[i]);
@@ -5413,14 +5451,15 @@ self.addEventListener("fetch", event => {
         // Slow EMA for all detection/voting; instantaneous for raw fade trigger
         std::vector<float>& power = avgPower;
 
-        double binHz  = lastKnownSr / FFT_SIZE;
+        double binHz  = lastKnownSr / fftSize;
+        if (manualLocalSnrEnabled) spectralFloor.update(instPower, binHz);
         std::vector<double> manualPassbandFreqs;
-        if (manualMode && manualPassbandLimit && !manualLocalSnrEnabled)
-            manualPassbandFreqs = getActiveManualFreqs();
+        if ((manualMode || bookmarkScanMode) && manualPassbandLimit && !manualLocalSnrEnabled)
+            manualPassbandFreqs = getDetectorManualFreqs();
 
         std::vector<uint8_t> manualPassbandMask;
         if (!manualPassbandFreqs.empty()) {
-            manualPassbandMask.assign(FFT_SIZE, 0);
+            manualPassbandMask.assign(fftSize, 0);
             for (double f : manualPassbandFreqs) {
                 int pbLo = 0, pbHi = -1;
                 if (!manualPassbandBinsForFreq(f, binHz, pbLo, pbHi)) continue;
@@ -5431,7 +5470,7 @@ self.addEventListener("fetch", event => {
         // numSlots covers the FULL bandwidth so we can detect signals anywhere.
         // bwUsage only controls which slots contribute to the noise floor estimate
         // (avoids filter rolloff edges inflating it).
-        int numSlots  = (int)std::floor(lastKnownSr / channelSpacing);
+        int numSlots  = std::max(1, (int)std::floor(lastKnownSr / channelSpacing));
         // Detection window: fixed ~8 kHz bandwidth (matching AM signal width)
         // regardless of channel spacing, so wider spacings don't dilute the SNR.
         // Capped to not exceed the slot width.
@@ -5458,14 +5497,29 @@ self.addEventListener("fetch", event => {
         // Two variants: slotMeans (slow EMA) for voting; instSlotMeans (instantaneous) for fade trigger.
         std::vector<float> slotMeans(numSlots);
         std::vector<float> instSlotMeans(numSlots);
+        std::vector<float> slotNoiseFloors(numSlots);
+        std::vector<float> gridMeans(numSlots);
+        std::vector<float> instGridMeans(numSlots);
+        std::vector<float> gridNoiseFloors(numSlots);
+        const channel_bank_detector::AutoEnergyWindows energyWindows(power);
+        const channel_bank_detector::AutoEnergyWindows instantWindows(instPower);
+        const int halfSlotBins = std::max(1, (int)std::ceil(channelSpacing * 0.5 / binHz));
         std::vector<float> slotFlatness(numSlots, 1.0f);  // spectral flatness per slot: ~1 flat/noise, ~0 peaky/carrier
         std::vector<float> slotCentroidHz(numSlots, 0.0f);// carrier centroid relative to slot center (Hz) — for drift gate
         std::map<int, double> newPeakOffsets;
         for (int s = 0; s < numSlots; s++) {
             double slotOffset = ((double)s - (double)(numSlots - 1) / 2.0) * channelSpacing;
-            int centerBin = (int)std::round((slotOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
-            int lo = std::clamp(centerBin - halfBins, 0, FFT_SIZE - 1);
-            int hi = std::clamp(centerBin + halfBins, 0, FFT_SIZE - 1);
+            int centerBin = (int)std::round((slotOffset / lastKnownSr) * fftSize) + fftSize / 2;
+            // Keep the original fixed-window statistics for floor calibration
+            // and broadband occupancy, so searching does not bias their noise
+            // reference upward. Only Auto/Scan signal measurement moves.
+            gridMeans[s] = energyWindows.mean(centerBin, halfBins);
+            instGridMeans[s] = instantWindows.mean(centerBin, halfBins);
+            gridNoiseFloors[s] = spectralFloor.mean(centerBin - halfBins, centerBin + halfBins);
+            if (!manualMode && !bookmarkScanMode)
+                centerBin = energyWindows.strongestCenter(centerBin, halfSlotBins, halfBins);
+            int lo = std::clamp(centerBin - halfBins, 0, fftSize - 1);
+            int hi = std::clamp(centerBin + halfBins, 0, fftSize - 1);
             // Single pass over bins: accumulate mean, instantaneous mean, log-sum
             // (for spectral flatness), peak bin, AND energy-weighted centroid sum.
             // Previously the centroid was a separate second loop — merging saves
@@ -5485,6 +5539,7 @@ self.addEventListener("fetch", event => {
             int nBins = hi - lo + 1;
             slotMeans[s]     = sum     / (float)nBins;
             instSlotMeans[s] = instSum / (float)nBins;
+            slotNoiseFloors[s] = spectralFloor.mean(lo, hi);
             // Spectral flatness measure (Wiener entropy): geometric mean / arithmetic mean
             // of the channel's power bins. → 1.0 for a flat (broadband static) spectrum,
             // → 0 when one bin (the carrier) dominates. This is what separates a real
@@ -5498,7 +5553,7 @@ self.addEventListener("fetch", event => {
             // (~1000–1500 Hz above/below carrier) rather than at the loudest
             // fundamental (~300–500 Hz), giving much better carrier tracking.
             double centroidBin = (sum > 0.0f) ? (weightedSum / (double)sum) : (double)centerBin;
-            newPeakOffsets[s] = ((centroidBin - FFT_SIZE / 2) / FFT_SIZE) * lastKnownSr;
+            newPeakOffsets[s] = ((centroidBin - fftSize / 2) / fftSize) * lastKnownSr;
             // Centroid relative to this slot's center — small (±detection window), so the
             // drift-gate variance math stays well-conditioned. Subtracting a constant
             // doesn't change the stddev we ultimately test.
@@ -5518,14 +5573,14 @@ self.addEventListener("fetch", event => {
             int rightSkip = std::max(baseEdgeSkip, (int)std::round(numSlots * rightTrimFrac));
             std::vector<float> centerMeans;
             if (!manualPassbandMask.empty()) {
-                centerMeans.reserve(FFT_SIZE);
-                for (int b = 0; b < FFT_SIZE; b++)
+                centerMeans.reserve(fftSize);
+                for (int b = 0; b < fftSize; b++)
                     if (manualPassbandMask[b]) centerMeans.push_back(power[b]);
             } else {
                 for (int s = leftSkip; s < numSlots - rightSkip; s++)
-                    centerMeans.push_back(slotMeans[s]);
+                    centerMeans.push_back(gridMeans[s]);
             }
-            if (centerMeans.empty()) centerMeans = {slotMeans[numSlots / 2]};
+            if (centerMeans.empty()) centerMeans = {gridMeans[numSlots / 2]};
             std::sort(centerMeans.begin(), centerMeans.end());
             float floorPct = manualPassbandMask.empty() ? 0.20f : 0.25f;
             float rawFloor = centerMeans[std::max(0, (int)(centerMeans.size() * floorPct) - 1)];
@@ -5535,10 +5590,7 @@ self.addEventListener("fetch", event => {
             // unless they last for more than half the buffer. EMA smoothers
             // partially track every pulse, raising the threshold momentarily and
             // making detection vulnerable to brief whole-band noise events.
-            // ~30 frames is ~100ms at 2.4MHz SR (FFT_SIZE=8192, ~290 Hz frame
-            // rate); short enough to track real band-condition changes within
-            // half a second, long enough that 50/60/100/120 Hz mains-related
-            // RFI pulses are completely ignored.
+            // The legacy median spans 1.5 seconds at the 20 Hz analysis rate.
             constexpr size_t FLOOR_HISTORY_LEN = 30;
             floorHistory.push_back(rawFloor);
             if (floorHistory.size() > FLOOR_HISTORY_LEN) floorHistory.pop_front();
@@ -5554,6 +5606,10 @@ self.addEventListener("fetch", event => {
                 globalNoiseFloor = sorted[sorted.size() / 2];
             }
             displayNoiseFloor = 0.985f * displayNoiseFloor + 0.015f * globalNoiseFloor;
+        }
+        if (!manualLocalSnrEnabled) {
+            std::fill(slotNoiseFloors.begin(), slotNoiseFloors.end(), globalNoiseFloor);
+            std::fill(gridNoiseFloors.begin(), gridNoiseFloors.end(), globalNoiseFloor);
         }
 
         // Wideband noise event detection — lightning, power-line QRM, solar events, etc.
@@ -5581,7 +5637,7 @@ self.addEventListener("fetch", event => {
             int wbAbove     = 0;
             if (!manualPassbandMask.empty()) {
                 wbCenter = 0;
-                for (int b = 0; b < FFT_SIZE; b++) {
+                for (int b = 0; b < fftSize; b++) {
                     if (!manualPassbandMask[b]) continue;
                     wbCenter++;
                     if (instPower[b] > globalNoiseFloor * snrLinear) wbAbove++;
@@ -5589,14 +5645,15 @@ self.addEventListener("fetch", event => {
                 widebandEvent = (wbCenter > 0 && wbAbove > wbCenter * 4 / 5);  // >80% of allowed passbands
             } else {
                 for (int s = wbLeftEdge; s < numSlots - wbRightEdge; s++)
-                    if (instSlotMeans[s] > globalNoiseFloor * snrLinear) wbAbove++;
+                    if (instGridMeans[s] > gridNoiseFloors[s] * snrLinear) wbAbove++;
                 widebandEvent = (wbAbove > wbCenter * 2 / 5);  // >40%
             }
         }
 
-        // Manual mode: check configured frequencies instead of grid voting
-        if (manualMode) {
-            std::vector<double> localFreqs = getActiveManualFreqs();
+        // Manual / bookmark scan: use the same frequency indices as the
+        // channel manager, including when a scan stop contains only a subset.
+        if (manualMode || bookmarkScanMode) {
+            std::vector<double> localFreqs = getDetectorManualFreqs();
             std::set<int>       newDetected;
             std::set<int>       newRawDetected;
             std::map<int,float> newManualSnr;
@@ -5616,7 +5673,7 @@ self.addEventListener("fetch", event => {
                 float thresholdDb = 0.0f;
             };
             std::vector<ManualWindow> manualWindows(localFreqs.size());
-            std::vector<uint8_t> manualSignalMask(FFT_SIZE, 0);
+            std::vector<uint8_t> manualSignalMask(fftSize, 0);
 
             std::map<std::string, float> localOverrides;
             {
@@ -5632,28 +5689,28 @@ self.addEventListener("fetch", event => {
                 if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
                 auto& w = manualWindows[i];
                 w.valid = true;
-                w.centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+                w.centerBin = std::clamp((int)std::round((freqOffset / lastKnownSr) * fftSize) + fftSize / 2, 0, fftSize - 1);
                 int halfBins2 = std::max(1, (int)std::round(
                     std::min(channelSpacing * 0.4, DETECT_BW_HZ / 2.0) / binHz));
                 if (demodMode == DEMOD_USB) {
                     int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
                     w.lo = w.centerBin;
-                    w.hi = std::clamp(w.centerBin + ssbBins, 0, FFT_SIZE - 1);
+                    w.hi = std::clamp(w.centerBin + ssbBins, 0, fftSize - 1);
                     w.guard1Lo = w.hi + 1;
-                    w.guard1Hi = std::clamp(w.hi + ssbBins, 0, FFT_SIZE - 1);
-                    w.guard2Lo = std::clamp(w.centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    w.guard1Hi = std::clamp(w.hi + ssbBins, 0, fftSize - 1);
+                    w.guard2Lo = std::clamp(w.centerBin - ssbBins, 0, fftSize - 1);
                     w.guard2Hi = std::max(0, w.centerBin - 1);
                 } else if (demodMode == DEMOD_LSB) {
                     int ssbBins = std::max(1, (int)std::round(2800.0 / binHz));
-                    w.lo = std::clamp(w.centerBin - ssbBins, 0, FFT_SIZE - 1);
+                    w.lo = std::clamp(w.centerBin - ssbBins, 0, fftSize - 1);
                     w.hi = w.centerBin;
-                    w.guard1Lo = std::clamp(w.lo - ssbBins, 0, FFT_SIZE - 1);
+                    w.guard1Lo = std::clamp(w.lo - ssbBins, 0, fftSize - 1);
                     w.guard1Hi = w.lo - 1;
                     w.guard2Lo = w.hi + 1;
-                    w.guard2Hi = std::clamp(w.hi + ssbBins, 0, FFT_SIZE - 1);
+                    w.guard2Hi = std::clamp(w.hi + ssbBins, 0, fftSize - 1);
                 } else {
-                    w.lo = std::clamp(w.centerBin - halfBins2, 0, FFT_SIZE - 1);
-                    w.hi = std::clamp(w.centerBin + halfBins2, 0, FFT_SIZE - 1);
+                    w.lo = std::clamp(w.centerBin - halfBins2, 0, fftSize - 1);
+                    w.hi = std::clamp(w.centerBin + halfBins2, 0, fftSize - 1);
                 }
                 for (int b = w.lo; b <= w.hi; b++) manualSignalMask[b] = 1;
                 auto overrideIt = localOverrides.find(manualSnrOverrideKey(localFreqs[i], demodMode));
@@ -5663,8 +5720,8 @@ self.addEventListener("fetch", event => {
 
             auto noisePercentile = [&](const std::vector<float>& source, int lo, int hi) -> float {
                 std::vector<float> samples;
-                lo = std::clamp(lo, 0, FFT_SIZE - 1);
-                hi = std::clamp(hi, 0, FFT_SIZE - 1);
+                lo = std::clamp(lo, 0, fftSize - 1);
+                hi = std::clamp(hi, 0, fftSize - 1);
                 if (lo > hi) return 0.0f;
                 samples.reserve(hi - lo + 1);
                 for (int b = lo; b <= hi; b++)
@@ -5711,17 +5768,15 @@ self.addEventListener("fetch", event => {
                 if (tracked > 0.0f) {
                     stormEligible++;
                     if (instLocal > tracked * stormRiseLinear) stormRaised++;
-                    // Track sustained atmospheric changes, but cap upward motion at
-                    // 0.5 dB/frame so a single large crash cannot poison sensitivity
-                    // for the following weak transmission. Release slowly to avoid
-                    // threshold pumping between closely spaced crashes.
+                    // Keep the existing shoulder-based storm reference separate
+                    // from the continuous curve used for signal measurement.
                     float a = rawLocal > tracked ? 0.30f : 0.04f;
                     float next = a * rawLocal + (1.0f - a) * tracked;
                     tracked = std::min(next, tracked * maxFloorRisePerFrame);
                 } else {
                     tracked = rawLocal;
                 }
-                w.noiseFloor = manualLocalSnrEnabled ? tracked : globalNoiseFloor;
+                w.noiseFloor = manualLocalSnrEnabled ? spectralFloor.mean(w.lo, w.hi) : globalNoiseFloor;
                 w.instantNoiseFloor = manualLocalSnrEnabled ? instLocal : globalNoiseFloor;
             }
 
@@ -5862,10 +5917,10 @@ self.addEventListener("fetch", event => {
                 if ((aboveRaw || aboveVote) && demodMode != DEMOD_USB && demodMode != DEMOD_LSB) {
                     const double AMBIENT_BW_HZ = 12000.0;
                     int ambW = std::max(1, (int)std::round(AMBIENT_BW_HZ / binHz));
-                    int leftLo  = std::clamp(lo - ambW, 0, FFT_SIZE - 1);
-                    int leftHi  = std::clamp(lo - 1,   0, FFT_SIZE - 1);
-                    int rightLo = std::clamp(hi + 1,    0, FFT_SIZE - 1);
-                    int rightHi = std::clamp(hi + ambW, 0, FFT_SIZE - 1);
+                    int leftLo  = std::clamp(lo - ambW, 0, fftSize - 1);
+                    int leftHi  = std::clamp(lo - 1,   0, fftSize - 1);
+                    int rightLo = std::clamp(hi + 1,    0, fftSize - 1);
+                    int rightHi = std::clamp(hi + ambW, 0, fftSize - 1);
 
                     // Instantaneous ambient mean (for aboveRaw gate)
                     auto instAmbMean = [&](int aLo, int aHi) -> float {
@@ -5908,13 +5963,15 @@ self.addEventListener("fetch", event => {
                 rawManualDetected = newRawDetected;   // copy — keep newRawDetected usable below
                 manualSnrDb       = std::move(newManualSnr);
                 manualThresholdDb = newManualThresholdDb;
+                manualDetectedFreqs = localFreqs;
             }
             {
                 std::lock_guard<std::mutex> dlck(displayMtx);
-                displaySnap.power.resize(FFT_SIZE);
-                for (int i = 0; i < FFT_SIZE; i++)
+                displaySnap.power.resize(fftSize);
+                for (int i = 0; i < fftSize; i++)
                     displaySnap.power[i] = 10.0f * log10f(power[i] + 1e-30f);
                 displaySnap.threshDb  = 10.0f * log10f(displayNoiseFloor * snrLinear + 1e-30f);
+                snapshotNoiseFloor();
                 displaySnap.slotCenterBin.clear();
                 displaySnap.detected.clear();
                 displaySnap.numSlots  = 0;
@@ -5924,7 +5981,7 @@ self.addEventListener("fetch", event => {
                 for (int i = 0; i < (int)localFreqs.size(); i++) {
                     double freqOffset = localFreqs[i] - lastKnownCenter;
                     if (std::abs(freqOffset) >= lastKnownSr / 2.0) continue;
-                    int bin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+                    int bin = (int)std::round((freqOffset / lastKnownSr) * fftSize) + fftSize / 2;
                     displaySnap.manualCenterBins.push_back(bin);
                     displaySnap.manualActiveFlags.push_back(newDetected.count(i) > 0);
                     auto wit = manualWindows.begin() + i;
@@ -5934,8 +5991,8 @@ self.addEventListener("fetch", event => {
                         10.0f * log10f(absoluteThreshold + 1e-30f));
                 }
                 std::vector<float> sorted = displaySnap.power;
-                int lo5  = (int)(FFT_SIZE * 0.05f);
-                int hi95 = (int)(FFT_SIZE * 0.95f);
+                int lo5  = (int)(fftSize * 0.05f);
+                int hi95 = (int)(fftSize * 0.95f);
                 std::nth_element(sorted.begin(), sorted.begin() + lo5, sorted.end());
                 displaySnap.dBmin = sorted[lo5] - 5.0f;
                 std::nth_element(sorted.begin(), sorted.begin() + hi95, sorted.end());
@@ -5984,7 +6041,7 @@ self.addEventListener("fetch", event => {
             return;
         }
 
-        // Vote on each slot against the global floor.
+        // Vote on each slot against the floor integrated over its signal window.
         // Frozen during wideband noise events (lightning, etc.) so broadband
         // impulses can't accumulate the votes needed to spawn new channels.
         // Existing votes don't decay either — real active signals are protected.
@@ -5995,7 +6052,7 @@ self.addEventListener("fetch", event => {
         if (!widebandEvent) {
             for (int s = 0; s < numSlots; s++) {
                 float effSnr        = openSlotIndices.count(s) ? holdSnrLinear : snrLinear;
-                bool aboveThreshold = (slotMeans[s] > globalNoiseFloor * effSnr);
+                bool aboveThreshold = (slotMeans[s] > slotNoiseFloors[s] * effSnr);
                 int& votes = slotVotes[s];
                 if (aboveThreshold) { votes = std::min(votes + 1, MAX_VOTES); }
                 else                { votes = std::max(votes - 1, 0); }
@@ -6083,9 +6140,9 @@ self.addEventListener("fetch", event => {
                 for (auto& [idx, slot] : activeChannels) {
                     const int missLimit = (slot->fileOpen && !slot->amDemod) ? 4 : 2;
                     float effSnrRaw = slot->fileOpen ? holdSnrLinear : snrLinear;
-                    bool above = (idx < numSlots && instSlotMeans[idx] > globalNoiseFloor * effSnrRaw);
-                    if (slot->fileOpen && idx < numSlots && globalNoiseFloor > 0.0f && instSlotMeans[idx] > 1e-30f) {
-                        float instantSnrDb = 10.0f * log10f(instSlotMeans[idx] / globalNoiseFloor);
+                    bool above = (idx < numSlots && instSlotMeans[idx] > slotNoiseFloors[idx] * effSnrRaw);
+                    if (slot->fileOpen && idx < numSlots && slotNoiseFloors[idx] > 0.0f && instSlotMeans[idx] > 1e-30f) {
+                        float instantSnrDb = 10.0f * log10f(instSlotMeans[idx] / slotNoiseFloors[idx]);
                         updateSustainSnr(*slot, instantSnrDb);
                     }
                     if (above) {
@@ -6125,8 +6182,8 @@ self.addEventListener("fetch", event => {
             // Per-slot SNR for M4A metadata: signal power relative to noise floor (dB)
             slotSnrDb.resize(numSlots);
             for (int s = 0; s < numSlots; s++)
-                slotSnrDb[s] = (globalNoiseFloor > 0.0f)
-                    ? 10.0f * log10f(slotMeans[s] / globalNoiseFloor)
+                slotSnrDb[s] = (slotNoiseFloors[s] > 0.0f)
+                    ? 10.0f * log10f(slotMeans[s] / slotNoiseFloors[s])
                     : 0.0f;
             // Raw (un-voted) detection — uses instSlotMeans (instantaneous, no EMA).
             // Not updated during wideband events to prevent management-thread reads
@@ -6134,7 +6191,7 @@ self.addEventListener("fetch", event => {
             if (!widebandEvent) {
                 rawDetectedSlots.clear();
                 for (int s = 0; s < numSlots; s++)
-                    if (instSlotMeans[s] > globalNoiseFloor * snrLinear)
+                    if (instSlotMeans[s] > slotNoiseFloors[s] * snrLinear)
                         rawDetectedSlots.insert(s);
             }
         }
@@ -6142,15 +6199,16 @@ self.addEventListener("fetch", event => {
         // Update display snapshot (UI reads under displayMtx)
         {
             std::lock_guard<std::mutex> dlck(displayMtx);
-            displaySnap.power.resize(FFT_SIZE);
-            for (int i = 0; i < FFT_SIZE; i++)
+            displaySnap.power.resize(fftSize);
+            for (int i = 0; i < fftSize; i++)
                 displaySnap.power[i] = 10.0f * log10f(power[i] + 1e-30f);
             displaySnap.slotCenterBin.resize(numSlots);
             for (int s = 0; s < numSlots; s++) {
                 double slotOffset = ((double)s - (double)(numSlots - 1) / 2.0) * channelSpacing;
-                displaySnap.slotCenterBin[s] = (int)std::round((slotOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+                displaySnap.slotCenterBin[s] = (int)std::round((slotOffset / lastKnownSr) * fftSize) + fftSize / 2;
             }
             displaySnap.threshDb  = 10.0f * log10f(displayNoiseFloor * snrLinear + 1e-30f);
+            snapshotNoiseFloor();
             displaySnap.detected  = detected;
             displaySnap.numSlots  = numSlots;
             displaySnap.manualCenterBins.clear();
@@ -6160,8 +6218,8 @@ self.addEventListener("fetch", event => {
             // nth_element is O(n) vs std::sort's O(n log n) — saves ~50% of
             // this block's CPU on 8192-element arrays at 20 Hz.
             std::vector<float> sorted = displaySnap.power;
-            int lo5  = (int)(FFT_SIZE * 0.05f);
-            int hi95 = (int)(FFT_SIZE * 0.95f);
+            int lo5  = (int)(fftSize * 0.05f);
+            int hi95 = (int)(fftSize * 0.95f);
             std::nth_element(sorted.begin(), sorted.begin() + lo5, sorted.end());
             displaySnap.dBmin = sorted[lo5] - 5.0f;
             std::nth_element(sorted.begin(), sorted.begin() + hi95, sorted.end());
@@ -6381,6 +6439,7 @@ self.addEventListener("fetch", event => {
                                 activeChannels.clear();
                             }
                             bookmarkScanStopIdx = (bookmarkScanStopIdx + 1) % (int)bookmarkScanStops.size();
+                            publishBookmarkDetectorStop();
                             bookmarkScanHadSignal = false;
                             double nextCenter = bookmarkScanStops[bookmarkScanStopIdx].centerHz;
                             flog::info("[ChannelBank] BkScan: advancing to stop {0} at {1:.3f}MHz",
@@ -7820,10 +7879,18 @@ self.addEventListener("fetch", event => {
         dl->AddText(ImVec2(padMin.x + 4.0f, padMin.y + 2.0f),
                     IM_COL32(255, 255, 255, 255), buf);
 
-        // SNR threshold line — horizontal line at the detection threshold dB level.
-        // Only drawn once the noise floor is calibrated (displayNoiseFloor > 0).
+        // The main waterfall has its own FFT length/window and dB calibration.
+        // Show the adaptive SNR margin here; the measured floor/threshold curves
+        // are drawn in Channel Bank's spectrum with matching detector units.
+        if (_this->manualLocalSnrEnabled) {
+            char label[96];
+            snprintf(label, sizeof(label), "Adaptive +%.1f dB | floor in Channel Bank", _this->snrThreshold);
+            dl->AddText(ImVec2(args.min.x + 4.0f, args.max.y - 42.0f),
+                        IM_COL32(255, 200, 50, 255), label);
+        }
+        // Preserve the legacy shared-floor overlay for comparison mode.
         float nf = _this->displayNoiseFloor;
-        if (nf > 0.0f && _this->running) {
+        if (!_this->manualLocalSnrEnabled && nf > 0.0f && _this->running) {
             float snrLinear = powf(10.0f, _this->snrThreshold / 10.0f);
             float threshDb  = 10.0f * log10f(nf * snrLinear);
             float fftMin    = gui::waterfall.getFFTMin();
@@ -7999,7 +8066,7 @@ self.addEventListener("fetch", event => {
         }
 
         // Store new params but DON'T touch DSP-thread-owned state (slotVotes,
-        // avgPower, fftBufPos, etc.) — set a flag so the DSP thread resets
+        // avgPower, frameCollector, etc.) — set a flag so the DSP thread resets
         // them safely at the start of its next frame.
         _this->pendingRetuneSr     = newSr;
         _this->pendingRetuneCenter = newCenter;
@@ -8312,20 +8379,18 @@ self.addEventListener("fetch", event => {
 
         if (_this->running) { style::endDisabled(); }
 
-        bool canTuneManualDetector = _this->manualMode;
-        if (!canTuneManualDetector) style::beginDisabled();
-        if (ImGui::Checkbox(CONCAT("Local SNR floors##_cb_local_snr_", _this->name),
+        if (ImGui::Checkbox(CONCAT("Adaptive noise floor##_cb_local_snr_", _this->name),
                             &_this->manualLocalSnrEnabled)) {
             _this->saveManualConfig();
             _this->resetDetectorFloor();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Manual mode only. Measures each configured frequency\n"
-                              "against nearby modulation-aware noise shoulders.\n"
-                              "USB/LSB use one-sided voice windows; AM/NFM/WFM\n"
-                              "use symmetric windows. Disable to restore the legacy\n"
-                              "shared noise floor.");
+            ImGui::SetTooltip("Track the noise background across the spectrum in all modes.\n"
+                              "Each channel uses the floor over its own detection window.\n"
+                              "Disable to compare against the legacy shared floor.");
         }
+        bool canTuneManualDetector = _this->manualMode || _this->bookmarkScanMode;
+        if (!canTuneManualDetector) style::beginDisabled();
         if (ImGui::Checkbox(CONCAT("Storm guard##_cb_storm_guard_", _this->name),
                             &_this->manualStormGuardEnabled)) {
             _this->saveManualConfig();
@@ -8811,16 +8876,30 @@ self.addEventListener("fetch", event => {
                     dl->AddLine(ImVec2(x, pos.y), ImVec2(x, pos.y + H), col, 1.5f);
                 }
 
-                // FFT power curve (green)
-                for (int i = 0; i < N - 1; i++) {
-                    float x0 = binToX(i),     y0 = dBtoY(snap.power[i]);
-                    float x1 = binToX(i + 1), y1 = dBtoY(snap.power[i + 1]);
-                    dl->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(0, 210, 0, 200));
+                // One peak per pixel preserves narrow carriers without submitting
+                // 65k-262k line segments per UI frame at wide sample rates.
+                const int pixels = std::max(1, std::min(N, (int)W));
+                ImVec2 previous;
+                for (int x = 0; x < pixels; ++x) {
+                    int lo = x * N / pixels, hi = (x + 1) * N / pixels;
+                    float peak = *std::max_element(snap.power.begin() + lo, snap.power.begin() + hi);
+                    ImVec2 point(pos.x + x * W / pixels, dBtoY(peak));
+                    if (x) dl->AddLine(previous, point, IM_COL32(0, 210, 0, 200));
+                    previous = point;
                 }
 
-                // Manual/local mode has a different absolute threshold at each
-                // frequency, so draw short orange ticks instead of a misleading
-                // full-span line. Auto and legacy Manual mode keep the global line.
+                // Cyan = background, orange = common SNR margin above it.
+                for (int i = 1; i < (int)snap.noiseFloorDb.size(); ++i) {
+                    float x0 = pos.x + (i - 1) * W / (snap.noiseFloorDb.size() - 1);
+                    float x1 = pos.x + i * W / (snap.noiseFloorDb.size() - 1);
+                    dl->AddLine(ImVec2(x0, dBtoY(snap.noiseFloorDb[i - 1])),
+                                ImVec2(x1, dBtoY(snap.noiseFloorDb[i])), IM_COL32(60, 170, 230, 200));
+                    dl->AddLine(ImVec2(x0, dBtoY(snap.noiseFloorDb[i - 1] + _this->snrThreshold)),
+                                ImVec2(x1, dBtoY(snap.noiseFloorDb[i] + _this->snrThreshold)), IM_COL32(255, 120, 0, 200));
+                }
+
+                // Per-frequency overrides retain their individual threshold ticks
+                // on top of the common adaptive curve.
                 bool localThresholds = !snap.manualThresholdDb.empty() &&
                     snap.manualThresholdDb.size() == snap.manualCenterBins.size();
                 if (localThresholds) {
@@ -8830,7 +8909,7 @@ self.addEventListener("fetch", event => {
                         dl->AddLine(ImVec2(x - 5.0f, y), ImVec2(x + 5.0f, y),
                                     IM_COL32(255, 120, 0, 220), 2.0f);
                     }
-                } else {
+                } else if (snap.noiseFloorDb.empty()) {
                     float ty = dBtoY(snap.threshDb);
                     dl->AddLine(ImVec2(pos.x, ty), ImVec2(pos.x + W, ty),
                                 IM_COL32(255, 120, 0, 200), 1.5f);
@@ -8841,6 +8920,9 @@ self.addEventListener("fetch", event => {
                 dl->AddText(ImVec2(pos.x + 4, pos.y + 14), IM_COL32(255, 120, 0, 200),
                             localThresholds ? "Local thresholds" : "Threshold");
                 dl->AddText(ImVec2(pos.x + 4, pos.y + 26), IM_COL32(255, 200, 0, 200),  "Detected");
+                char resolution[64];
+                snprintf(resolution, sizeof(resolution), "Floor | %.0f Hz/bin", snap.detectorBinHz);
+                dl->AddText(ImVec2(pos.x + 4, pos.y + 38), IM_COL32(60, 170, 230, 200), resolution);
 
                 // dB range labels
                 char buf[32];
@@ -9442,17 +9524,32 @@ self.addEventListener("fetch", event => {
                                       "limit so the recording folder keeps moving.");
             }
 
-            // Diagnostic: show noise floor + threshold in dB
+            // Read floor diagnostics from the synchronized display snapshot.
             {
-                float nf = _this->globalNoiseFloor;
-                float th = nf * powf(10.0f, _this->snrThreshold / 10.0f);
-                float nfDb = (nf > 0.0f) ? 10.0f * log10f(nf) : -999.0f;
-                float thDb = (th > 0.0f) ? 10.0f * log10f(th) : -999.0f;
+                float floorLo, floorHi;
+                bool adaptive;
+                double binHz;
+                {
+                    std::lock_guard<std::mutex> lk(_this->displayMtx);
+                    const auto& snap = _this->displaySnap;
+                    adaptive = !snap.noiseFloorDb.empty();
+                    floorLo = floorHi = snap.threshDb - _this->snrThreshold;
+                    if (adaptive) {
+                        auto bounds = std::minmax_element(snap.noiseFloorDb.begin(), snap.noiseFloorDb.end());
+                        floorLo = *bounds.first;
+                        floorHi = *bounds.second;
+                    }
+                    binHz = snap.detectorBinHz;
+                }
                 int det = _this->debugDetectedCount.load();
                 int blk = _this->debugBlockedSkips.load();
                 int cap = _this->debugCapSkips.load();
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-                ImGui::Text("Floor: %.1f dB  Thresh: %.1f dB", nfDb, thDb);
+                if (adaptive)
+                    ImGui::Text("Floor: %.1f to %.1f dB  Margin: %.1f dB", floorLo, floorHi, _this->snrThreshold);
+                else
+                    ImGui::Text("Floor: %.1f dB  Thresh: %.1f dB", floorLo, floorLo + _this->snrThreshold);
+                ImGui::Text("Detector: %.1f Hz/bin", binHz);
                 ImGui::Text("Det: %d  BlkSkip: %d  CapSkip: %d", det, blk, cap);
                 ImGui::PopStyleColor();
             }
@@ -10143,12 +10240,26 @@ self.addEventListener("fetch", event => {
                std::to_string((int64_t)std::llround(freqHz / 1000.0));
     }
 
+    // The scan manager owns stop changes. Publish just the immutable frequency
+    // list to the DSP thread rather than reading its mutable stop index there.
+    void publishBookmarkDetectorStop() {
+        std::lock_guard<std::mutex> lock(manualFreqMtx);
+        bookmarkDetectorFreqs = bookmarkScanStops.empty()
+            ? std::vector<double>{} : bookmarkScanStops[bookmarkScanStopIdx].freqsHz;
+    }
+
+    std::vector<double> getDetectorManualFreqs() {
+        if (!bookmarkScanMode) return getActiveManualFreqs();
+        std::lock_guard<std::mutex> lock(manualFreqMtx);
+        return bookmarkDetectorFreqs;
+    }
+
     bool manualPassbandBinsForFreq(double freqHz, double binHz, int& lo, int& hi) const {
         if (lastKnownSr <= 0.0 || binHz <= 0.0) return false;
         double freqOffset = freqHz - lastKnownCenter;
         if (std::abs(freqOffset) >= lastKnownSr / 2.0) return false;
 
-        int centerBin = (int)std::round((freqOffset / lastKnownSr) * FFT_SIZE) + FFT_SIZE / 2;
+        int centerBin = (int)std::round((freqOffset / lastKnownSr) * fftSize) + fftSize / 2;
         int widthBins = std::max(1, (int)std::round(channelSpacing / binHz));
 
         if (demodMode == DEMOD_USB) {
@@ -10163,8 +10274,8 @@ self.addEventListener("fetch", event => {
             hi = centerBin + half;
         }
 
-        lo = std::clamp(lo, 0, FFT_SIZE - 1);
-        hi = std::clamp(hi, 0, FFT_SIZE - 1);
+        lo = std::clamp(lo, 0, fftSize - 1);
+        hi = std::clamp(hi, 0, fftSize - 1);
         return lo <= hi;
     }
 
@@ -10558,6 +10669,7 @@ self.addEventListener("fetch", event => {
     std::vector<double>   manualFrequencies;    // user-entered frequencies (custom additions)
     std::set<std::string> boundBookmarkLists;   // names of bound FM bookmark lists
     std::vector<double>   boundFreqs;           // union of boundBookmarkLists (refreshed periodically)
+    std::vector<double>   bookmarkDetectorFreqs; // current stop, protected by manualFreqMtx
     // Waterfall visibility save/restore (Option A)
     std::map<std::string, bool> savedShowOnWaterfall; // saved FM visibility states before Manual mode
     bool                        waterfallStateSaved = false;
@@ -10568,6 +10680,7 @@ self.addEventListener("fetch", event => {
     std::set<int>       rawManualDetected;   // un-voted; instant fade-out (under manualDetectedMtx)
     std::map<int,float> manualSnrDb;         // per-freq SNR dB; manual/bookmark scan mode
     std::map<int,float> manualThresholdDb;   // effective start threshold per manual frequency
+    std::vector<double> manualDetectedFreqs; // frequency mapping for the same telemetry snapshot
     std::mutex          manualDetectedMtx;
     std::set<int64_t> watchedFreqs;       // watched freq keys; protected by manualFreqMtx
     // Optional start thresholds are keyed by "demod-mode:rounded-kHz" so the
@@ -10600,19 +10713,19 @@ self.addEventListener("fetch", event => {
     dsp::sink::Handler<dsp::complex_t>*     specSink       = nullptr;
     fftwf_complex*                          fftIn          = nullptr;
     fftwf_complex*                          fftOut         = nullptr;
-    fftwf_plan                              fftPlan;
-    std::vector<float>                      hannWindow;
-    // At very low sample rates (< FFT_SIZE * SPEC_ANALYSIS_HZ ≈ 164 kHz) the
-    // DSP block has fewer than FFT_SIZE samples, so fftAccum is zero-padded.
+    fftwf_plan                              fftPlan = nullptr;
+    // At very low sample rates (< fftSize * SPEC_ANALYSIS_HZ ≈ 164 kHz) the
+    // DSP block has fewer than fftSize samples, so fftAccum is zero-padded.
     // Applying the full-size BH window to truncated data leaves it non-zero at
     // the cut point, causing sidelobes nearly as bad as Hann.  We cache a BH
-    // window sized to the actual fill length (zero-padded to FFT_SIZE) and
+    // window sized to the actual fill length (zero-padded to fftSize) and
     // recompute only when the sample rate changes.
-    std::vector<float>                      fftWindow;     // active window (length FFT_SIZE, correct for current SR)
+    std::vector<float>                      fftWindow;     // active window (length fftSize, correct for current SR)
     int                                     fftWindowFill  = 0; // fill length fftWindow was built for
     std::vector<dsp::complex_t>             fftAccum;
-    int                                     fftBufPos      = 0;
-    int64_t                                 specSamplesUntilFFT = 0;  // countdown; analysis fires when ≤ 0
+    int                                     fftRealSamples = 0;
+    channel_bank_detector::FrameCollector   frameCollector;
+    channel_bank_detector::SpectralFloor    spectralFloor;
     std::atomic<int>                        debugDetectedCount { 0 };
     std::atomic<int>                        debugBlockedSkips  { 0 };
     std::atomic<int>                        debugCapSkips      { 0 };
@@ -11043,7 +11156,12 @@ self.addEventListener("fetch", event => {
 
     // Display snapshot (written by DSP thread, read by UI thread)
     struct DisplaySnapshot {
-        std::vector<float>  power;          // per-bin dB  (FFT_SIZE)
+        std::vector<float>  power;          // per-bin dB  (fftSize)
+        std::vector<float>  noiseFloorDb;   // 512-point continuous floor trace
+        double              detectorBinHz = 0.0;
+        uint64_t            detectorFrames = 0;
+        std::chrono::steady_clock::time_point detectorUpdatedAt{};
+        bool                detectorWidebandEvent = false;
         float               threshDb = -120.0f; // global threshold line in dB
         std::vector<int>    slotCenterBin;  // pixel-mapping helper (auto mode)
         std::set<int>       detected;
