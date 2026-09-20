@@ -8,7 +8,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     return()
 endif ()
 
-project(sdrpp LANGUAGES C CXX OBJC OBJCXX)
+project(sdrpp LANGUAGES C CXX)
+
+if (APPLE)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif ()
 
 # Backends
 option(OPT_BACKEND_GLFW "Use the GLFW backend" ON)

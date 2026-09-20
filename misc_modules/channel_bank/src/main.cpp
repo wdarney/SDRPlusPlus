@@ -706,7 +706,22 @@ public:
         monitorStream.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         monitorSinkStream = new SinkManager::Stream();
         monitorSinkStream->init(&monitorStream, &monitorSrHandler, 48000.0f);
+#if defined(__ANDROID__)
+        monitorProviderRegisteredHandler.ctx = this;
+        monitorProviderRegisteredHandler.handler = [](std::string provider, void* ctx) {
+            if (provider == "Audio") {
+                ((ChannelBankModule*)ctx)->ensureAndroidMonitorAudioSink();
+            }
+        };
+        sigpath::sinkManager.onSinkProviderRegistered.bindHandler(&monitorProviderRegisteredHandler);
+        monitorProviderHandlerBound = true;
+#endif
         sigpath::sinkManager.registerStream(name + "_monitor", monitorSinkStream);
+#if defined(__ANDROID__)
+        // Android has no comfortable desktop-style sink setup flow; make preview
+        // playback audible by default instead of leaving the monitor on "None".
+        ensureAndroidMonitorAudioSink();
+#endif
         monitorSinkStream->start();
 
         // Start playback thread
@@ -752,6 +767,12 @@ public:
 
         // Tear down monitor stream
         monitorSinkStream->stop();
+#if defined(__ANDROID__)
+        if (monitorProviderHandlerBound) {
+            sigpath::sinkManager.onSinkProviderRegistered.unbindHandler(&monitorProviderRegisteredHandler);
+            monitorProviderHandlerBound = false;
+        }
+#endif
         sigpath::sinkManager.unregisterStream(name + "_monitor");
         delete monitorSinkStream;
         monitorSinkStream = nullptr;
@@ -11205,6 +11226,13 @@ self.addEventListener("fetch", event => {
     // PlaybackEntry now carries the segments alongside the WAV path so the
     // playback thread can install them as `playingSegments` for the synced
     // display.  Empty segments = no sync overlay (Apple Speech / transcription off).
+#if defined(__ANDROID__)
+    void ensureAndroidMonitorAudioSink() {
+        const std::string streamName = name + "_monitor";
+        sigpath::sinkManager.setStreamSink(streamName, "Audio");
+    }
+#endif
+
     struct PlaybackEntry {
         std::string path;
         double      freqHz;
@@ -11241,10 +11269,8 @@ self.addEventListener("fetch", event => {
 #endif
     std::atomic<int64_t>            currentlyPlayingFreqKey { 0 };
     std::atomic<double>             currentlyPlayingFreqHz { 0.0 };
-#if defined(__APPLE__) || defined(_WIN32)
     std::string                     currentPlaybackPath;
     std::mutex                      currentPlaybackPathMtx;
-#endif
     std::mutex                      playbackMtx;
     std::condition_variable         playbackCv;
     std::thread                     playbackThread;
@@ -11252,6 +11278,10 @@ self.addEventListener("fetch", event => {
     dsp::stream<dsp::stereo_t>      monitorStream;
     SinkManager::Stream*            monitorSinkStream = nullptr;
     EventHandler<float>             monitorSrHandler;
+#if defined(__ANDROID__)
+    EventHandler<std::string>       monitorProviderRegisteredHandler;
+    bool                            monitorProviderHandlerBound = false;
+#endif
 
     // SDR state
     double lastKnownSr     = 0.0;
