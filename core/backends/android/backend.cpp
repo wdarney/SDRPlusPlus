@@ -1,4 +1,4 @@
-#include <backend.h>log
+#include <backend.h>
 #include "android_backend.h"
 #include <core.h>
 #include <gui/gui.h>
