@@ -6603,7 +6603,7 @@ self.addEventListener("fetch", event => {
             bool changed = false;
             std::lock_guard<std::mutex> observationLock(detector->observationsMtx);
             for (auto& [key, observation] : detector->observations) {
-                double offset = (double)key * 1000.0 - detector->centerHz.load();
+                double offset = observation.frequencyHz - detector->centerHz.load();
                 if (std::abs(offset) >= detector->sampleRate * 0.45) {
                     observation.present = false;
                     observation.consecutiveHits = 0;
@@ -6800,9 +6800,11 @@ self.addEventListener("fetch", event => {
                    source, (int)released.size());
     }
 
-    void enqueueDispatch(double frequencyHz) {
+    void enqueueDispatch(double frequencyHz, double carrierHz) {
         const double normalized = std::round(frequencyHz / channelSpacing) * channelSpacing;
         const int64_t key = freqKey(normalized);
+        if (!std::isfinite(carrierHz) ||
+            std::abs(carrierHz - normalized) > channelSpacing) carrierHz = normalized;
         if (isBlocked(normalized) || isRnVoiceQuarantined(normalized)) return;
         {
             std::lock_guard<std::mutex> lk(multiReceiverMtx);
@@ -6810,7 +6812,7 @@ self.addEventListener("fetch", event => {
         }
         {
             std::lock_guard<std::mutex> lk(dispatchQueueMtx);
-            dispatchQueue.push({key, normalized});
+            dispatchQueue.push({key, normalized, carrierHz});
         }
         flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> PENDING", normalized / 1e6);
         dispatchQueueCv.notify_one();
@@ -6831,7 +6833,7 @@ self.addEventListener("fetch", event => {
             bool allocated = false;
             while (dispatchRunning.load() && !allocated) {
                 std::unique_lock<std::mutex> mlk(multiReceiverMtx);
-                auto allocation = receiverAllocator.choose(request.frequencyHz, channelSpacing);
+                auto allocation = receiverAllocator.choose(request.carrierHz, channelSpacing);
                 if (!allocation) {
                     receiverAllocator.failPending(request.key);
                     if (setupFailed) dispatchFailureCount.fetch_add(1);
@@ -6856,7 +6858,7 @@ self.addEventListener("fetch", event => {
                     // and activity panel available while this source tunes.
                     mlk.unlock();
                     bool tuned = sigpath::sourceManager.tuneIndependentSource(
-                        receiverId, name + ":multi-receiver", request.frequencyHz);
+                        receiverId, name + ":multi-receiver", request.carrierHz);
                     mlk.lock();
                     runtimeIt = receiverRuntimes.find(receiverId);
                     if (!tuned || runtimeIt == receiverRuntimes.end()) {
@@ -6865,16 +6867,16 @@ self.addEventListener("fetch", event => {
                         flog::warn("[ChannelBank] Multi-Receiver: tune failed on '{0}', trying next receiver", receiverId);
                         continue;
                     }
-                    runtimeIt->second.centerHz = request.frequencyHz;
+                    runtimeIt->second.centerHz = request.carrierHz;
                     auto& detector = *runtimeIt->second.detector;
                     {
                         std::lock_guard<std::mutex> analysisLock(detector.analysisMtx);
-                        detector.centerHz = request.frequencyHz;
+                        detector.centerHz = request.carrierHz;
                         detector.collector.reset();
                         detector.floor.reset();
                     }
                     flog::info("[ChannelBank] Multi-Receiver: tuned warm '{0}' to {1:.3f} MHz",
-                               receiverId, request.frequencyHz / 1e6);
+                               receiverId, request.carrierHz / 1e6);
                 }
                 ReceiverRuntime& runtime = runtimeIt->second;
                 ChannelSlot* slot = new ChannelSlot();
@@ -6888,8 +6890,9 @@ self.addEventListener("fetch", event => {
                 {
                     std::lock_guard<std::mutex> clk(channelsMtx);
                     initSlot(*slot, (int)request.key, 1, 0.0,
-                             request.frequencyHz - runtime.centerHz,
-                             runtime.splitter, runtime.sampleRate, runtime.centerHz);
+                             request.carrierHz - runtime.centerHz,
+                             runtime.splitter, runtime.sampleRate, runtime.centerHz,
+                             request.frequencyHz);
                     activeChannels[(int)request.key] = slot;
                 }
 
@@ -6904,11 +6907,13 @@ self.addEventListener("fetch", event => {
                 }
                 {
                     std::lock_guard<std::mutex> observationLock(runtime.detector->observationsMtx);
-                    runtime.detector->observations.emplace(request.key, ReceiverObservation{});
+                    ReceiverObservation observation;
+                    observation.frequencyHz = request.carrierHz;
+                    runtime.detector->observations.emplace(request.key, observation);
                 }
                 allocated = true;
-                flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> ACTIVE on '{1}' ({2})",
-                           request.frequencyHz / 1e6, receiverId,
+                flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz grid, {1:.3f} MHz carrier -> ACTIVE on '{2}' ({3})",
+                           request.frequencyHz / 1e6, request.carrierHz / 1e6, receiverId,
                            allocation->reusedCoverage ? "coverage reuse" : "idle receiver");
             }
         }
@@ -6979,18 +6984,28 @@ self.addEventListener("fetch", event => {
 
     void manageMultiReceiverScan(const std::chrono::steady_clock::time_point& now) {
         std::set<int> current;
+        std::map<int, double> peakOffsets;
         {
             std::lock_guard<std::mutex> lk(detectedMtx);
             current = detectedSlots;
+            peakOffsets = slotPeakOffsets;
         }
         const int numSlots = std::max(1, (int)std::floor(lastKnownSr / channelSpacing));
         for (int idx : current) {
             double slotOffset = ((double)idx - (double)(numSlots - 1) / 2.0) * channelSpacing;
             double frequency = std::round((lastKnownCenter + slotOffset) / channelSpacing) * channelSpacing;
             if (!isInActiveSpan(frequency)) continue;
+            double carrierHz = frequency;
+            auto peak = peakOffsets.find(idx);
+            if (peak != peakOffsets.end()) {
+                double measuredHz = lastKnownCenter + peak->second;
+                if (std::isfinite(measuredHz) &&
+                    std::abs(measuredHz - frequency) <= channelSpacing)
+                    carrierHz = measuredHz;
+            }
             int64_t key = freqKey(frequency);
             scanObservedKeys.insert(key);
-            enqueueDispatch(frequency);
+            enqueueDispatch(frequency, carrierHz);
         }
 
         // A dispatched channel follows RF on its assigned receiver. The
@@ -7295,7 +7310,8 @@ self.addEventListener("fetch", event => {
                   double exactOffsetHz = NAN,
                   dsp::routing::Splitter<dsp::complex_t>* sourceSplitter = nullptr,
                   double sourceSampleRate = NAN,
-                  double sourceCenterHz = NAN) {
+                  double sourceCenterHz = NAN,
+                  double gridFrequencyOverride = NAN) {
         slot.module  = this;
         slot.gridIdx = gridIdx;
         slot.iqSourceSplitter = sourceSplitter ? sourceSplitter : iqSplitter;
@@ -7326,7 +7342,8 @@ self.addEventListener("fetch", event => {
         // Snap to nearest multiple of channelSpacing so the key is independent
         // of the SDR center frequency — retuning won't invalidate blocks.
         double rawGrid = isManual ? slot.freqHz : (inputCenter + gridOffset);
-        slot.gridFreqHz = std::round(rawGrid / channelSpacing) * channelSpacing;
+        slot.gridFreqHz = std::isfinite(gridFrequencyOverride)
+            ? gridFrequencyOverride : std::round(rawGrid / channelSpacing) * channelSpacing;
 
         char freqBuf[64];
         snprintf(freqBuf, sizeof(freqBuf), "%.3fMHz", slot.freqHz / 1e6);
@@ -11542,8 +11559,10 @@ self.addEventListener("fetch", event => {
     struct DispatchRequest {
         int64_t key = 0;
         double frequencyHz = 0.0;
+        double carrierHz = 0.0;
     };
     struct ReceiverObservation {
+        double frequencyHz = 0.0;
         bool present = false;
         int consecutiveHits = 0;
         int consecutiveMisses = 0;
