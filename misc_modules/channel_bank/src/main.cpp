@@ -29,6 +29,7 @@
 #include <utils/wav.h>
 #include <fftw3.h>
 #include "spectral_floor.h"
+#include "voice_squelch.h"
 #ifndef CB_NO_RNNOISE
 #include <rnnoise.h>
 #endif
@@ -253,6 +254,11 @@ struct ChannelSlot {
     std::atomic<int>                           rawConsecutiveHits { 0 };  // consecutive FFT frames rawSignalPresent was true; gated file-open requires ≥2
     std::atomic<float>                         sustainSnrDb { -120.0f }; // smoothed SNR for audio sustain only
     std::atomic<bool>                          sustainSnrValid { false };
+    channel_bank::VoiceSquelch                 voiceSquelch;
+    uint64_t voiceBufferPolicy = 0; // audio thread only
+    uint64_t voiceProbePolicy = 0;  // management thread under channelsMtx
+    bool voiceProbeRunning = false;
+    std::chrono::steady_clock::time_point voiceProbeStart;
     bool                                       prevSignalPresent = false;  // rising-edge detect for watch alert
 
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
@@ -268,6 +274,8 @@ struct ChannelSlot {
     std::vector<float> preRollTmp  = std::vector<float>(PREROLL_SAMPLES, 0.0f);  // scratch for flush
     int  preRollHead  = 0;   // next write position (wraps mod PREROLL_SAMPLES)
     int  preRollCount = 0;   // valid samples currently in buffer (0..PREROLL_SAMPLES)
+    std::vector<uint8_t> voicePreRollAir; // allocated only when voice squelch is on
+    int voicePreRollAirSamples = 0;
 
 #if defined(__APPLE__) || defined(_WIN32)
     void*       transcribeHandle       = nullptr;
@@ -416,6 +424,8 @@ public:
             nrMix = config.conf[name]["nrMix"];
         if (config.conf[name].contains("rnVoiceGateEnabled"))
             rnVoiceGateEnabled = config.conf[name]["rnVoiceGateEnabled"];
+        if (config.conf[name].contains("voiceSquelchEnabled"))
+            setVoiceSquelchEnabled(config.conf[name]["voiceSquelchEnabled"].get<bool>());
         if (config.conf[name].contains("rnVoiceGateVoiceFrac"))
             rnVoiceGateVoiceFrac = config.conf[name]["rnVoiceGateVoiceFrac"];
         if (config.conf[name].contains("rnVoiceGateProbeSec"))
@@ -1455,6 +1465,8 @@ private:
             {"maxChannels", maxChannels},
             {"bwUsage", bwUsage},
             {"recordingEnabled", recordingEnabled},
+            {"voiceSquelchEnabled", voiceSquelchEnabled()},
+            {"supportsVoiceSquelch", channel_bank::VoiceSquelch::available},
             {"minTransmissionMs", minTransmissionMs},
             {"signalHoldMs", signalHoldMs},
             {"tailMs", tailMs},
@@ -1522,6 +1534,12 @@ private:
         }
         if (body.contains("recordingEnabled") && !body["recordingEnabled"].is_boolean()) {
             error = "recording must be true or false";
+            return false;
+        }
+        if (body.contains("voiceSquelchEnabled") &&
+            (!body["voiceSquelchEnabled"].is_boolean() ||
+             (body["voiceSquelchEnabled"].get<bool>() && !channel_bank::VoiceSquelch::available))) {
+            error = "voice squelch requires a boolean and an RNNoise-enabled build";
             return false;
         }
         if (body.contains("minTransmissionMs") && !body["minTransmissionMs"].is_number_integer()) {
@@ -1651,6 +1669,10 @@ private:
         if (body.contains("recordingEnabled")) {
             recordingEnabled = nextRecordingEnabled;
             config.conf[name]["recordingEnabled"] = recordingEnabled;
+        }
+        if (body.contains("voiceSquelchEnabled")) {
+            setVoiceSquelchEnabled(body["voiceSquelchEnabled"].get<bool>());
+            config.conf[name]["voiceSquelchEnabled"] = voiceSquelchEnabled();
         }
         if (body.contains("minTransmissionMs")) {
             minTransmissionMs = nextMinTransmissionMs;
@@ -2055,6 +2077,7 @@ private:
                     {"recording", slot->fileOpen},
                     {"signalPresent", slot->signalPresent.load()},
                     {"rawSignalPresent", slot->rawSignalPresent.load()},
+                    {"voiceSquelchState", voiceSquelchState(*slot)},
                     {"file", slot->currentFilePath}
                 });
             }
@@ -6441,12 +6464,13 @@ self.addEventListener("fetch", event => {
 #endif
 
             if (bookmarkScanMode) {
-                bool anySignal = manageBookmarkScanChannels();
+                bool voicePending = false;
+                bool anySignal = manageBookmarkScanChannels(voicePending);
                 if (!bookmarkScanStops.empty()) {
                     if (anySignal) {
                         bookmarkScanHadSignal = true;
                         lastSignalTime = now;
-                    } else {
+                    } else if (!voicePending || now - lastSignalTime >= std::chrono::milliseconds(1200)) {
                         float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
                         float timeout = bookmarkScanHadSignal ? scanQuietSec : scanNoSignalSec;
                         if (elapsed >= timeout) {
@@ -6500,6 +6524,18 @@ self.addEventListener("fetch", event => {
 
             std::lock_guard<std::mutex> clck(channelsMtx);
 
+            // Independent, short Auto-mode retry suppression; never writes the
+            // user's block list, cooldown, RF votes, or RNNoise quarantine.
+            const auto voicePolicy = voiceSquelchPolicy.load();
+            if (voiceRetryPolicy != voicePolicy) {
+                voiceRetryPolicy = voicePolicy;
+                voiceRetryAfter.clear();
+            }
+            for (auto it = voiceRetryAfter.begin(); it != voiceRetryAfter.end(); ) {
+                if (it->second <= now) it = voiceRetryAfter.erase(it);
+                else ++it;
+            }
+
             // Create or refresh channels for detected slots
             debugDetectedCount.store((int)current.size());
             int blkSkip = 0, capSkip = 0;
@@ -6514,6 +6550,7 @@ self.addEventListener("fetch", event => {
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
                     if (!isInActiveSpan(slotFreq)) continue;
+                    if (voiceSquelchEnabled() && voiceRetryAfter.count(voiceRetryKey(slotFreq))) continue;
                     if (isBlocked(slotFreq) || isRnVoiceQuarantined(slotFreq)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
@@ -6541,6 +6578,17 @@ self.addEventListener("fetch", event => {
             // Mark channels no longer detected; destroy once file is closed
             for (auto it = activeChannels.begin(); it != activeChannels.end(); ) {
                 auto* slot = it->second;
+
+                if (voiceSquelchEnabled() && !slot->fileOpen &&
+                    !voiceSquelchAccepted(*slot) && !voiceSquelchProbing(*slot, now)) {
+                    // Release the demodulator capacity as well as scan hold.
+                    // Retry soon so a persistent carrier can later carry speech.
+                    voiceRetryAfter[voiceRetryKey(slot->gridFreqHz)] = now + std::chrono::seconds(1);
+                    destroySlot(*slot);
+                    delete slot;
+                    it = activeChannels.erase(it);
+                    continue;
+                }
 
                 // Immediately tear down blocked channels.  Key on gridFreqHz so this
                 // matches the block-check at spawn (which used slotFreq = grid) — using
@@ -6607,12 +6655,15 @@ self.addEventListener("fetch", event => {
             // Scan mode: advance to next stop once the band has been quiet long enough
             if (scanMode && !scanStops.empty()) {
                 bool anyActive = false;
-                for (auto& [idx, slot] : activeChannels)
-                    if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
+                bool voicePending = false;
+                for (auto& [idx, slot] : activeChannels) {
+                    if ((slot->signalPresent || slot->fileOpen) && voiceSquelchAccepted(*slot)) anyActive = true;
+                    voicePending |= voiceSquelchProbing(*slot, now);
+                }
                 if (anyActive) {
                     scanStopHadSignal = true;
                     lastSignalTime = now;
-                } else {
+                } else if (!voicePending || now - lastSignalTime >= std::chrono::milliseconds(1200)) {
                     float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
                     float timeout = scanStopHadSignal ? scanQuietSec : scanNoSignalSec;
                     if (elapsed >= timeout) {
@@ -6888,6 +6939,20 @@ self.addEventListener("fetch", event => {
         ChannelSlot* slot = (ChannelSlot*)ctx;
         ChannelBankModule* _this = slot->module;
 
+        const auto voicePolicy = _this->voiceSquelchPolicy.load();
+        const bool voiceEnabled = (voicePolicy & 1) != 0;
+        if (slot->voiceBufferPolicy != voicePolicy) {
+            slot->voiceBufferPolicy = voicePolicy;
+            // Longer pre-roll only while probing voice; legacy Off uses exactly
+            // its original capacity. Drop buffered rejected audio on toggles.
+            const int capacity = voiceEnabled ? 48000 : ChannelSlot::PREROLL_SAMPLES;
+            slot->preRollBuf.resize(capacity);
+            slot->preRollTmp.resize(capacity);
+            slot->preRollHead = slot->preRollCount = 0;
+            slot->voicePreRollAir.assign(voiceEnabled ? capacity : 0, 0);
+            slot->voicePreRollAirSamples = 0;
+        }
+
         // Discard audio until the AGC has had 200ms of *continuous* signal to
         // settle on.  If the signal drops during warmup the AGC ramps back up,
         // so we reset the clock each time it comes back — no pop on recording start.
@@ -6907,11 +6972,21 @@ self.addEventListener("fetch", event => {
         // of audio ready to prepend when a file opens.  Runs before the
         // file-open check so the samples that arrived just before detection
         // fired are captured — that's where the call sign lives.
+        const bool preRollRfPresent = slot->rawSignalPresent.load();
         for (int i = 0; i < count; i++) {
             slot->preRollBuf[slot->preRollHead] = (data[i].l + data[i].r) * 0.5f;
-            slot->preRollHead = (slot->preRollHead + 1) % ChannelSlot::PREROLL_SAMPLES;
-            if (slot->preRollCount < ChannelSlot::PREROLL_SAMPLES) slot->preRollCount++;
+            if (voiceEnabled) {
+                auto& wasOnAir = slot->voicePreRollAir[slot->preRollHead];
+                slot->voicePreRollAirSamples -= wasOnAir;
+                wasOnAir = preRollRfPresent ? 1 : 0;
+                slot->voicePreRollAirSamples += wasOnAir;
+            }
+            slot->preRollHead = (slot->preRollHead + 1) % slot->preRollBuf.size();
+            if (slot->preRollCount < (int)slot->preRollBuf.size()) slot->preRollCount++;
         }
+
+        slot->voiceSquelch.process(data, count, voicePolicy,
+            slot->signalPresent.load() || slot->rawSignalPresent.load(), slot->fileOpen);
 
         // Use FFT-based detection rather than audio amplitude.
         // AM/FM demodulators always output noise, so amplitude-based silence
@@ -6945,6 +7020,7 @@ self.addEventListener("fetch", event => {
         bool rawOpen     = (slot->rawSignalPresent.load() && slot->rawConsecutiveHits.load() >= 2);
         bool quarantined = _this->isRnVoiceQuarantined(slot->gridFreqHz);
         bool activeSignal = !quarantined && (slot->signalPresent.load() || rawOpen);
+        if (voiceEnabled) activeSignal = activeSignal && _this->voiceSquelchAccepted(*slot);
 
         // Hard duration cap: a recording open longer than maxRecordingSec is force-closed
         // regardless of whether the signal is still "present". Persistent come-and-go
@@ -6973,22 +7049,34 @@ self.addEventListener("fetch", event => {
             slot->inSilence = false;
             if (!slot->fileOpen) {
                 _this->openNewFile(*slot);
+                if (voiceEnabled && !slot->fileOpen) return;
                 // Flush pre-roll: write the last PREROLL_SAMPLES of audio that
                 // arrived before detection fired.  This recovers the ~100-300ms
                 // of transmission that happened before the file opened.
                 // Gain is applied; the buffer already contains mixed mono.
                 if (slot->preRollCount > 0) {
                     int avail = slot->preRollCount;
-                    int startIdx = (slot->preRollHead - avail + ChannelSlot::PREROLL_SAMPLES)
-                                   % ChannelSlot::PREROLL_SAMPLES;
+                    const int capacity = (int)slot->preRollBuf.size();
+                    int startIdx = (slot->preRollHead - avail + capacity) % capacity;
                     for (int i = 0; i < avail; i++) {
-                        int idx = (startIdx + i) % ChannelSlot::PREROLL_SAMPLES;
+                        int idx = (startIdx + i) % capacity;
                         slot->preRollTmp[i] = std::clamp(
                             slot->preRollBuf[idx] * _this->recGain, -1.0f, 1.0f);
                     }
                     slot->writer.write(slot->preRollTmp.data(), avail);
                     slot->audioSamplesWritten += avail;
+                    if (voiceEnabled) {
+                        // openNewFile resets the RF airtime tally. Include the
+                        // buffered, RF-present audio so confirmation latency
+                        // does not make a short call fail the existing Min TX.
+                        slot->onAirFrames.fetch_add(slot->voicePreRollAirSamples / 2400);
+                        std::fill(slot->voicePreRollAir.begin(), slot->voicePreRollAir.end(), 0);
+                        slot->voicePreRollAirSamples = 0;
+                    }
                     slot->preRollCount = 0;   // consumed; don't re-write on next call
+                    // The current block was included in pre-roll. Preserve the
+                    // legacy Off path, but don't duplicate it on voice admission.
+                    if (voiceEnabled) return;
                 }
             }
         }
@@ -7829,7 +7917,7 @@ self.addEventListener("fetch", event => {
             std::lock_guard<std::mutex> clck(_this->channelsMtx);
             marks.reserve(_this->activeChannels.size());
             for (auto& [idx, slot] : _this->activeChannels) {
-                bool live = slot->rawSignalPresent.load();
+                bool live = slot->rawSignalPresent.load() && _this->voiceSquelchAccepted(*slot);
                 bool rec  = slot->fileOpen;
                 if (live) recCount++;
                 bool play = (playingKey != 0 && _this->freqKey(slot->freqHz) == playingKey);
@@ -8279,6 +8367,17 @@ self.addEventListener("fetch", event => {
         }
 
 #ifndef CB_NO_RNNOISE
+        bool voiceSquelchOn = _this->voiceSquelchEnabled();
+        if (ImGui::Checkbox(CONCAT("Voice Squelch##_cb_voice_squelch_", _this->name), &voiceSquelchOn)) {
+            _this->setVoiceSquelchEnabled(voiceSquelchOn);
+            config.acquire();
+            config.conf[_this->name]["voiceSquelchEnabled"] = voiceSquelchOn;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Experimental: confirm speech before recording/playback or holding a scan.\n"
+                              "Uses dry audio; does not change SNR, noise reduction, or tail settings.\n"
+                              "Off immediately bypasses all voice decisions. Weak speech may be missed.");
         if (ImGui::Checkbox(CONCAT("RNNoise Voice Gate##_cb_rn_vad_", _this->name),
                             &_this->rnVoiceGateEnabled)) {
             config.acquire();
@@ -9691,6 +9790,11 @@ self.addEventListener("fetch", event => {
                         else if (slot->fileOpen) {
                             ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[REC]");
                         }
+                        else if (_this->voiceSquelchEnabled() && !_this->voiceSquelchAccepted(*slot)) {
+                            const auto policy = _this->voiceSquelchPolicy.load();
+                            ImGui::TextDisabled(slot->voiceSquelch.decision(policy) == channel_bank::VoiceSquelch::Rejected
+                                ? "[NO VOICE]" : "[VOICE?]");
+                        }
                         else if (slot->inSilence) {
                             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "[---]");
                         }
@@ -10049,7 +10153,8 @@ self.addEventListener("fetch", event => {
 
     // Manages slots for the current bookmark scan stop.
     // Returns true if any slot currently has signal or an open file.
-    bool manageBookmarkScanChannels() {
+    bool manageBookmarkScanChannels(bool& voicePending) {
+        voicePending = false;
         if (retuneFlag.load()) return false;
         if (bookmarkScanStops.empty()) return false;
         auto& stop = bookmarkScanStops[bookmarkScanStopIdx];
@@ -10158,8 +10263,10 @@ self.addEventListener("fetch", event => {
 
         // Return whether any slot is active with signal or recording
         bool anyActive = false;
-        for (auto& [idx, slot] : activeChannels)
-            if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
+        for (auto& [idx, slot] : activeChannels) {
+            if ((slot->signalPresent || slot->fileOpen) && voiceSquelchAccepted(*slot)) anyActive = true;
+            voicePending |= voiceSquelchProbing(*slot, now);
+        }
         return anyActive;
     }
 
@@ -10494,12 +10601,13 @@ self.addEventListener("fetch", event => {
                 }
             }
             // Watch alert: fire on rising edge of signal presence
-            if (present && !it->second->prevSignalPresent) {
+            bool admitted = present && voiceSquelchAccepted(*it->second);
+            if (admitted && !it->second->prevSignalPresent) {
                 int64_t k = freqKey(localFreqs[idx]);
                 std::lock_guard<std::mutex> wlk(manualFreqMtx);
                 if (watchedFreqs.count(k) > 0) watchAlert.store(k);
             }
-            it->second->prevSignalPresent = present;
+            it->second->prevSignalPresent = admitted;
             ++it;
         }
 
@@ -10652,6 +10760,9 @@ self.addEventListener("fetch", event => {
     bool         noiseReduction = false;    // RNNoise neural noise suppression on recordings
     float        nrMix          = 0.7f;    // 0=dry (original), 1=full NR
     bool         rnVoiceGateEnabled = false; // RNNoise VAD test gate, independent of noise reduction
+    std::atomic<uint64_t> voiceSquelchPolicy{0}; // generation plus enabled bit
+    uint64_t voiceRetryPolicy = 0; // management thread only
+    std::map<int64_t, std::chrono::steady_clock::time_point> voiceRetryAfter;
     float        rnVoiceGateFrameThreshold = 0.50f;
     float        rnVoiceGateVoiceFrac = 0.20f;
     int          rnVoiceGateMinFrames = 30;
@@ -10921,6 +11032,61 @@ self.addEventListener("fetch", event => {
 #else
         return false;
 #endif
+    }
+
+    bool voiceSquelchEnabled() const { return (voiceSquelchPolicy.load() & 1) != 0; }
+
+    void setVoiceSquelchEnabled(bool enabled) {
+        enabled = enabled && channel_bank::VoiceSquelch::available;
+        auto old = voiceSquelchPolicy.load();
+        while (((old & 1) != 0) != enabled) {
+            const auto next = ((old + 2) & ~uint64_t(1)) | (enabled ? 1u : 0u);
+            if (voiceSquelchPolicy.compare_exchange_weak(old, next)) break;
+        }
+    }
+
+    bool voiceSquelchAccepted(const ChannelSlot& slot) const {
+        const auto policy = voiceSquelchPolicy.load();
+        return !(policy & 1) || slot.fileOpen ||
+            slot.voiceSquelch.decision(policy) == channel_bank::VoiceSquelch::Confirmed;
+    }
+
+    const char* voiceSquelchState(const ChannelSlot& slot) const {
+        const auto policy = voiceSquelchPolicy.load();
+        if (!(policy & 1)) return "off";
+        if (slot.fileOpen) return "confirmed";
+        if (!slot.signalPresent.load() && !slot.rawSignalPresent.load()) return "idle";
+        switch (slot.voiceSquelch.decision(policy)) {
+            case channel_bank::VoiceSquelch::Confirmed: return "confirmed";
+            case channel_bank::VoiceSquelch::Rejected: return "rejected";
+            default: return "probing";
+        }
+    }
+
+    // Caller holds channelsMtx. An RF candidate gets bounded audio probe time,
+    // but does not set the scan's "had signal" latch or refresh its quiet timer.
+    bool voiceSquelchProbing(ChannelSlot& slot, std::chrono::steady_clock::time_point now) {
+        const auto policy = voiceSquelchPolicy.load();
+        if (slot.voiceProbePolicy != policy) {
+            slot.voiceProbePolicy = policy;
+            slot.voiceProbeRunning = false;
+        }
+        if (!(policy & 1)) return false;
+        if (!slot.signalPresent.load() && !slot.rawSignalPresent.load()) {
+            slot.voiceProbeRunning = false;
+            return false;
+        }
+        if (voiceSquelchAccepted(slot)) return false;
+        if (!slot.voiceProbeRunning) {
+            slot.voiceProbeRunning = true;
+            slot.voiceProbeStart = now;
+        }
+        return slot.voiceSquelch.decision(policy) != channel_bank::VoiceSquelch::Rejected &&
+            now - slot.voiceProbeStart < std::chrono::milliseconds(1200);
+    }
+
+    int64_t voiceRetryKey(double hz) const {
+        return (int64_t)std::llround(hz / channelSpacing);
     }
 
     bool isInActiveSpan(double freqHz) const {
@@ -11317,6 +11483,7 @@ self.addEventListener("fetch", event => {
         p["noiseReduction"]   = noiseReduction;
         p["nrMix"]            = nrMix;
         p["rnVoiceGateEnabled"] = rnVoiceGateEnabled;
+        p["voiceSquelchEnabled"] = voiceSquelchEnabled();
         p["rnVoiceGateVoiceFrac"] = rnVoiceGateVoiceFrac;
         p["rnVoiceGateProbeSec"] = rnVoiceGateProbeSec;
         p["rnVoiceGateQuarantineSec"] = rnVoiceGateQuarantineSec;
@@ -11380,6 +11547,7 @@ self.addEventListener("fetch", event => {
         noiseReduction    = p.value("noiseReduction", false);
         nrMix             = p.value("nrMix", 0.7f);
         rnVoiceGateEnabled = p.value("rnVoiceGateEnabled", false);
+        setVoiceSquelchEnabled(p.value("voiceSquelchEnabled", false));
         rnVoiceGateVoiceFrac = p.value("rnVoiceGateVoiceFrac", 0.20f);
         rnVoiceGateProbeSec = p.value("rnVoiceGateProbeSec", 10.0f);
         rnVoiceGateQuarantineSec = p.value("rnVoiceGateQuarantineSec", 60.0f);
