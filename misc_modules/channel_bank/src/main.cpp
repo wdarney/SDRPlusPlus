@@ -6806,7 +6806,7 @@ self.addEventListener("fetch", event => {
         if (isBlocked(normalized) || isRnVoiceQuarantined(normalized)) return;
         {
             std::lock_guard<std::mutex> lk(multiReceiverMtx);
-            if (!receiverAllocator.markPending(key)) return;
+            if (!receiverAllocator.markPendingDistinct(key, channelSpacing, nmsRadiusSlots)) return;
         }
         {
             std::lock_guard<std::mutex> lk(dispatchQueueMtx);

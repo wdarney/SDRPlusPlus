@@ -42,6 +42,20 @@ public:
         return true;
     }
 
+    // Discovery NMS sees only the current FFT frame. Retain that exclusion
+    // across later frames, after a channel has entered dispatch. Keys are
+    // rounded to kHz, so allow 1 kHz for two rounding errors.
+    bool markPendingDistinct(int64_t key, double spacingHz, int radiusSlots) {
+        if (dispatch_.count(key)) return false;
+        const double radiusHz = std::max(1, radiusSlots) * spacingHz + 1000.0;
+        for (const auto& [existingKey, state] : dispatch_) {
+            if (state == DispatchState::Suppressed) continue;
+            if (std::abs((double)(key - existingKey) * 1000.0) <= radiusHz) return false;
+        }
+        dispatch_[key] = DispatchState::Pending;
+        return true;
+    }
+
     bool activate(int64_t key, const Allocation& allocation) {
         auto state = dispatch_.find(key);
         if (state == dispatch_.end() || state->second != DispatchState::Pending) return false;

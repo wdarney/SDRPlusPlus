@@ -16,6 +16,23 @@ int main() {
     assert(a.activate(124700, *first));
     assert(!a.markPending(124700)); // duplicate while ACTIVE
 
+    // The FFT may vote for a neighboring 8.33 kHz slot on a later frame.
+    // Both pending and active assignments must suppress that second VFO.
+    ReceiverAllocator nms;
+    assert(nms.markPendingDistinct(124545, 8333.333, 2));
+    assert(!nms.markPendingDistinct(124553, 8333.333, 2));
+    assert(nms.markPendingDistinct(124570, 8333.333, 2));
+    nms.failPending(124545);
+    assert(nms.markPendingDistinct(124553, 8333.333, 2));
+    nms.clear();
+    nms.setReceivers({{"RTL-SDR", 2400000.0, 0.0, true, {}}});
+    assert(nms.markPendingDistinct(124545, 8333.333, 2));
+    auto nmsAllocation = nms.choose(124.545e6, 8333.333);
+    assert(nmsAllocation && nms.activate(124545, *nmsAllocation));
+    assert(!nms.markPendingDistinct(124553, 8333.333, 2));
+    nms.release(124545, false);
+    assert(nms.markPendingDistinct(124553, 8333.333, 2));
+
     assert(a.markPending(125100));
     auto packed = a.choose(125.100e6, 12500.0);
     assert(packed && packed->receiverId == "A" && packed->reusedCoverage);
