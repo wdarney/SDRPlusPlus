@@ -1832,6 +1832,22 @@ private:
             entry.freqHz = keyHz;
             entry.blocked = blocked;
         }
+        if (blocked) {
+            if (currentlyPlayingFreqKey.load() == key)
+                playbackCancelGeneration.fetch_add(1);
+            discardBlockedPlaybackEntries(key);
+            // Browser audio is a FIFO of PCM chunks without per-chunk keys.
+            // If this frequency owns it, drop its buffered tail as well.
+            {
+                std::lock_guard<std::mutex> lk(liveAudioMtx);
+                if (liveAudioSelectedFreqKey.load() == key) {
+                    liveAudioChunks.clear();
+                    liveAudioQueuedSamples = 0;
+                    liveAudioSelectedFreqKey.store(0);
+                    liveAudioSelectedMs.store(0);
+                }
+            }
+        }
         saveFreqLog();
         mgmtCv.notify_one();
         return true;
@@ -4496,11 +4512,12 @@ self.addEventListener("fetch", event => {
             float s = std::clamp(mono[i], -1.0f, 1.0f);
             chunk[(size_t)i] = (int16_t)std::lround(s * 32767.0f);
         }
-        publishLiveAudioPcm(slot.freqHz, chunk.data(), (int)chunk.size(), false);
+        publishLiveAudioPcm(slot.gridFreqHz, chunk.data(), (int)chunk.size(), false);
     }
 
     void publishLiveAudioPcm(double freqHz, const int16_t* pcm, int count, bool forceSelect) {
         if (liveAudioClients.load() <= 0 || !pcm || count <= 0) return;
+        if (isBlocked(freqHz)) return;
 
         std::unique_lock<std::mutex> lk(liveAudioMtx, std::try_to_lock);
         if (!lk.owns_lock()) {
@@ -8169,6 +8186,25 @@ self.addEventListener("fetch", event => {
         }
     }
 
+    void discardBlockedPlaybackEntries(int64_t key) {
+        std::vector<PlaybackEntry> skipped;
+        {
+            std::lock_guard<std::mutex> lk(playbackMtx);
+            for (auto it = playbackQueue.begin(); it != playbackQueue.end(); ) {
+                if (freqKey(it->freqHz) == key) {
+                    skipped.push_back(std::move(*it));
+                    it = playbackQueue.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& entry : skipped) completeUnplayedPlaybackEntry(entry);
+        if (!skipped.empty())
+            flog::info("[ChannelBank] Block skipped {0} queued recording(s) at {1:.3f} MHz",
+                       (int)skipped.size(), (double)key / 1000.0);
+    }
+
     void cleanupDiscardedPlaybackEntry(const PlaybackEntry& entry) {
         if (entry.deleteAfter) {
             std::remove(entry.path.c_str());
@@ -8186,22 +8222,25 @@ self.addEventListener("fetch", event => {
     }
 
     size_t enqueuePlayback(PlaybackEntry entry) {
-        if (!playbackAllowed(entry.freqHz)) {
+        if (!playbackAllowed(entry.freqHz) || isBlocked(entry.freqHz)) {
             completeUnplayedPlaybackEntry(entry);
             std::lock_guard<std::mutex> lk(playbackMtx);
             return playbackQueue.size();
         }
         std::vector<PlaybackEntry> dropped;
         size_t qSize = 0;
+        bool blockedWhileEnqueuing = false;
         {
             std::lock_guard<std::mutex> lk(playbackMtx);
-            playbackQueue.push_back(std::move(entry));
+            blockedWhileEnqueuing = isBlocked(entry.freqHz);
+            if (!blockedWhileEnqueuing) playbackQueue.push_back(std::move(entry));
             while (playbackQueue.size() > PLAYBACK_QUEUE_HARD_LIMIT) {
                 dropped.push_back(std::move(playbackQueue.front()));
                 playbackQueue.pop_front();
             }
             qSize = playbackQueue.size();
         }
+        if (blockedWhileEnqueuing) completeUnplayedPlaybackEntry(entry);
         for (auto& old : dropped) cleanupDiscardedPlaybackEntry(old);
         if (!dropped.empty()) {
             flog::warn("[ChannelBank] Dropped {0} old playback item(s); queue hard limit is {1}",
@@ -8287,6 +8326,7 @@ self.addEventListener("fetch", event => {
             }
 
             if (!path.empty()) {
+                const uint64_t cancelGeneration = playbackCancelGeneration.load();
 #if defined(__APPLE__) || defined(_WIN32)
                 // Install synced-playback state for THIS file before playback
                 // starts, so the UI thread can highlight whichever segment the
@@ -8312,7 +8352,8 @@ self.addEventListener("fetch", event => {
                 normalizeRecordingIfEnabled(path);
                 currentlyPlayingFreqHz.store(playFreq);
                 currentlyPlayingFreqKey.store(freqKey(playFreq));
-                playbackWavFile(path, playFreq);
+                if (!isBlocked(playFreq) && cancelGeneration == playbackCancelGeneration.load())
+                    playbackWavFile(path, playFreq, cancelGeneration);
                 currentlyPlayingFreqKey.store(0);
                 currentlyPlayingFreqHz.store(0.0);
 #if defined(__APPLE__) || defined(_WIN32)
@@ -8369,7 +8410,8 @@ self.addEventListener("fetch", event => {
         }
     }
 
-    void playbackWavFile(const std::string& path, double playFreq) {
+    void playbackWavFile(const std::string& path, double playFreq, uint64_t cancelGeneration) {
+        if (cancelGeneration != playbackCancelGeneration.load() || isBlocked(playFreq)) return;
         // Write one silence chunk before opening the file so the file I/O
         // happens while the consumer processes audio — prevents underrun pop.
         const int PREBUF = 1024;
@@ -8418,7 +8460,8 @@ self.addEventListener("fetch", event => {
 
         uint32_t remaining = dataSize;
         int      samplesRead = 0;
-        while (remaining > 0 && playbackRunning) {
+        while (remaining > 0 && playbackRunning &&
+               cancelGeneration == playbackCancelGeneration.load()) {
             uint32_t toRead = std::min(remaining, (uint32_t)(CHUNK * bytesPerFrame));
             f.read((char*)pcm.data(), toRead);
             int bytesRead = (int)f.gcount();
@@ -9452,6 +9495,59 @@ self.addEventListener("fetch", event => {
                     }
                 }
                 ImGui::EndChild();
+                ImGui::TextDisabled("Transmission receiver gain (configured values)");
+                auto gainNow = std::chrono::steady_clock::now();
+                if (!ImGui::IsAnyItemActive() &&
+                    gainNow - _this->transmissionGainSnapshotAt > std::chrono::seconds(2)) {
+                    for (const auto& receiverId : _this->transmissionReceiverPool)
+                        _this->transmissionGainSnapshots[receiverId] = _this->jsonSourceStateJson(receiverId);
+                    _this->transmissionGainSnapshotAt = gainNow;
+                }
+                for (const auto& receiverId : _this->transmissionReceiverPool) {
+                    ImGui::PushID(receiverId.c_str());
+                    std::string gainHeading = receiverId + " gain";
+                    if (ImGui::TreeNode(gainHeading.c_str())) {
+                        auto found = _this->transmissionGainSnapshots.find(receiverId);
+                        const char* iface = _this->selectedSourceControlInterface(receiverId);
+                        if (!iface || found == _this->transmissionGainSnapshots.end() ||
+                            !found->second.value("available", false) ||
+                            !found->second.contains("gains") || !found->second["gains"].is_array()) {
+                            ImGui::TextDisabled("%s: gain controls unavailable", receiverId.c_str());
+                        } else {
+                            ImGui::Text("%s", receiverId.c_str());
+                            bool refreshGainState = false;
+                            for (auto& gain : found->second["gains"]) {
+                                if (!gain.is_object() || !gain.contains("name")) continue;
+                                const std::string gainName = gain.value("name", std::string());
+                                const std::string label = gain.value("label", gainName + " Gain");
+                                float value = gain.value("value", 0.0f);
+                                const float min = gain.value("min", 0.0f);
+                                const float max = gain.value("max", 0.0f);
+                                bool editable = gain.value("available", true) &&
+                                                gain.value("liveMutable", false) && max > min;
+                                if (!editable) style::beginDisabled();
+                                ImGui::Text("%s", label.c_str());
+                                ImGui::SetNextItemWidth(menuWidth - 24.0f);
+                                std::string sliderId = "##gain_" + gainName;
+                                if (ImGui::SliderFloat(sliderId.c_str(), &value, min, max, "%.1f dB"))
+                                    gain["value"] = value;
+                                if (editable && ImGui::IsItemDeactivatedAfterEdit()) {
+                                    RX888SourceControlV1 req{};
+                                    std::string request = json({{"gains", {{gainName, value}}}}).dump();
+                                    strncpy(req.request, request.c_str(), sizeof(req.request) - 1);
+                                    if (!_this->callJsonSourceControl(iface, RX888_SOURCE_CONTROL_SET, &req) || !req.ok)
+                                        flog::warn("[ChannelBank] Could not set {0} gain on '{1}'", gainName, receiverId);
+                                    refreshGainState = true;
+                                }
+                                if (!editable) style::endDisabled();
+                            }
+                            if (refreshGainState)
+                                _this->transmissionGainSnapshots[receiverId] = _this->jsonSourceStateJson(receiverId);
+                        }
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
                 ImGui::Separator();
             }
 
@@ -10439,7 +10535,7 @@ self.addEventListener("fetch", event => {
             // panel below (Frequency History, settings, etc.) stays put even as
             // channels spawn/expire.
             ImGui::Separator();
-            bool needSaveFreqLog = false;
+            std::vector<std::pair<double, bool>> blockActions;
             ImGui::BeginChild(CONCAT("##_cb_ch_", _this->name),
                               ImVec2(menuWidth, 150), false);
             {
@@ -10472,13 +10568,8 @@ self.addEventListener("fetch", event => {
                         bool blocked = _this->isBlocked(slot->gridFreqHz);
                         char blkId[48];
                         snprintf(blkId, sizeof(blkId), "Blk##_cb_ablk_%d", idx);
-                        if (ImGui::Checkbox(blkId, &blocked)) {
-                            std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                            auto& entry = _this->freqLog[_this->freqKey(slot->gridFreqHz)];
-                            if (entry.freqHz == 0.0) entry.freqHz = slot->gridFreqHz;
-                            entry.blocked = blocked;
-                            needSaveFreqLog = true;
-                        }
+                        if (ImGui::Checkbox(blkId, &blocked))
+                            blockActions.push_back({slot->gridFreqHz, blocked});
                     }
                 }
 
@@ -10526,21 +10617,16 @@ self.addEventListener("fetch", event => {
                         }
                     }
 
-                    // Apply block toggle outside both locks (freqLogMtx → saveFreqLog)
-                    if (toBlockFreq != 0.0) {
-                        {
-                            std::lock_guard<std::mutex> lk(_this->freqLogMtx);
-                            auto& entry = _this->freqLog[_this->freqKey(toBlockFreq)];
-                            if (entry.freqHz == 0.0) entry.freqHz = toBlockFreq;
-                            entry.blocked = toBlockVal;
-                        }
-                        _this->saveFreqLog();
-                    }
+                    if (toBlockFreq != 0.0) blockActions.push_back({toBlockFreq, toBlockVal});
                 }
             }
             ImGui::EndChild();
 
-            if (needSaveFreqLog) _this->saveFreqLog();
+            for (const auto& [hz, blocked] : blockActions) {
+                std::string error;
+                if (!_this->setFrequencyBlocked(hz, blocked, error))
+                    flog::warn("[ChannelBank] Could not change block at {0:.3f} MHz: {1}", hz / 1e6, error);
+            }
         }
 
         // ── Frequency history + blocklist ─────────────────────────────────────
@@ -11417,6 +11503,7 @@ self.addEventListener("fetch", event => {
     int          playbackAutoFlushThreshold  = 30;  // queue size above which auto-flush kicks in
     int          playbackAutoFlushKeepLatest = 5;   // how many to keep playable after a flush
     std::atomic<int64_t> playbackLockFreqKey { 0 };  // 0 = all frequencies may enter playback queue
+    std::atomic<uint64_t> playbackCancelGeneration { 0 }; // Block interrupts the current WAV
     // Non-max-suppression radius in slots — when detecting a signal at slot N,
     // also suppress neighbors up to ±nmsRadiusSlots from joining `detected`.
     // Default 2: covers AM voice (carrier + ±5–8 kHz sidebands) at 8.33–25 kHz
@@ -11504,6 +11591,8 @@ self.addEventListener("fetch", event => {
     std::string discoveryReceiver;
     std::mutex uiSourceSnapshotMtx;
     std::vector<SourceManager::IndependentSourceInfo> uiIndependentSources; // stable while scanning
+    std::map<std::string, json> transmissionGainSnapshots; // UI thread only
+    std::chrono::steady_clock::time_point transmissionGainSnapshotAt{};
     std::vector<std::string> transmissionReceiverPool;
     float maximumMonitorSec = 0.0f; // 0 = Off
     channel_bank_multi_receiver::ReceiverAllocator receiverAllocator;
