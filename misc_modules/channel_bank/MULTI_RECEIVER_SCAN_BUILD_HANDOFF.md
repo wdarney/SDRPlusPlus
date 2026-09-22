@@ -46,7 +46,7 @@ The separate legacy `sddc_source` target could not be configured in this checkou
 
 ## Interface and current limits
 
-The desktop UI adds the mode, Discovery Receiver selection, ordered Transmission Receiver Pool, and Maximum Monitor Time. Channel Bank settings expose `mode: "multi_receiver_scan"`, `discoveryReceiver`, `transmissionReceiverPool`, `maximumMonitorSec`, and `supportsMultiReceiverScan`. The existing state response includes a separate `multiReceiverScan` object with receiver assignments, dispatch states, and failure counts. Structural settings still require Channel Bank to be stopped.
+The desktop UI adds the mode, Discovery Receiver selection, ordered Transmission Receiver Pool, Maximum Monitor Time, and a live Transmission Receiver Activity list showing each receiver's assigned channel frequencies. Active channel rows also name the assigned receiver. The Web UI's Active Channels table has a Receiver column. Channel Bank settings expose `mode: "multi_receiver_scan"`, `discoveryReceiver`, `transmissionReceiverPool`, `maximumMonitorSec`, and `supportsMultiReceiverScan`. The existing state response includes a separate `multiReceiverScan` object with receiver assignments, dispatch states, and failure counts; each active channel also includes `receiverId`. Structural settings still require Channel Bank to be stopped.
 
 Receiver identifiers currently come from registered SDR++ source instances. The adapters listed above register one instance per driver type in the current upstream source modules. Running several dongles of the *same* driver type concurrently will need those modules to register distinct source instances; this feature does not create them automatically.
 

@@ -2173,6 +2173,7 @@ private:
                     {"recording", slot->fileOpen},
                     {"signalPresent", slot->signalPresent.load()},
                     {"rawSignalPresent", slot->rawSignalPresent.load()},
+                    {"receiverId", slot->assignedReceiver},
                     {"file", slot->currentFilePath}
                 });
             }
@@ -2553,7 +2554,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 </section>
 <section>
 <h2>Active Channels</h2>
-<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Signal</th><th>Recording</th><th>Block</th></tr></thead><tbody id="channels"></tbody></table>
+<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Receiver</th><th>Signal</th><th>Recording</th><th>Block</th></tr></thead><tbody id="channels"></tbody></table>
 </section>
 <section>
 <h2>Playback / Transcript</h2>
@@ -3875,8 +3876,8 @@ async function refresh(force = false) {
 	    renderActivityHistory(s);
 	    renderHeatMap(s);
 	    document.getElementById("channels").innerHTML = (s.activeChannels || []).map(ch =>
-	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${blockHzFor(ch)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
-	    ).join("") || `<tr><td colspan="6" class="muted">No active channels</td></tr>`;
+	      `<tr><td>${ch.slot}</td><td>${esc(fmtMHz(ch.freqHz))}</td><td>${esc(ch.name || "")}</td><td>${esc(ch.receiverId || s.selectedSource || "Main source")}</td><td>${ch.signalPresent ? "yes" : "no"}</td><td>${ch.recording ? "yes" : "no"}</td><td><button class="inline-action ${ch.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${blockHzFor(ch)}, ${ch.blocked ? "false" : "true"})">${ch.blocked ? "Unblock" : "Block"}</button></td></tr>`
+	    ).join("") || `<tr><td colspan="7" class="muted">No active channels</td></tr>`;
 	    renderBlockedFrequencies(s);
     const tx = (s.lastTranscriptText || "").trim();
     document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
@@ -9239,6 +9240,44 @@ self.addEventListener("fetch", event => {
                     if (_this->maximumMonitorSec < 1.0f) _this->maximumMonitorSec = 0.0f;
                     _this->saveScanConfig();
                 }
+                ImGui::Text("Transmission Receiver Activity");
+                std::vector<channel_bank_multi_receiver::ReceiverState> receiverStates;
+                {
+                    std::lock_guard<std::mutex> lk(_this->multiReceiverMtx);
+                    receiverStates = _this->receiverAllocator.receivers();
+                }
+                ImGui::BeginChild(CONCAT("##_cb_receiver_activity_", _this->name),
+                                  ImVec2(menuWidth, 125), true);
+                if (!_this->running) {
+                    ImGui::TextDisabled("Start Channel Bank to see assignments.");
+                }
+                else {
+                    for (const auto& receiverId : _this->transmissionReceiverPool) {
+                        auto it = std::find_if(receiverStates.begin(), receiverStates.end(),
+                            [&](const auto& receiver) { return receiver.id == receiverId; });
+                        if (it == receiverStates.end() || !it->available) {
+                            ImGui::Text("%s: UNAVAILABLE", receiverId.c_str());
+                            continue;
+                        }
+                        if (it->idle()) {
+                            ImGui::Text("%s: IDLE", receiverId.c_str());
+                            continue;
+                        }
+                        ImGui::Text("%s: ACTIVE at %.3f MHz (%d channels)",
+                                    receiverId.c_str(), it->centerHz / 1e6, (int)it->channels.size());
+                        for (int64_t key : it->channels) {
+                            double frequencyHz = (double)key * 1000.0;
+                            std::string channelName = _this->displayName(frequencyHz);
+                            char frequencyLabel[64];
+                            snprintf(frequencyLabel, sizeof(frequencyLabel), "%.3f MHz", frequencyHz / 1e6);
+                            if (channelName == frequencyLabel)
+                                ImGui::BulletText("%s", frequencyLabel);
+                            else
+                                ImGui::BulletText("%s  %s", frequencyLabel, channelName.c_str());
+                        }
+                    }
+                }
+                ImGui::EndChild();
                 ImGui::Separator();
             }
 
@@ -10237,6 +10276,10 @@ self.addEventListener("fetch", event => {
                         std::string label = _this->displayName(slot->freqHz);
                         ImGui::Text("%s", label.c_str());
                         if (ImGui::IsItemHovered()) _this->hoveredFreqHz = slot->freqHz;
+                        if (slot->multiReceiver) {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("on %s", slot->assignedReceiver.c_str());
+                        }
                         ImGui::SameLine();
                         bool playing = (_this->currentlyPlayingFreqKey.load() == _this->freqKey(slot->freqHz));
                         if (playing) {
