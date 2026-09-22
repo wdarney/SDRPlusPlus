@@ -74,6 +74,15 @@ endif()
 
 include(${SDRPP_MODULE_CMAKE})
 
+if (BUILD_TESTING)
+    enable_testing()
+    add_executable(channel_bank_multi_receiver_allocator_test
+        tests/multi_receiver_allocator_test.cpp)
+    target_compile_features(channel_bank_multi_receiver_allocator_test PRIVATE cxx_std_17)
+    add_test(NAME channel_bank_multi_receiver_allocator
+        COMMAND channel_bank_multi_receiver_allocator_test)
+endif()
+
 # Desktop modules are loaded with dlsym/GetProcAddress using the legacy
 # unscoped entry-point names (_INFO_, _INIT_, and friends).  The unified core
 # header's fallback token is reserved for core/static-module translation units;

@@ -76,6 +76,8 @@ public:
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.getSampleRateHandler = [](void* ctx) { return ((RTLSDRSourceModule*)ctx)->sampleRate; };
+        handler.isRunningHandler = [](void* ctx) { return ((RTLSDRSourceModule*)ctx)->running; };
         handler.stream = &stream;
 
         strcpy(dbTxt, "--");

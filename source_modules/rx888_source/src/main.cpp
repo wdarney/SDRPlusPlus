@@ -53,6 +53,8 @@ public:
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.getSampleRateHandler = [](void* ctx) { return ((RX888SourceModule*)ctx)->sampleRate; };
+        handler.isRunningHandler = [](void* ctx) { return ((RX888SourceModule*)ctx)->running.load(); };
         handler.stream = &stream;
 
         loadSoapySDDC();

@@ -48,6 +48,8 @@ public:
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.getSampleRateHandler = [](void* ctx) { return ((SoapyModule*)ctx)->sampleRate; };
+        handler.isRunningHandler = [](void* ctx) { return ((SoapyModule*)ctx)->running; };
         handler.stream = &stream;
         sigpath::sourceManager.registerSource("SoapySDR", &handler);
     }

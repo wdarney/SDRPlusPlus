@@ -29,6 +29,7 @@
 #include <utils/wav.h>
 #include <fftw3.h>
 #include "spectral_floor.h"
+#include "multi_receiver_allocator.h"
 #ifndef CB_NO_RNNOISE
 #include <rnnoise.h>
 #endif
@@ -215,6 +216,12 @@ struct ChannelSlot {
     // channel.  Same as freqHz in manual mode (no centroid).
     double gridFreqHz = 0.0;
     std::string streamName;
+    dsp::routing::Splitter<dsp::complex_t>* iqSourceSplitter = nullptr;
+    bool multiReceiver = false;
+    std::string assignedReceiver;
+    std::chrono::steady_clock::time_point allocationStarted;
+    bool releaseRequested = false;
+    bool suppressOnRelease = false;
 
     ChannelBankModule* module = nullptr;
 
@@ -506,6 +513,16 @@ public:
             normalizeRecordings = config.conf[name]["normalizeRecordings"];
         if (config.conf[name].contains("scanMode"))
             scanMode = config.conf[name]["scanMode"];
+        if (config.conf[name].contains("multiReceiverScanMode"))
+            multiReceiverScanMode = config.conf[name]["multiReceiverScanMode"];
+        if (config.conf[name].contains("discoveryReceiver"))
+            discoveryReceiver = config.conf[name]["discoveryReceiver"].get<std::string>();
+        if (config.conf[name].contains("transmissionReceiverPool") &&
+            config.conf[name]["transmissionReceiverPool"].is_array())
+            for (auto& j : config.conf[name]["transmissionReceiverPool"])
+                if (j.is_string()) transmissionReceiverPool.push_back(j.get<std::string>());
+        if (config.conf[name].contains("maximumMonitorSec"))
+            maximumMonitorSec = std::max(0.0f, config.conf[name]["maximumMonitorSec"].get<float>());
         if (config.conf[name].contains("scanQuietSec"))
             scanQuietSec = config.conf[name]["scanQuietSec"];
         if (config.conf[name].contains("scanNoSignalSec"))
@@ -548,6 +565,9 @@ public:
         retuneHandler.ctx     = this;
         retuneHandler.handler = retuneHandlerFunc;
         sigpath::sourceManager.onRetune.bindHandler(&retuneHandler);
+        sourceUnregisterHandler.ctx = this;
+        sourceUnregisterHandler.handler = sourceUnregisterHandlerFunc;
+        sigpath::sourceManager.onSourceUnregister.bindHandler(&sourceUnregisterHandler);
 
         gui::menu.registerEntry(name, menuHandler, this);
     }
@@ -560,6 +580,7 @@ public:
         stopWebServer();
         gui::menu.removeEntry(name);
         sigpath::sourceManager.onRetune.unbindHandler(&retuneHandler);
+        sigpath::sourceManager.onSourceUnregister.unbindHandler(&sourceUnregisterHandler);
         gui::waterfall.onFFTRedraw.unbindHandler(&fftRedrawHandler);
         restoreWaterfallVisibility();  // always restore on unload, safe no-op if not saved
         if (running) { stop(); }
@@ -628,7 +649,7 @@ public:
 
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
-        if (scanMode) {
+        if (scanMode || multiReceiverScanMode) {
             size_t stopCount = 0;
             if (!scanStopCount(scanRanges, lastKnownSr, bwUsage, stopCount)) {
                 flog::error("[ChannelBank] Cannot start Scan: ranges are invalid for the current {0:.0f} Hz source sample rate",
@@ -653,7 +674,7 @@ public:
         }
         { std::lock_guard<std::mutex> lck(channelsMtx); recentChannels.clear(); }
 
-        if (scanMode) {
+        if (scanMode || multiReceiverScanMode) {
             computeScanStops();
             scanStopIdx        = 0;
             scanStopHadSignal  = false;
@@ -663,6 +684,8 @@ public:
                 gui::waterfall.centerFreqMoved = true;
             }
         }
+
+        if (multiReceiverScanMode && !prepareMultiReceiverScan()) return;
 
         if (bookmarkScanMode) {
             computeBookmarkScanStops();
@@ -729,6 +752,10 @@ public:
         playbackThread  = std::thread(&ChannelBankModule::playbackThreadFunc, this);
 
         running = true;
+        if (multiReceiverScanMode) {
+            dispatchRunning = true;
+            dispatchThread = std::thread(&ChannelBankModule::dispatchThreadFunc, this);
+        }
 #ifdef __APPLE__
         if (startAudioMonitorOnStart) startAudioMonitorLaunchAgent();
 #endif
@@ -780,6 +807,7 @@ public:
         // Stop management thread and spectrum monitor so no new channels are spawned
         // or modified while we tear down.
         if (mgmtThread.joinable()) { mgmtThread.join(); }
+        if (multiReceiverScanMode) stopMultiReceiverOrchestration();
 
         iqSplitter->unbindStream(specStream);
         specSink->stop();
@@ -797,6 +825,7 @@ public:
             }
             activeChannels.clear();
         }
+        if (multiReceiverScanMode) releaseMultiReceiverSources();
 
 #if defined(__APPLE__) || defined(_WIN32)
         cancelTranscriptionJobs();
@@ -1328,6 +1357,7 @@ private:
 
     std::string detectionModeName() const {
         if (manualMode) return "manual";
+        if (multiReceiverScanMode) return "multi_receiver_scan";
         if (scanMode) return "scan";
         if (bookmarkScanMode) return "bookmark_scan";
         return "auto";
@@ -1438,13 +1468,55 @@ private:
         };
     }
 
+    json multiReceiverStatusJson() {
+        json receivers = json::array();
+        json dispatches = json::array();
+        std::lock_guard<std::mutex> lk(multiReceiverMtx);
+        for (const auto& receiver : receiverAllocator.receivers()) {
+            json channels = json::array();
+            for (int64_t key : receiver.channels) channels.push_back((double)key * 1000.0);
+            receivers.push_back({
+                {"id", receiver.id}, {"available", receiver.available},
+                {"state", receiver.channels.empty() ? "IDLE" : "ACTIVE"},
+                {"centerHz", receiver.centerHz}, {"sampleRate", receiver.sampleRate},
+                {"channels", channels}
+            });
+        }
+        for (const auto& [key, state] : receiverAllocator.dispatches()) {
+            const char* stateName = state == channel_bank_multi_receiver::DispatchState::Pending ? "PENDING" :
+                                    state == channel_bank_multi_receiver::DispatchState::Active ? "ACTIVE" : "SUPPRESSED";
+            dispatches.push_back({
+                {"freqKey", key}, {"frequencyHz", (double)key * 1000.0},
+                {"state", stateName}, {"receiverId", receiverAllocator.assignment(key)}
+            });
+        }
+        return {
+            {"discoveryReceiver", discoveryReceiver},
+            {"discoveryState", running && multiReceiverScanMode ? "SCANNING" : "STOPPED"},
+            {"currentDiscoveryHz", lastKnownCenter},
+            {"receivers", receivers}, {"dispatches", dispatches},
+            {"noCapacityCount", dispatchNoCapacityCount.load()},
+            {"failureCount", dispatchFailureCount.load()}
+        };
+    }
+
     json channelBankSettingsJson() {
         json ranges = json::array();
         for (const auto& range : scanRanges) {
             ranges.push_back({{"start", range.startHz}, {"stop", range.stopHz}});
         }
+        json receiverPool = json::array();
+        for (const auto& receiver : transmissionReceiverPool) receiverPool.push_back(receiver);
+        json availableReceivers = json::array();
+        for (const auto& source : sigpath::sourceManager.getIndependentSources()) {
+            availableReceivers.push_back({
+                {"id", source.name}, {"sampleRate", source.sampleRate},
+                {"selected", source.selected}, {"claimed", source.claimed}
+            });
+        }
         return {
             {"supportsScanRanges", true},
+            {"supportsMultiReceiverScan", true},
             {"mode", detectionModeName()},
             {"spacingId", spacingId},
             {"channelSpacingHz", channelSpacing},
@@ -1461,6 +1533,10 @@ private:
             {"scanQuietSec", scanQuietSec},
             {"scanNoSignalSec", scanNoSignalSec},
             {"scanRanges", ranges},
+            {"discoveryReceiver", discoveryReceiver},
+            {"transmissionReceiverPool", receiverPool},
+            {"availableReceivers", availableReceivers},
+            {"maximumMonitorSec", maximumMonitorSec},
             {"transcriptionBackend", transcriptionBackend},
             {"transcriptionBackendName", transcriptionBackendName()}
         };
@@ -1472,7 +1548,9 @@ private:
             return false;
         }
         bool structural = body.contains("mode") || body.contains("spacingId") ||
-                          body.contains("demodMode") || body.contains("scanRanges");
+                          body.contains("demodMode") || body.contains("scanRanges") ||
+                          body.contains("discoveryReceiver") ||
+                          body.contains("transmissionReceiverPool");
         if (running && structural) {
             error = "stop Channel Bank before changing mode, spacing, demod, or scan ranges";
             return false;
@@ -1486,6 +1564,7 @@ private:
             }
             nextMode = body["mode"].get<std::string>();
             if (nextMode != "auto" && nextMode != "manual" && nextMode != "scan" &&
+                nextMode != "multi_receiver_scan" &&
                 nextMode != "bookmark_scan") {
                 error = "invalid Channel Bank mode";
                 return false;
@@ -1548,6 +1627,18 @@ private:
             error = "transcription backend must be an integer";
             return false;
         }
+        if (body.contains("discoveryReceiver") && !body["discoveryReceiver"].is_string()) {
+            error = "discovery receiver must be a string";
+            return false;
+        }
+        if (body.contains("transmissionReceiverPool") && !body["transmissionReceiverPool"].is_array()) {
+            error = "transmission receiver pool must be an array";
+            return false;
+        }
+        if (body.contains("maximumMonitorSec") && !body["maximumMonitorSec"].is_number()) {
+            error = "maximum monitor time must be numeric";
+            return false;
+        }
 
         auto finiteNumber = [&](const char* key, const char* message) {
             if (!body.contains(key)) return true;
@@ -1559,7 +1650,8 @@ private:
         if (!finiteNumber("snrThresholdDb", "snr threshold must be finite") ||
             !finiteNumber("bwUsage", "frequency span must be finite") ||
             !finiteNumber("scanQuietSec", "scan quiet must be finite") ||
-            !finiteNumber("scanNoSignalSec", "no-signal skip must be finite")) {
+            !finiteNumber("scanNoSignalSec", "no-signal skip must be finite") ||
+            !finiteNumber("maximumMonitorSec", "maximum monitor time must be finite")) {
             return false;
         }
 
@@ -1602,20 +1694,38 @@ private:
             !validateApiScanRanges(body["scanRanges"], nextBwUsage, nextScanRanges, error)) {
             return false;
         }
+        std::string nextDiscoveryReceiver = body.value("discoveryReceiver", discoveryReceiver);
+        std::vector<std::string> nextReceiverPool = transmissionReceiverPool;
+        if (body.contains("transmissionReceiverPool")) {
+            nextReceiverPool.clear();
+            for (const auto& entry : body["transmissionReceiverPool"]) {
+                if (!entry.is_string()) { error = "receiver pool entries must be strings"; return false; }
+                std::string id = entry.get<std::string>();
+                if (!id.empty() && std::find(nextReceiverPool.begin(), nextReceiverPool.end(), id) == nextReceiverPool.end())
+                    nextReceiverPool.push_back(std::move(id));
+            }
+        }
+        float nextMaximumMonitorSec = body.contains("maximumMonitorSec")
+            ? std::clamp(body["maximumMonitorSec"].get<float>(), 0.0f, 86400.0f)
+            : maximumMonitorSec;
 
         // All fields have now been validated. From here onward the update is a
         // single in-memory/config commit with no validation failure exits.
         if (body.contains("mode")) {
-            if ((nextMode == "auto" || nextMode == "scan") &&
+            if ((nextMode == "auto" || nextMode == "scan" || nextMode == "multi_receiver_scan") &&
                 (manualMode || bookmarkScanMode)) restoreWaterfallVisibility();
             if (nextMode == "bookmark_scan" && manualMode) restoreWaterfallVisibility();
             manualMode = nextMode == "manual";
             scanMode = nextMode == "scan";
+            multiReceiverScanMode = nextMode == "multi_receiver_scan";
             bookmarkScanMode = nextMode == "bookmark_scan";
             if ((manualMode || bookmarkScanMode) && !boundBookmarkLists.empty())
                 applyWaterfallVisibility();
         }
         if (body.contains("scanRanges")) scanRanges = std::move(nextScanRanges);
+        if (body.contains("discoveryReceiver")) discoveryReceiver = std::move(nextDiscoveryReceiver);
+        if (body.contains("transmissionReceiverPool")) transmissionReceiverPool = std::move(nextReceiverPool);
+        if (body.contains("maximumMonitorSec")) maximumMonitorSec = nextMaximumMonitorSec;
 
         bool transcriptionTurnedOff = false;
         config.acquire();
@@ -1680,6 +1790,7 @@ private:
         if (body.contains("mode")) {
             config.conf[name]["manualMode"] = manualMode;
             config.conf[name]["scanMode"] = scanMode;
+            config.conf[name]["multiReceiverScanMode"] = multiReceiverScanMode;
             config.conf[name]["bookmarkScanMode"] = bookmarkScanMode;
         }
         if (body.contains("scanRanges")) {
@@ -1687,6 +1798,13 @@ private:
             ranges = json::array();
             for (const auto& range : scanRanges)
                 ranges.push_back({{"start", range.startHz}, {"stop", range.stopHz}});
+        }
+        if (body.contains("discoveryReceiver")) config.conf[name]["discoveryReceiver"] = discoveryReceiver;
+        if (body.contains("maximumMonitorSec")) config.conf[name]["maximumMonitorSec"] = maximumMonitorSec;
+        if (body.contains("transmissionReceiverPool")) {
+            config.conf[name]["transmissionReceiverPool"] = json::array();
+            for (const auto& receiver : transmissionReceiverPool)
+                config.conf[name]["transmissionReceiverPool"].push_back(receiver);
         }
         config.conf[name]["profiles"][activeProfileName] = snapshotProfile();
         config.conf[name]["activeProfile"] = activeProfileName;
@@ -2227,6 +2345,7 @@ private:
         j["currentlyPlayingFreqKey"] = playingKey;
         j["history"] = history;
         j["diagnostics"] = diagnosticsJson();
+        j["multiReceiverScan"] = multiReceiverStatusJson();
         if (scanMode) {
             j["scanStopIndex"] = scanStopIdx;
             j["scanStopCount"] = (int)scanStops.size();
@@ -6427,6 +6546,360 @@ self.addEventListener("fetch", event => {
     }
 #endif
 
+    bool prepareMultiReceiverScan() {
+        const std::string selectedDiscovery = sigpath::sourceManager.getSelectedSourceName();
+        if (discoveryReceiver.empty()) discoveryReceiver = selectedDiscovery;
+        if (discoveryReceiver.empty()) {
+            flog::error("[ChannelBank] Multi-Receiver Scan requires a selected Discovery Receiver");
+            return false;
+        }
+        if (selectedDiscovery != discoveryReceiver) {
+            flog::error("[ChannelBank] Multi-Receiver: configured Discovery Receiver '{0}' is not the selected SDR++ source ('{1}')",
+                        discoveryReceiver, selectedDiscovery);
+            return false;
+        }
+        auto available = sigpath::sourceManager.getIndependentSources();
+        std::map<std::string, double> sampleRates;
+        for (const auto& source : available) sampleRates[source.name] = source.sampleRate;
+
+        std::vector<channel_bank_multi_receiver::ReceiverState> receivers;
+        const std::string owner = name + ":multi-receiver";
+        for (const auto& receiver : transmissionReceiverPool) {
+            if (receiver == discoveryReceiver) {
+                flog::warn("[ChannelBank] Multi-Receiver: discovery source '{0}' cannot be in the transmission pool", receiver);
+                continue;
+            }
+            auto rate = sampleRates.find(receiver);
+            if (rate == sampleRates.end() || rate->second <= 0.0 ||
+                !sigpath::sourceManager.claimIndependentSource(receiver, owner)) {
+                flog::warn("[ChannelBank] Multi-Receiver: configured receiver '{0}' is unavailable", receiver);
+                continue;
+            }
+            receivers.push_back({receiver, rate->second});
+            flog::info("[ChannelBank] Multi-Receiver: claimed '{0}' at {1:.0f} Hz", receiver, rate->second);
+        }
+        if (receivers.empty()) {
+            flog::error("[ChannelBank] Multi-Receiver Scan has no available transmission receivers");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(multiReceiverMtx);
+            receiverAllocator.setReceivers(std::move(receivers));
+            receiverRuntimes.clear();
+            scanObservedKeys.clear();
+        }
+        return true;
+    }
+
+    static void sourceUnregisterHandlerFunc(std::string source, void* ctx) {
+        auto* self = (ChannelBankModule*)ctx;
+        if (!self->running || !self->multiReceiverScanMode) return;
+        if (source == self->discoveryReceiver) {
+            flog::error("[ChannelBank] Multi-Receiver: Discovery Receiver '{0}' disconnected; stopping scan", source);
+            self->stop();
+            return;
+        }
+        self->handleMultiReceiverDisconnect(source);
+    }
+
+    void handleMultiReceiverDisconnect(const std::string& source) {
+        std::scoped_lock lk(multiReceiverMtx, channelsMtx);
+        auto released = receiverAllocator.disconnect(source);
+        if (released.empty() && receiverRuntimes.find(source) == receiverRuntimes.end()) return;
+        for (int64_t key : released) {
+            auto slot = activeChannels.find((int)key);
+            if (slot == activeChannels.end()) continue;
+            destroySlot(*slot->second);
+            delete slot->second;
+            activeChannels.erase(slot);
+        }
+        auto runtime = receiverRuntimes.find(source);
+        if (runtime != receiverRuntimes.end()) {
+            if (runtime->second.splitter) {
+                runtime->second.splitter->stop();
+                delete runtime->second.splitter;
+            }
+            receiverRuntimes.erase(runtime);
+        }
+        dispatchFailureCount.fetch_add(1);
+        flog::warn("[ChannelBank] Multi-Receiver: '{0}' disconnected; {1} hosted channels ended",
+                   source, (int)released.size());
+    }
+
+    void enqueueDispatch(double frequencyHz) {
+        const double normalized = std::round(frequencyHz / channelSpacing) * channelSpacing;
+        const int64_t key = freqKey(normalized);
+        if (isBlocked(normalized) || isRnVoiceQuarantined(normalized)) return;
+        {
+            std::lock_guard<std::mutex> lk(multiReceiverMtx);
+            if (!receiverAllocator.markPending(key)) return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(dispatchQueueMtx);
+            dispatchQueue.push({key, normalized});
+        }
+        flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> PENDING", normalized / 1e6);
+        dispatchQueueCv.notify_one();
+    }
+
+    void dispatchThreadFunc() {
+        while (dispatchRunning.load()) {
+            DispatchRequest request;
+            {
+                std::unique_lock<std::mutex> lk(dispatchQueueMtx);
+                dispatchQueueCv.wait(lk, [&] { return !dispatchRunning.load() || !dispatchQueue.empty(); });
+                if (!dispatchRunning.load() && dispatchQueue.empty()) break;
+                request = dispatchQueue.front();
+                dispatchQueue.pop();
+            }
+
+            bool setupFailed = false;
+            bool allocated = false;
+            while (dispatchRunning.load() && !allocated) {
+                std::unique_lock<std::mutex> mlk(multiReceiverMtx);
+                auto allocation = receiverAllocator.choose(request.frequencyHz, channelSpacing);
+                if (!allocation) {
+                    receiverAllocator.failPending(request.key);
+                    if (setupFailed) dispatchFailureCount.fetch_add(1);
+                    else dispatchNoCapacityCount.fetch_add(1);
+                    flog::warn("[ChannelBank] Multi-Receiver: allocation failed for {0:.3f} MHz ({1})",
+                               request.frequencyHz / 1e6,
+                               setupFailed ? "receiver setup exhausted" : "no capacity");
+                    break;
+                }
+
+                const std::string receiverId = allocation->receiverId;
+                auto runtimeIt = receiverRuntimes.find(receiverId);
+                bool idleAllocation = !allocation->reusedCoverage;
+                if (idleAllocation) {
+                    ReceiverRuntime runtime;
+                    runtime.id = receiverId;
+                    runtime.sampleRate = sigpath::sourceManager.getIndependentSourceSampleRate(
+                        receiverId, name + ":multi-receiver");
+                    auto* stream = sigpath::sourceManager.getIndependentSourceStream(
+                        receiverId, name + ":multi-receiver");
+                    if (!stream || runtime.sampleRate <= 0.0 ||
+                        !sigpath::sourceManager.tuneIndependentSource(
+                            receiverId, name + ":multi-receiver", request.frequencyHz)) {
+                        receiverAllocator.setAvailable(receiverId, false);
+                        setupFailed = true;
+                        flog::warn("[ChannelBank] Multi-Receiver: tune/setup failed on '{0}', trying next receiver", receiverId);
+                        continue;
+                    }
+                    runtime.centerHz = request.frequencyHz;
+                    runtime.splitter = new dsp::routing::Splitter<dsp::complex_t>(stream);
+                    runtimeIt = receiverRuntimes.emplace(receiverId, std::move(runtime)).first;
+                }
+
+                ReceiverRuntime& runtime = runtimeIt->second;
+                ChannelSlot* slot = new ChannelSlot();
+                slot->multiReceiver = true;
+                slot->assignedReceiver = receiverId;
+                slot->allocationStarted = std::chrono::steady_clock::now();
+                slot->lastDetected = slot->allocationStarted;
+                slot->signalPresent = true;
+                slot->rawSignalPresent = true;
+                slot->rawConsecutiveHits = 2;
+                {
+                    std::lock_guard<std::mutex> clk(channelsMtx);
+                    initSlot(*slot, (int)request.key, 1, 0.0,
+                             request.frequencyHz - runtime.centerHz,
+                             runtime.splitter, runtime.sampleRate, runtime.centerHz);
+                    activeChannels[(int)request.key] = slot;
+                }
+
+                if (idleAllocation) {
+                    runtime.splitter->start();
+                    if (!sigpath::sourceManager.startIndependentSource(
+                            receiverId, name + ":multi-receiver")) {
+                        {
+                            std::lock_guard<std::mutex> clk(channelsMtx);
+                            destroySlot(*slot);
+                            activeChannels.erase((int)request.key);
+                        }
+                        delete slot;
+                        runtime.splitter->stop();
+                        delete runtime.splitter;
+                        receiverRuntimes.erase(runtimeIt);
+                        receiverAllocator.setAvailable(receiverId, false);
+                        setupFailed = true;
+                        flog::warn("[ChannelBank] Multi-Receiver: start failed on '{0}', trying next receiver", receiverId);
+                        continue;
+                    }
+                    runtime.started = true;
+                    flog::info("[ChannelBank] Multi-Receiver: tuned '{0}' to {1:.3f} MHz",
+                               receiverId, runtime.centerHz / 1e6);
+                }
+
+                if (!receiverAllocator.activate(request.key, *allocation)) {
+                    std::lock_guard<std::mutex> clk(channelsMtx);
+                    destroySlot(*slot);
+                    activeChannels.erase((int)request.key);
+                    delete slot;
+                    receiverAllocator.failPending(request.key);
+                    dispatchFailureCount.fetch_add(1);
+                    break;
+                }
+                allocated = true;
+                flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> ACTIVE on '{1}' ({2})",
+                           request.frequencyHz / 1e6, receiverId,
+                           allocation->reusedCoverage ? "coverage reuse" : "idle receiver");
+            }
+        }
+    }
+
+    void requestMultiReceiverRelease(int64_t key, bool suppress) {
+        std::scoped_lock lk(multiReceiverMtx, channelsMtx);
+        auto it = activeChannels.find((int)key);
+        if (it == activeChannels.end() || !it->second->multiReceiver) return;
+        it->second->releaseRequested = true;
+        it->second->suppressOnRelease = it->second->suppressOnRelease || suppress;
+        it->second->rawSignalPresent = false;
+        it->second->rawConsecutiveHits = 0;
+        it->second->signalPresent = false;
+        it->second->lastDetected = std::chrono::steady_clock::now();
+    }
+
+    void finishMultiReceiverRelease(int64_t key) {
+        std::scoped_lock lk(multiReceiverMtx, channelsMtx);
+        auto it = activeChannels.find((int)key);
+        if (it == activeChannels.end() || !it->second->multiReceiver) return;
+        ChannelSlot* slot = it->second;
+        const bool suppress = slot->suppressOnRelease;
+        const std::string receiverId = slot->assignedReceiver;
+        destroySlot(*slot);
+        delete slot;
+        activeChannels.erase(it);
+        receiverAllocator.release(key, suppress);
+        bool idle = false;
+        for (const auto& receiver : receiverAllocator.receivers())
+            if (receiver.id == receiverId) idle = receiver.idle();
+        if (idle) {
+            auto runtime = receiverRuntimes.find(receiverId);
+            if (runtime != receiverRuntimes.end()) {
+                if (runtime->second.started)
+                    sigpath::sourceManager.stopIndependentSource(receiverId, name + ":multi-receiver");
+                if (runtime->second.splitter) {
+                    runtime->second.splitter->stop();
+                    delete runtime->second.splitter;
+                }
+                receiverRuntimes.erase(runtime);
+            }
+            flog::info("[ChannelBank] Multi-Receiver: '{0}' -> IDLE", receiverId);
+        }
+        flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> {1}",
+                   (double)key / 1000.0, suppress ? "SUPPRESSED" : "released");
+    }
+
+    void stopMultiReceiverOrchestration() {
+        dispatchRunning = false;
+        dispatchQueueCv.notify_all();
+        if (dispatchThread.joinable()) dispatchThread.join();
+        {
+            std::lock_guard<std::mutex> qlk(dispatchQueueMtx);
+            while (!dispatchQueue.empty()) {
+                std::lock_guard<std::mutex> mlk(multiReceiverMtx);
+                receiverAllocator.failPending(dispatchQueue.front().key);
+                dispatchQueue.pop();
+            }
+        }
+    }
+
+    void releaseMultiReceiverSources() {
+        std::lock_guard<std::mutex> lk(multiReceiverMtx);
+        const std::string owner = name + ":multi-receiver";
+        for (auto& [id, runtime] : receiverRuntimes) {
+            if (runtime.started) sigpath::sourceManager.stopIndependentSource(id, owner);
+            if (runtime.splitter) {
+                runtime.splitter->stop();
+                delete runtime.splitter;
+            }
+        }
+        receiverRuntimes.clear();
+        for (const auto& receiver : transmissionReceiverPool)
+            sigpath::sourceManager.releaseIndependentSource(receiver, owner);
+        receiverAllocator.clear();
+        scanObservedKeys.clear();
+    }
+
+    void manageMultiReceiverScan(const std::chrono::steady_clock::time_point& now) {
+        std::set<int> current;
+        {
+            std::lock_guard<std::mutex> lk(detectedMtx);
+            current = detectedSlots;
+        }
+        const int numSlots = std::max(1, (int)std::floor(lastKnownSr / channelSpacing));
+        for (int idx : current) {
+            double slotOffset = ((double)idx - (double)(numSlots - 1) / 2.0) * channelSpacing;
+            double frequency = std::round((lastKnownCenter + slotOffset) / channelSpacing) * channelSpacing;
+            if (!isInActiveSpan(frequency)) continue;
+            int64_t key = freqKey(frequency);
+            scanObservedKeys.insert(key);
+            enqueueDispatch(frequency);
+            std::lock_guard<std::mutex> clk(channelsMtx);
+            auto active = activeChannels.find((int)key);
+            if (active != activeChannels.end() && active->second->multiReceiver) {
+                active->second->lastDetected = now;
+                active->second->signalPresent = true;
+                active->second->rawSignalPresent = true;
+                active->second->rawConsecutiveHits = 2;
+            }
+        }
+
+        std::vector<int64_t> releaseReady;
+        {
+            std::lock_guard<std::mutex> clk(channelsMtx);
+            for (auto& [idx, slot] : activeChannels) {
+                if (!slot->multiReceiver) continue;
+                if (isBlocked(slot->gridFreqHz)) {
+                    slot->releaseRequested = true;
+                    slot->suppressOnRelease = false;
+                    slot->signalPresent = false;
+                    slot->rawSignalPresent = false;
+                }
+                if (maximumMonitorSec > 0.0f && !slot->releaseRequested &&
+                    std::chrono::duration<float>(now - slot->allocationStarted).count() >= maximumMonitorSec) {
+                    slot->releaseRequested = true;
+                    slot->suppressOnRelease = true;
+                    slot->signalPresent = false;
+                    slot->rawSignalPresent = false;
+                    flog::info("[ChannelBank] Multi-Receiver: maximum monitor time reached at {0:.3f} MHz",
+                               slot->gridFreqHz / 1e6);
+                }
+                if (slot->releaseRequested && !slot->fileOpen) releaseReady.push_back(freqKey(slot->gridFreqHz));
+            }
+        }
+        for (int64_t key : releaseReady) finishMultiReceiverRelease(key);
+
+        const bool detectedHere = !current.empty();
+        const float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
+        if (!scanStops.empty() && (detectedHere || elapsed >= scanNoSignalSec)) {
+            const double halfSpan = lastKnownSr * bwUsage * 0.5;
+            std::vector<int64_t> ended;
+            {
+                std::lock_guard<std::mutex> mlk(multiReceiverMtx);
+                for (const auto& [key, state] : receiverAllocator.dispatches()) {
+                    const double hz = (double)key * 1000.0;
+                    if (std::abs(hz - lastKnownCenter) > halfSpan || scanObservedKeys.count(key)) continue;
+                    if (state == channel_bank_multi_receiver::DispatchState::Suppressed) {
+                        receiverAllocator.clearSuppressed(key);
+                        flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz carrier cleared; suppression removed", hz / 1e6);
+                    }
+                    else if (state == channel_bank_multi_receiver::DispatchState::Active) ended.push_back(key);
+                }
+            }
+            for (int64_t key : ended) requestMultiReceiverRelease(key, false);
+            scanObservedKeys.clear();
+            scanStopIdx = (scanStopIdx + 1) % (int)scanStops.size();
+            const double nextCenter = scanStops[scanStopIdx];
+            flog::info("[ChannelBank] Multi-Receiver: discovery advancing immediately to stop {0} at {1:.3f} MHz",
+                       scanStopIdx, nextCenter / 1e6);
+            gui::waterfall.setCenterFrequency(nextCenter);
+            gui::waterfall.centerFreqMoved = true;
+            lastSignalTime = now;
+        }
+    }
+
     void managementThreadFunc() {
         while (mgmtRunning) {
             std::unique_lock<std::mutex> ulck(mgmtWaitMtx);
@@ -6439,6 +6912,11 @@ self.addEventListener("fetch", event => {
             pollTranscriptions();
             expirePendingEncodeWaits();
 #endif
+
+            if (multiReceiverScanMode) {
+                manageMultiReceiverScan(now);
+                continue;
+            }
 
             if (bookmarkScanMode) {
                 bool anySignal = manageBookmarkScanChannels();
@@ -6631,9 +7109,16 @@ self.addEventListener("fetch", event => {
 
     // exactOffsetHz: when not NaN, overrides the grid-based offset calculation and
     // disables spectral-centroid / BFO adjustment (used by manual mode).
-    void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz, double exactOffsetHz = NAN) {
+    void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz,
+                  double exactOffsetHz = NAN,
+                  dsp::routing::Splitter<dsp::complex_t>* sourceSplitter = nullptr,
+                  double sourceSampleRate = NAN,
+                  double sourceCenterHz = NAN) {
         slot.module  = this;
         slot.gridIdx = gridIdx;
+        slot.iqSourceSplitter = sourceSplitter ? sourceSplitter : iqSplitter;
+        const double inputSampleRate = std::isfinite(sourceSampleRate) ? sourceSampleRate : lastKnownSr;
+        const double inputCenter = std::isfinite(sourceCenterHz) ? sourceCenterHz : lastKnownCenter;
 
         bool isManual = !std::isnan(exactOffsetHz);
         // Auto mode: use the spectral centroid (peakOffsetHz) as the channel frequency.
@@ -6654,11 +7139,11 @@ self.addEventListener("fetch", event => {
         double offset = isManual
             ? exactOffsetHz
             : std::clamp(peakOffsetHz, gridOffset - channelSpacing * 0.5, gridOffset + channelSpacing * 0.5);
-        slot.freqHz     = lastKnownCenter + offset;
+        slot.freqHz     = inputCenter + offset;
         // gridFreqHz: deterministic identity for blocking + freqLog keying.
         // Snap to nearest multiple of channelSpacing so the key is independent
         // of the SDR center frequency — retuning won't invalidate blocks.
-        double rawGrid = isManual ? slot.freqHz : (lastKnownCenter + gridOffset);
+        double rawGrid = isManual ? slot.freqHz : (inputCenter + gridOffset);
         slot.gridFreqHz = std::round(rawGrid / channelSpacing) * channelSpacing;
 
         char freqBuf[64];
@@ -6689,7 +7174,7 @@ self.addEventListener("fetch", event => {
 
         slot.iqIn = new dsp::stream<dsp::complex_t>();
         slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
-        slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, lastKnownSr, audioSr, bw, vfoOff);
+        slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, inputSampleRate, audioSr, bw, vfoOff);
         slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
         // AM demod bandwidth = full channel width (same as VFO), matching SDR++ radio module.
@@ -6755,7 +7240,7 @@ self.addEventListener("fetch", event => {
         slot.vfo->start();
 
         // Expose the completed receiver chain to the live local IQ splitter last.
-        iqSplitter->bindStream(slot.iqIn);
+        slot.iqSourceSplitter->bindStream(slot.iqIn);
 
     }
 
@@ -6780,7 +7265,7 @@ self.addEventListener("fetch", event => {
 
         // Remove the live producer first, then stop upstream-to-downstream. No
         // stopped consumer remains attached to a synchronous splitter.
-        iqSplitter->unbindStream(slot.iqIn);
+        if (slot.iqSourceSplitter) slot.iqSourceSplitter->unbindStream(slot.iqIn);
 
         slot.vfo->stop();
         if (slot.amDemod)  slot.amDemod->stop();
@@ -8367,18 +8852,19 @@ self.addEventListener("fetch", event => {
         ImGui::Spacing();
 
         // Detection mode (disabled while running)
-        bool isAuto   = !_this->manualMode && !_this->scanMode && !_this->bookmarkScanMode;
+        bool isAuto   = !_this->manualMode && !_this->scanMode && !_this->multiReceiverScanMode && !_this->bookmarkScanMode;
         bool isManual = _this->manualMode;
         bool isScan   = _this->scanMode;
+        bool isMultiScan = _this->multiReceiverScanMode;
         bool isBkScan = _this->bookmarkScanMode;
         if (ImGui::RadioButton(CONCAT("Auto##_cb_auto_", _this->name), isAuto)) {
             if (_this->manualMode || _this->bookmarkScanMode) _this->restoreWaterfallVisibility();
-            _this->manualMode = false; _this->scanMode = false; _this->bookmarkScanMode = false;
+            _this->manualMode = false; _this->scanMode = false; _this->multiReceiverScanMode = false; _this->bookmarkScanMode = false;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Manual##_cb_manual_", _this->name), isManual)) {
-            _this->manualMode = true; _this->scanMode = false; _this->bookmarkScanMode = false;
+            _this->manualMode = true; _this->scanMode = false; _this->multiReceiverScanMode = false; _this->bookmarkScanMode = false;
             if (!_this->boundBookmarkLists.empty())
                 _this->applyWaterfallVisibility();
             _this->saveManualConfig(); _this->saveScanConfig();
@@ -8386,15 +8872,20 @@ self.addEventListener("fetch", event => {
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Scan##_cb_scan_", _this->name), isScan)) {
             if (_this->manualMode || _this->bookmarkScanMode) _this->restoreWaterfallVisibility();
-            _this->manualMode = false; _this->scanMode = true; _this->bookmarkScanMode = false;
+            _this->manualMode = false; _this->scanMode = true; _this->multiReceiverScanMode = false; _this->bookmarkScanMode = false;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
         ImGui::SameLine();
         if (ImGui::RadioButton(CONCAT("Bk Scan##_cb_bkscan_", _this->name), isBkScan)) {
             if (_this->manualMode) _this->restoreWaterfallVisibility();
-            _this->manualMode = false; _this->scanMode = false; _this->bookmarkScanMode = true;
+            _this->manualMode = false; _this->scanMode = false; _this->multiReceiverScanMode = false; _this->bookmarkScanMode = true;
             if (!_this->boundBookmarkLists.empty())
                 _this->applyWaterfallVisibility();
+            _this->saveManualConfig(); _this->saveScanConfig();
+        }
+        if (ImGui::RadioButton(CONCAT("Multi-Receiver Scan##_cb_multiscan_", _this->name), isMultiScan)) {
+            if (_this->manualMode || _this->bookmarkScanMode) _this->restoreWaterfallVisibility();
+            _this->manualMode = false; _this->scanMode = false; _this->multiReceiverScanMode = true; _this->bookmarkScanMode = false;
             _this->saveManualConfig(); _this->saveScanConfig();
         }
 
@@ -8685,8 +9176,71 @@ self.addEventListener("fetch", event => {
         }
 
         // ── Scan range list (shown when scan mode selected) ───────────────────
-        if (_this->scanMode) {
+        if (_this->scanMode || _this->multiReceiverScanMode) {
             ImGui::Spacing();
+
+            if (_this->multiReceiverScanMode) {
+                auto sources = sigpath::sourceManager.getIndependentSources();
+                std::string selectedDiscovery = sigpath::sourceManager.getSelectedSourceName();
+                if (_this->discoveryReceiver.empty()) _this->discoveryReceiver = selectedDiscovery;
+                bool discoveryAvailable = std::any_of(sources.begin(), sources.end(), [&](const auto& source) {
+                    return source.name == _this->discoveryReceiver;
+                });
+                std::string discoveryLabel = _this->discoveryReceiver.empty() ? "Unavailable" : _this->discoveryReceiver;
+                if (!discoveryAvailable && !_this->discoveryReceiver.empty()) discoveryLabel += " (unavailable)";
+                ImGui::Text("Discovery Receiver");
+                if (gui::mainWindow.isPlaying()) style::beginDisabled();
+                if (ImGui::BeginCombo(CONCAT("##_cb_discovery_receiver_", _this->name),
+                                      discoveryLabel.c_str())) {
+                    for (const auto& source : sources) {
+                        bool selected = source.name == _this->discoveryReceiver;
+                        if (ImGui::Selectable(source.name.c_str(), selected)) {
+                            sigpath::sourceManager.selectSource(source.name);
+                            _this->discoveryReceiver = source.name;
+                            _this->saveScanConfig();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (gui::mainWindow.isPlaying()) style::endDisabled();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stop the SDR before changing the Discovery Receiver.");
+
+                ImGui::Text("Transmission Receiver Pool");
+                std::set<std::string> seen;
+                for (const auto& source : sources) {
+                    if (source.name == _this->discoveryReceiver) continue;
+                    seen.insert(source.name);
+                    bool selected = std::find(_this->transmissionReceiverPool.begin(),
+                                              _this->transmissionReceiverPool.end(),
+                                              source.name) != _this->transmissionReceiverPool.end();
+                    bool compatible = source.sampleRate > 0.0 && !source.claimed;
+                    if (!compatible) style::beginDisabled();
+                    std::string label = source.name + " (" +
+                        (source.sampleRate > 0.0 ? std::to_string((int)(source.sampleRate / 1000.0)) + " kHz" : "unavailable") +
+                        ")##cb_pool_" + source.name + _this->name;
+                    if (ImGui::Checkbox(label.c_str(), &selected)) {
+                        auto& pool = _this->transmissionReceiverPool;
+                        pool.erase(std::remove(pool.begin(), pool.end(), source.name), pool.end());
+                        if (selected) pool.push_back(source.name);
+                        _this->saveScanConfig();
+                    }
+                    if (!compatible) style::endDisabled();
+                }
+                for (const auto& configured : _this->transmissionReceiverPool)
+                    if (configured != _this->discoveryReceiver && !seen.count(configured))
+                        ImGui::TextDisabled("[ ] %s (unavailable)", configured.c_str());
+
+                ImGui::LeftLabel("Maximum Monitor Time");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(CONCAT("##_cb_max_monitor_", _this->name),
+                                       &_this->maximumMonitorSec, 0.0f, 600.0f,
+                                       _this->maximumMonitorSec <= 0.0f ? "Off" : "%.0f s")) {
+                    if (_this->maximumMonitorSec < 1.0f) _this->maximumMonitorSec = 0.0f;
+                    _this->saveScanConfig();
+                }
+                ImGui::Separator();
+            }
 
             // Add a range: [start] → [stop]  [Add]
             float addBtnW = ImGui::CalcTextSize("Add").x + ImGui::GetStyle().FramePadding.x * 2 + ImGui::GetStyle().ItemSpacing.x;
@@ -10166,6 +10720,12 @@ self.addEventListener("fetch", event => {
     void saveScanConfig() {
         config.acquire();
         config.conf[name]["scanMode"]     = scanMode;
+        config.conf[name]["multiReceiverScanMode"] = multiReceiverScanMode;
+        config.conf[name]["discoveryReceiver"] = discoveryReceiver;
+        config.conf[name]["maximumMonitorSec"] = maximumMonitorSec;
+        config.conf[name]["transmissionReceiverPool"] = nlohmann::json::array();
+        for (const auto& receiver : transmissionReceiverPool)
+            config.conf[name]["transmissionReceiverPool"].push_back(receiver);
         config.conf[name]["scanQuietSec"]    = scanQuietSec;
         config.conf[name]["scanNoSignalSec"] = scanNoSignalSec;
         auto& arr = config.conf[name]["scanRanges"];
@@ -10660,6 +11220,7 @@ self.addEventListener("fetch", event => {
 
     // Scan mode
     bool scanMode = false;
+    bool multiReceiverScanMode = false;
     std::vector<ScanRange> scanRanges;
     float scanQuietSec    = 3.0f;
     float scanNoSignalSec = 1.0f;
@@ -10670,6 +11231,35 @@ self.addEventListener("fetch", event => {
     std::chrono::steady_clock::time_point lastSignalTime;
     char  scanStartBuf[32] = {};
     char  scanStopBuf[32]  = {};
+
+    // Multi-Receiver Scan orchestration. Discovery remains on the normal
+    // frontend; these source leases and splitters are used only by dispatched
+    // logical channels.
+    struct DispatchRequest {
+        int64_t key = 0;
+        double frequencyHz = 0.0;
+    };
+    struct ReceiverRuntime {
+        std::string id;
+        double sampleRate = 0.0;
+        double centerHz = 0.0;
+        dsp::routing::Splitter<dsp::complex_t>* splitter = nullptr;
+        bool started = false;
+    };
+    std::string discoveryReceiver;
+    std::vector<std::string> transmissionReceiverPool;
+    float maximumMonitorSec = 0.0f; // 0 = Off
+    channel_bank_multi_receiver::ReceiverAllocator receiverAllocator;
+    std::map<std::string, ReceiverRuntime> receiverRuntimes;
+    std::mutex multiReceiverMtx;
+    std::queue<DispatchRequest> dispatchQueue;
+    std::mutex dispatchQueueMtx;
+    std::condition_variable dispatchQueueCv;
+    std::thread dispatchThread;
+    std::atomic<bool> dispatchRunning { false };
+    std::set<int64_t> scanObservedKeys;
+    std::atomic<uint64_t> dispatchNoCapacityCount { 0 };
+    std::atomic<uint64_t> dispatchFailureCount { 0 };
 
     // Bookmark scan mode — clusters bookmarks by SDR bandwidth and hops between them
     bool bookmarkScanMode = false;
@@ -11288,6 +11878,7 @@ self.addEventListener("fetch", event => {
     double lastKnownCenter = 0.0;
 
     EventHandler<double> retuneHandler;
+    EventHandler<std::string> sourceUnregisterHandler;
 
     // Main waterfall draw hook — adds per-channel markers to gui::waterfall
     EventHandler<ImGui::WaterFall::FFTRedrawArgs> fftRedrawHandler;
@@ -11345,6 +11936,12 @@ self.addEventListener("fetch", event => {
         p["manualLocalSnrEnabled"] = manualLocalSnrEnabled;
         p["manualStormGuardEnabled"] = manualStormGuardEnabled;
         p["scanMode"]           = scanMode;
+        p["multiReceiverScanMode"] = multiReceiverScanMode;
+        p["discoveryReceiver"] = discoveryReceiver;
+        p["maximumMonitorSec"] = maximumMonitorSec;
+        p["transmissionReceiverPool"] = json::array();
+        for (const auto& receiver : transmissionReceiverPool)
+            p["transmissionReceiverPool"].push_back(receiver);
         p["scanQuietSec"]       = scanQuietSec;
         p["scanNoSignalSec"]    = scanNoSignalSec;
         p["playbackAutoFlushEnabled"]    = playbackAutoFlushEnabled;
@@ -11408,6 +12005,13 @@ self.addEventListener("fetch", event => {
         manualLocalSnrEnabled = p.value("manualLocalSnrEnabled", true);
         manualStormGuardEnabled = p.value("manualStormGuardEnabled", true);
         scanMode           = p.value("scanMode", false);
+        multiReceiverScanMode = p.value("multiReceiverScanMode", false);
+        discoveryReceiver = p.value("discoveryReceiver", std::string());
+        maximumMonitorSec = std::max(0.0f, p.value("maximumMonitorSec", 0.0f));
+        transmissionReceiverPool.clear();
+        if (p.contains("transmissionReceiverPool") && p["transmissionReceiverPool"].is_array())
+            for (auto& j : p["transmissionReceiverPool"])
+                if (j.is_string()) transmissionReceiverPool.push_back(j.get<std::string>());
         scanQuietSec       = p.value("scanQuietSec", 3.0f);
         scanNoSignalSec    = p.value("scanNoSignalSec", 1.0f);
         playbackAutoFlushEnabled    = p.value("playbackAutoFlushEnabled", true);

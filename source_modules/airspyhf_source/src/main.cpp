@@ -49,6 +49,8 @@ public:
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.getSampleRateHandler = [](void* ctx) { return ((AirspyHFSourceModule*)ctx)->sampleRate; };
+        handler.isRunningHandler = [](void* ctx) { return ((AirspyHFSourceModule*)ctx)->running; };
         handler.stream = &stream;
 
         refresh();
