@@ -472,7 +472,8 @@ private:
             if (best >= 0) {
                 srId = best;
                 sampleRate = sampleRates[srId];
-                core::setInputSampleRate(sampleRate);
+                if (sigpath::sourceManager.getSelectedSourceName() == "RX888")
+                    core::setInputSampleRate(sampleRate);
                 changed = true;
             }
         }
@@ -592,7 +593,8 @@ private:
         }
         srId       = best;
         sampleRate = sampleRates[srId];
-        core::setInputSampleRate(sampleRate);
+        if (sigpath::sourceManager.getSelectedSourceName() == "RX888")
+            core::setInputSampleRate(sampleRate);
     }
 
     void saveConfig() {
@@ -951,7 +953,8 @@ private:
             if (!std::isfinite(actualSampleRate) || actualSampleRate <= 0.0)
                 throw std::runtime_error("Driver reported an invalid IQ sample rate");
             _this->sampleRate = actualSampleRate;
-            core::setInputSampleRate(_this->sampleRate);
+            if (sigpath::sourceManager.getSelectedSourceName() == "RX888")
+                core::setInputSampleRate(_this->sampleRate);
             _this->dev->setAntenna(SOAPY_SDR_RX, 0, _this->mode);
             _this->updateGainRanges();
             _this->dev->setFrequency(SOAPY_SDR_RX, 0, _this->freq);

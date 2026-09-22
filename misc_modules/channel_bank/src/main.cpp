@@ -222,6 +222,8 @@ struct ChannelSlot {
     std::chrono::steady_clock::time_point allocationStarted;
     bool releaseRequested = false;
     bool suppressOnRelease = false;
+    uint64_t receiverFramesAbove = 0;
+    uint64_t receiverFramesVoice = 0;
 
     ChannelBankModule* module = nullptr;
 
@@ -344,6 +346,7 @@ public:
 private:
     struct PlaybackEntry;
     struct WebClientThread;
+    struct ReceiverRuntime;
     struct ScanRange { double startHz, stopHz; };
     static constexpr size_t MAX_SCAN_RANGES = 64;
     static constexpr size_t MAX_SCAN_STOPS = 4096;
@@ -5631,7 +5634,7 @@ self.addEventListener("fetch", event => {
         {
             std::lock_guard<std::mutex> clck(channelsMtx);
             for (auto& [idx, slot] : activeChannels)
-                if (slot->fileOpen) openSlotIndices.insert(idx);
+                if (!slot->multiReceiver && slot->fileOpen) openSlotIndices.insert(idx);
         }
 
         // Compute per-slot means (using detection window, not full slot width).
@@ -6146,6 +6149,7 @@ self.addEventListener("fetch", event => {
             if (!widebandEvent) {
                 std::lock_guard<std::mutex> clck(channelsMtx);
                 for (auto& [idx, slot] : activeChannels) {
+                    if (slot->multiReceiver) continue;
                     const int missLimit = (slot->fileOpen && !slot->amDemod) ? 4 : 2;
                     bool above = (newRawDetected.count(idx) > 0);
                     auto ssit = newManualInstantSnr.find(idx);
@@ -6233,7 +6237,8 @@ self.addEventListener("fetch", event => {
             // disappears.
             std::vector<int> candidates;
             for (int s = 0; s < numSlots; s++) {
-                bool active = (activeChannels.find(s) != activeChannels.end());
+                auto activeIt = activeChannels.find(s);
+                bool active = activeIt != activeChannels.end() && !activeIt->second->multiReceiver;
                 if (active) {
                     if (slotVotes[s] > 0) detected.insert(s);
                     // votes==0 → let the channel die naturally; don't insert
@@ -6279,6 +6284,7 @@ self.addEventListener("fetch", event => {
             // their miss counter reset by broadband noise.
             if (!widebandEvent) {
                 for (auto& [idx, slot] : activeChannels) {
+                    if (slot->multiReceiver) continue;
                     const int missLimit = (slot->fileOpen && !slot->amDemod) ? 4 : 2;
                     float effSnrRaw = slot->fileOpen ? holdSnrLinear : snrLinear;
                     bool above = (idx < numSlots && instSlotMeans[idx] > slotNoiseFloors[idx] * effSnrRaw);
@@ -6547,8 +6553,137 @@ self.addEventListener("fetch", event => {
     }
 #endif
 
+    static void receiverSpectrumHandler(dsp::complex_t* data, int count, void* ctx) {
+        auto* detector = (ReceiverDetector*)ctx;
+        std::lock_guard<std::mutex> analysisLock(detector->analysisMtx);
+        {
+            std::lock_guard<std::mutex> observationLock(detector->observationsMtx);
+            if (detector->observations.empty()) return; // idle sources still drain IQ
+        }
+        detector->collector.feed(data, count, detector->frame.data(), detector->fftSize,
+                                 detector->sampleRate, [detector](int fill) {
+            auto* self = detector->module;
+            for (int i = 0; i < detector->fftSize; ++i) {
+                detector->fftIn[i][0] = detector->frame[i].re * detector->window[i];
+                detector->fftIn[i][1] = detector->frame[i].im * detector->window[i];
+            }
+            fftwf_execute(detector->fftPlan);
+            const float scale = 1.0f / ((float)detector->fftSize * detector->fftSize);
+            for (int i = 0; i < detector->fftSize; ++i) {
+                int shifted = (i + detector->fftSize / 2) % detector->fftSize;
+                float re = detector->fftOut[shifted][0];
+                float im = detector->fftOut[shifted][1];
+                detector->power[i] = (re * re + im * im) * scale;
+            }
+            const double binHz = detector->sampleRate / detector->fftSize;
+            detector->floor.update(detector->power, binHz);
+            const channel_bank_detector::AutoEnergyWindows energy(detector->power);
+            const int halfBins = std::max(1, (int)std::round(
+                std::min(self->channelSpacing * 0.4, 4000.0) / binHz));
+            const int halfSlot = std::max(1, (int)std::round(self->channelSpacing * 0.5 / binHz));
+            const float threshold = powf(10.0f,
+                std::max(1.0f, self->snrThreshold - self->holdHysteresisDb) / 10.0f);
+            bool changed = false;
+            std::lock_guard<std::mutex> observationLock(detector->observationsMtx);
+            for (auto& [key, observation] : detector->observations) {
+                double offset = (double)key * 1000.0 - detector->centerHz.load();
+                if (std::abs(offset) >= detector->sampleRate * 0.45) {
+                    observation.present = false;
+                    observation.consecutiveHits = 0;
+                    observation.consecutiveMisses = 0;
+                    continue;
+                }
+                int nominalBin = (int)std::round(offset / binHz) + detector->fftSize / 2;
+                int centerBin = energy.strongestCenter(nominalBin, halfSlot, halfBins);
+                int lo = std::max(0, centerBin - halfBins);
+                int hi = std::min(detector->fftSize - 1, centerBin + halfBins);
+                float signal = energy.mean(centerBin, halfBins);
+                float noise = detector->floor.mean(lo, hi);
+                bool above = signal > noise * threshold;
+                bool prior = observation.present;
+                if (above) {
+                    observation.consecutiveHits = std::min(4, observation.consecutiveHits + 1);
+                    observation.consecutiveMisses = 0;
+                    observation.present = observation.consecutiveHits >= 2;
+                    observation.framesAbove++;
+                    double logSum = 0.0;
+                    for (int bin = lo; bin <= hi; ++bin)
+                        logSum += logf(std::max(detector->power[bin], 1e-20f));
+                    double flatness = exp(logSum / (hi - lo + 1)) / std::max(signal, 1e-30f);
+                    if (flatness < self->staticGateFlatness) observation.framesVoice++;
+                }
+                else {
+                    observation.consecutiveHits = 0;
+                    observation.consecutiveMisses = std::min(4, observation.consecutiveMisses + 1);
+                    if (observation.consecutiveMisses >= 2) observation.present = false;
+                }
+                observation.snrDb = 10.0f * log10f(std::max(signal, 1e-30f) / noise);
+                changed |= prior != observation.present;
+            }
+            if (changed) self->mgmtCv.notify_one();
+        });
+    }
+
+    bool startReceiverDetector(ReceiverRuntime& runtime) {
+        auto detector = std::make_unique<ReceiverDetector>();
+        detector->module = this;
+        detector->receiverId = runtime.id;
+        detector->sampleRate = runtime.sampleRate;
+        detector->centerHz = runtime.centerHz;
+        detector->fftSize = std::min(65536, channel_bank_detector::fftSizeForRate(runtime.sampleRate));
+        detector->fftIn = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * detector->fftSize);
+        detector->fftOut = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * detector->fftSize);
+        {
+            std::lock_guard<std::mutex> lk(detectorPlannerMutex());
+            if (detector->fftIn && detector->fftOut)
+                detector->fftPlan = fftwf_plan_dft_1d(detector->fftSize, detector->fftIn,
+                                                       detector->fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
+        }
+        if (!detector->fftPlan) return false;
+        detector->frame.resize(detector->fftSize);
+        detector->power.resize(detector->fftSize);
+        detector->window.resize(detector->fftSize, 0.0f);
+        const int fill = std::min(detector->fftSize,
+            std::max(1, (int)std::llround(runtime.sampleRate / SPEC_ANALYSIS_HZ)));
+        for (int i = 0; i < fill; ++i) {
+            float phase = fill > 1 ? 2.0f * M_PI * i / (float)(fill - 1) : 0.0f;
+            detector->window[i] = 0.35875f - 0.48829f * cosf(phase)
+                                + 0.14128f * cosf(2.0f * phase) - 0.01168f * cosf(3.0f * phase);
+        }
+        detector->stream = new dsp::stream<dsp::complex_t>();
+        detector->sink = new dsp::sink::Handler<dsp::complex_t>(
+            detector->stream, receiverSpectrumHandler, detector.get());
+        detector->sink->start();
+        runtime.splitter->bindStream(detector->stream);
+        runtime.detector = std::move(detector);
+        return true;
+    }
+
+    void stopReceiverRuntime(ReceiverRuntime& runtime) {
+        if (runtime.started)
+            sigpath::sourceManager.stopIndependentSource(runtime.id, name + ":multi-receiver");
+        if (runtime.detector) {
+            runtime.splitter->unbindStream(runtime.detector->stream);
+            runtime.detector->sink->stop();
+            delete runtime.detector->sink;
+            delete runtime.detector->stream;
+            runtime.detector.reset();
+        }
+        if (runtime.splitter) {
+            runtime.splitter->stop();
+            delete runtime.splitter;
+            runtime.splitter = nullptr;
+        }
+        runtime.started = false;
+    }
+
     bool prepareMultiReceiverScan() {
         const std::string selectedDiscovery = sigpath::sourceManager.getSelectedSourceName();
+        {
+            auto sources = sigpath::sourceManager.getIndependentSources();
+            std::lock_guard<std::mutex> lk(uiSourceSnapshotMtx);
+            uiIndependentSources = std::move(sources);
+        }
         if (discoveryReceiver.empty()) discoveryReceiver = selectedDiscovery;
         if (discoveryReceiver.empty()) {
             flog::error("[ChannelBank] Multi-Receiver Scan requires a selected Discovery Receiver");
@@ -6559,25 +6694,50 @@ self.addEventListener("fetch", event => {
                         discoveryReceiver, selectedDiscovery);
             return false;
         }
-        auto available = sigpath::sourceManager.getIndependentSources();
-        std::map<std::string, double> sampleRates;
-        for (const auto& source : available) sampleRates[source.name] = source.sampleRate;
-
         std::vector<channel_bank_multi_receiver::ReceiverState> receivers;
         const std::string owner = name + ":multi-receiver";
+        const double initialCenter = scanStops.empty() ? lastKnownCenter : scanStops.front();
         for (const auto& receiver : transmissionReceiverPool) {
             if (receiver == discoveryReceiver) {
                 flog::warn("[ChannelBank] Multi-Receiver: discovery source '{0}' cannot be in the transmission pool", receiver);
                 continue;
             }
-            auto rate = sampleRates.find(receiver);
-            if (rate == sampleRates.end() || rate->second <= 0.0 ||
-                !sigpath::sourceManager.claimIndependentSource(receiver, owner)) {
+            if (!sigpath::sourceManager.claimIndependentSource(receiver, owner)) {
                 flog::warn("[ChannelBank] Multi-Receiver: configured receiver '{0}' is unavailable", receiver);
                 continue;
             }
-            receivers.push_back({receiver, rate->second});
-            flog::info("[ChannelBank] Multi-Receiver: claimed '{0}' at {1:.0f} Hz", receiver, rate->second);
+            ReceiverRuntime runtime;
+            runtime.id = receiver;
+            runtime.centerHz = initialCenter;
+            runtime.sampleRate = sigpath::sourceManager.getIndependentSourceSampleRate(receiver, owner);
+            auto* stream = sigpath::sourceManager.getIndependentSourceStream(receiver, owner);
+            if (!stream || runtime.sampleRate <= 0.0 ||
+                !sigpath::sourceManager.tuneIndependentSource(receiver, owner, initialCenter)) {
+                flog::warn("[ChannelBank] Multi-Receiver: could not prepare '{0}'", receiver);
+                sigpath::sourceManager.releaseIndependentSource(receiver, owner);
+                continue;
+            }
+            runtime.splitter = new dsp::routing::Splitter<dsp::complex_t>(stream);
+            runtime.splitter->start(); // drains the warm SDR even with no assigned VFO
+            if (!sigpath::sourceManager.startIndependentSource(receiver, owner)) {
+                sigpath::sourceManager.stopIndependentSource(receiver, owner);
+                stopReceiverRuntime(runtime);
+                sigpath::sourceManager.releaseIndependentSource(receiver, owner);
+                flog::warn("[ChannelBank] Multi-Receiver: '{0}' failed to start", receiver);
+                continue;
+            }
+            runtime.started = true;
+            runtime.sampleRate = sigpath::sourceManager.getIndependentSourceSampleRate(receiver, owner);
+            if (runtime.sampleRate <= 0.0 || !startReceiverDetector(runtime)) {
+                stopReceiverRuntime(runtime);
+                sigpath::sourceManager.releaseIndependentSource(receiver, owner);
+                flog::warn("[ChannelBank] Multi-Receiver: '{0}' detector setup failed", receiver);
+                continue;
+            }
+            receivers.push_back({receiver, runtime.sampleRate});
+            receiverRuntimes.emplace(receiver, std::move(runtime));
+            flog::info("[ChannelBank] Multi-Receiver: '{0}' open and ready at {1:.0f} Hz",
+                       receiver, initialCenter);
         }
         if (receivers.empty()) {
             flog::error("[ChannelBank] Multi-Receiver Scan has no available transmission receivers");
@@ -6586,7 +6746,6 @@ self.addEventListener("fetch", event => {
         {
             std::lock_guard<std::mutex> lk(multiReceiverMtx);
             receiverAllocator.setReceivers(std::move(receivers));
-            receiverRuntimes.clear();
             scanObservedKeys.clear();
         }
         return true;
@@ -6616,10 +6775,7 @@ self.addEventListener("fetch", event => {
         }
         auto runtime = receiverRuntimes.find(source);
         if (runtime != receiverRuntimes.end()) {
-            if (runtime->second.splitter) {
-                runtime->second.splitter->stop();
-                delete runtime->second.splitter;
-            }
+            stopReceiverRuntime(runtime->second);
             receiverRuntimes.erase(runtime);
         }
         dispatchFailureCount.fetch_add(1);
@@ -6671,27 +6827,38 @@ self.addEventListener("fetch", event => {
 
                 const std::string receiverId = allocation->receiverId;
                 auto runtimeIt = receiverRuntimes.find(receiverId);
-                bool idleAllocation = !allocation->reusedCoverage;
+                if (runtimeIt == receiverRuntimes.end() || !runtimeIt->second.started ||
+                    !runtimeIt->second.detector) {
+                    receiverAllocator.setAvailable(receiverId, false);
+                    setupFailed = true;
+                    continue;
+                }
+                const bool idleAllocation = !allocation->reusedCoverage;
                 if (idleAllocation) {
-                    ReceiverRuntime runtime;
-                    runtime.id = receiverId;
-                    runtime.sampleRate = sigpath::sourceManager.getIndependentSourceSampleRate(
-                        receiverId, name + ":multi-receiver");
-                    auto* stream = sigpath::sourceManager.getIndependentSourceStream(
-                        receiverId, name + ":multi-receiver");
-                    if (!stream || runtime.sampleRate <= 0.0 ||
-                        !sigpath::sourceManager.tuneIndependentSource(
-                            receiverId, name + ":multi-receiver", request.frequencyHz)) {
+                    // Hardware tuning can take time. Keep the receiver allocator
+                    // and activity panel available while this source tunes.
+                    mlk.unlock();
+                    bool tuned = sigpath::sourceManager.tuneIndependentSource(
+                        receiverId, name + ":multi-receiver", request.frequencyHz);
+                    mlk.lock();
+                    runtimeIt = receiverRuntimes.find(receiverId);
+                    if (!tuned || runtimeIt == receiverRuntimes.end()) {
                         receiverAllocator.setAvailable(receiverId, false);
                         setupFailed = true;
-                        flog::warn("[ChannelBank] Multi-Receiver: tune/setup failed on '{0}', trying next receiver", receiverId);
+                        flog::warn("[ChannelBank] Multi-Receiver: tune failed on '{0}', trying next receiver", receiverId);
                         continue;
                     }
-                    runtime.centerHz = request.frequencyHz;
-                    runtime.splitter = new dsp::routing::Splitter<dsp::complex_t>(stream);
-                    runtimeIt = receiverRuntimes.emplace(receiverId, std::move(runtime)).first;
+                    runtimeIt->second.centerHz = request.frequencyHz;
+                    auto& detector = *runtimeIt->second.detector;
+                    {
+                        std::lock_guard<std::mutex> analysisLock(detector.analysisMtx);
+                        detector.centerHz = request.frequencyHz;
+                        detector.collector.reset();
+                        detector.floor.reset();
+                    }
+                    flog::info("[ChannelBank] Multi-Receiver: tuned warm '{0}' to {1:.3f} MHz",
+                               receiverId, request.frequencyHz / 1e6);
                 }
-
                 ReceiverRuntime& runtime = runtimeIt->second;
                 ChannelSlot* slot = new ChannelSlot();
                 slot->multiReceiver = true;
@@ -6699,37 +6866,14 @@ self.addEventListener("fetch", event => {
                 slot->allocationStarted = std::chrono::steady_clock::now();
                 slot->lastDetected = slot->allocationStarted;
                 slot->signalPresent = true;
-                slot->rawSignalPresent = true;
-                slot->rawConsecutiveHits = 2;
+                slot->rawSignalPresent = false;
+                slot->rawConsecutiveHits = 0;
                 {
                     std::lock_guard<std::mutex> clk(channelsMtx);
                     initSlot(*slot, (int)request.key, 1, 0.0,
                              request.frequencyHz - runtime.centerHz,
                              runtime.splitter, runtime.sampleRate, runtime.centerHz);
                     activeChannels[(int)request.key] = slot;
-                }
-
-                if (idleAllocation) {
-                    runtime.splitter->start();
-                    if (!sigpath::sourceManager.startIndependentSource(
-                            receiverId, name + ":multi-receiver")) {
-                        {
-                            std::lock_guard<std::mutex> clk(channelsMtx);
-                            destroySlot(*slot);
-                            activeChannels.erase((int)request.key);
-                        }
-                        delete slot;
-                        runtime.splitter->stop();
-                        delete runtime.splitter;
-                        receiverRuntimes.erase(runtimeIt);
-                        receiverAllocator.setAvailable(receiverId, false);
-                        setupFailed = true;
-                        flog::warn("[ChannelBank] Multi-Receiver: start failed on '{0}', trying next receiver", receiverId);
-                        continue;
-                    }
-                    runtime.started = true;
-                    flog::info("[ChannelBank] Multi-Receiver: tuned '{0}' to {1:.3f} MHz",
-                               receiverId, runtime.centerHz / 1e6);
                 }
 
                 if (!receiverAllocator.activate(request.key, *allocation)) {
@@ -6740,6 +6884,10 @@ self.addEventListener("fetch", event => {
                     receiverAllocator.failPending(request.key);
                     dispatchFailureCount.fetch_add(1);
                     break;
+                }
+                {
+                    std::lock_guard<std::mutex> observationLock(runtime.detector->observationsMtx);
+                    runtime.detector->observations.emplace(request.key, ReceiverObservation{});
                 }
                 allocated = true;
                 flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> ACTIVE on '{1}' ({2})",
@@ -6768,6 +6916,11 @@ self.addEventListener("fetch", event => {
         ChannelSlot* slot = it->second;
         const bool suppress = slot->suppressOnRelease;
         const std::string receiverId = slot->assignedReceiver;
+        auto runtime = receiverRuntimes.find(receiverId);
+        if (runtime != receiverRuntimes.end() && runtime->second.detector) {
+            std::lock_guard<std::mutex> observationLock(runtime->second.detector->observationsMtx);
+            runtime->second.detector->observations.erase(key);
+        }
         destroySlot(*slot);
         delete slot;
         activeChannels.erase(it);
@@ -6776,17 +6929,7 @@ self.addEventListener("fetch", event => {
         for (const auto& receiver : receiverAllocator.receivers())
             if (receiver.id == receiverId) idle = receiver.idle();
         if (idle) {
-            auto runtime = receiverRuntimes.find(receiverId);
-            if (runtime != receiverRuntimes.end()) {
-                if (runtime->second.started)
-                    sigpath::sourceManager.stopIndependentSource(receiverId, name + ":multi-receiver");
-                if (runtime->second.splitter) {
-                    runtime->second.splitter->stop();
-                    delete runtime->second.splitter;
-                }
-                receiverRuntimes.erase(runtime);
-            }
-            flog::info("[ChannelBank] Multi-Receiver: '{0}' -> IDLE", receiverId);
+            flog::info("[ChannelBank] Multi-Receiver: '{0}' -> IDLE (source remains ready)", receiverId);
         }
         flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz -> {1}",
                    (double)key / 1000.0, suppress ? "SUPPRESSED" : "released");
@@ -6809,13 +6952,7 @@ self.addEventListener("fetch", event => {
     void releaseMultiReceiverSources() {
         std::lock_guard<std::mutex> lk(multiReceiverMtx);
         const std::string owner = name + ":multi-receiver";
-        for (auto& [id, runtime] : receiverRuntimes) {
-            if (runtime.started) sigpath::sourceManager.stopIndependentSource(id, owner);
-            if (runtime.splitter) {
-                runtime.splitter->stop();
-                delete runtime.splitter;
-            }
-        }
+        for (auto& [id, runtime] : receiverRuntimes) stopReceiverRuntime(runtime);
         receiverRuntimes.clear();
         for (const auto& receiver : transmissionReceiverPool)
             sigpath::sourceManager.releaseIndependentSource(receiver, owner);
@@ -6837,26 +6974,53 @@ self.addEventListener("fetch", event => {
             int64_t key = freqKey(frequency);
             scanObservedKeys.insert(key);
             enqueueDispatch(frequency);
-            std::lock_guard<std::mutex> clk(channelsMtx);
-            auto active = activeChannels.find((int)key);
-            if (active != activeChannels.end() && active->second->multiReceiver) {
-                active->second->lastDetected = now;
-                active->second->signalPresent = true;
-                active->second->rawSignalPresent = true;
-                active->second->rawConsecutiveHits = 2;
-            }
         }
 
+        // A dispatched channel follows RF on its assigned receiver. The
+        // discovery FFT cannot update its slot: that FFT is tuned elsewhere.
+        std::map<int64_t, ReceiverObservation> observations;
+        {
+            std::lock_guard<std::mutex> mlk(multiReceiverMtx);
+            for (const auto& [id, runtime] : receiverRuntimes) {
+                if (!runtime.detector) continue;
+                std::lock_guard<std::mutex> olk(runtime.detector->observationsMtx);
+                observations.insert(runtime.detector->observations.begin(),
+                                    runtime.detector->observations.end());
+            }
+        }
         std::vector<int64_t> releaseReady;
         {
             std::lock_guard<std::mutex> clk(channelsMtx);
             for (auto& [idx, slot] : activeChannels) {
                 if (!slot->multiReceiver) continue;
+                auto observation = observations.find(freqKey(slot->gridFreqHz));
+                if (observation != observations.end() && !slot->releaseRequested) {
+                    const auto& state = observation->second;
+                    uint64_t aboveDelta = state.framesAbove - slot->receiverFramesAbove;
+                    uint64_t voiceDelta = state.framesVoice - slot->receiverFramesVoice;
+                    slot->receiverFramesAbove = state.framesAbove;
+                    slot->receiverFramesVoice = state.framesVoice;
+                    if (slot->fileOpen && aboveDelta) {
+                        slot->onAirFrames.fetch_add((int)aboveDelta);
+                        slot->gateFramesAbove.fetch_add((int)aboveDelta);
+                        slot->gateFramesVoice.fetch_add((int)voiceDelta);
+                        updateSustainSnr(*slot, state.snrDb);
+                    }
+                    slot->rawSignalPresent = state.present;
+                    slot->rawConsecutiveHits = state.present ? state.consecutiveHits : 0;
+                    if (state.present) slot->lastDetected = now;
+                    float quietMs = std::chrono::duration<float, std::milli>(now - slot->lastDetected).count();
+                    slot->signalPresent = state.present || quietMs < signalHoldMs;
+                    if (!slot->signalPresent &&
+                        std::chrono::duration<float>(now - slot->allocationStarted).count() > 1.0f)
+                        slot->releaseRequested = true;
+                }
                 if (isBlocked(slot->gridFreqHz)) {
                     slot->releaseRequested = true;
                     slot->suppressOnRelease = false;
                     slot->signalPresent = false;
                     slot->rawSignalPresent = false;
+                    slot->rawConsecutiveHits = 0;
                 }
                 if (maximumMonitorSec > 0.0f && !slot->releaseRequested &&
                     std::chrono::duration<float>(now - slot->allocationStarted).count() >= maximumMonitorSec) {
@@ -6864,6 +7028,7 @@ self.addEventListener("fetch", event => {
                     slot->suppressOnRelease = true;
                     slot->signalPresent = false;
                     slot->rawSignalPresent = false;
+                    slot->rawConsecutiveHits = 0;
                     flog::info("[ChannelBank] Multi-Receiver: maximum monitor time reached at {0:.3f} MHz",
                                slot->gridFreqHz / 1e6);
                 }
@@ -6876,7 +7041,6 @@ self.addEventListener("fetch", event => {
         const float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
         if (!scanStops.empty() && (detectedHere || elapsed >= scanNoSignalSec)) {
             const double halfSpan = lastKnownSr * bwUsage * 0.5;
-            std::vector<int64_t> ended;
             {
                 std::lock_guard<std::mutex> mlk(multiReceiverMtx);
                 for (const auto& [key, state] : receiverAllocator.dispatches()) {
@@ -6886,10 +7050,10 @@ self.addEventListener("fetch", event => {
                         receiverAllocator.clearSuppressed(key);
                         flog::info("[ChannelBank] Multi-Receiver: {0:.3f} MHz carrier cleared; suppression removed", hz / 1e6);
                     }
-                    else if (state == channel_bank_multi_receiver::DispatchState::Active) ended.push_back(key);
+                    // Active channels are monitored on their assigned receiver.
+                    // Leaving a discovery stop must not cut off their recording.
                 }
             }
-            for (int64_t key : ended) requestMultiReceiverRelease(key, false);
             scanObservedKeys.clear();
             scanStopIdx = (scanStopIdx + 1) % (int)scanStops.size();
             const double nextCenter = scanStops[scanStopIdx];
@@ -9181,8 +9345,18 @@ self.addEventListener("fetch", event => {
             ImGui::Spacing();
 
             if (_this->multiReceiverScanMode) {
-                auto sources = sigpath::sourceManager.getIndependentSources();
-                std::string selectedDiscovery = sigpath::sourceManager.getSelectedSourceName();
+                if (!_this->running) {
+                    auto fresh = sigpath::sourceManager.getIndependentSources();
+                    std::lock_guard<std::mutex> lk(_this->uiSourceSnapshotMtx);
+                    _this->uiIndependentSources = std::move(fresh);
+                }
+                std::vector<SourceManager::IndependentSourceInfo> sources;
+                {
+                    std::lock_guard<std::mutex> lk(_this->uiSourceSnapshotMtx);
+                    sources = _this->uiIndependentSources;
+                }
+                std::string selectedDiscovery = _this->running
+                    ? _this->discoveryReceiver : sigpath::sourceManager.getSelectedSourceName();
                 if (_this->discoveryReceiver.empty()) _this->discoveryReceiver = selectedDiscovery;
                 bool discoveryAvailable = std::any_of(sources.begin(), sources.end(), [&](const auto& source) {
                     return source.name == _this->discoveryReceiver;
@@ -9216,7 +9390,7 @@ self.addEventListener("fetch", event => {
                                               _this->transmissionReceiverPool.end(),
                                               source.name) != _this->transmissionReceiverPool.end();
                     bool compatible = source.sampleRate > 0.0 && !source.claimed;
-                    if (!compatible) style::beginDisabled();
+                    if (_this->running || !compatible) style::beginDisabled();
                     std::string label = source.name + " (" +
                         (source.sampleRate > 0.0 ? std::to_string((int)(source.sampleRate / 1000.0)) + " kHz" : "unavailable") +
                         ")##cb_pool_" + source.name + _this->name;
@@ -9226,7 +9400,7 @@ self.addEventListener("fetch", event => {
                         if (selected) pool.push_back(source.name);
                         _this->saveScanConfig();
                     }
-                    if (!compatible) style::endDisabled();
+                    if (_this->running || !compatible) style::endDisabled();
                 }
                 for (const auto& configured : _this->transmissionReceiverPool)
                     if (configured != _this->discoveryReceiver && !seen.count(configured))
@@ -9260,7 +9434,7 @@ self.addEventListener("fetch", event => {
                             continue;
                         }
                         if (it->idle()) {
-                            ImGui::Text("%s: IDLE", receiverId.c_str());
+                            ImGui::Text("%s: READY (open)", receiverId.c_str());
                             continue;
                         }
                         ImGui::Text("%s: ACTIVE at %.3f MHz (%d channels)",
@@ -11282,14 +11456,54 @@ self.addEventListener("fetch", event => {
         int64_t key = 0;
         double frequencyHz = 0.0;
     };
+    struct ReceiverObservation {
+        bool present = false;
+        int consecutiveHits = 0;
+        int consecutiveMisses = 0;
+        uint64_t framesAbove = 0;
+        uint64_t framesVoice = 0;
+        float snrDb = -120.0f;
+    };
+    struct ReceiverDetector {
+        ChannelBankModule* module = nullptr;
+        std::string receiverId;
+        double sampleRate = 0.0;
+        std::atomic<double> centerHz { 0.0 };
+        int fftSize = 0;
+        fftwf_complex* fftIn = nullptr;
+        fftwf_complex* fftOut = nullptr;
+        fftwf_plan fftPlan = nullptr;
+        std::vector<dsp::complex_t> frame;
+        std::vector<float> window;
+        std::vector<float> power;
+        channel_bank_detector::FrameCollector collector;
+        channel_bank_detector::SpectralFloor floor;
+        std::mutex analysisMtx;
+        std::mutex observationsMtx;
+        std::map<int64_t, ReceiverObservation> observations;
+        dsp::stream<dsp::complex_t>* stream = nullptr;
+        dsp::sink::Handler<dsp::complex_t>* sink = nullptr;
+
+        ~ReceiverDetector() {
+            if (fftPlan) {
+                std::lock_guard<std::mutex> lk(ChannelBankModule::detectorPlannerMutex());
+                fftwf_destroy_plan(fftPlan);
+            }
+            fftwf_free(fftIn);
+            fftwf_free(fftOut);
+        }
+    };
     struct ReceiverRuntime {
         std::string id;
         double sampleRate = 0.0;
         double centerHz = 0.0;
         dsp::routing::Splitter<dsp::complex_t>* splitter = nullptr;
+        std::unique_ptr<ReceiverDetector> detector;
         bool started = false;
     };
     std::string discoveryReceiver;
+    std::mutex uiSourceSnapshotMtx;
+    std::vector<SourceManager::IndependentSourceInfo> uiIndependentSources; // stable while scanning
     std::vector<std::string> transmissionReceiverPool;
     float maximumMonitorSec = 0.0f; // 0 = Off
     channel_bank_multi_receiver::ReceiverAllocator receiverAllocator;
