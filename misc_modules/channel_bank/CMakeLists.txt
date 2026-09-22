@@ -81,6 +81,15 @@ if (BUILD_TESTING)
     target_compile_features(channel_bank_multi_receiver_allocator_test PRIVATE cxx_std_17)
     add_test(NAME channel_bank_multi_receiver_allocator
         COMMAND channel_bank_multi_receiver_allocator_test)
+    # Keep assertions active in the existing allocator regression under Release.
+    if (MSVC)
+        target_compile_options(channel_bank_multi_receiver_allocator_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(channel_bank_multi_receiver_allocator_test PRIVATE -UNDEBUG)
+    endif()
+    add_executable(channel_bank_scan_readiness_test tests/scan_readiness_test.cpp)
+    target_compile_features(channel_bank_scan_readiness_test PRIVATE cxx_std_17)
+    add_test(NAME channel_bank_scan_readiness COMMAND channel_bank_scan_readiness_test)
 endif()
 
 # Desktop modules are loaded with dlsym/GetProcAddress using the legacy

@@ -30,6 +30,7 @@
 #include <fftw3.h>
 #include "spectral_floor.h"
 #include "multi_receiver_allocator.h"
+#include "scan_readiness.h"
 #ifndef CB_NO_RNNOISE
 #include <rnnoise.h>
 #endif
@@ -652,6 +653,12 @@ public:
 
         lastKnownSr     = sigpath::iqFrontEnd.getSampleRate();
         lastKnownCenter = gui::waterfall.getCenterFrequency();
+        acknowledgedCenter = lastKnownCenter;
+        acknowledgedSr = lastKnownSr;
+        scanReadiness.reset();
+        scanDwellGeneration = 0;
+        retuneFlag.store(false);
+        retuneCleanupPending = false;
         if (scanMode || multiReceiverScanMode) {
             size_t stopCount = 0;
             if (!scanStopCount(scanRanges, lastKnownSr, bwUsage, stopCount)) {
@@ -683,8 +690,7 @@ public:
             scanStopHadSignal  = false;
             lastSignalTime     = std::chrono::steady_clock::now();
             if (!scanStops.empty()) {
-                gui::waterfall.setCenterFrequency(scanStops[0]);
-                gui::waterfall.centerFreqMoved = true;
+                requestScanTune(scanStops[0]);
             }
         }
 
@@ -697,8 +703,7 @@ public:
             lastSignalTime        = std::chrono::steady_clock::now();
             publishBookmarkDetectorStop();
             if (!bookmarkScanStops.empty()) {
-                gui::waterfall.setCenterFrequency(bookmarkScanStops[0].centerHz);
-                gui::waterfall.centerFreqMoved = true;
+                requestScanTune(bookmarkScanStops[0].centerHz);
             }
         }
 
@@ -5248,7 +5253,7 @@ self.addEventListener("fetch", event => {
                 gui::waterfall.setCenterFrequency(hz);
                 gui::waterfall.centerFreqMoved = true;
                 sigpath::sourceManager.tune(hz);
-                lastKnownCenter = hz;
+                // Detector frequency changes only after the source retune callback.
                 return webStateSnapshot();
             });
             return;
@@ -5479,25 +5484,72 @@ self.addEventListener("fetch", event => {
         return true;
     }
 
+    bool scanning() const { return scanMode || multiReceiverScanMode || bookmarkScanMode; }
+
+    // Serialize FFT collection with tune invalidation. Never acquire
+    // spectrumAnalysisMtx while holding channelsMtx; the FFT also reads slots.
+    // Hardware tuning and DSP sink teardown run outside this lock.
+    void clearDiscoveryDetections() {
+        {
+            std::lock_guard<std::mutex> lk(detectedMtx);
+            detectedSlots.clear();
+            rawDetectedSlots.clear();
+            slotPeakOffsets.clear();
+            slotSnrDb.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(manualDetectedMtx);
+            manualDetected.clear();
+            rawManualDetected.clear();
+            manualSnrDb.clear();
+            manualThresholdDb.clear();
+        }
+    }
+
+    void requestScanTune(double center) {
+        std::lock_guard<std::mutex> lk(spectrumAnalysisMtx);
+        scanReadiness.request();
+        clearDiscoveryDetections();
+        gui::waterfall.setCenterFrequency(center);
+        gui::waterfall.centerFreqMoved = true;
+    }
+
+    bool scanWindowReady() {
+        std::lock_guard<std::mutex> lk(spectrumAnalysisMtx);
+        if (!scanReadiness.ready() || retuneFlag.load()) return false;
+        if (scanDwellGeneration != scanReadiness.generation) {
+            scanDwellGeneration = scanReadiness.generation;
+            lastSignalTime = scanReadiness.firstFrame;
+            flog::info("[ChannelBank] Scan: fresh FFT window ready at {0:.3f} MHz ({1} ms settle)",
+                       lastKnownCenter / 1e6, channel_bank_scan::Readiness::settleMs);
+        }
+        return true;
+    }
+
     static void spectrumHandler(dsp::complex_t* data, int count, void* ctx) {
         ChannelBankModule* _this = (ChannelBankModule*)ctx;
+        std::lock_guard<std::mutex> analysisLock(_this->spectrumAnalysisMtx);
+        if (_this->retuneCleanupPending) return; // drain IQ while local slots stop
         // Consume a deferred retune before collecting; discard the source block
         // straddling it so a transform cannot mix different tuning/rate epochs.
         if (_this->retuneFlag.load()) { _this->analyzeSpectrum(true); return; }
+        if (_this->scanning() && _this->scanReadiness.discard(count, std::chrono::steady_clock::now())) return;
         if (!_this->fftPlan || !(_this->lastKnownSr > 0.0) || count <= 0) return;
         _this->frameCollector.feed(data, count, _this->fftAccum.data(), _this->fftSize,
             _this->lastKnownSr, [_this](int fill) {
                 _this->fftRealSamples = fill;
                 // A retune arriving mid-buffer is handled on the next callback.
-                if (!_this->retuneFlag.load()) _this->analyzeSpectrum();
+                if (!_this->retuneFlag.load()) {
+                    _this->analyzeSpectrum();
+                    if (_this->scanning()) _this->scanReadiness.frame(std::chrono::steady_clock::now());
+                }
             });
     }
 
     void analyzeSpectrum(bool consumeRetune = false) {
         if (retuneFlag.load() && !consumeRetune) return;
-        // Refresh center frequency every frame — free (single double load) and ensures
-        // PPM changes or other mid-session corrections are picked up without a full retune.
-        lastKnownCenter = gui::waterfall.getCenterFrequency();
+        // The GUI can already show the next requested center while IQ is still
+        // arriving from the old tune. Only the acknowledged retune changes this.
 
         // Check for deferred retune — safely reset DSP-owned state on the DSP thread
         if (consumeRetune) {
@@ -6983,12 +7035,16 @@ self.addEventListener("fetch", event => {
     }
 
     void manageMultiReceiverScan(const std::chrono::steady_clock::time_point& now) {
+        // Receiver observations/releases must continue while discovery settles.
+        const bool discoveryReady = scanWindowReady();
         std::set<int> current;
         std::map<int, double> peakOffsets;
         {
             std::lock_guard<std::mutex> lk(detectedMtx);
-            current = detectedSlots;
-            peakOffsets = slotPeakOffsets;
+            if (discoveryReady) {
+                current = detectedSlots;
+                peakOffsets = slotPeakOffsets;
+            }
         }
         const int numSlots = std::max(1, (int)std::floor(lastKnownSr / channelSpacing));
         for (int idx : current) {
@@ -7071,7 +7127,7 @@ self.addEventListener("fetch", event => {
 
         const bool detectedHere = !current.empty();
         const float elapsed = std::chrono::duration<float>(now - lastSignalTime).count();
-        if (!scanStops.empty() && (detectedHere || elapsed >= scanNoSignalSec)) {
+        if (discoveryReady && !scanStops.empty() && (detectedHere || elapsed >= scanNoSignalSec)) {
             const double halfSpan = lastKnownSr * bwUsage * 0.5;
             {
                 std::lock_guard<std::mutex> mlk(multiReceiverMtx);
@@ -7089,11 +7145,9 @@ self.addEventListener("fetch", event => {
             scanObservedKeys.clear();
             scanStopIdx = (scanStopIdx + 1) % (int)scanStops.size();
             const double nextCenter = scanStops[scanStopIdx];
-            flog::info("[ChannelBank] Multi-Receiver: discovery advancing immediately to stop {0} at {1:.3f} MHz",
-                       scanStopIdx, nextCenter / 1e6);
-            gui::waterfall.setCenterFrequency(nextCenter);
-            gui::waterfall.centerFreqMoved = true;
-            lastSignalTime = now;
+            flog::info("[ChannelBank] Multi-Receiver: discovery advancing to stop {0} at {1:.3f} MHz ({2}, {3:.2f}s fresh dwell)",
+                       scanStopIdx, nextCenter / 1e6, detectedHere ? "detected" : "no signal", elapsed);
+            requestScanTune(nextCenter);
         }
     }
 
@@ -7116,6 +7170,7 @@ self.addEventListener("fetch", event => {
             }
 
             if (bookmarkScanMode) {
+                if (!scanWindowReady()) continue;
                 bool anySignal = manageBookmarkScanChannels();
                 if (!bookmarkScanStops.empty()) {
                     if (anySignal) {
@@ -7140,9 +7195,7 @@ self.addEventListener("fetch", event => {
                             double nextCenter = bookmarkScanStops[bookmarkScanStopIdx].centerHz;
                             flog::info("[ChannelBank] BkScan: advancing to stop {0} at {1:.3f}MHz",
                                        bookmarkScanStopIdx, nextCenter / 1e6);
-                            gui::waterfall.setCenterFrequency(nextCenter);
-                            gui::waterfall.centerFreqMoved = true;
-                            lastSignalTime = now;
+                            requestScanTune(nextCenter);
                         }
                     }
                 }
@@ -7150,6 +7203,7 @@ self.addEventListener("fetch", event => {
             }
 
             if (manualMode) { manageManualChannels(); continue; }
+            if (scanMode && !scanWindowReady()) continue;
 
             std::set<int>         current;
             std::set<int>         localRawDetected;
@@ -7173,7 +7227,7 @@ self.addEventListener("fetch", event => {
                     queuedFreqKeys.insert(freqKey(entry.freqHz));
             }
 
-            std::lock_guard<std::mutex> clck(channelsMtx);
+            std::unique_lock<std::mutex> clck(channelsMtx);
 
             // Create or refresh channels for detected slots
             debugDetectedCount.store((int)current.size());
@@ -7279,11 +7333,16 @@ self.addEventListener("fetch", event => {
                 ++it;
             }
 
+            clck.unlock(); // release before requesting a discovery retune
+
             // Scan mode: advance to next stop once the band has been quiet long enough
             if (scanMode && !scanStops.empty()) {
                 bool anyActive = false;
-                for (auto& [idx, slot] : activeChannels)
-                    if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
+                {
+                    std::lock_guard<std::mutex> lk(channelsMtx);
+                    for (auto& [idx, slot] : activeChannels)
+                        if (slot->signalPresent || slot->fileOpen) { anyActive = true; break; }
+                }
                 if (anyActive) {
                     scanStopHadSignal = true;
                     lastSignalTime = now;
@@ -7295,9 +7354,7 @@ self.addEventListener("fetch", event => {
                         scanStopHadSignal = false;
                         flog::info("[ChannelBank] Scan: advancing to stop {0} at {1:.3f}MHz",
                                    scanStopIdx, scanStops[scanStopIdx] / 1e6);
-                        gui::waterfall.setCenterFrequency(scanStops[scanStopIdx]);
-                        gui::waterfall.centerFreqMoved = true;
-                        lastSignalTime = now;
+                        requestScanTune(scanStops[scanStopIdx]);
                     }
                 }
             }
@@ -8775,35 +8832,38 @@ self.addEventListener("fetch", event => {
 
         double newSr     = sigpath::iqFrontEnd.getSampleRate();
         double newCenter = gui::waterfall.getCenterFrequency();
-        if (newSr == _this->lastKnownSr && newCenter == _this->lastKnownCenter) { return; }
+        {
+            std::lock_guard<std::mutex> lk(_this->spectrumAnalysisMtx);
+            // Compare acknowledged tunes, never the GUI's requested frequency.
+            // A same-frequency scan stop still needs an acknowledgement.
+            if (newSr == _this->acknowledgedSr && newCenter == _this->acknowledgedCenter &&
+                !_this->scanReadiness.awaitingTune()) return;
+            _this->acknowledgedSr = newSr;
+            _this->acknowledgedCenter = newCenter;
+            if (_this->scanning())
+                _this->scanReadiness.acknowledge(newSr, std::chrono::steady_clock::now());
+            _this->clearDiscoveryDetections();
+            _this->pendingRetuneSr = newSr;
+            _this->pendingRetuneCenter = newCenter;
+            _this->retuneFlag.store(true);
+            _this->retuneCleanupPending = true;
+        }
 
-        // Teardown all active channels — safe because destroySlot stops the
-        // DSP sinks before freeing, so no audio callback will fire on freed data.
+        // Independent receivers keep their VFOs, recording files, detector
+        // observations and allocator ownership when discovery changes frequency.
         {
             std::lock_guard<std::mutex> lck(_this->channelsMtx);
-            for (auto& [idx, slot] : _this->activeChannels) {
+            channel_bank_scan::clearDiscoveryChannels(_this->activeChannels, [_this](ChannelSlot* slot) {
                 _this->destroySlot(*slot);
                 delete slot;
-            }
-            _this->activeChannels.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lck(_this->detectedMtx);
-            _this->detectedSlots.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lk(_this->manualDetectedMtx);
-            _this->manualDetected.clear();
+            });
         }
 
-        // Store new params but DON'T touch DSP-thread-owned state (slotVotes,
-        // avgPower, frameCollector, etc.) — set a flag so the DSP thread resets
-        // them safely at the start of its next frame.
-        _this->pendingRetuneSr     = newSr;
-        _this->pendingRetuneCenter = newCenter;
-        _this->retuneFlag.store(true);
-
-        // Wake mgmt thread to re-spawn manual channels at new center immediately
+        {
+            std::lock_guard<std::mutex> lk(_this->spectrumAnalysisMtx);
+            _this->retuneCleanupPending = false;
+        }
+        // Wake management; scan decisions stay gated until fresh FFTs arrive.
         _this->mgmtCv.notify_one();
     }
 
@@ -9611,6 +9671,9 @@ self.addEventListener("fetch", event => {
                 _this->scanRanges.erase(_this->scanRanges.begin() + toRemoveScan);
                 _this->saveScanConfig();
             }
+
+            ImGui::TextDisabled("Retune settling: %d ms + %u fresh FFT frames",
+                channel_bank_scan::Readiness::settleMs, channel_bank_scan::Readiness::requiredFrames);
 
             // Quiet timeout (after a transmission ends)
             ImGui::LeftLabel("Quiet Timeout");
@@ -11718,6 +11781,12 @@ self.addEventListener("fetch", event => {
     std::map<int, int>                      slotVotes;
 
     // Deferred retune — set by waterfall thread, consumed by DSP thread
+    std::mutex spectrumAnalysisMtx;
+    bool retuneCleanupPending = false;
+    channel_bank_scan::Readiness scanReadiness;
+    uint64_t scanDwellGeneration = 0;
+    double acknowledgedCenter = 0.0;
+    double acknowledgedSr = 0.0;
     std::atomic<bool>                       retuneFlag { false };
     double                                  pendingRetuneSr     = 0.0;
     double                                  pendingRetuneCenter = 0.0;
