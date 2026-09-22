@@ -6,8 +6,9 @@ contains `integration/main` at `7ad6434c`. The two remote tips were fetched and
 verified on 2026-09-22. No core or source-driver changes are part of this fix.
 
 The user will have a separate session build the app and will perform runtime
-and hardware testing. **Do not push this candidate or integrate it into
-`integration/main` until the user explicitly approves the fix after testing.**
+and hardware testing. The user authorized pushing this candidate branch so the
+build session can fetch it. **Do not integrate it into `integration/main` until
+the user explicitly approves the fix after testing.**
 
 ## Behavior
 
