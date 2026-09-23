@@ -1,6 +1,40 @@
 import Foundation
 import Combine
 
+public struct ScannerTuningRange: Equatable {
+    public let centerHz: Double
+    public let bandwidthUsage: Double
+
+    public init(lowMHz: String, highMHz: String, sampleRate: Double?) throws {
+        guard let low = Double(lowMHz.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let high = Double(highMHz.trimmingCharacters(in: .whitespacesAndNewlines)),
+              low.isFinite, high.isFinite, low > 0, high > low,
+              high * 1_000_000 < 1e12 else { throw ValidationError.invalidBounds }
+        guard let sampleRate, sampleRate.isFinite, sampleRate > 0 else {
+            throw ValidationError.missingSampleRate
+        }
+        let width = (high - low) * 1_000_000
+        let fraction = width / sampleRate
+        guard fraction >= 0.5 - 1e-9, fraction <= 1 + 1e-9 else {
+            throw ValidationError.unsupportedWidth(sampleRate: sampleRate)
+        }
+        centerHz = (low + (high - low) / 2) * 1_000_000
+        bandwidthUsage = min(1, max(0.5, fraction))
+    }
+
+    public enum ValidationError: LocalizedError {
+        case invalidBounds, missingSampleRate, unsupportedWidth(sampleRate: Double)
+        public var errorDescription: String? {
+            switch self {
+            case .invalidBounds: return "Enter positive MHz values with From below To."
+            case .missingSampleRate: return "Waiting for the source sample rate."
+            case .unsupportedWidth(let rate):
+                return String(format: "Range width must be %.3f to %.3f MHz at this sample rate.", rate / 2_000_000, rate / 1_000_000)
+            }
+        }
+    }
+}
+
 public struct SpanInfo: Equatable {
     public var centerHz: Double
     public var spanHz: Double

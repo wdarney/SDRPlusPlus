@@ -115,6 +115,36 @@ final class ChannelBankClientTests: XCTestCase {
     }
 
     @MainActor
+    func testScannerAndAddressedGainBodiesSurviveBLEFragmentation() async throws {
+        let transport = FakeTransport()
+        transport.frameLength = 40
+        let client = ChannelBankClient(transport: transport)
+        let assembler = ChannelBankFrameAssembler()
+        var requests: [ChannelBankRequest] = []
+        transport.onWrite = { data in
+            guard let message = try assembler.push(data) else { return }
+            let request = try JSONDecoder().decode(ChannelBankRequest.self, from: message.payload)
+            requests.append(request)
+            client.receiveResponsePayload(Data("{\"v\":1,\"id\":\(request.id),\"ok\":true,\"status\":200,\"body\":{\"receiverControls\":{\"Airspy\":{\"available\":true}},\"multiReceiverScan\":{\"discoveryState\":\"STOPPED\"}}}".utf8))
+        }
+        let scanner: [String: JSONValue] = [
+            "mode": .init(.string("multi_receiver_scan")),
+            "discoveryReceiver": .init(.string("RX888")),
+            "transmissionReceiverPool": .init(.array([.string("Airspy"), .string("RTL-SDR")])),
+            "scanRanges": .init(.array([.object(["start": .number(118000000), "stop": .number(137000000)])])),
+            "maximumMonitorSec": .init(.number(30)), "scanSettleMs": .init(.number(500))
+        ]
+        let state = try await client.setChannelBankSettings(scanner)
+        let gains: [String: JSONValue] = ["receiver": .init(.string("Airspy")), "gains": .init(.object(["VGA": .number(8)]))]
+        _ = try await client.setSourceControls(gains)
+        XCTAssertEqual(requests.map(\.path), ["/api/channel-bank/settings", "/api/source-controls"])
+        XCTAssertEqual(requests[0].body, scanner)
+        XCTAssertEqual(requests[1].body, gains)
+        XCTAssertEqual(state.receiverControls?["Airspy"]?.available, true)
+        XCTAssertEqual(state.multiReceiverScan?.discoveryState, "STOPPED")
+    }
+
+    @MainActor
     func testConcurrentCommandsCompleteWithOutOfOrderReplies() async throws {
         let transport = FakeTransport()
         let client = ChannelBankClient(transport: transport)

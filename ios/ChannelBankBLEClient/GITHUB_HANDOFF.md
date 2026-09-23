@@ -1,5 +1,81 @@
 # Channel Bank BLE iOS Client Handoff
 
+## Airband Preset And Scan Ranges (2026-09-19)
+
+The iPhone now consumes server feature `843e60e8` / integration merge `6e7572e2`:
+`settings.supportsScanRanges` and `settings.scanRanges[{start,stop}]` (Hz).
+Simple mode includes Custom / Airband (US). Airband selects 118-137 MHz coverage,
+AM, and spacing preset 2 (25 kHz). Selecting the preset edits the draft only;
+Play fetches fresh Summary/settings, validates, starts the source if needed,
+rechecks its sample rate, applies settings, tunes, and starts Channel Bank in
+acknowledged order. A failed request aborts the sequence and shows an error.
+Channel Bank must be stopped before configuring; recording, blocking, SNR and
+bandwidth preferences are not written by the preset.
+
+Planning uses reported sampleRate * settings.bwUsage. A fitting range selects
+Auto and its midpoint. Otherwise Scan uses the submitted range; position count
+and initial center match the existing server's evenly divided scan windows.
+The server owns all subsequent retunes. More than 4,096 positions is rejected.
+Scan requests require supportsScanRanges:true; old servers can still use Auto
+when the band fits. A missing/invalid sample rate or bandwidth produces an error
+rather than guessing; the user may need to power on/configure the source first.
+
+The range checkmark also supports custom scan ranges now, replacing the earlier
+fixed-span-only restriction. Custom preserves modulation and spacing. Play with
+Custom selected starts the existing configuration; apply custom edits first.
+Auto leaves stored scan ranges intact. A wide SDR may cover frequencies outside
+the preset: this uses the existing engine and does not add an RF bandpass filter.
+
+47 Swift tests pass, covering scan/Auto selection, exact-fit boundaries, initial
+center, capability handling, limits, preserved settings and schema compatibility.
+No server source, Mac build or Android build was changed here. Physical iPhone
+testing requires a running Mac build containing the server extension; a pushed
+server commit alone does not update the installed Mac app.
+
+## Simple Scanner Interface (2026-09-17)
+
+Branch: `wd/iphone-simple-mode`, based on the tested binary-audio/client branch.
+The saved Simple/Advanced switch changes layout only; it never starts/stops a
+radio or changes Channel Bank's operating mode. Simple is the initial default.
+Advanced retains the existing controls. Simple contains source selection/power,
+collapsed source controls and connection details, current playback/center,
+Channel Bank start/stop, modulation, SNR threshold/overview, Record, audio monitor,
+activity history with playback lock and block/unblock, and the blocked list.
+
+Frequency Range uses existing center and bandwidth commands. It is a fixed live
+span, NOT a new scan-range endpoint. From/To are MHz; width must be 50-100% of
+the current source sample rate (the existing server's bandwidth limits).
+Changes are disabled while Channel Bank runs or in scan/bookmark-scan mode.
+Bandwidth is acknowledged before center tuning; either failure is shown, and
+the live span remains visible because the two server operations are not atomic.
+Text edits are not overwritten by telemetry; the refresh icon loads live bounds.
+Editing arbitrary server scan start/end ranges requires a separate server
+contract, which was not changed in this iOS-only task.
+
+All 42 Swift tests pass, including range conversion, limit endpoints, reversed,
+empty, nonfinite and unsupported bounds. Device interaction remains to be tested.
+No Mac/Android source changes or builds are needed for this layout.
+
+## Blocked SNR Display (2026-09-14)
+
+The iPhone SNR chart now combines blocked history frequencies with telemetry
+block flags using the server's rounded-kHz identity. It draws red frequency
+markers even when a sampled SNR bucket is absent or near zero, and matching
+bars remain red with a three-pixel minimum height. This is an iOS-only display
+change; no Mac or Android server rebuild is needed for it. All 40 core tests
+pass, including blocked history with absent/unflagged telemetry and low-SNR
+telemetry-only blocks. Live chart appearance still needs iPhone confirmation.
+
+## Binary Audio Trial (2026-09-14)
+
+The optional macOS/iPhone binary notification transfer is on `wd/ble-binary-audio`.
+It sends bounded, checksum-validated windows instead of Base64 Response pages,
+with retries and same-lease paged fallback. Both endpoints need rebuilding;
+an old Mac server continues using paged audio. See
+[BINARY_AUDIO_HANDOFF.md](BINARY_AUDIO_HANDOFF.md) for the exact protocol, build
+boundary, tests and physical-device throughput checklist. Local Mac Channel Bank
+playback/recording and Android are unchanged. Live speed is not yet validated.
+
 ## Bluetooth AAC/M4A Transfer (2026-09-13)
 
 The iPhone now requests `body.encoding: "aac"` when creating a current-playback

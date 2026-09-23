@@ -3,9 +3,135 @@ import ChannelBankCore
 #endif
 import SwiftUI
 
+private struct MultiReceiverScannerControls: View {
+    @ObservedObject var model: ChannelBankViewModel
+    let state: ChannelBankState
+    @State private var draft: MultiReceiverScannerDraft?
+    @State private var saving = false
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Multi-Receiver Scan").font(.headline)
+            Text("Discovery searches; transmission receivers monitor detected channels in pool order.")
+                .font(.caption).foregroundStyle(.secondary)
+            if draft != nil {
+                editor
+                    .disabled(saving || state.running != false)
+                Button("Apply Scanner") { save() }
+                    .disabled(saving || state.running != false)
+                Button("Reload saved settings") { load() }
+                    .disabled(saving)
+            }
+            if saving { ProgressView() }
+            if let message { Text(message).font(.caption) }
+            if state.running == true { Text("Stop Channel Bank to edit the scanner.").font(.caption) }
+            if let activity = state.multiReceiverScan {
+                Divider()
+                Text("Discovery: \(activity.discoveryReceiver ?? "—") · \(activity.discoveryState ?? "—")")
+                Text(ChannelBankFormatters.mhz(activity.currentDiscoveryHz)).monospacedDigit()
+                ForEach(activity.receivers ?? []) { receiver in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(receiver.id) · \(receiver.available == false ? "Unavailable" : receiver.state ?? "—")").font(.headline)
+                        Text("Tuned \(ChannelBankFormatters.mhz(receiver.tunedCenterHz ?? receiver.centerHz)) · \(ChannelBankFormatters.compactHz(receiver.sampleRate))")
+                        ForEach(Array((receiver.channelDetails ?? []).enumerated()), id: \.offset) { _, channel in
+                            Text("\(ChannelBankFormatters.mhz(channel.tunedHz ?? channel.gridHz)) · \(channel.recording == true ? "Recording" : channel.held == true ? "Held" : "Monitoring")\(channel.releasing == true ? " · Releasing" : "")\(channel.signalPresent == true ? " · Signal" : "")")
+                        }
+                    }.font(.caption)
+                }
+                ForEach(Array((activity.dispatches ?? []).enumerated()), id: \.offset) { _, dispatch in
+                    Text("\(ChannelBankFormatters.mhz(dispatch.frequencyHz)) · \(dispatch.state ?? "—") · \(dispatch.receiverId ?? "Unassigned")").font(.caption)
+                }
+                Text("No capacity: \(activity.noCapacityCount ?? 0) · Failures: \(activity.failureCount ?? 0)").font(.caption)
+            }
+        }
+        .onAppear { if draft == nil { load() } }
+    }
+
+    private var editor: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Discovery SDR", selection: Binding(get: { draft?.discovery ?? "" }, set: { value in
+                draft?.discovery = value
+                draft?.pool.removeAll { $0 == value }
+            })) {
+                ForEach(state.sources ?? [], id: \.self) { Text($0).tag($0) }
+            }.disabled(state.radioPlaying != false)
+            if state.radioPlaying != false { Text("Stop the radio to change discovery SDR.").font(.caption) }
+            Text("Transmission pool (priority order)").font(.headline)
+            ForEach(Array((draft?.pool ?? []).enumerated()), id: \.element) { index, name in
+                HStack {
+                    Text("\(index + 1). \(name)")
+                    Spacer()
+                    Button("Up") { draft?.pool.swapAt(index, index - 1) }.disabled(index == 0)
+                    Button("Down") { draft?.pool.swapAt(index, index + 1) }.disabled(index + 1 == draft?.pool.count)
+                    Button("Remove") { draft?.pool.removeAll { $0 == name } }
+                }.font(.caption)
+            }
+            Menu("Add transmission receiver") {
+                ForEach((state.sources ?? []).filter { $0 != draft?.discovery && !(draft?.pool.contains($0) ?? false) }, id: \.self) { name in
+                    Button(name) { draft?.pool.append(name) }
+                }
+            }
+            Text("Scan ranges (MHz)").font(.headline)
+            ForEach(Array((draft?.ranges ?? []).indices), id: \.self) { index in
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("From MHz").font(.caption)
+                        TextField("From MHz", value: rangeBinding(index, start: true), format: .number)
+                    }
+                    VStack(alignment: .leading) {
+                        Text("To MHz").font(.caption)
+                        TextField("To MHz", value: rangeBinding(index, start: false), format: .number)
+                    }
+                    Button("Remove") { draft?.ranges.remove(at: index) }
+                }
+            }
+            Button("Add range") { draft?.ranges.append(.init(start: 118_000_000, stop: 137_000_000)) }
+                .disabled((draft?.ranges.count ?? 0) >= 64)
+            Text("Maximum monitor time (seconds; 0 = unlimited)").font(.caption)
+            TextField("Seconds", value: Binding(get: { draft?.maximumMonitorSec ?? 0 }, set: { draft?.maximumMonitorSec = $0 }), format: .number)
+            Stepper("Scan settling: \(draft?.scanSettleMs ?? 250) ms", value: Binding(get: { draft?.scanSettleMs ?? 250 }, set: { draft?.scanSettleMs = $0 }), in: 250...2000, step: 50)
+        }.textFieldStyle(.roundedBorder)
+    }
+
+    private func rangeBinding(_ index: Int, start: Bool) -> Binding<Double> {
+        Binding(get: {
+            guard let ranges = draft?.ranges, ranges.indices.contains(index) else { return 0 }
+            return (start ? ranges[index].start : ranges[index].stop) / 1_000_000
+        }, set: { value in
+            guard draft?.ranges.indices.contains(index) == true else { return }
+            if start { draft?.ranges[index].start = value * 1_000_000 }
+            else { draft?.ranges[index].stop = value * 1_000_000 }
+        })
+    }
+
+    private func load() {
+        guard let settings = state.settings else { return }
+        draft = MultiReceiverScannerDraft(settings: settings, selectedSource: state.selectedSource)
+        message = nil
+    }
+
+    private func save() {
+        guard let draft else { return }
+        saving = true
+        message = nil
+        Task {
+            defer { saving = false }
+            do {
+                try await model.ble.applyMultiReceiverScanner(draft)
+                message = "Scanner settings saved."
+            } catch { message = error.localizedDescription }
+        }
+    }
+}
+
 public struct ChannelBankRootView: View {
     @StateObject private var model = ChannelBankViewModel()
     @State private var confirmClearWavs = false
+    @State private var bluetoothLogExpanded = false
+    @AppStorage("channelBank.simpleInterface") private var simpleInterface = true
+    @State private var connectionExpanded = false
+    @State private var simpleSourceControlsExpanded = false
 
     public init() {}
 
@@ -13,13 +139,41 @@ public struct ChannelBankRootView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    connectionPanel
+                    Picker("Interface", selection: $simpleInterface) {
+                        Text("Simple").tag(true)
+                        Text("Advanced").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(model.rangeApplying)
+                    if simpleInterface && connected {
+                        DisclosureGroup(isExpanded: $connectionExpanded) {
+                            connectionPanel
+                        } label: {
+                            Label(model.ble.connectedName ?? "Connected", systemImage: "antenna.radiowaves.left.and.right")
+                                .font(.caption).foregroundStyle(.green)
+                        }
+                        if let error = model.ble.lastError, !connectionExpanded {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
+                    } else {
+                        connectionPanel
+                    }
                     if let state = model.ble.latestState {
+                        if state.multiReceiverScan != nil {
+                            DisclosureGroup("Multi-Receiver Scanner") {
+                                MultiReceiverScannerControls(model: model, state: state)
+                            }
+                        }
+                        if simpleInterface {
+                            simpleContent(state)
+                                .disabled(model.rangeApplying)
+                        } else {
                         radioPanel(state)
                         sourcePanel(state)
-                        sdrppServerPanel(state)
+                        if state.selectedSource == "SDR++ Server" {
+                            sdrppServerPanel(state)
+                        }
                         sourceOffsetPanel(state)
-                        sourceControlsPanel(state)
                         centerPanel(state)
                         channelBankPanel(state)
                         settingsPanel(state)
@@ -33,6 +187,7 @@ public struct ChannelBankRootView: View {
                         playbackTranscriptPanel(state)
                         recordingsPanel
                         blockedFrequenciesPanel(state)
+                        }
                     } else {
                         emptyStatePanel
                     }
@@ -43,6 +198,7 @@ public struct ChannelBankRootView: View {
             .navigationTitle("Channel Bank")
             .iosInlineNavigationTitle()
             .preferredColorScheme(.dark)
+            .onChange(of: simpleInterface) { _ in model.endCenterTune() }
             .onReceive(model.ble.$latestState) { _ in model.acceptStateUpdate() }
             .alert("Frequency", isPresented: Binding(get: { model.pendingBlockPoint != nil }, set: { if !$0 { model.pendingBlockPoint = nil } })) {
                 Button(model.pendingBlockPoint?.blocked == true ? "Unblock" : "Block", role: model.pendingBlockPoint?.blocked == true ? .none : .destructive) {
@@ -58,6 +214,183 @@ public struct ChannelBankRootView: View {
             } message: {
                 Text("M4A files and active or queued playback files are preserved.")
             }
+        }
+    }
+
+    @ViewBuilder
+    private func simpleContent(_ state: ChannelBankState) -> some View {
+        simpleSource(state)
+            .disabled(model.rangeApplying)
+        if state.selectedSource == "SDR++ Server" { sdrppServerPanel(state) }
+        simpleScanner(state)
+        SNRChartView(state: state)
+        simpleRange(state)
+        activityHistoryPanel(state)
+        blockedFrequenciesPanel(state)
+            .disabled(model.rangeApplying)
+    }
+
+    private func simpleSource(_ state: ChannelBankState) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("SDR Source").font(.headline)
+                Spacer()
+                Button {
+                    model.ble.setRadioRunning(state.radioPlaying != true)
+                } label: {
+                    Image(systemName: "power").frame(width: 28, height: 28)
+                }
+                .buttonStyle(.bordered)
+                .tint(state.radioPlaying == true ? .green : .secondary)
+                .accessibilityLabel(state.radioPlaying == true ? "Stop radio" : "Start radio")
+                .help(state.radioPlaying == true ? "Stop radio" : "Start radio")
+            }
+            HStack {
+                Menu {
+                    ForEach(state.sources ?? [], id: \.self) { source in
+                        Button(source) { model.selectSource(source) }
+                    }
+                } label: {
+                    Label(state.selectedSource ?? "Select source", systemImage: "antenna.radiowaves.left.and.right")
+                        .lineLimit(2)
+                }
+                .disabled(state.radioPlaying == true || (state.sources ?? []).isEmpty)
+                Spacer()
+                Text(state.radioPlaying == true ? "Running" : "Stopped")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            DisclosureGroup("Source Controls", isExpanded: $simpleSourceControlsExpanded) {
+                sourceControlsContent(state)
+            }
+            Divider()
+        }
+    }
+
+    private func simpleScanner(_ state: ChannelBankState) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("Band", selection: Binding(get: { model.selectedBand }, set: { model.selectBand($0) })) {
+                Text("Custom").tag("custom")
+                Text("Airband (US)").tag("airbandUS")
+            }
+            .pickerStyle(.menu)
+            .disabled(state.running == true || model.rangeApplying)
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(state.playback?.active == true ? (state.playback?.name ?? "Playback") : "Channel Bank")
+                        .font(.headline).lineLimit(2)
+                    Text(state.playback?.active == true ? ChannelBankFormatters.mhz(state.playback?.freqHz) : ChannelBankFormatters.mhz(state.centerHz ?? state.waterfallCenterHz))
+                        .font(.title2.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.7)
+                        .foregroundStyle(state.playback?.active == true ? .blue : .primary)
+                }
+                Spacer()
+                Button {
+                    if state.running == true { model.ble.setChannelBankRunning(false) }
+                    else { model.startSimpleScanner() }
+                } label: {
+                    Image(systemName: state.running == true ? "stop.fill" : "play.fill")
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(state.running == true ? .red : .green)
+                .disabled(!connected || (state.running != true && state.radioPlaying != true && model.selectedBand != "airbandUS") || model.rangeApplying)
+                .accessibilityLabel(state.running == true ? "Stop Channel Bank" : "Start Channel Bank")
+                .help(state.running == true ? "Stop Channel Bank" : "Start Channel Bank")
+            }
+            HStack {
+                Text(state.running == true ? (state.mode == "scan" ? "Scanning" : "Monitoring") : "Stopped")
+                Spacer()
+                Text(state.mode ?? "-")
+                Text("\(state.activeChannelCount ?? state.activeChannels?.count ?? 0) active")
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            Picker("Modulation", selection: Binding(
+                get: { state.demodMode ?? state.settings?.demodMode ?? "NFM" },
+                set: { model.setSetting("demodMode", string: $0) }
+            )) {
+                ForEach(["AM", "NFM", "WFM", "USB", "LSB"], id: \.self) { Text($0).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .disabled(state.running == true || model.rangeApplying)
+            Stepper(value: Binding(
+                get: { min(30, max(1, state.snrThresholdDb ?? state.settings?.snrThresholdDb ?? 8)) },
+                set: { model.setSetting("snrThresholdDb", number: $0) }
+            ), in: 1...30, step: 0.5) {
+                Text("SNR \(state.snrThresholdDb ?? state.settings?.snrThresholdDb ?? 8, specifier: "%.1f") dB")
+                    .monospacedDigit()
+            }
+            Toggle("Record", isOn: Binding(
+                get: { state.recordingEnabled ?? state.settings?.recordingEnabled ?? false },
+                set: { model.setSetting("recordingEnabled", bool: $0) }
+            ))
+            .tint(.green)
+            HStack {
+                Text(model.ble.audioMonitorStatus).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { model.ble.monitorCurrentPlayback() } label: {
+                    Image(systemName: "speaker.wave.2").frame(width: 28, height: 28)
+                }
+                .buttonStyle(.bordered).accessibilityLabel("Monitor audio").help("Monitor audio")
+                if state.playbackLock?.active == true {
+                    Button { model.ble.clearPlaybackLock() } label: {
+                        Image(systemName: "lock.open").frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.bordered).accessibilityLabel("Clear playback lock").help("Clear playback lock")
+                }
+            }
+            Divider()
+        }
+    }
+
+    private func simpleRange(_ state: ChannelBankState) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Frequency Range").font(.headline)
+                Spacer()
+                Button { model.loadCurrentRange() } label: { Image(systemName: "arrow.clockwise") }
+                    .accessibilityLabel("Use current range").help("Use current range")
+                    .disabled(model.rangeApplying)
+            }
+            if let span = SpanInfo(state: state) {
+                Text("\(ChannelBankFormatters.mhz(span.lowHz)) - \(ChannelBankFormatters.mhz(span.highHz))")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            if state.running == true {
+                Label("Range locked", systemImage: "lock.fill")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(alignment: .bottom, spacing: 10) {
+                rangeInput("From MHz", text: $model.rangeLowMHzText)
+                rangeInput("To MHz", text: $model.rangeHighMHzText)
+                Button { model.applySimpleRange() } label: {
+                    Image(systemName: "checkmark").frame(width: 28, height: 28)
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityLabel("Apply frequency range").help("Apply frequency range")
+                .disabled(state.running == true || model.rangeApplying || !connected)
+            }
+            .disabled(state.running == true || model.rangeApplying)
+            .onChange(of: model.rangeLowMHzText) { value in
+                if model.selectedBand == "airbandUS", Double(value) != 118 { model.selectBand("custom") }
+            }
+            .onChange(of: model.rangeHighMHzText) { value in
+                if model.selectedBand == "airbandUS", Double(value) != 137 { model.selectBand("custom") }
+            }
+            if let status = model.bandStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
+            if let error = model.rangeError { Text(error).font(.caption).foregroundStyle(.red) }
+            if model.rangeApplying { ProgressView().frame(maxWidth: .infinity, alignment: .leading) }
+            Divider()
+        }
+    }
+
+    private func rangeInput(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            TextField(title, text: text)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel(title)
+                #if os(iOS)
+                .keyboardType(.decimalPad)
+                #endif
         }
     }
 
@@ -92,27 +425,29 @@ public struct ChannelBankRootView: View {
                     }
                 }
             }
-            if let protocolDocument = model.ble.protocolDocument {
-                Text("Protocol: \(protocolDocument.prefix(80))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            if !model.ble.scanDiagnostics.isEmpty {
-                ScrollView(.vertical) {
-                    LazyVStack(alignment: .leading, spacing: 3) {
-                        ForEach(model.ble.scanDiagnostics, id: \.self) { line in
-                            Text(line)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(.vertical, 2)
+            DisclosureGroup("Bluetooth Log", isExpanded: $bluetoothLogExpanded) {
+                if let protocolDocument = model.ble.protocolDocument {
+                    Text("Protocol: \(protocolDocument.prefix(80))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
-                .frame(maxHeight: 170)
-                .scrollIndicators(.visible)
+                if !model.ble.scanDiagnostics.isEmpty {
+                    ScrollView(.vertical) {
+                        LazyVStack(alignment: .leading, spacing: 3) {
+                            ForEach(model.ble.scanDiagnostics, id: \.self) { line in
+                                Text(line)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(maxHeight: 170)
+                    .scrollIndicators(.visible)
+                }
             }
             if let lastError = model.ble.lastError {
                 Text(lastError)
@@ -164,6 +499,7 @@ public struct ChannelBankRootView: View {
                 .buttonStyle(.bordered)
                 .disabled(state.radioPlaying == true)
             }
+            sourceControlsContent(state)
         }
     }
 
@@ -219,9 +555,29 @@ public struct ChannelBankRootView: View {
         }
     }
 
-    private func sourceControlsPanel(_ state: ChannelBankState) -> some View {
-        Panel("Source Controls") {
-            if let controls = state.sourceControls, controls.available == true {
+    private func sourceControlsContent(_ state: ChannelBankState) -> some View {
+        let target = model.controlReceiver.isEmpty ? state.selectedSource ?? "" : model.controlReceiver
+        let selected = target == state.selectedSource
+        let controls = selected ? state.sourceControls : state.receiverControls?[target]
+        return VStack(alignment: .leading, spacing: 10) {
+            if state.receiverControls != nil {
+                Picker("Control receiver", selection: $model.controlReceiver) {
+                    Text("Selected SDR").tag("")
+                    ForEach(state.sources ?? [], id: \.self) { Text($0).tag($0) }
+                }
+            }
+            // Keep device recovery visible even when the adapter is unavailable.
+            if target.localizedCaseInsensitiveContains("RX888") {
+                Button {
+                    model.setSourceControl("refresh", bool: true)
+                } label: {
+                    Label("Refresh RX888", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!selected || state.radioPlaying != false || state.running != false || controls?.running == true || controls?.cleanupBusy == true)
+            }
+            if let controls = controls, controls.available == true {
+                Divider()
                 MetricGrid(items: [
                     ("Source", controls.source ?? state.selectedSource ?? "-"),
                     ("Mode", controls.mode ?? "-"),
@@ -230,13 +586,13 @@ public struct ChannelBankRootView: View {
                 ])
                 sourceControlMenus(
                     controls,
-                    running: state.radioPlaying == true || controls.running == true,
-                    selectedSource: state.selectedSource
+                    running: !selected || state.radioPlaying != false || state.running != false || controls.running == true,
+                    selectedSource: target
                 )
                 sourceControlLiveToggles(controls)
                 sourceControlGains(controls)
-            } else {
-                Text(state.selectedSource == "SDR++ Server" ? "Use the SDR++ Server panel above." : "No source controls exposed for this source.")
+            } else if state.selectedSource != "SDR++ Server" {
+                Text("No source controls exposed for this source.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -275,15 +631,7 @@ public struct ChannelBankRootView: View {
                 } label: {
                     Label("Mode", systemImage: "waveform")
                 }
-                .disabled(running)
-            }
-            if (controls.source ?? selectedSource ?? "").localizedCaseInsensitiveContains("RX888") {
-                Button {
-                    model.ble.refreshRX888Source()
-                } label: {
-                    Label("Refresh RX888", systemImage: "arrow.clockwise")
-                }
-                .disabled(running)
+                .disabled(running && selectedSource != "Airspy")
             }
         }
         .buttonStyle(.bordered)
@@ -316,20 +664,23 @@ public struct ChannelBankRootView: View {
                     ToggleRow(label: "HF Bias Tee", value: controls.biasTeeHF == true) {
                         model.setSourceControl("biasTeeHF", bool: !(controls.biasTeeHF == true))
                     }
+                    .disabled(controls.running == true && controls.biasTeeLiveMutable == false)
                     ToggleRow(label: "VHF Bias Tee", value: controls.biasTeeVHF == true) {
                         model.setSourceControl("biasTeeVHF", bool: !(controls.biasTeeVHF == true))
                     }
+                    .disabled(controls.running == true && controls.biasTeeLiveMutable == false)
                 }
                 if controls.supportsDithering == true {
                     ToggleRow(label: "Dithering", value: controls.dithering == true) {
                         model.setSourceControl("dithering", bool: !(controls.dithering == true))
                     }
+                    .disabled(controls.running == true && controls.ditheringLiveMutable == false)
                 }
                 ForEach(toggles) { toggle in
                     ToggleRow(label: toggle.label ?? toggle.key, value: toggle.value == true) {
                         model.setSourceToggle(toggle.key, value: !(toggle.value == true))
                     }
-                    .disabled(toggle.available == false)
+                    .disabled(toggle.available == false || (controls.running == true && toggle.liveMutable == false))
                 }
                 if let speeds = controls.telemetrySpeeds, !speeds.isEmpty {
                     Menu {
@@ -344,7 +695,7 @@ public struct ChannelBankRootView: View {
                         Label("Telemetry", systemImage: "gauge.with.dots.needle.33percent")
                     }
                     .buttonStyle(.bordered)
-                    .disabled(controls.telemetryLiveMutable == false)
+                    .disabled(controls.telemetryLiveMutable == false || (!model.controlReceiver.isEmpty && model.controlReceiver != model.ble.latestState?.selectedSource))
                 }
             }
         }
@@ -493,33 +844,107 @@ public struct ChannelBankRootView: View {
 
     private func activityHistoryPanel(_ state: ChannelBankState) -> some View {
         Panel("Activity History") {
-            let rows = (state.history ?? []).sorted { ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
+            let rows = activityHistoryRows(state)
             if rows.isEmpty {
                 Text("No history yet").foregroundStyle(.secondary)
             } else {
-                ForEach(rows.prefix(16)) { row in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(ChannelBankFormatters.mhz(row.freqHz)).monospacedDigit()
-                            Text(row.name ?? "-").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                ForEach(rows) { row in
+                    let playing = isPlayingFrequency(row.freqHz, state: state)
+                    let recording = isRecordingFrequency(row.freqHz, state: state)
+                    let color: Color = playing ? .blue : recording ? .green : .primary
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(ChannelBankFormatters.mhz(row.freqHz))
+                                    .monospacedDigit()
+                                    .foregroundStyle(color)
+                                Text(row.name ?? "-").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("\(row.count ?? 0) hits")
+                                Text(row.lastSeenDisplay).font(.caption).foregroundStyle(.secondary)
+                            }
                         }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Text("\(row.count ?? 0) hits")
-                            Text(row.lastSeenDisplay).font(.caption).foregroundStyle(.secondary)
+                        ViewThatFits(in: .horizontal) {
+                            HStack {
+                                activityHistoryStatus(playing: playing, recording: recording, blocked: row.blocked == true)
+                                Spacer()
+                                activityHistoryActions(row)
+                            }
+                            VStack(alignment: .leading, spacing: 6) {
+                                activityHistoryStatus(playing: playing, recording: recording, blocked: row.blocked == true)
+                                activityHistoryActions(row)
+                            }
                         }
-                        if row.blocked == true { Text("Blocked").foregroundStyle(.red).font(.caption) }
-                        Button("Lock") { model.ble.setPlaybackLock(hz: row.freqHz) }
-                            .buttonStyle(.bordered)
-                        Button(row.blocked == true ? "Unblock" : "Block") {
-                            model.ble.setFrequency(row.freqHz, blocked: row.blocked != true)
-                        }
-                        .buttonStyle(.bordered)
                     }
                     .font(.callout)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(playing ? Color.blue.opacity(0.12) : recording ? Color.green.opacity(0.12) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
         }
+    }
+
+    private func isPlayingFrequency(_ hz: Double, state: ChannelBankState) -> Bool {
+        guard state.playback?.active == true, let playingHz = state.playback?.freqHz else { return false }
+        return hz.rounded() == playingHz.rounded()
+    }
+
+    private func isRecordingFrequency(_ hz: Double, state: ChannelBankState) -> Bool {
+        (state.activeChannels ?? []).contains {
+            $0.recording == true && (hz.rounded() == ($0.gridFreqHz ?? $0.freqHz).rounded() || hz.rounded() == $0.freqHz.rounded())
+        }
+    }
+
+    private func activityHistoryRows(_ state: ChannelBankState) -> [HistoryEntry] {
+        var rows = state.history ?? []
+        func add(_ hz: Double, name: String?, blocked: Bool?) {
+            guard !rows.contains(where: { $0.freqHz.rounded() == hz.rounded() }) else { return }
+            rows.append(HistoryEntry(freqHz: hz, name: name, blocked: blocked))
+        }
+        for channel in state.activeChannels ?? [] where channel.recording == true {
+            add(channel.gridFreqHz ?? channel.freqHz, name: channel.name, blocked: channel.blocked)
+        }
+        if state.playback?.active == true, let hz = state.playback?.freqHz {
+            add(hz, name: state.playback?.name, blocked: nil)
+        }
+        func priority(_ row: HistoryEntry) -> Int {
+            isPlayingFrequency(row.freqHz, state: state) ? 2 : isRecordingFrequency(row.freqHz, state: state) ? 1 : 0
+        }
+        rows.sort {
+            let left = priority($0), right = priority($1)
+            if left != right { return left > right }
+            if $0.lastSeen != $1.lastSeen { return ($0.lastSeen ?? 0) > ($1.lastSeen ?? 0) }
+            return $0.freqHz < $1.freqHz
+        }
+        let live = rows.filter { priority($0) > 0 }
+        return live + Array(rows.filter { priority($0) == 0 }.prefix(16))
+    }
+
+    private func activityHistoryStatus(playing: Bool, recording: Bool, blocked: Bool) -> some View {
+        HStack(spacing: 8) {
+            if playing { Label("Playing", systemImage: "speaker.wave.2.fill").foregroundStyle(.blue) }
+            if recording { Label("Recording", systemImage: "record.circle").foregroundStyle(.green) }
+            if blocked { Text("Blocked").foregroundStyle(.red) }
+        }
+        .font(.caption)
+    }
+
+    private func activityHistoryActions(_ row: HistoryEntry) -> some View {
+        HStack {
+            Button { model.ble.setPlaybackLock(hz: row.freqHz) } label: {
+                Image(systemName: "lock")
+            }
+            .accessibilityLabel("Lock playback to \(ChannelBankFormatters.mhz(row.freqHz))")
+            .help("Lock playback")
+            Button(row.blocked == true ? "Unblock" : "Block") {
+                model.ble.setFrequency(row.freqHz, blocked: row.blocked != true)
+            }
+        }
+        .buttonStyle(.bordered)
     }
 
     private func frequencyHeatMapPanel(_ state: ChannelBankState) -> some View {
@@ -647,7 +1072,7 @@ public struct ChannelBankRootView: View {
             let settings = state.settings
             HStack {
                 Menu {
-                    ForEach(["auto", "manual", "scan", "bookmark_scan"], id: \.self) { mode in
+                    ForEach(["auto", "manual", "scan", "bookmark_scan"] + (state.multiReceiverScan == nil ? [] : ["multi_receiver_scan"]), id: \.self) { mode in
                         Button(mode) { model.setSetting("mode", string: mode) }
                     }
                 } label: {

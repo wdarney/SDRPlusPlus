@@ -248,7 +248,7 @@ public final class ChannelBankClient {
         )
     }
 
-    public func currentPlaybackPage(offset: Int, transferId: String? = nil, limit: Int = 4096) async throws -> RecordingPage {
+    public func currentPlaybackPage(offset: Int, transferId: String? = nil, limit: Int = 4096, binary: Bool = false) async throws -> RecordingPage {
         var body: [String: JSONValue] = [
             "offset": JSONValue(.number(Double(offset))),
             "limit": JSONValue(.number(Double(limit)))
@@ -258,12 +258,21 @@ public final class ChannelBankClient {
         } else {
             body["encoding"] = JSONValue(.string("aac"))
         }
+        if binary { body["transport"] = JSONValue(.string("binary-v1")) }
         return try await request(
             method: "GET",
             path: "/api/audio/current-playback",
             body: body,
             responseBody: RecordingPage.self
         )
+    }
+
+    public func audioWindow(transferId: String, offset: Int, windowId: UInt32) async throws -> BinaryAudioWindow {
+        try await request(method: "GET", path: "/api/audio/window", body: [
+            "transferId": JSONValue(.string(transferId)),
+            "offset": JSONValue(.number(Double(offset))),
+            "windowId": JSONValue(.number(Double(windowId)))
+        ], responseBody: BinaryAudioWindow.self, timeoutNanoseconds: 4_000_000_000)
     }
 
     public func cancelCurrentPlayback(transferId: String) async throws {

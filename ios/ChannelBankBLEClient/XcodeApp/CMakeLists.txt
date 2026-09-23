@@ -13,6 +13,8 @@ set(MACOSX_BUNDLE_BUNDLE_VERSION "1")
 set(CHANNEL_BANK_IOS_DEVELOPMENT_TEAM "7WP947RA97" CACHE STRING "Apple development team for iOS signing")
 
 add_executable(ChannelBankBLEClient MACOSX_BUNDLE
+    "${CHANNEL_BANK_CLIENT_ROOT}/Sources/ChannelBankCore/ScannerBandPlan.swift"
+    "${CHANNEL_BANK_CLIENT_ROOT}/Sources/ChannelBankCore/BinaryAudioTransfer.swift"
     "${CHANNEL_BANK_CLIENT_ROOT}/Sources/ChannelBankCore/ChannelBankClient.swift"
     "${CHANNEL_BANK_CLIENT_ROOT}/Sources/ChannelBankCore/ChannelBankFramer.swift"
     "${CHANNEL_BANK_CLIENT_ROOT}/Sources/ChannelBankCore/ChannelBankModels.swift"

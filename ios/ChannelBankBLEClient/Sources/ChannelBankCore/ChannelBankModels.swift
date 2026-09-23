@@ -106,6 +106,8 @@ public struct ChannelBankState: Codable, Equatable {
     public var sources: [String]?
     public var sdrppServer: SDRPPServerState?
     public var sourceControls: RX888SourceControls?
+    public var receiverControls: [String: RX888SourceControls]?
+    public var multiReceiverScan: MultiReceiverScanState?
     public var sourceOffset: SourceOffsetState?
     public var settings: ChannelBankSettings?
     public var snrThresholdDb: Double?
@@ -132,6 +134,7 @@ public struct ChannelBankState: Codable, Equatable {
     public var extra: [String: JSONValue] = [:]
 
     enum CodingKeys: String, CodingKey {
+        case receiverControls, multiReceiverScan
         case seq, module, enabled, running, mode, demodMode, centerHz, waterfallCenterHz, sampleRate, usableSpanHz, bwUsage
         case radioPlaying, sdrppHeartbeat, serverTimeMs, selectedSource, sources, sdrppServer, sourceControls, sourceOffset, settings, snrThresholdDb
         case maxChannels, recordingEnabled, activeChannelCount, activeChannels, recentChannels, detectedSlots, manualDetected, snrOverview
@@ -159,6 +162,8 @@ public struct ChannelBankState: Codable, Equatable {
         sources = try? container.decodeIfPresent([String].self, forKey: .sources)
         sdrppServer = try? container.decodeIfPresent(SDRPPServerState.self, forKey: .sdrppServer)
         sourceControls = try? container.decodeIfPresent(RX888SourceControls.self, forKey: .sourceControls)
+        receiverControls = try? container.decodeIfPresent([String: RX888SourceControls].self, forKey: .receiverControls)
+        multiReceiverScan = try? container.decodeIfPresent(MultiReceiverScanState.self, forKey: .multiReceiverScan)
         sourceOffset = try? container.decodeIfPresent(SourceOffsetState.self, forKey: .sourceOffset)
         settings = try? container.decodeIfPresent(ChannelBankSettings.self, forKey: .settings)
         snrThresholdDb = try? container.decodeIfPresent(Double.self, forKey: .snrThresholdDb)
@@ -206,6 +211,8 @@ public struct ChannelBankState: Codable, Equatable {
         try container.encodeIfPresent(sources, forKey: .sources)
         try container.encodeIfPresent(sdrppServer, forKey: .sdrppServer)
         try container.encodeIfPresent(sourceControls, forKey: .sourceControls)
+        try container.encodeIfPresent(receiverControls, forKey: .receiverControls)
+        try container.encodeIfPresent(multiReceiverScan, forKey: .multiReceiverScan)
         try container.encodeIfPresent(sourceOffset, forKey: .sourceOffset)
         try container.encodeIfPresent(settings, forKey: .settings)
         try container.encodeIfPresent(snrThresholdDb, forKey: .snrThresholdDb)
@@ -268,8 +275,19 @@ public struct ChannelBankState: Codable, Equatable {
         sources = fullState.sources ?? sources
         sdrppServer = fullState.sdrppServer ?? sdrppServer
         sourceControls = fullState.sourceControls ?? sourceControls
+        receiverControls = fullState.receiverControls ?? receiverControls
+        multiReceiverScan = fullState.multiReceiverScan ?? multiReceiverScan
         sourceOffset = fullState.sourceOffset ?? sourceOffset
         if settings == nil { settings = fullState.settings }
+        // Summary has no scanner configuration. Keep these full-state-only
+        // fields fresh even when a newer summary overtakes a large snapshot.
+        if let detail = fullState.settings {
+            if let value = detail.discoveryReceiver { settings?.discoveryReceiver = value }
+            if let value = detail.transmissionReceiverPool { settings?.transmissionReceiverPool = value }
+            if let value = detail.scanRanges { settings?.scanRanges = value }
+            if let value = detail.maximumMonitorSec { settings?.maximumMonitorSec = value }
+            if let value = detail.scanSettleMs { settings?.scanSettleMs = value }
+        }
 
         activeChannels = fullState.activeChannels ?? activeChannels
         recentChannels = fullState.recentChannels ?? recentChannels
@@ -299,6 +317,7 @@ public struct ChannelBankState: Codable, Equatable {
             sources == nil &&
             sdrppServer == nil &&
             sourceControls == nil &&
+            receiverControls == nil && multiReceiverScan == nil &&
             sourceOffset == nil &&
             settings == nil &&
             activeChannels == nil &&
@@ -518,6 +537,17 @@ public struct HistoryEntry: Codable, Equatable, Identifiable {
     }
 }
 
+extension ChannelBankState {
+    // Match the server's rounded-kHz block identity, independently of sampled
+    // SNR buckets: a downsampled bucket need not land on a blocked frequency.
+    public var snrBlockedFrequencyKeys: Set<Double> {
+        let historyHz = (history ?? []).filter { $0.blocked == true }.map(\.freqHz)
+        let telemetryHz = (snrOverview ?? []).filter { $0.blocked == true }.map(\.freqHz)
+        return Set((historyHz + telemetryHz).filter { $0.isFinite && $0 > 0 }
+            .map { ($0 / 1000).rounded() })
+    }
+}
+
 public struct SNROverviewPoint: Codable, Equatable, Identifiable {
     public var id: Double { freqHz }
     public var freqHz: Double
@@ -581,7 +611,50 @@ public struct SNRTelemetryFrame: Equatable {
     }
 }
 
+public struct MultiReceiverScanState: Codable, Equatable {
+    public var discoveryReceiver: String?
+    public var discoveryState: String?
+    public var currentDiscoveryHz: Double?
+    public var receivers: [ScannerReceiverActivity]?
+    public var dispatches: [ScannerDispatch]?
+    public var noCapacityCount: Int?
+    public var failureCount: Int?
+}
+
+public struct ScannerReceiverActivity: Codable, Equatable, Identifiable {
+    public var id: String
+    public var available: Bool?
+    public var state: String?
+    public var centerHz: Double?
+    public var tunedCenterHz: Double?
+    public var sampleRate: Double?
+    public var channels: [Double]?
+    public var channelDetails: [ScannerChannelActivity]?
+}
+
+public struct ScannerChannelActivity: Codable, Equatable {
+    public var gridHz: Double?
+    public var tunedHz: Double?
+    public var signalPresent: Bool?
+    public var held: Bool?
+    public var recording: Bool?
+    public var releasing: Bool?
+}
+
+public struct ScannerDispatch: Codable, Equatable {
+    public var freqKey: Int64?
+    public var frequencyHz: Double?
+    public var state: String?
+    public var receiverId: String?
+}
+
 public struct ChannelBankSettings: Codable, Equatable {
+    public var discoveryReceiver: String?
+    public var transmissionReceiverPool: [String]?
+    public var maximumMonitorSec: Double?
+    public var scanSettleMs: Int?
+    public var supportsScanRanges: Bool?
+    public var scanRanges: [ChannelBankScanRange]?
     public var mode: String?
     public var spacingId: Int?
     public var demodMode: String?
@@ -621,6 +694,16 @@ public struct ChannelBankSettings: Codable, Equatable {
         self.scanNoSignalSec = scanNoSignalSec
         self.transcriptionBackend = transcriptionBackend
         self.transcriptionBackendName = transcriptionBackendName
+    }
+}
+
+public struct ChannelBankScanRange: Codable, Equatable {
+    public var start: Double
+    public var stop: Double
+
+    public init(start: Double, stop: Double) {
+        self.start = start
+        self.stop = stop
     }
 }
 
@@ -727,6 +810,7 @@ public struct Diagnostics: Codable, Equatable {
 
 public struct RecordingPage: Codable, Equatable {
     public var transferId: String? = nil
+    public var streamId: UInt32? = nil
     public var preparing: Bool? = nil
     public var retryAfterMs: Int? = nil
     public var dataBase64: String?

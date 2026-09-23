@@ -18,16 +18,24 @@
 @end
 @implementation TestRequest
 @end
+@interface TestCharacteristic : CBMutableCharacteristic
+@property NSArray<CBCentral*>* testSubscribers;
+@end
+@implementation TestCharacteristic
+- (NSArray<CBCentral*>*)subscribedCentrals { return _testSubscribers ?: @[]; }
+@end
 @interface TestPeripheral : NSObject
 @property CBATTError lastResult;
 @property BOOL writable;
 @property NSMutableArray<NSData*>* frames;
+@property NSMutableArray<CBUUID*>* types;
 @end
 @implementation TestPeripheral
 - (void)respondToRequest:(CBATTRequest*)request withResult:(CBATTError)result { _lastResult = result; }
 - (BOOL)updateValue:(NSData*)value forCharacteristic:(CBMutableCharacteristic*)characteristic onSubscribedCentrals:(NSArray*)centrals {
     if (!_writable) return NO;
     [_frames addObject:value];
+    if (characteristic.UUID) [_types addObject:characteristic.UUID];
     return YES;
 }
 @end
@@ -38,6 +46,95 @@ static NSData* frame(uint8_t flags, uint16_t identifier, uint32_t offset, NSData
     NSMutableData* result = [NSMutableData dataWithBytes:header length:8];
     [result appendData:payload];
     return result;
+}
+
+static void testBinaryWindows(CBMacServer* server, TestCentral* central, TestPeripheral* peripheral) {
+    server.characteristics = [NSMutableArray new];
+    for (unsigned n = 1; n <= 8; ++n) {
+        TestCharacteristic* c = [[TestCharacteristic alloc] initWithType:uuid(n)
+            properties:CBCharacteristicPropertyNotify value:nil permissions:CBAttributePermissionsReadable];
+        c.testSubscribers = @[(CBCentral*)central];
+        [server.characteristics addObject:c];
+    }
+    char path[] = "/tmp/cb-binary-audio-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0 && unlink(path) == 0);
+    NSMutableData* original = [NSMutableData dataWithLength:21000];
+    for (NSUInteger i = 0; i < original.length; ++i) ((uint8_t*)original.mutableBytes)[i] = i % 251;
+    assert(write(fd, original.bytes, original.length) == (ssize_t)original.length);
+    server->openPlayback = [fd](std::string& name) { name = "voice.m4a"; return dup(fd); };
+    auto request = [&](NSString* route, NSDictionary* body, NSUUID* owner) {
+        return [server perform:@{@"v":@1, @"id":@44, @"method":@"GET", @"path":route, @"body":body} owner:owner];
+    };
+    NSString* route = @"/api/audio/window";
+    NSDictionary* ready = request(@"/api/audio/current-playback", @{@"transport":@"binary-v1"}, central.identifier)[@"body"];
+    NSString* token = ready[@"transferId"];
+    assert(token.length && [ready[@"size"] intValue] == 21000 && !ready[@"dataBase64"]);
+    assert([ready[@"streamId"] unsignedIntValue] != 0);
+    close(fd);
+    server->openPlayback = [](std::string&) { return -1; };
+    assert([request(route, @{@"transferId":token, @"offset":@0, @"windowId":@1}, NSUUID.UUID)[@"status"] intValue] == 404);
+    assert([request(route, @{@"transferId":token, @"offset":@-1, @"windowId":@1}, central.identifier)[@"status"] intValue] == 400);
+    assert([request(route, @{@"transferId":token, @"offset":@0, @"windowId":@0}, central.identifier)[@"status"] intValue] == 416);
+    TestCharacteristic* audio = (TestCharacteristic*)server.characteristics[7];
+    audio.testSubscribers = @[];
+    assert([request(route, @{@"transferId":token, @"offset":@0, @"windowId":@1}, central.identifier)[@"status"] intValue] == 409);
+    audio.testSubscribers = @[(CBCentral*)central];
+    for (NSNumber* mtu in @[@20, @185, @512]) {
+        central.maximumUpdateValueLength = mtu.unsignedIntegerValue;
+        peripheral.writable = NO;
+        [peripheral.frames removeAllObjects];
+        [server.outgoing removeAllObjects];
+        NSDictionary* descriptor = request(route, @{@"transferId":token, @"offset":@0, @"windowId":@1}, central.identifier)[@"body"];
+        assert([descriptor[@"chunkBytes"] unsignedIntegerValue] == mtu.unsignedIntegerValue - 16);
+        [server pump];
+        assert(server.outgoing.count == 1 && server.outgoing.firstObject.offset == 0);
+        // Replace a stalled window, then serve a command before any audio bytes.
+        descriptor = request(route, @{@"transferId":token, @"offset":@0, @"windowId":@2}, central.identifier)[@"body"];
+        assert(server.outgoing.count == 1);
+        [server enqueue:jsonData(@{@"ok":@YES}) characteristic:server.characteristics[2]
+            central:(CBCentral*)central identifier:44];
+        assert([server.outgoing.firstObject.characteristic.UUID isEqual:uuid(3)]);
+        [server.outgoing removeObjectAtIndex:0];
+        peripheral.writable = YES;
+        [server pump];
+        assert(peripheral.frames.count == 16 && server.outgoing.count == 0);
+        NSMutableData* received = [NSMutableData new];
+        for (NSData* packet in peripheral.frames) {
+            assert(packet.length <= mtu.unsignedIntegerValue);
+            const uint8_t* p = (const uint8_t*)packet.bytes;
+            auto u32 = [&](unsigned at) { return p[at] | uint32_t(p[at+1]) << 8 | uint32_t(p[at+2]) << 16 | uint32_t(p[at+3]) << 24; };
+            assert(p[0] == 1 && p[1] == 0 && p[2] == 0 && p[3] == 0);
+            assert(u32(4) == [ready[@"streamId"] unsignedIntValue] && u32(8) == 2);
+            assert(u32(12) == received.length);
+            [received appendData:[packet subdataWithRange:NSMakeRange(16, packet.length - 16)]];
+        }
+        assert([received isEqual:[original subdataWithRange:NSMakeRange(0, received.length)]]);
+        assert(received.length == [descriptor[@"nextOffset"] unsignedIntegerValue]);
+    }
+    // Every window, including the short EOF window, retains its lease for retry.
+    NSMutableData* received = [NSMutableData new];
+    uint32_t window = 3;
+    while (received.length < original.length) {
+        [peripheral.frames removeAllObjects];
+        NSDictionary* descriptor = request(route, @{@"transferId":token, @"offset":@(received.length), @"windowId":@(window++)}, central.identifier)[@"body"];
+        assert(descriptor);
+        [server pump];
+        for (NSData* packet in peripheral.frames) [received appendData:[packet subdataWithRange:NSMakeRange(16, packet.length - 16)]];
+        assert(received.length == [descriptor[@"nextOffset"] unsignedIntegerValue]);
+    }
+    assert([received isEqual:original] && server.transfers[token]);
+    request(route, @{@"transferId":token, @"offset":@0, @"windowId":@(window++)}, central.identifier);
+    assert(server.outgoing.count == 1);
+    NSDictionary* fallback = request(@"/api/audio/current-playback", @{@"transferId":token, @"offset":@0, @"limit":@4096}, central.identifier)[@"body"];
+    NSData* fallbackBytes = [[NSData alloc] initWithBase64EncodedString:fallback[@"dataBase64"] options:0];
+    assert([fallbackBytes isEqual:[original subdataWithRange:NSMakeRange(0, 4096)]]);
+    assert(server.outgoing.count == 0 && server.transfers[token]);
+    request(route, @{@"transferId":token, @"offset":@0, @"windowId":@(window++)}, central.identifier);
+    assert([request(@"/api/audio/current-playback", @{@"transferId":token, @"cancel":@YES}, central.identifier)[@"status"] intValue] == 200);
+    assert(server.transfers.count == 0 && server.outgoing.count == 0);
+    assert([request(route, @{@"transferId":token, @"offset":@0, @"windowId":@(window)}, central.identifier)[@"status"] intValue] == 404);
+    std::cout << "Binary windows: subscription, ownership, retries, MTU 20/185/512, command priority and EOF cleanup passed\n";
 }
 static void testCompressedPlayback(CBMacServer* server, NSUUID* owner) {
     // Ten seconds of 48 kHz mono PCM, independent of the local recording pipeline.
@@ -267,6 +364,7 @@ int main() {
         assert(server.transfers.count == 0);
         close(large);
         testCompressedPlayback(server, central.identifier);
+        testBinaryWindows(server, central, peripheral);
         std::cout << "Bluetooth framing, bounds, backpressure, routing, snapshot and audio lease tests passed\n";
     }
 }
