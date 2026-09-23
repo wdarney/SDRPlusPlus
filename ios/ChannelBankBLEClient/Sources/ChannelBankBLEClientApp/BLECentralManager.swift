@@ -259,6 +259,19 @@ public final class BLECentralManager: NSObject, ObservableObject, ChannelBankTra
         Task { await apply { try await self.client.setSourceControls(body) } }
     }
 
+    public func applyMultiReceiverScanner(_ draft: MultiReceiverScannerDraft) async throws {
+        let summary = try await client.getStateSummary()
+        acceptStateSummary(summary)
+        let settings = try await client.getChannelBankSettings()
+        guard var state = latestState else { throw ScannerBandPlan.PlanError.missingBandwidth }
+        state.settings = settings
+        let body = try draft.requestBody(state: state)
+        acceptCommandStateResponse(try await client.setChannelBankSettings(body))
+        // Summary does not contain scanner configuration; refresh it explicitly.
+        let saved = try await client.getChannelBankSettings()
+        updateLatestState { $0.settings = saved }
+    }
+
     public func refreshRX888Source() {
         guard latestState?.radioPlaying != true, latestState?.sourceControls?.running != true else {
             lastError = "Stop RX888 before refreshing it."

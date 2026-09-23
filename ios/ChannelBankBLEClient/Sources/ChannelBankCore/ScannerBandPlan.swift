@@ -1,5 +1,52 @@
 import Foundation
 
+/// An explicit draft: incoming telemetry never overwrites edits to the scanner.
+public struct MultiReceiverScannerDraft {
+    public var discovery = ""
+    public var pool: [String] = []
+    public var ranges: [ChannelBankScanRange] = []
+    public var maximumMonitorSec = 0.0
+    public var scanSettleMs = 0
+
+    public init(settings: ChannelBankSettings, selectedSource: String?) {
+        discovery = settings.discoveryReceiver.flatMap { $0.isEmpty ? nil : $0 } ?? selectedSource ?? ""
+        pool = settings.transmissionReceiverPool ?? []
+        ranges = settings.scanRanges ?? []
+        maximumMonitorSec = settings.maximumMonitorSec ?? 0
+        scanSettleMs = settings.scanSettleMs ?? 250
+    }
+
+    public func requestBody(state: ChannelBankState) throws -> [String: JSONValue] {
+        guard state.running == false else { throw DraftError.invalid("Stop Channel Bank before applying scanner settings.") }
+        guard state.sources?.contains(discovery) == true else { throw DraftError.invalid("Choose an available discovery SDR.") }
+        let changedDiscovery = discovery != state.selectedSource || discovery != state.settings?.discoveryReceiver
+        guard !changedDiscovery || state.radioPlaying == false else { throw DraftError.invalid("Stop the radio before changing discovery SDR.") }
+        guard Set(pool).count == pool.count, !pool.contains(discovery),
+              pool.allSatisfy({ state.sources?.contains($0) == true }) else {
+            throw DraftError.invalid("Choose distinct transmission receivers other than discovery.")
+        }
+        guard ranges.count <= 64, ranges.allSatisfy({ $0.start.isFinite && $0.stop.isFinite && $0.start > 0 && $0.start < $0.stop }) else {
+            throw DraftError.invalid("Use at most 64 ranges with positive From MHz below To MHz.")
+        }
+        guard maximumMonitorSec.isFinite, (0...86400).contains(maximumMonitorSec),
+              (250...2000).contains(scanSettleMs) else { throw DraftError.invalid("Use 0–86400 monitor seconds and 250–2000 settling milliseconds.") }
+        var body: [String: JSONValue] = [
+            "mode": .init(.string("multi_receiver_scan")),
+            "transmissionReceiverPool": .init(.array(pool.map { .string($0) })),
+            "scanRanges": .init(.array(ranges.map { .object(["start": .number($0.start), "stop": .number($0.stop)]) })),
+            "maximumMonitorSec": .init(.number(maximumMonitorSec)),
+            "scanSettleMs": .init(.number(Double(scanSettleMs)))
+        ]
+        if changedDiscovery { body["discoveryReceiver"] = .init(.string(discovery)) }
+        return body
+    }
+
+    public enum DraftError: LocalizedError {
+        case invalid(String)
+        public var errorDescription: String? { if case .invalid(let text) = self { return text }; return nil }
+    }
+}
+
 public struct ScannerBandPlan {
     public let range: ChannelBankScanRange
     public let mode: String

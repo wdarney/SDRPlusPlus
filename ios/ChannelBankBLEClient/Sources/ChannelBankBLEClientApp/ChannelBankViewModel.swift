@@ -6,6 +6,15 @@ import Foundation
 
 @MainActor
 public final class ChannelBankViewModel: ObservableObject {
+    @Published public var controlReceiver = ""
+
+    private func sendReceiverControls(_ body: [String: JSONValue]) {
+        // Capture the target before starting asynchronous work or switching UI receivers.
+        var addressed = body
+        let receiver = controlReceiver.isEmpty ? ble.latestState?.selectedSource : controlReceiver
+        if let receiver { addressed["receiver"] = .init(.string(receiver)) }
+        ble.setSourceControls(addressed)
+    }
     @Published public var centerMHzText = ""
     @Published public var centerTuneValue = 0.0
     @Published public private(set) var centerTuneStatus = "Waiting for center"
@@ -84,7 +93,8 @@ public final class ChannelBankViewModel: ObservableObject {
     }
 
     public func startSimpleScanner() {
-        if selectedBand == "airbandUS" { applySimpleRange(start: true) }
+        if ble.latestState?.mode == "multi_receiver_scan" { ble.setChannelBankRunning(true) }
+        else if selectedBand == "airbandUS" { applySimpleRange(start: true) }
         else { ble.setChannelBankRunning(true) }
     }
 
@@ -197,27 +207,27 @@ public final class ChannelBankViewModel: ObservableObject {
     }
 
     public func setSourceControl(_ key: String, number value: Double) {
-        ble.setSourceControls([key: JSONValue(.number(value))])
+        sendReceiverControls([key: JSONValue(.number(value))])
     }
 
     public func setSourceControl(_ key: String, int value: Int) {
-        ble.setSourceControls([key: JSONValue(.number(Double(value)))])
+        sendReceiverControls([key: JSONValue(.number(Double(value)))])
     }
 
     public func setSourceControl(_ key: String, string value: String) {
-        ble.setSourceControls([key: JSONValue(.string(value))])
+        sendReceiverControls([key: JSONValue(.string(value))])
     }
 
     public func setSourceControl(_ key: String, bool value: Bool) {
-        ble.setSourceControls([key: JSONValue(.bool(value))])
+        sendReceiverControls([key: JSONValue(.bool(value))])
     }
 
     public func setSourceToggle(_ key: String, value: Bool) {
-        ble.setSourceControls(["toggles": JSONValue(.object([key: .bool(value)]))])
+        sendReceiverControls(["toggles": JSONValue(.object([key: .bool(value)]))])
     }
 
     public func setSourceGain(_ name: String, value: Double) {
-        ble.setSourceControls(["gains": JSONValue(.object([name: .number(value)]))])
+        sendReceiverControls(["gains": JSONValue(.object([name: .number(value)]))])
     }
 
     public func setRecordingSession() {
