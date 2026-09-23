@@ -531,6 +531,8 @@ public:
             scanQuietSec = config.conf[name]["scanQuietSec"];
         if (config.conf[name].contains("scanNoSignalSec"))
             scanNoSignalSec = config.conf[name]["scanNoSignalSec"];
+        scanSettleMs.store(channel_bank_scan::Readiness::clampSettleMs(
+            config.conf[name].value("scanSettleMs", channel_bank_scan::Readiness::defaultSettleMs)));
         if (config.conf[name].contains("scanRanges"))
             for (auto& j : config.conf[name]["scanRanges"])
                 scanRanges.push_back({ j.value("start", 0.0), j.value("stop", 0.0) });
@@ -1540,6 +1542,7 @@ private:
             {"tailMs", tailMs},
             {"scanQuietSec", scanQuietSec},
             {"scanNoSignalSec", scanNoSignalSec},
+            {"scanSettleMs", scanSettleMs.load()},
             {"scanRanges", ranges},
             {"discoveryReceiver", discoveryReceiver},
             {"transmissionReceiverPool", receiverPool},
@@ -1631,6 +1634,10 @@ private:
             error = "no-signal skip must be numeric";
             return false;
         }
+        if (body.contains("scanSettleMs") && !body["scanSettleMs"].is_number_integer()) {
+            error = "scan settling time must be an integer in milliseconds";
+            return false;
+        }
         if (body.contains("transcriptionBackend") && !body["transcriptionBackend"].is_number_integer()) {
             error = "transcription backend must be an integer";
             return false;
@@ -1692,6 +1699,8 @@ private:
             ? std::clamp(body["scanQuietSec"].get<float>(), 1.0f, 30.0f) : scanQuietSec;
         const float nextScanNoSignalSec = body.contains("scanNoSignalSec")
             ? std::clamp(body["scanNoSignalSec"].get<float>(), 0.1f, 5.0f) : scanNoSignalSec;
+        const int nextScanSettleMs = clampedInteger("scanSettleMs", scanSettleMs.load(),
+            channel_bank_scan::Readiness::minSettleMs, channel_bank_scan::Readiness::maxSettleMs);
         int nextTranscriptionBackend = clampedInteger(
             "transcriptionBackend", transcriptionBackend, (int)TB_OFF, (int)TB_WHISPER_TURBO);
 #ifndef __APPLE__
@@ -1789,6 +1798,10 @@ private:
         if (body.contains("scanNoSignalSec")) {
             scanNoSignalSec = nextScanNoSignalSec;
             config.conf[name]["scanNoSignalSec"] = scanNoSignalSec;
+        }
+        if (body.contains("scanSettleMs")) {
+            scanSettleMs.store(nextScanSettleMs);
+            config.conf[name]["scanSettleMs"] = nextScanSettleMs;
         }
         if (body.contains("transcriptionBackend")) {
             transcriptionTurnedOff = transcriptionOn() && nextTranscriptionBackend == TB_OFF;
@@ -2542,6 +2555,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control slider-control"><span class="label">TX tail ms</span><span class="slider-value" id="cbTailValue">-</span><input id="cbTail" type="range" min="100" max="2000" step="25"></label>
 <label class="control slider-control"><span class="label">Scan quiet s</span><span class="slider-value" id="cbScanQuietValue">-</span><input id="cbScanQuiet" type="range" min="1" max="30" step="0.5"></label>
 <label class="control slider-control"><span class="label">No-signal skip s</span><span class="slider-value" id="cbScanNoSignalValue">-</span><input id="cbScanNoSignal" type="range" min="0.1" max="5" step="0.1"></label>
+<label class="control slider-control"><span class="label">Scan settling ms</span><span class="slider-value" id="cbScanSettleValue">-</span><input id="cbScanSettle" type="range" min="250" max="2000" step="50" title="Applies on the next retune; three fresh FFT frames are also required."></label>
 <label class="control"><span class="label">Transcribe</span><select id="cbTranscribe"><option value="0">Off</option><option value="1">Apple Speech</option><option value="2">Whisper ATC Large</option><option value="3">Whisper ATC Medium</option><option value="4">Whisper Turbo</option></select></label>
 <label class="control"><span class="label">Save recordings</span><button class="secondary" id="cbRecordingToggle" type="button">-</button></label>
 <label class="control"><span class="label">Adaptive noise floor</span><button class="secondary" id="cbLocalSnrToggle" type="button">-</button></label>
@@ -2680,7 +2694,8 @@ const sliderFormatters = {
   cbSignalHold: v => `${Math.round(v)} ms`,
   cbTail: v => `${Math.round(v)} ms`,
   cbScanQuiet: v => `${v.toFixed(1)} s`,
-  cbScanNoSignal: v => `${v.toFixed(1)} s`
+  cbScanNoSignal: v => `${v.toFixed(1)} s`,
+  cbScanSettle: v => `${Math.round(v)} ms`
 };
 async function post(path, body, refreshAfter = true) {
   const ctl = new AbortController();
@@ -3879,6 +3894,7 @@ async function refresh(force = false) {
     setSliderValue("cbTail", settings.tailMs, v => `${Math.round(v)} ms`);
     setSliderValue("cbScanQuiet", settings.scanQuietSec, v => `${v.toFixed(1)} s`);
     setSliderValue("cbScanNoSignal", settings.scanNoSignalSec, v => `${v.toFixed(1)} s`);
+    setSliderValue("cbScanSettle", settings.scanSettleMs ?? 250, v => `${Math.round(v)} ms`);
     setControlValue("cbTranscribe", settings.transcriptionBackend ?? 0);
     currentRecordingEnabled = settings.recordingEnabled !== false;
     const recToggle = document.getElementById("cbRecordingToggle");
@@ -4027,6 +4043,7 @@ saveSetting("cbSignalHold", "signalHoldMs", v => Number.parseInt(v, 10));
 saveSetting("cbTail", "tailMs", v => Number.parseInt(v, 10));
 saveSetting("cbScanQuiet", "scanQuietSec", Number);
 saveSetting("cbScanNoSignal", "scanNoSignalSec", Number);
+saveSetting("cbScanSettle", "scanSettleMs", Number);
 saveSetting("cbTranscribe", "transcriptionBackend", v => Number.parseInt(v, 10));
 document.getElementById("centerInput").onchange = e => {
   const mhz = Number(e.target.value);
@@ -5521,7 +5538,7 @@ self.addEventListener("fetch", event => {
             scanDwellGeneration = scanReadiness.generation;
             lastSignalTime = scanReadiness.firstFrame;
             flog::info("[ChannelBank] Scan: fresh FFT window ready at {0:.3f} MHz ({1} ms settle)",
-                       lastKnownCenter / 1e6, channel_bank_scan::Readiness::settleMs);
+                       lastKnownCenter / 1e6, scanReadiness.settlingMs());
         }
         return true;
     }
@@ -8841,7 +8858,8 @@ self.addEventListener("fetch", event => {
             _this->acknowledgedSr = newSr;
             _this->acknowledgedCenter = newCenter;
             if (_this->scanning())
-                _this->scanReadiness.acknowledge(newSr, std::chrono::steady_clock::now());
+                _this->scanReadiness.acknowledge(newSr, std::chrono::steady_clock::now(),
+                                                  _this->scanSettleMs.load());
             _this->clearDiscoveryDetections();
             _this->pendingRetuneSr = newSr;
             _this->pendingRetuneCenter = newCenter;
@@ -9672,8 +9690,7 @@ self.addEventListener("fetch", event => {
                 _this->saveScanConfig();
             }
 
-            ImGui::TextDisabled("Retune settling: %d ms + %u fresh FFT frames",
-                channel_bank_scan::Readiness::settleMs, channel_bank_scan::Readiness::requiredFrames);
+            _this->drawScanSettlingControl();
 
             // Quiet timeout (after a transmission ends)
             ImGui::LeftLabel("Quiet Timeout");
@@ -9777,6 +9794,7 @@ self.addEventListener("fetch", event => {
             }
 
             // Timers (shared with scan mode)
+            _this->drawScanSettlingControl();
             ImGui::LeftLabel("Quiet Timeout");
             ImGui::FillWidth();
             if (ImGui::SliderFloat(CONCAT("##_cb_bkquiet_", _this->name),
@@ -11100,6 +11118,22 @@ self.addEventListener("fetch", event => {
         return anyActive;
     }
 
+    void drawScanSettlingControl() {
+        int value = scanSettleMs.load();
+        ImGui::LeftLabel("Scan settling (ms)");
+        ImGui::FillWidth();
+        if (ImGui::SliderInt(CONCAT("##_cb_scsettle_", name), &value,
+                             channel_bank_scan::Readiness::minSettleMs,
+                             channel_bank_scan::Readiness::maxSettleMs, "%d ms")) {
+            // Clamp typed slider input too, not just mouse dragging.
+            scanSettleMs.store(channel_bank_scan::Readiness::clampSettleMs(value));
+            saveScanConfig();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Wait after retuning before measuring signals. Applies on the next retune.\n"
+                              "Minimum/default: 250 ms; three fresh FFT frames are also required.");
+    }
+
     void saveScanConfig() {
         config.acquire();
         config.conf[name]["scanMode"]     = scanMode;
@@ -11111,6 +11145,7 @@ self.addEventListener("fetch", event => {
             config.conf[name]["transmissionReceiverPool"].push_back(receiver);
         config.conf[name]["scanQuietSec"]    = scanQuietSec;
         config.conf[name]["scanNoSignalSec"] = scanNoSignalSec;
+        config.conf[name]["scanSettleMs"] = scanSettleMs.load();
         auto& arr = config.conf[name]["scanRanges"];
         arr = nlohmann::json::array();
         for (auto& r : scanRanges)
@@ -11608,6 +11643,7 @@ self.addEventListener("fetch", event => {
     std::vector<ScanRange> scanRanges;
     float scanQuietSec    = 3.0f;
     float scanNoSignalSec = 1.0f;
+    std::atomic<int> scanSettleMs { channel_bank_scan::Readiness::defaultSettleMs };
     // Runtime scan state (not persisted)
     std::vector<double> scanStops;
     int   scanStopIdx       = 0;
@@ -12378,6 +12414,7 @@ self.addEventListener("fetch", event => {
             p["transmissionReceiverPool"].push_back(receiver);
         p["scanQuietSec"]       = scanQuietSec;
         p["scanNoSignalSec"]    = scanNoSignalSec;
+        p["scanSettleMs"]       = scanSettleMs.load();
         p["playbackAutoFlushEnabled"]    = playbackAutoFlushEnabled;
         p["playbackAutoFlushThreshold"]  = playbackAutoFlushThreshold;
         p["playbackAutoFlushKeepLatest"] = playbackAutoFlushKeepLatest;
@@ -12448,6 +12485,8 @@ self.addEventListener("fetch", event => {
                 if (j.is_string()) transmissionReceiverPool.push_back(j.get<std::string>());
         scanQuietSec       = p.value("scanQuietSec", 3.0f);
         scanNoSignalSec    = p.value("scanNoSignalSec", 1.0f);
+        scanSettleMs.store(channel_bank_scan::Readiness::clampSettleMs(
+            p.value("scanSettleMs", channel_bank_scan::Readiness::defaultSettleMs)));
         playbackAutoFlushEnabled    = p.value("playbackAutoFlushEnabled", true);
         playbackAutoFlushThreshold  = p.value("playbackAutoFlushThreshold", 30);
         playbackAutoFlushKeepLatest = p.value("playbackAutoFlushKeepLatest", 5);

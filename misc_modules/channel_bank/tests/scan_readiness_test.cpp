@@ -18,7 +18,7 @@ int main() {
     check(gate.discard(1000000, t + seconds(5)), "IQ must be ignored before tune acknowledgement");
     gate.frame(t);
     check(!gate.ready(), "old detections cannot make an unacknowledged stop ready");
-    gate.acknowledge(1000, t);
+    gate.acknowledge(1000, t, 350);
     check(gate.discard(350, t + milliseconds(1)), "fast buffered delivery cannot bypass wall settling");
     gate.frame(t + milliseconds(2));
     check(!gate.ready(), "settling frames cannot be counted");
@@ -34,7 +34,7 @@ int main() {
     auto generation = gate.generation;
     gate.request(); // Even a repeated/same-frequency stop starts a new epoch.
     check(gate.generation != generation && !gate.ready(), "hop must invalidate previous readiness");
-    gate.acknowledge(1000, t + seconds(1));
+    gate.acknowledge(1000, t + seconds(1), 350);
     check(gate.discard(10, t + seconds(3)), "wall time alone cannot substitute for fresh IQ");
     gate.frame(t + seconds(3));
     check(!gate.ready(), "stalled source cannot skip an unmeasured stop");
@@ -71,5 +71,23 @@ int main() {
     check(disposed == 1 && channels.size() == 2, "repeated hops preserve independent receivers");
     gate.reset();
     check(!gate.ready() && gate.generation == 0, "restart clears prior readiness");
+    // Default/minimum and configurable per-retune settling use both budgets.
+    gate.request();
+    gate.acknowledge(1000, t);
+    check(gate.settlingMs() == 250, "default returns to the user-tested 250 ms");
+    check(gate.discard(249, t + milliseconds(250)), "default still requires 250 samples at 1 kHz");
+    check(gate.discard(1, t + milliseconds(250)), "discard boundary at default settling");
+    check(!gate.discard(1, t + milliseconds(251)), "default allows collection after 250 ms");
+    gate.request();
+    gate.acknowledge(1000, t, 50);
+    check(gate.settlingMs() == 250, "values below tested minimum are clamped");
+    gate.request();
+    gate.acknowledge(1000, t, 1000);
+    check(gate.discard(1000, t + milliseconds(999)), "longer setting holds despite enough IQ");
+    check(gate.discard(1, t + milliseconds(1000)), "longer setting discards boundary block");
+    check(!gate.discard(1, t + milliseconds(1001)), "longer setting resumes collection");
+    gate.request();
+    gate.acknowledge(1000, t, 10000);
+    check(gate.settlingMs() == 2000, "upper setting bound is enforced");
     std::cout << "Scan readiness and independent receiver preservation passed\n";
 }

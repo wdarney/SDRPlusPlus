@@ -9,7 +9,10 @@ namespace channel_bank_scan {
 class Readiness {
 public:
     using Clock = std::chrono::steady_clock;
-    static constexpr int settleMs = 350;
+    static constexpr int minSettleMs = 250;
+    static constexpr int defaultSettleMs = minSettleMs;
+    static constexpr int maxSettleMs = 2000;
+    static int clampSettleMs(int value) { return std::clamp(value, minSettleMs, maxSettleMs); }
     static constexpr unsigned requiredFrames = 3;
 
     void reset() { *this = Readiness{}; }
@@ -20,12 +23,14 @@ public:
         frames = 0;
         firstFrame = {};
     }
-    void acknowledge(double sampleRate, Clock::time_point now) {
+    void acknowledge(double sampleRate, Clock::time_point now, int settleMs = defaultSettleMs) {
         if (!waiting) request();
         waiting = false;
         settling = true;
-        settleUntil = now + std::chrono::milliseconds(settleMs);
-        samplesLeft = static_cast<int64_t>(std::ceil(sampleRate * settleMs / 1000.0));
+        // Snapshot the setting for this tune; live edits apply on the next tune.
+        activeSettleMs = clampSettleMs(settleMs);
+        settleUntil = now + std::chrono::milliseconds(activeSettleMs);
+        samplesLeft = static_cast<int64_t>(std::ceil(sampleRate * activeSettleMs / 1000.0));
     }
     bool discard(int count, Clock::time_point now) {
         if (waiting) return true;
@@ -42,9 +47,11 @@ public:
     }
     bool ready() const { return !waiting && !settling && frames >= requiredFrames; }
     bool awaitingTune() const { return waiting; }
+    int settlingMs() const { return activeSettleMs; }
     uint64_t generation = 0;
     Clock::time_point firstFrame{};
 private:
+    int activeSettleMs = defaultSettleMs;
     bool waiting = false;
     bool settling = false;
     unsigned frames = 0;

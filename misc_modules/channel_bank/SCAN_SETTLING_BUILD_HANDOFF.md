@@ -1,80 +1,83 @@
-# Scan settling test candidate
+# Channel Bank scan settling
 
-This source candidate is on `codex/channel-bank-scan-settling`, based on
-`51617820` (`codex/channel-bank-multi-receiver-scan`). That baseline already
-contains `integration/main` at `7ad6434c`. The two remote tips were fetched and
-verified on 2026-09-22. No core or source-driver changes are part of this fix.
+## Integration history and current candidate
 
-The user will have a separate session build the app and will perform runtime
-and hardware testing. The user authorized pushing this candidate branch so the
-build session can fetch it. **Do not integrate it into `integration/main` until
-the user explicitly approves the fix after testing.**
+- The user confirmed the initial 250 ms fix worked. It was integrated into
+  `integration/main` at `4c1c8507`, including the multi-receiver scanner at
+  `51617820`.
+- The fixed 350 ms follow-up was approved and integrated at `28da0509`.
+- The current follow-up on `codex/channel-bank-scan-settling` makes settling
+  configurable and returns the default and minimum to 250 ms. This is the
+  lowest setting the user confirmed working; lower values have not been
+  established as reliable.
 
-## Behavior
+The user uses a separate session for application builds and hardware testing.
+The candidate branch may be pushed for that session to fetch. **Wait for user
+approval before integrating this configurable-setting follow-up into main.**
+No core, source-driver, or native iPhone UI changes are included in this follow-up.
 
-- A requested scan hop immediately invalidates discovery results and pauses
-  discovery analysis until the source's retune callback acknowledges tuning.
-- The detector discards at least 350 ms of IQ samples and waits at least 350 ms
-  of wall time after acknowledgement. It discards the complete boundary block,
-  then collects at least three new FFT frames before scan decisions resume.
-- No Signal Skip starts at the first post-settling FFT frame. Without arriving
-  IQ, the scanner remains at the unmeasured stop rather than skipping it.
-- Multi-Receiver Scan retains immediate advancement after a fresh detection;
-  No Signal Skip remains an empty-stop dwell, not a mandatory delay after a hit.
-  Receiver observations, release timers and recording management continue
-  throughout discovery settling.
-- Retune cleanup only destroys discovery-owned slots. Independent receivers
-  keep their VFOs, open files, observations and allocator assignments.
-- The detector center is updated by the acknowledged retune, not by reading the
-  requested GUI center during analysis. FFT collection and invalidation are
-  serialized; local sink teardown occurs outside that lock so IQ can drain.
-- Ordinary range Scan and bookmark scan share this readiness guard. Stationary
-  Auto/Manual modes do not receive the scan settling delay.
+## Setting
 
-The 350 ms interval adds 100 ms to the user-tested initial 250 ms setting; it is not a hardware timestamp
-or a measurement of a particular driver's buffered latency. It still needs RF
-acceptance on the user's receiver setup. The desktop range-scan panel shows the
-settling interval and fresh-frame requirement. Logs identify when a fresh FFT
-window becomes ready, and why multi-receiver discovery advanced.
+The desktop range Scan, Multi-Receiver Scan, and bookmark scan panels expose
+**Scan settling (ms)**. The range is **250–2,000 ms**, default **250 ms**. It is
+also available in the built-in web controls and settings API as `scanSettleMs`
+(integer milliseconds). API values are clamped to the same bounds and
+non-integer values are rejected before settings are applied.
 
-## Validation so far
+The setting is saved in the module configuration and named profiles. Existing
+configurations/profiles without this field use 250 ms. A change while running
+applies to the next acknowledged retune; it does not shorten or extend a
+settling interval already in progress. Logs report the interval actually used
+for that tune, even if the setting has subsequently changed.
 
-The standalone `scan_readiness_test.cpp` passed at the original 250 ms setting before build/test work was
-stopped at the user's request. It covers tune acknowledgement, both wall-time
-and sample-count settling, three-frame readiness through the real FFT frame
-collector, stop/restart, and independent recording-slot preservation using
-the teardown helper called by production code. The later source-only cleanup
-coordination has not been compiled or run.
+This is the settling delay before detection, not the total dwell at a scan
+stop. Three fresh FFT frames are still required after settling. **No Signal
+Skip** continues to control the empty-stop detection dwell, starting at the
+first post-settling frame. **Quiet Timeout** retains its existing meaning.
 
-The full app configure was attempted but did not complete: Brown DSD dependency
+## Retune and multi-receiver behavior
+
+- A requested scan hop invalidates discovery results and pauses discovery
+  analysis until the source retune callback acknowledges tuning.
+- The detector waits for both the configured wall-time interval and the
+  corresponding number of discarded IQ samples. It discards the complete
+  boundary block, then collects at least three new FFT frames before making
+  scan decisions. Without arriving IQ, it stays at the unmeasured stop.
+- Multi-Receiver Scan retains advancement after a fresh detection. Receiver
+  observations, release timers and recording management continue throughout
+  discovery settling.
+- Discovery retunes preserve independently hosted VFOs, open files, detector
+  observations and allocator assignments.
+- FFT collection and tune invalidation are serialized. The detector center
+  follows the acknowledged tune rather than the requested GUI center. Local
+  sink teardown occurs outside the analysis lock so IQ can drain.
+- Stationary Auto/Manual modes do not receive the scan settling delay.
+
+The interval is a practical guard, not a hardware timestamp or a measurement
+of a particular driver's buffered latency. Reliability remains receiver- and
+buffering-dependent; increase the setting if hardware testing calls for it.
+
+## Validation and build handoff
+
+No build or tests were run for the configurable-setting follow-up, following
+the user's source-only handoff workflow. The regression source now covers the
+250 ms default, 350 ms selection, longer settling, and lower/upper bounds, in
+addition to the original fresh-frame and independent-slot preservation cases.
+The original standalone readiness test passed during the initial investigation;
+the user subsequently reported the initial fix working on hardware.
+
+Follow `MULTI_RECEIVER_SCAN_BUILD_HANDOFF.md` for the full app build with
+`BUILD_TESTING=ON`. Include `channel_bank_scan_readiness_test` and run CTest in
+the Channel Bank build directory. Use a fresh build directory: the earlier
+`build-scan-settling` configure was incomplete after Brown DSD dependency
 bootstrap encountered generated dependency directories in its filename glob.
-No app build, packaging, launch, deployment, or RF validation was completed.
-Use a fresh build directory in the build session. The existing allocator test
-now explicitly retains assertions in Release builds.
 
-## Build-session checks
-
-Follow `MULTI_RECEIVER_SCAN_BUILD_HANDOFF.md` for the full app build, with
-`BUILD_TESTING=ON`. Also build `channel_bank_scan_readiness_test`, then run CTest
-in the Channel Bank build directory. Preserve the existing multi-receiver
-source adapters, carrier centering, adjacent-dispatch suppression, gain
-controls, and RX888 driver provenance when packaging.
-
-For hardware acceptance, compare stationary Auto with range Scan on known
-active frequencies. Compare empty-stop dwell at No Signal Skip 0.1 s and 2 s;
-allow the additional settling and fresh-frame time. With Multi-Receiver Scan,
-verify discovery continues hopping while recordings on other receivers remain
-open and audible. Check several channels sharing a receiver, no free receiver,
-blocked/suppressed candidates, maximum-monitor release, and stop/restart.
-Keep this candidate separate from known-good apps until accepted.
-
-## 350 ms follow-up
-
-The user confirmed the initial fix worked and it was integrated at `4c1c8507`.
-They subsequently requested a 350 ms settling interval. This candidate changes
-both the wall-time and discarded-IQ requirements through the same constant;
-the three-frame requirement and independent-receiver handling are unchanged.
-The desktop interval display follows the constant automatically. Test boundary
-fixtures were updated, but no build or tests were run for this follow-up, per
-the source-only handoff workflow. Push the candidate for the build session;
-wait for user acceptance before integrating this follow-up into main.
+Check desktop changes and restart/profile persistence at 250, 350, and 1,000 ms.
+Confirm a live change applies at the next hop and API bounds match desktop
+bounds. Compare stationary Auto with range Scan on known active frequencies;
+compare empty-stop No Signal Skip at 0.1 s and 2 s, allowing for settling and
+fresh-frame time. In Multi-Receiver Scan, verify discovery continues hopping
+while other receivers' recordings remain open and audible. Preserve and check
+carrier centering, adjacent-dispatch suppression, multiple channels on one
+receiver, no-capacity behavior, blocking/suppression, maximum-monitor release,
+and stop/restart. Keep the test app separate from known-good apps until accepted.
