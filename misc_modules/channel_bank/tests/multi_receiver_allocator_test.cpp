@@ -23,6 +23,7 @@ int main() {
     assert(!nms.markPendingDistinct(124553, 8333.333, 2));
     assert(nms.markPendingDistinct(124570, 8333.333, 2));
     nms.failPending(124545);
+    nms.failPending(124570);
     assert(nms.markPendingDistinct(124553, 8333.333, 2));
     nms.clear();
     nms.setReceivers({{"RTL-SDR", 2400000.0, 0.0, true, {}}});

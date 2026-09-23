@@ -1,19 +1,19 @@
 # Channel Bank scan settling
 
-## Integration history and current candidate
+## Integration history
 
 - The user confirmed the initial 250 ms fix worked. It was integrated into
   `integration/main` at `4c1c8507`, including the multi-receiver scanner at
   `51617820`.
 - The fixed 350 ms follow-up was approved and integrated at `28da0509`.
-- The current follow-up on `codex/channel-bank-scan-settling` makes settling
+- Follow-up `0181f692`, now on `integration/main`, makes settling
   configurable and returns the default and minimum to 250 ms. This is the
   lowest setting the user confirmed working; lower values have not been
   established as reliable.
 
 The user uses a separate session for application builds and hardware testing.
-The candidate branch may be pushed for that session to fetch. **Wait for user
-approval before integrating this configurable-setting follow-up into main.**
+The integration baseline includes the configurable setting and the approved
+receiver-status display. Build from `integration/main` to include both.
 No core, source-driver, or native iPhone UI changes are included in this follow-up.
 
 ## Setting
@@ -59,8 +59,11 @@ buffering-dependent; increase the setting if hardware testing calls for it.
 
 ## Validation and build handoff
 
-No build or tests were run for the configurable-setting follow-up, following
-the user's source-only handoff workflow. The regression source now covers the
+The configurable-setting follow-up originally used a source-only handoff.
+Integration validation on 2026-09-23 subsequently built `sdrpp`, `channel_bank`,
+and both Channel Bank test targets in a fresh ARM64 Release build; allocator
+and scan-readiness CTests passed (2/2). Packaging and RF checks remain with the
+separate build session. The regression source covers the
 250 ms default, 350 ms selection, longer settling, and lower/upper bounds, in
 addition to the original fresh-frame and independent-slot preservation cases.
 The original standalone readiness test passed during the initial investigation;
