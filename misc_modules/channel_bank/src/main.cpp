@@ -347,6 +347,8 @@ private:
     struct PlaybackEntry;
     struct WebClientThread;
     struct ReceiverRuntime;
+    struct ReceiverChannelActivity;
+    struct ReceiverActivity;
     struct ScanRange { double startHz, stopHz; };
     static constexpr size_t MAX_SCAN_RANGES = 64;
     static constexpr size_t MAX_SCAN_STOPS = 4096;
@@ -1471,27 +1473,65 @@ private:
         };
     }
 
+    std::vector<ReceiverActivity> receiverActivitySnapshot() {
+        std::vector<ReceiverActivity> result;
+        std::scoped_lock lk(multiReceiverMtx, channelsMtx);
+        for (const auto& receiver : receiverAllocator.receivers()) {
+            ReceiverActivity activity;
+            activity.id = receiver.id;
+            activity.available = receiver.available;
+            activity.allocationCenterHz = receiver.centerHz;
+            activity.sampleRate = receiver.sampleRate;
+            auto runtime = receiverRuntimes.find(receiver.id);
+            if (runtime != receiverRuntimes.end() && runtime->second.started)
+                activity.tunedCenterHz = runtime->second.centerHz;
+            for (int64_t key : receiver.channels) {
+                auto slot = activeChannels.find((int)key);
+                if (slot == activeChannels.end() || !slot->second->multiReceiver) continue;
+                activity.channels.push_back({key, slot->second->freqHz,
+                    slot->second->gridFreqHz, slot->second->rawSignalPresent.load(),
+                    slot->second->signalPresent.load(), slot->second->fileOpen,
+                    slot->second->releaseRequested});
+            }
+            result.push_back(std::move(activity));
+        }
+        return result;
+    }
+
     json multiReceiverStatusJson() {
         json receivers = json::array();
         json dispatches = json::array();
-        std::lock_guard<std::mutex> lk(multiReceiverMtx);
-        for (const auto& receiver : receiverAllocator.receivers()) {
+        for (const auto& receiver : receiverActivitySnapshot()) {
             json channels = json::array();
-            for (int64_t key : receiver.channels) channels.push_back((double)key * 1000.0);
+            json channelDetails = json::array();
+            for (const auto& channel : receiver.channels) {
+                channels.push_back((double)channel.key * 1000.0);
+                channelDetails.push_back({
+                    {"gridHz", channel.gridHz}, {"tunedHz", channel.tunedHz},
+                    {"signalPresent", channel.signalPresent},
+                    {"held", channel.held}, {"recording", channel.recording},
+                    {"releasing", channel.releasing}
+                });
+            }
             receivers.push_back({
                 {"id", receiver.id}, {"available", receiver.available},
                 {"state", receiver.channels.empty() ? "IDLE" : "ACTIVE"},
-                {"centerHz", receiver.centerHz}, {"sampleRate", receiver.sampleRate},
-                {"channels", channels}
+                {"centerHz", receiver.allocationCenterHz},
+                {"sampleRate", receiver.sampleRate},
+                {"tunedCenterHz", receiver.tunedCenterHz},
+                {"channels", channels}, {"channelDetails", channelDetails}
             });
         }
-        for (const auto& [key, state] : receiverAllocator.dispatches()) {
-            const char* stateName = state == channel_bank_multi_receiver::DispatchState::Pending ? "PENDING" :
-                                    state == channel_bank_multi_receiver::DispatchState::Active ? "ACTIVE" : "SUPPRESSED";
-            dispatches.push_back({
-                {"freqKey", key}, {"frequencyHz", (double)key * 1000.0},
-                {"state", stateName}, {"receiverId", receiverAllocator.assignment(key)}
-            });
+        {
+            std::lock_guard<std::mutex> lk(multiReceiverMtx);
+            for (const auto& [key, state] : receiverAllocator.dispatches()) {
+                const char* stateName = state == channel_bank_multi_receiver::DispatchState::Pending ? "PENDING" :
+                                        state == channel_bank_multi_receiver::DispatchState::Active ? "ACTIVE" : "SUPPRESSED";
+                dispatches.push_back({
+                    {"freqKey", key}, {"frequencyHz", (double)key * 1000.0},
+                    {"state", stateName}, {"receiverId", receiverAllocator.assignment(key)}
+                });
+            }
         }
         return {
             {"discoveryReceiver", discoveryReceiver},
@@ -9475,13 +9515,9 @@ self.addEventListener("fetch", event => {
                     _this->saveScanConfig();
                 }
                 ImGui::Text("Transmission Receiver Activity");
-                std::vector<channel_bank_multi_receiver::ReceiverState> receiverStates;
-                {
-                    std::lock_guard<std::mutex> lk(_this->multiReceiverMtx);
-                    receiverStates = _this->receiverAllocator.receivers();
-                }
+                auto receiverStates = _this->receiverActivitySnapshot();
                 ImGui::BeginChild(CONCAT("##_cb_receiver_activity_", _this->name),
-                                  ImVec2(menuWidth, 125), true);
+                                  ImVec2(menuWidth, 155), true);
                 if (!_this->running) {
                     ImGui::TextDisabled("Start Channel Bank to see assignments.");
                 }
@@ -9493,25 +9529,34 @@ self.addEventListener("fetch", event => {
                             ImGui::Text("%s: UNAVAILABLE", receiverId.c_str());
                             continue;
                         }
-                        if (it->idle()) {
-                            ImGui::Text("%s: READY (open)", receiverId.c_str());
+                        if (it->tunedCenterHz <= 0.0) {
+                            ImGui::Text("%s: READY (tuning unknown)", receiverId.c_str());
                             continue;
                         }
-                        ImGui::Text("%s: ACTIVE at %.3f MHz (%d channels)",
-                                    receiverId.c_str(), it->centerHz / 1e6, (int)it->channels.size());
-                        for (int64_t key : it->channels) {
-                            double frequencyHz = (double)key * 1000.0;
-                            std::string channelName = _this->displayName(frequencyHz);
-                            char frequencyLabel[64];
-                            snprintf(frequencyLabel, sizeof(frequencyLabel), "%.3f MHz", frequencyHz / 1e6);
-                            if (channelName == frequencyLabel)
-                                ImGui::BulletText("%s", frequencyLabel);
+                        ImGui::Text("%s SDR center set: %.4f MHz%s", receiverId.c_str(),
+                                    it->tunedCenterHz / 1e6,
+                                    it->channels.empty() ? " (parked, no channels)" : "");
+                        for (const auto& channel : it->channels) {
+                            const char* state = channel.releasing ? "RELEASING" :
+                                channel.signalPresent ? (channel.recording ? "SIGNAL + REC" : "SIGNAL") :
+                                channel.recording ? "HOLD + REC" :
+                                channel.held ? "HOLD" : "QUIET / ASSIGNED";
+                            std::string channelName = _this->displayName(channel.gridHz);
+                            ImGui::BulletText("VFO set: %.4f MHz  [%s]", channel.tunedHz / 1e6, state);
+                            ImGui::Indent();
+                            char gridLabel[64];
+                            snprintf(gridLabel, sizeof(gridLabel), "%.3f MHz", channel.gridHz / 1e6);
+                            if (channelName.empty() || channelName == gridLabel)
+                                ImGui::TextDisabled("Grid %s", gridLabel);
                             else
-                                ImGui::BulletText("%s  %s", frequencyLabel, channelName.c_str());
+                                ImGui::TextDisabled("Grid %s  %s", gridLabel, channelName.c_str());
+                            ImGui::Unindent();
                         }
                     }
                 }
                 ImGui::EndChild();
+                if (_this->running)
+                    ImGui::TextDisabled("SIGNAL = now; HOLD/QUIET = assigned, not a new detection.");
                 ImGui::TextDisabled("Transmission receiver gain (configured values)");
                 auto gainNow = std::chrono::steady_clock::now();
                 if (!ImGui::IsAnyItemActive() &&
@@ -11606,6 +11651,23 @@ self.addEventListener("fetch", event => {
         dsp::routing::Splitter<dsp::complex_t>* splitter = nullptr;
         std::unique_ptr<ReceiverDetector> detector;
         bool started = false;
+    };
+    struct ReceiverChannelActivity {
+        int64_t key = 0;
+        double tunedHz = 0.0;
+        double gridHz = 0.0;
+        bool signalPresent = false;
+        bool held = false;
+        bool recording = false;
+        bool releasing = false;
+    };
+    struct ReceiverActivity {
+        std::string id;
+        bool available = false;
+        double allocationCenterHz = 0.0;
+        double tunedCenterHz = 0.0;
+        double sampleRate = 0.0;
+        std::vector<ReceiverChannelActivity> channels;
     };
     std::string discoveryReceiver;
     std::mutex uiSourceSnapshotMtx;
