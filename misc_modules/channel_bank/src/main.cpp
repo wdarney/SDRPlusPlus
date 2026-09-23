@@ -1766,6 +1766,26 @@ private:
             ? std::clamp(body["maximumMonitorSec"].get<float>(), 0.0f, 86400.0f)
             : maximumMonitorSec;
 
+        // Discovery selection must also update the actual SDR++ source.
+        if (body.contains("discoveryReceiver")) {
+            if (gui::mainWindow.isPlaying() || !sourceExists(nextDiscoveryReceiver)) {
+                error = "stop SDR and choose an available discovery source";
+                return false;
+            }
+            for (const auto& source : sigpath::sourceManager.getIndependentSources()) {
+                if (source.name == nextDiscoveryReceiver && source.claimed) {
+                    error = "discovery source is in use";
+                    return false;
+                }
+            }
+            sigpath::sourceManager.selectSource(nextDiscoveryReceiver);
+            core::configManager.acquire();
+            core::configManager.conf["source"] = nextDiscoveryReceiver;
+            core::configManager.release(true);
+            nextReceiverPool.erase(std::remove(nextReceiverPool.begin(), nextReceiverPool.end(),
+                nextDiscoveryReceiver), nextReceiverPool.end());
+        }
+
         // All fields have now been validated. From here onward the update is a
         // single in-memory/config commit with no validation failure exits.
         if (body.contains("mode")) {
@@ -1781,7 +1801,7 @@ private:
         }
         if (body.contains("scanRanges")) scanRanges = std::move(nextScanRanges);
         if (body.contains("discoveryReceiver")) discoveryReceiver = std::move(nextDiscoveryReceiver);
-        if (body.contains("transmissionReceiverPool")) transmissionReceiverPool = std::move(nextReceiverPool);
+        if (body.contains("transmissionReceiverPool") || body.contains("discoveryReceiver")) transmissionReceiverPool = std::move(nextReceiverPool);
         if (body.contains("maximumMonitorSec")) maximumMonitorSec = nextMaximumMonitorSec;
 
         bool transcriptionTurnedOff = false;
@@ -1862,7 +1882,7 @@ private:
         }
         if (body.contains("discoveryReceiver")) config.conf[name]["discoveryReceiver"] = discoveryReceiver;
         if (body.contains("maximumMonitorSec")) config.conf[name]["maximumMonitorSec"] = maximumMonitorSec;
-        if (body.contains("transmissionReceiverPool")) {
+        if (body.contains("transmissionReceiverPool") || body.contains("discoveryReceiver")) {
             config.conf[name]["transmissionReceiverPool"] = json::array();
             for (const auto& receiver : transmissionReceiverPool)
                 config.conf[name]["transmissionReceiverPool"].push_back(receiver);
@@ -2407,6 +2427,12 @@ private:
         j["sources"] = sourceNamesJson();
         j["sdrppServer"] = serverSourceStateJson();
         j["sourceControls"] = selectedSourceControlsJson();
+        j["receiverControls"] = json::object();
+        for (const auto& source : sigpath::sourceManager.getIndependentSources()) {
+            if (selectedSourceControlInterface(source.name))
+                j["receiverControls"][source.name] = source.name == selectedSourceName()
+                    ? j["sourceControls"] : jsonSourceStateJson(source.name);
+        }
         j["sourceOffset"] = sourceOffsetStateJson();
         j["settings"] = channelBankSettingsJson();
         j["snrThresholdDb"] = snrThreshold;
@@ -2551,6 +2577,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 </div>
 <div class="source-settings" id="sourceSettings">
 <h2 style="margin-top:4px">Source Settings</h2>
+<label class="control"><span class="label">Control receiver</span><select id="sourceControlTarget"></select></label>
 <div class="source-grid" id="sourceSettingsGrid"></div>
 <div class="source-actions"><button class="secondary" id="sourceRefresh" type="button">Refresh Devices</button><span class="muted" id="sourceSettingsStatus">Source settings ready</span></div>
 </div>
@@ -2584,7 +2611,7 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 </div>
 <div class="muted" id="settingsStatus" style="margin-top:8px">Settings ready</div>
 <div class="settings-grid" style="margin-top:10px">
-<label class="control"><span class="label">Mode</span><select id="cbMode"><option value="auto">Auto</option><option value="manual">Manual</option><option value="scan">Scan</option><option value="bookmark_scan">Bookmark Scan</option></select></label>
+<label class="control"><span class="label">Mode</span><select id="cbMode"><option value="auto">Auto</option><option value="manual">Manual</option><option value="scan">Scan</option><option value="bookmark_scan">Bookmark Scan</option><option value="multi_receiver_scan">Multi-Receiver Scan</option></select></label>
 <label class="control slider-control"><span class="label">Channel spacing</span><span class="slider-value" id="cbSpacingValue">-</span><input id="cbSpacing" type="range" min="0" max="5" step="1"></label>
 <label class="control"><span class="label">Demod</span><select id="cbDemod"><option>AM</option><option>NFM</option><option>WFM</option><option>USB</option><option>LSB</option></select></label>
 <label class="control slider-control"><span class="label">SNR dB</span><span class="slider-value" id="cbSnrValue">-</span><input id="cbSnr" type="range" min="1" max="30" step="0.1"></label>
@@ -2601,6 +2628,21 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <label class="control"><span class="label">Adaptive noise floor</span><button class="secondary" id="cbLocalSnrToggle" type="button">-</button></label>
 <label class="control"><span class="label">Storm guard</span><button class="secondary" id="cbStormGuardToggle" type="button">-</button></label>
 </div>
+</section>
+<section>
+<h2>Scanner</h2>
+<div id="scannerConfig">
+<div class="settings-grid">
+<label class="control"><span class="label">Discovery SDR</span><select id="discoveryReceiver"></select></label>
+<label class="control slider-control"><span class="label">Maximum monitor time</span><span class="slider-value" id="cbMaximumMonitorValue">-</span><input id="cbMaximumMonitor" type="range" min="0" max="86400" step="1"></label>
+</div>
+<h3>Transmission Pool</h3><div id="receiverPool"></div>
+<h3>Scan Ranges</h3><div id="scanRanges"></div>
+<button type="button" id="addScanRange" class="secondary" title="Add frequency range">+</button>
+<button type="button" id="saveScanner" class="primary">Apply Scanner</button>
+<span id="scannerStatus" class="muted"></span>
+</div>
+<div id="receiverActivity" style="overflow-x:auto"></div>
 </section>
 <section>
 <div class="span-head">
@@ -2721,6 +2763,12 @@ let blockedSortDir = 1;
 let currentRecordingEnabled = true;
 let currentLocalSnrEnabled = true;
 let currentStormGuardEnabled = true;
+let scannerState = null;
+let scannerDirty = false;
+let scannerSaving = false;
+let scannerPool = [];
+let scannerRanges = [];
+let sourceControlReceiver = "";
 const spanWaterfallFrames = [];
 const spanWaterfallMaxFrames = 72;
 let spanWaterfallKey = "";
@@ -2735,7 +2783,8 @@ const sliderFormatters = {
   cbTail: v => `${Math.round(v)} ms`,
   cbScanQuiet: v => `${v.toFixed(1)} s`,
   cbScanNoSignal: v => `${v.toFixed(1)} s`,
-  cbScanSettle: v => `${Math.round(v)} ms`
+  cbScanSettle: v => `${Math.round(v)} ms`,
+  cbMaximumMonitor: v => v === 0 ? "Unlimited" : `${Math.round(v)} s`
 };
 async function post(path, body, refreshAfter = true) {
   const ctl = new AbortController();
@@ -2911,6 +2960,7 @@ async function flushSettingSave(controlId) {
   }
 }
 async function saveSourceControls(body, controlId, seq) {
+  body = { receiver: sourceControlReceiver, ...body };
   const status = document.getElementById("sourceSettingsStatus");
   if (status) status.textContent = "Saving source settings...";
   const ok = await postAndReport("/api/source-controls", body, false);
@@ -2922,6 +2972,8 @@ async function saveSourceControls(body, controlId, seq) {
   return ok;
 }
 function queueSourceControlSave(controlId, body, delayMs) {
+  body = { receiver: sourceControlReceiver, ...body };
+  controlId = `${body.receiver}:${controlId}`;
   const seq = (pendingSourceSeq.get(controlId) || 0) + 1;
   pendingSourceSeq.set(controlId, seq);
   pendingSourceDirty.add(controlId);
@@ -3075,9 +3127,19 @@ function renderSourceControls(s) {
   const panel = document.getElementById("sourceSettings");
   const grid = document.getElementById("sourceSettingsGrid");
   const status = document.getElementById("sourceSettingsStatus");
-  const c = s.sourceControls || {};
+  const target = document.getElementById("sourceControlTarget");
+  const names = [...new Set([s.selectedSource, ...(s.settings?.availableReceivers || []).map(r => r.id)].filter(Boolean))];
+  if (!names.includes(sourceControlReceiver) && pendingSourceDirty.size === 0) sourceControlReceiver = s.selectedSource || "";
+  if (document.activeElement !== target && pendingSourceDirty.size === 0) {
+    target.innerHTML = names.map(n => `<option value="${esc(n)}">${esc(n)}${n === s.selectedSource ? " (selected)" : ""}</option>`).join("");
+    target.value = sourceControlReceiver;
+  }
+  target.disabled = pendingSourceDirty.size > 0 || sourceSaveInFlight.size > 0;
+  const c = sourceControlReceiver === s.selectedSource ? (s.sourceControls || {}) : (s.receiverControls?.[sourceControlReceiver] || {});
   if (!panel || !grid) return;
-  const selected = s.selectedSource || c.source || "";
+  const selected = sourceControlReceiver || c.source || "";
+  const independent = selected !== s.selectedSource;
+  document.getElementById("sourceRefresh").disabled = independent || !!c.running || !c.available;
   if (!selected) {
     panel.style.display = "none";
     grid.innerHTML = "";
@@ -3094,13 +3156,13 @@ function renderSourceControls(s) {
   panel.style.display = "block";
   if (panel.contains(document.activeElement) || pendingSourceDirty.size > 0) return;
 
-  const running = !!(s.radioPlaying || c.running);
+  const running = !!c.running || (!independent && !!s.radioPlaying);
   const devices = c.devices || [];
   const rates = c.sampleRates || [];
   const modes = c.modes || [];
   const gains = (c.gains || []).filter(g => g && g.name);
   const opt = (value, label, selected) => `<option value="${esc(value)}" ${selected ? "selected" : ""}>${esc(label)}</option>`;
-  const disabled = running ? "disabled" : "";
+  const disabled = running || independent ? "disabled" : "";
   const parts = [];
 
   parts.push(`<label class="control"><span class="label">Device</span><select id="srcDevice" ${disabled}>${
@@ -3110,7 +3172,7 @@ function renderSourceControls(s) {
     rates.map(r => opt(r.id, r.label, !!r.selected)).join("")
   }</select></label>`);
   if (modes.length) {
-    parts.push(`<label class="control"><span class="label">Mode</span><select id="srcMode" ${disabled}>${
+    parts.push(`<label class="control"><span class="label">Mode</span><select id="srcMode" ${selected === "Airspy" ? "" : disabled}>${
       modes.map(m => opt(m, m, m === c.mode)).join("")
     }</select></label>`);
   }
@@ -3137,7 +3199,7 @@ function renderSourceControls(s) {
   });
 
   grid.innerHTML = parts.join("");
-  if (status) status.textContent = running ? "SDR is playing: live controls remain available. Stop SDR for device, sample rate, ADC, mode, or refresh." : `${c.source || selected} source settings ready`;
+  if (status) status.textContent = independent ? `${selected}: live controls` : running ? "SDR is playing: live controls remain available. Stop SDR for device, sample rate, ADC, mode, or refresh." : `${c.source || selected} source settings ready`;
 
   const device = document.getElementById("srcDevice");
   if (device) device.onchange = e => saveSourceControls({ deviceId: Number(e.target.value) });
@@ -3176,6 +3238,96 @@ function renderSourceControls(s) {
       saveSourceControls({ toggles: { [key]: !(current && current.value) } });
     };
   });
+}
+function renderScannerDraft() {
+  const s = scannerState;
+  if (!s) return;
+  const settings = s.settings || {};
+  const discovery = document.getElementById("discoveryReceiver").value;
+  const available = settings.availableReceivers || [];
+  const names = [...new Set([...scannerPool, ...available.map(r => r.id)])].filter(n => n !== discovery);
+  const pool = document.getElementById("receiverPool");
+  pool.innerHTML = names.map((name, i) => {
+    const info = available.find(r => r.id === name);
+    const index = scannerPool.indexOf(name);
+    const unavailable = !info || info.sampleRate <= 0 || info.claimed;
+    return `<div class="source-actions"><label><input type="checkbox" data-pool="${i}" ${index >= 0 ? "checked" : ""} ${s.running || (unavailable && index < 0) ? "disabled" : ""}> ${esc(name)}${!info ? " (unavailable)" : info.claimed ? " (in use)" : ""}</label><button type="button" class="secondary" data-up="${i}" title="Move earlier in pool" ${s.running || index <= 0 ? "disabled" : ""}>&uarr;</button></div>`;
+  }).join("") || '<p class="muted">No transmission receivers available</p>';
+  pool.querySelectorAll("[data-pool]").forEach(el => el.onchange = () => {
+    const name = names[Number(el.dataset.pool)];
+    scannerPool = scannerPool.filter(n => n !== name);
+    if (el.checked) scannerPool.push(name);
+    scannerDirty = true;
+    renderScannerDraft();
+  });
+  pool.querySelectorAll("[data-up]").forEach(el => el.onclick = () => {
+    const i = scannerPool.indexOf(names[Number(el.dataset.up)]);
+    if (i > 0) [scannerPool[i - 1], scannerPool[i]] = [scannerPool[i], scannerPool[i - 1]];
+    scannerDirty = true;
+    renderScannerDraft();
+  });
+  const ranges = document.getElementById("scanRanges");
+  ranges.innerHTML = scannerRanges.map((r, i) => `<div class="source-grid" style="margin-bottom:8px"><label class="control"><span class="label">Start MHz</span><input type="number" step="any" min="0" data-range="${i}" data-edge="start" value="${esc(r.start)}" ${s.running ? "disabled" : ""}></label><label class="control"><span class="label">Stop MHz</span><input type="number" step="any" min="0" data-range="${i}" data-edge="stop" value="${esc(r.stop)}" ${s.running ? "disabled" : ""}></label><button type="button" class="secondary" data-remove="${i}" title="Remove range" ${s.running ? "disabled" : ""}>&times;</button></div>`).join("");
+  ranges.querySelectorAll("[data-range]").forEach(el => el.oninput = () => {
+    scannerRanges[Number(el.dataset.range)][el.dataset.edge] = el.value;
+    scannerDirty = true;
+  });
+  ranges.querySelectorAll("[data-remove]").forEach(el => el.onclick = () => {
+    scannerRanges.splice(Number(el.dataset.remove), 1);
+    scannerDirty = true;
+    renderScannerDraft();
+  });
+}
+function renderScanner(s) {
+  const runningChanged = scannerState && scannerState.running !== s.running;
+  scannerState = s;
+  const settings = s.settings || {};
+  const select = document.getElementById("discoveryReceiver");
+  if (!scannerDirty && !scannerSaving && !document.getElementById("scannerConfig").contains(document.activeElement)) {
+    const discovery = settings.discoveryReceiver || s.selectedSource || "";
+    select.innerHTML = [...new Set([discovery, ...(s.sources || [])].filter(Boolean))].map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    select.value = discovery;
+    scannerPool = [...(settings.transmissionReceiverPool || [])];
+    scannerRanges = (settings.scanRanges || []).map(r => ({start: r.start / 1e6, stop: r.stop / 1e6}));
+    renderScannerDraft();
+  }
+  if (runningChanged) renderScannerDraft();
+  select.disabled = !!s.running || !!s.radioPlaying || scannerSaving;
+  document.getElementById("saveScanner").disabled = !!s.running || scannerSaving;
+  document.getElementById("addScanRange").disabled = !!s.running || scannerSaving;
+  document.querySelectorAll("#receiverPool input, #receiverPool button, #scanRanges input, #scanRanges button").forEach(el => {
+    if (s.running || scannerSaving) el.disabled = true;
+  });
+  setSliderValue("cbMaximumMonitor", settings.maximumMonitorSec ?? 0, v => v === 0 ? "Unlimited" : `${Math.round(v)} s`);
+  const state = s.multiReceiverScan || {};
+  document.getElementById("receiverActivity").innerHTML = `<p class="muted">${esc(state.discoveryState || "STOPPED")} / ${esc(fmtMHz(state.currentDiscoveryHz || 0))} MHz / no capacity ${Number(state.noCapacityCount || 0)} / failures ${Number(state.failureCount || 0)}</p><table><thead><tr><th>Receiver</th><th>State</th><th>Center MHz</th><th>Channels MHz</th></tr></thead><tbody>${(state.receivers || []).map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.state)}</td><td>${esc(fmtMHz(r.tunedCenterHz || r.centerHz || 0))}</td><td>${(r.channelDetails || []).map(c => `${esc(fmtMHz(c.tunedHz))} ${c.releasing ? "RELEASING" : c.signalPresent ? "SIGNAL" : c.held ? "HOLD" : "QUIET"}`).join("<br>") || "Parked"}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">No active transmission receivers</td></tr>'}</tbody></table>`;
+}
+async function saveScanner() {
+  if (!scannerState || scannerState.running || scannerSaving) return;
+  const status = document.getElementById("scannerStatus");
+  const discovery = document.getElementById("discoveryReceiver").value;
+  const ranges = scannerRanges.map(r => ({start: Number(r.start) * 1e6, stop: Number(r.stop) * 1e6}));
+  if (ranges.some(r => !Number.isFinite(r.start) || !Number.isFinite(r.stop) || r.start <= 0 || r.stop <= r.start)) {
+    status.textContent = "Each range needs a positive start and a higher stop frequency.";
+    return;
+  }
+  const body = {scanRanges: ranges, transmissionReceiverPool: scannerPool.filter(n => n !== discovery)};
+  if (discovery !== scannerState.selectedSource || discovery !== scannerState.settings?.discoveryReceiver)
+    body.discoveryReceiver = discovery;
+  scannerSaving = true;
+  renderScanner(scannerState);
+  status.textContent = "Saving scanner...";
+  try {
+    await post("/api/channel-bank/settings", body, false);
+    scannerDirty = false;
+    status.textContent = "Scanner saved";
+  } catch (error) { status.textContent = error.message; }
+  finally {
+    scannerSaving = false;
+    document.getElementById("saveScanner").blur();
+    renderScannerDraft();
+    await refresh(true);
+  }
 }
 function renderHeatMap(s) {
   const rows = new Map();
@@ -3922,6 +4074,7 @@ async function refresh(force = false) {
     }
     renderSourceControls(s);
     renderSourceOffset(s);
+    renderScanner(s);
     const settings = s.settings || {};
     setControlValue("cbMode", settings.mode || s.mode || "auto");
     setSliderValue("cbSpacing", settings.spacingId);
@@ -4021,6 +4174,22 @@ document.getElementById("serverConnect").onclick = async e => {
   await postAndReport(connecting ? "/api/sdrpp-server/connect" : "/api/sdrpp-server/disconnect");
 };
 document.getElementById("sourceRefresh").onclick = () => saveSourceControls({ refresh: true });
+document.getElementById("sourceControlTarget").onchange = e => {
+  sourceControlReceiver = e.target.value;
+  e.target.blur();
+  if (scannerState) renderSourceControls(scannerState);
+};
+document.getElementById("discoveryReceiver").onchange = () => {
+  scannerDirty = true;
+  scannerPool = scannerPool.filter(n => n !== document.getElementById("discoveryReceiver").value);
+  renderScannerDraft();
+};
+document.getElementById("addScanRange").onclick = () => {
+  scannerRanges.push({start: "", stop: ""});
+  scannerDirty = true;
+  renderScannerDraft();
+};
+document.getElementById("saveScanner").onclick = saveScanner;
 document.getElementById("sourceOffsetMode").onchange = saveSourceOffset;
 document.getElementById("sourceOffsetApply").onclick = saveSourceOffset;
 document.getElementById("recordingsRefresh").onclick = refreshRecordings;
@@ -4084,6 +4253,7 @@ saveSetting("cbTail", "tailMs", v => Number.parseInt(v, 10));
 saveSetting("cbScanQuiet", "scanQuietSec", Number);
 saveSetting("cbScanNoSignal", "scanNoSignalSec", Number);
 saveSetting("cbScanSettle", "scanSettleMs", Number);
+saveSetting("cbMaximumMonitor", "maximumMonitorSec", Number);
 saveSetting("cbTranscribe", "transcriptionBackend", v => Number.parseInt(v, 10));
 document.getElementById("centerInput").onchange = e => {
   const mhz = Number(e.target.value);
@@ -5191,13 +5361,31 @@ self.addEventListener("fetch", event => {
         if (method == "POST" && path == "/api/source-controls") {
             json body = requestJsonBody(reqText);
             sendUiActionResponse(fd, [this, body] {
-                std::string selected = selectedSourceName();
+                if (!body.is_object() || (body.contains("receiver") && !body["receiver"].is_string()))
+                    return json({{"ok", false}, {"error", "invalid receiver controls"}, {"_httpStatus", "400 Bad Request"}});
+                std::string selected = body.value("receiver", selectedSourceName());
+                if (!sourceExists(selected))
+                    return json({{"ok", false}, {"error", "receiver not found"}, {"_httpStatus", "404 Not Found"}});
+                json controls = body;
+                controls.erase("receiver");
+                // Nonselected adapters may publish global sample-rate changes for
+                // structural edits. Permit only their independent live controls.
+                if (selected != selectedSourceName()) {
+                    for (auto it = controls.begin(); it != controls.end(); ++it) {
+                        const auto& key = it.key();
+                        if (key != "gains" && key != "toggles" && key != "biasTeeHF" &&
+                            key != "biasTeeVHF" && key != "dithering" && !(selected == "Airspy" && key == "mode"))
+                            return json({{"ok", false}, {"error", "select this SDR while stopped to change device or sample rate"}, {"_httpStatus", "409 Conflict"}});
+                    }
+                }
                 const char* iface = selectedSourceControlInterface(selected);
                 if (!iface) {
                     return json({{"ok", false}, {"error", "selected source has no web controls"}, {"_httpStatus", "404 Not Found"}});
                 }
                 RX888SourceControlV1 req{};
-                std::string text = body.dump();
+                std::string text = controls.dump();
+                if (text.size() >= sizeof(req.request))
+                    return json({{"ok", false}, {"error", "source controls payload too large"}, {"_httpStatus", "400 Bad Request"}});
                 strncpy(req.request, text.c_str(), sizeof(req.request) - 1);
                 req.request[sizeof(req.request) - 1] = '\0';
                 if (!callJsonSourceControl(iface, RX888_SOURCE_CONTROL_SET, &req) || !req.ok) {
