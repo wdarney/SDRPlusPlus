@@ -9,7 +9,7 @@ namespace channel_bank_scan {
 class Readiness {
 public:
     using Clock = std::chrono::steady_clock;
-    static constexpr int settleMs = 250;
+    static constexpr int settleMs = 350;
     static constexpr unsigned requiredFrames = 3;
 
     void reset() { *this = Readiness{}; }

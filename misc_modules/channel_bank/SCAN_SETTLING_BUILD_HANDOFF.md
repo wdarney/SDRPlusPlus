@@ -14,7 +14,7 @@ the user explicitly approves the fix after testing.**
 
 - A requested scan hop immediately invalidates discovery results and pauses
   discovery analysis until the source's retune callback acknowledges tuning.
-- The detector discards at least 250 ms of IQ samples and waits at least 250 ms
+- The detector discards at least 350 ms of IQ samples and waits at least 350 ms
   of wall time after acknowledgement. It discards the complete boundary block,
   then collects at least three new FFT frames before scan decisions resume.
 - No Signal Skip starts at the first post-settling FFT frame. Without arriving
@@ -31,7 +31,7 @@ the user explicitly approves the fix after testing.**
 - Ordinary range Scan and bookmark scan share this readiness guard. Stationary
   Auto/Manual modes do not receive the scan settling delay.
 
-The 250 ms interval is a conservative initial value, not a hardware timestamp
+The 350 ms interval adds 100 ms to the user-tested initial 250 ms setting; it is not a hardware timestamp
 or a measurement of a particular driver's buffered latency. It still needs RF
 acceptance on the user's receiver setup. The desktop range-scan panel shows the
 settling interval and fresh-frame requirement. Logs identify when a fresh FFT
@@ -39,7 +39,7 @@ window becomes ready, and why multi-receiver discovery advanced.
 
 ## Validation so far
 
-The standalone `scan_readiness_test.cpp` passed before build/test work was
+The standalone `scan_readiness_test.cpp` passed at the original 250 ms setting before build/test work was
 stopped at the user's request. It covers tune acknowledgement, both wall-time
 and sample-count settling, three-frame readiness through the real FFT frame
 collector, stop/restart, and independent recording-slot preservation using
@@ -67,3 +67,14 @@ verify discovery continues hopping while recordings on other receivers remain
 open and audible. Check several channels sharing a receiver, no free receiver,
 blocked/suppressed candidates, maximum-monitor release, and stop/restart.
 Keep this candidate separate from known-good apps until accepted.
+
+## 350 ms follow-up
+
+The user confirmed the initial fix worked and it was integrated at `4c1c8507`.
+They subsequently requested a 350 ms settling interval. This candidate changes
+both the wall-time and discarded-IQ requirements through the same constant;
+the three-frame requirement and independent-receiver handling are unchanged.
+The desktop interval display follows the constant automatically. Test boundary
+fixtures were updated, but no build or tests were run for this follow-up, per
+the source-only handoff workflow. Push the candidate for the build session;
+wait for user acceptance before integrating this follow-up into main.

@@ -19,17 +19,17 @@ int main() {
     gate.frame(t);
     check(!gate.ready(), "old detections cannot make an unacknowledged stop ready");
     gate.acknowledge(1000, t);
-    check(gate.discard(250, t + milliseconds(1)), "fast buffered delivery cannot bypass wall settling");
+    check(gate.discard(350, t + milliseconds(1)), "fast buffered delivery cannot bypass wall settling");
     gate.frame(t + milliseconds(2));
     check(!gate.ready(), "settling frames cannot be counted");
-    check(gate.discard(1, t + milliseconds(250)), "discard block crossing settling boundary");
-    check(!gate.discard(1, t + milliseconds(251)), "fresh collection should now start");
-    gate.frame(t + milliseconds(251));
-    gate.frame(t + milliseconds(301));
-    check(!gate.ready(), "two fresh frames are insufficient");
+    check(gate.discard(1, t + milliseconds(350)), "discard block crossing settling boundary");
+    check(!gate.discard(1, t + milliseconds(351)), "fresh collection should now start");
     gate.frame(t + milliseconds(351));
+    gate.frame(t + milliseconds(401));
+    check(!gate.ready(), "two fresh frames are insufficient");
+    gate.frame(t + milliseconds(451));
     check(gate.ready(), "three fresh frames permit decisions");
-    check(gate.firstFrame == t + milliseconds(251), "empty dwell starts at first fresh frame");
+    check(gate.firstFrame == t + milliseconds(351), "empty dwell starts at first fresh frame");
 
     auto generation = gate.generation;
     gate.request(); // Even a repeated/same-frequency stop starts a new epoch.
@@ -38,7 +38,7 @@ int main() {
     check(gate.discard(10, t + seconds(3)), "wall time alone cannot substitute for fresh IQ");
     gate.frame(t + seconds(3));
     check(!gate.ready(), "stalled source cannot skip an unmeasured stop");
-    check(gate.discard(240, t + seconds(3)), "drain the remaining settling samples");
+    check(gate.discard(340, t + seconds(3)), "drain the remaining settling samples");
 
     // Feed samples through the real FFT collector. Old-source blocks cannot
     // contribute votes, and the post-settle window must span three analyses.
