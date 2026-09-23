@@ -2392,8 +2392,15 @@ private:
         json history = json::array();
         {
             std::lock_guard<std::mutex> lk(freqLogMtx);
-            int emitted = 0;
-            for (auto it = freqLog.rbegin(); it != freqLog.rend() && emitted < 160; ++it, ++emitted) {
+            std::vector<decltype(freqLog)::const_iterator> newest;
+            for (auto it = freqLog.cbegin(); it != freqLog.cend(); ++it) newest.push_back(it);
+            std::partial_sort(newest.begin(), newest.begin() + std::min<size_t>(160, newest.size()), newest.end(),
+                [](const auto& a, const auto& b) {
+                    return a->second.lastSeen != b->second.lastSeen
+                        ? a->second.lastSeen > b->second.lastSeen : a->first > b->first;
+                });
+            newest.resize(std::min<size_t>(160, newest.size()));
+            for (const auto& it : newest) {
                 const auto& e = it->second;
                 history.push_back({
                     {"freqHz", e.freqHz},
@@ -2661,6 +2668,14 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <div class="muted span-status" id="spanStatus"><div class="span-hint">Click lit activity to block or unblock it.</div></div>
 </section>
 <section>
+<h2>Active Channels</h2>
+<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Receiver</th><th>Signal</th><th>Recording</th><th>Block</th></tr></thead><tbody id="channels"></tbody></table>
+</section>
+<section id="transcriptSection" hidden>
+<h2>Playback / Transcript</h2>
+<pre id="transcript" class="muted">No transcript yet.</pre>
+</section>
+<section>
 <div class="span-head">
 <h2>Activity History</h2>
 <div class="muted"><span id="playbackLockStatus">Playback all frequencies</span> <button class="secondary inline-action" id="clearPlaybackLock" type="button">Clear Lock</button></div>
@@ -2671,14 +2686,6 @@ pre { white-space: pre-wrap; margin: 0; color: #ddd; }
 <h2>Frequency Heat Map</h2>
 <div class="heatmap" id="heatmap"></div>
 <div class="muted" id="heatmapStatus" style="margin-top:8px">Click a frequency to block or unblock it.</div>
-</section>
-<section>
-<h2>Active Channels</h2>
-<table><thead><tr><th>Slot</th><th>Frequency</th><th>Name</th><th>Receiver</th><th>Signal</th><th>Recording</th><th>Block</th></tr></thead><tbody id="channels"></tbody></table>
-</section>
-<section>
-<h2>Playback / Transcript</h2>
-<pre id="transcript" class="muted">No transcript yet.</pre>
 </section>
 <section>
 <div class="span-head">
@@ -3100,11 +3107,22 @@ function renderActivityHistory(s) {
     btn.setAttribute("aria-sort", historySortKey === key ? (historySortDir > 0 ? "ascending" : "descending") : "none");
     btn.title = `Sort by ${label}`;
   });
-  const rows = sortHistoryRows([...(s.history || [])]);
+  // Live rows are a view overlay, not kept-recording counts or permanent history.
+  const entries = new Map((s.history || []).map(h => [Math.round(blockHzFor(h) / 1000), {...h}]));
+  for (const ch of s.activeChannels || []) {
+    if (!ch.signalPresent && !ch.recording) continue;
+    const hz = blockHzFor(ch);
+    const key = Math.round(hz / 1000);
+    const previous = entries.get(key);
+    entries.set(key, {...previous, freqHz: ch.gridFreqHz || ch.freqHz, blockHz: hz,
+      name: ch.name || previous?.name || "", blocked: !!ch.blocked,
+      count: previous?.count || 0, lastSeen: Number(s.serverTimeMs || Date.now()) / 1000, live: true});
+  }
+  const rows = sortHistoryRows([...entries.values()]);
   body.innerHTML = rows.map(h => {
     const isLocked = lockedHz > 0 && sameFreqKey(h.freqHz, lockedHz);
     const hz = blockHzFor(h);
-    return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : hz})">${isLocked ? "Unlock" : "Lock"}</button></td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${hz}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`;
+    return `<tr><td>${esc(fmtMHz(h.freqHz))}</td><td>${esc(h.name || "")}</td><td>${h.count || 0}</td><td>${h.live ? "Live" : esc(fmtLastSeen(h.lastSeen))}</td><td><button class="inline-action ${isLocked ? "danger" : "secondary"}" onclick="setPlaybackLock(${isLocked ? 0 : hz})">${isLocked ? "Unlock" : "Lock"}</button></td><td><button class="inline-action ${h.blocked ? "danger" : "secondary"}" onclick="blockFrequency(${hz}, ${h.blocked ? "false" : "true"})">${h.blocked ? "Unblock" : "Block"}</button></td></tr>`;
   }).join("") || `<tr><td colspan="6" class="muted">No history yet</td></tr>`;
 }
 function renderBlockedFrequencies(s) {
@@ -4113,6 +4131,7 @@ async function refresh(force = false) {
 	    ).join("") || `<tr><td colspan="7" class="muted">No active channels</td></tr>`;
 	    renderBlockedFrequencies(s);
     const tx = (s.lastTranscriptText || "").trim();
+    document.getElementById("transcriptSection").hidden = !(Number(settings.transcriptionBackend || 0) > 0);
     document.getElementById("transcript").textContent = tx ? `${s.lastTranscriptName || "Last"}\n\n${tx}` : "No transcript yet.";
     syncMediaElementPlayback(s);
   } catch (e) {
