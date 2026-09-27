@@ -39,7 +39,7 @@ std::string modelFilename(Model m) {
     switch (m) {
         case Model::ATCLarge:  return "ggml-whisper-large-v3-atc-q5_0.bin";
         case Model::ATCMedium: return "ggml-whisper-medium.en-atc-q5_0.bin";
-        case Model::Turbo:     return "ggml-whisper-large-v3-turbo-q5_0.bin";
+        case Model::Turbo:     return "ggml-large-v3-turbo-atcosim-q5_0.bin";
     }
     return {};
 }
@@ -48,7 +48,7 @@ std::string modelLabel(Model m) {
     switch (m) {
         case Model::ATCLarge:  return "Whisper ATC Large (best ~1.1 GB)";
         case Model::ATCMedium: return "Whisper ATC Medium (~540 MB)";
-        case Model::Turbo:     return "Whisper Turbo (fast, generic ~570 MB)";
+        case Model::Turbo:     return "Whisper Turbo ATCOSIM (~570 MB)";
     }
     return {};
 }
@@ -187,11 +187,31 @@ static whisper_context* getOrLoadCtx(Model m) {
     if (p.empty() || !isModelInstalled(m)) return nullptr;
 
     whisper_context_params cparams = whisper_context_default_params();
+#ifdef CB_WHISPER_COREML
+    const bool coremlSupported = m == Model::ATCLarge || m == Model::Turbo;
+    const auto encoder = std::filesystem::path(p).parent_path() /
+        (m == Model::Turbo ? "ggml-large-v3-turbo-atcosim-encoder.mlmodelc" :
+                             "ggml-whisper-large-v3-atc-encoder.mlmodelc");
+    const char* disable = std::getenv("CB_WHISPER_DISABLE_COREML");
+    std::error_code ec;
+    cparams.use_coreml = coremlSupported && !(disable && std::strcmp(disable, "1") == 0)
+        && std::filesystem::is_directory(encoder, ec);
+    NSLog(@"[CBWhisper] %s: Core ML encoder %s (%s); Metal enabled",
+          modelFilename(m).c_str(), cparams.use_coreml ? "requested" : "not requested",
+          !coremlSupported ? "Core ML not enabled for this model" :
+          (disable && std::strcmp(disable, "1") == 0) ? "disabled by environment" : encoder.c_str());
+#endif
     cparams.use_gpu     = true;       // Metal acceleration on Apple Silicon
     cparams.flash_attn  = true;       // ggml's fused attention kernel
     whisper_context* ctx =
         whisper_init_from_file_with_params(p.c_str(), cparams);
     if (ctx) {
+#ifdef CB_WHISPER_COREML
+        NSLog(@"[CBWhisper] encoder=%s; decoder=whisper.cpp/Metal (ANE placement requires profiling)",
+              whisper_coreml_is_active(ctx) ? "Core ML active" : "ggml/Metal fallback");
+#else
+        NSLog(@"[CBWhisper] Core ML not compiled; encoder/decoder=ggml/Metal");
+#endif
         g_ctxCache[m] = ctx;
         NSLog(@"[CBWhisper] loaded + cached %s", modelFilename(m).c_str());
     } else {
