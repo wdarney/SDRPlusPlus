@@ -10,6 +10,7 @@
 #include <module.h>
 #include <frequency_manager_interface.h>
 #include <dsp/stream.h>
+#include "stream_buffer_sizes.h"
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
 #include <dsp/channel/frequency_xlator.h>
@@ -116,9 +117,6 @@ static constexpr int kM4AFsRetryAttempts = 5;
 #endif
 
 class ChannelBankModule;
-
-static constexpr int CB_RF_STREAM_BUFFER_SAMPLES    = 262144;
-static constexpr int CB_AUDIO_STREAM_BUFFER_SAMPLES = 32768;
 
 #ifdef __APPLE__
 static int runLaunchctl(const std::vector<std::string>& arguments, bool quiet = false) {
