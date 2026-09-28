@@ -138,8 +138,11 @@ def main():
     ml.save(str(package))
     # Verify actual Core ML predictions, not just conversion success. Force CPU
     # here for reproducible numerical checking; app placement is profiled separately.
+    # Core ML may release inputs on a background reset queue. A NumPy view of
+    # a torch tensor would then deallocate that tensor without Python's GIL.
+    coreml_sample = sample.numpy().copy()
     checked = ct.models.MLModel(str(package), compute_units=ct.ComputeUnit.CPU_ONLY)
-    result = checked.predict({'logmel_data': sample.numpy()})['output']
+    result = checked.predict({'logmel_data': coreml_sample})['output']
     if result.shape != (1, cfg.max_source_positions, cfg.d_model) or not np.isfinite(result).all():
         raise ValueError(f'Invalid Core ML output: {result.shape}')
     ref = reference_result.numpy()
@@ -159,7 +162,7 @@ def main():
                 merge_chunks_to_pipeline=True, check_output_correctness=False)
             split_path = Path(split_tmp) / (name + '_chunked_pipeline.mlpackage')
             split = ct.models.MLModel(str(split_path), compute_units=ct.ComputeUnit.CPU_ONLY)
-            split_result = split.predict({'logmel_data': sample.numpy()})['output']
+            split_result = split.predict({'logmel_data': coreml_sample})['output']
             if split_result.shape != result.shape or not np.isfinite(split_result).all():
                 raise ValueError('Invalid split encoder output')
             split_error = float(np.linalg.norm(split_result - result) / max(np.linalg.norm(result), 1e-12))
