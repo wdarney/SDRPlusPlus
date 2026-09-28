@@ -272,6 +272,8 @@ After the dependency setup above, use:
   --model tclin/whisper-large-v3-turbo-atcosim-finetune \
   --revision 94db4b4d66b6e6ed1cd8d971135d47a34418c329 \
   --ggml-name ggml-large-v3-turbo-atcosim-q5_0.bin \
+  --split-encoder \
+  --output-dir /tmp/cb-turbo-ane \
   --max-relative-l2-error 0.05
 ```
 
@@ -323,3 +325,58 @@ not include the full SDR++ application or establish the Mini's memory budget.
 The initial rejected export was preserved separately under `/tmp`; the existing
 GGML files were not replaced. A matching patched SDR++ application is still
 required on the Mini; updating model files alone does not update the app.
+
+## Turbo encoder split for ANE placement
+
+On macOS 27.0 (26A428), the original single-program ATCOSIM encoder reported
+GPU preference and zero ANE-supported operations on the M3 Max. Recompiling
+the package and reconverting the pinned HF checkpoint reproduced this result.
+A small control model still reported ANE support. The filename and FP16
+metadata were correct; successful Core ML loading did not establish ANE use.
+
+`--split-encoder` uses coremltools' `bisect_model` to put two smaller ML Programs
+inside one pipeline. The weights, `logmel_data` input, `output` output and
+whisper.cpp filename convention stay unchanged. Existing Core ML-enabled
+Channel Bank binaries can load the pipeline without a decoder or app change.
+The converter checks the pipeline against the original encoder on the same
+input (relative L2 limit 0.0001), repeats the original FP32-reference error
+gate, and records the stage count and split error in the manifest. This option
+is explicit so other model conversions keep their existing behavior.
+
+The split candidate reported ANE preference/support for all 2,447 operations
+with both `All` and `CPUAndNeuralEngine` compute policies. The original model
+had 2,443 reported operations; the additional operations connect the stages.
+This is a compute-plan result on this Mac, not proof of M1 behavior or an
+energy measurement. Check the target machine before claiming ANE acceleration.
+
+A separate Instruments Core AI trace of native whisper.cpp inference recorded
+`model0_main__Op0_AneInference Prediction` and
+`model1_main__Op0_AneInference Prediction` on the Apple Neural Engine track.
+The JFK speech fixture produced identical text with the split encoder under
+both compute policies and with the GGML/Metal baseline. The split/original
+CPU output difference was zero on the converter's seeded random input.
+These checks establish local encoder execution and a speech regression result;
+full-app audio continuity, power consumption and M1 memory use remain untested.
+
+The plan inspector understands both programs and pipelines. To require every
+nonconstant operation to have ANE support and prefer ANE:
+
+```sh
+clang -fobjc-arc -framework Foundation -framework CoreML \
+  misc_modules/channel_bank/tools/inspect_coreml_plan.m -o /tmp/cb-coreml-plan
+/tmp/cb-coreml-plan /tmp/cb-turbo-ane/ggml-large-v3-turbo-atcosim-encoder.mlmodelc \
+  all --require-ane
+/tmp/cb-coreml-plan /tmp/cb-turbo-ane/ggml-large-v3-turbo-atcosim-encoder.mlmodelc \
+  cpu-ane --require-ane
+```
+
+`cpu-ane` excludes GPU work only for the inspected Core ML encoder. It does not
+change the app's runtime policy or the whisper.cpp Metal decoder. Inspect
+actual inference using Instruments' Core ML/Neural Engine tracks; compare
+audio continuity and GPU load with the same recording workload.
+
+Keep the existing `.bin` and back up the installed encoder before replacing
+its `.mlmodelc` directory with the newly validated pipeline. Also retain the
+new `.json` provenance and `.mlpackage` for recompilation. Do this while the
+target app is closed, then restart it to clear cached contexts. The converter
+never overwrites an existing output directory's model files.

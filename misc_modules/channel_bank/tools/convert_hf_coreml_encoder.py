@@ -37,6 +37,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--model', required=True, help='Hugging Face model ID or local snapshot directory')
     ap.add_argument('--revision', help='HF commit/tag; remote IDs are resolved to a commit before loading')
+    ap.add_argument('--split-encoder', action='store_true',
+                    help='Package two smaller encoder stages in one Core ML pipeline for ANE compilation')
     ap.add_argument('--ggml-name', required=True, help='Existing matching GGML model basename')
     ap.add_argument('--output-dir', type=Path,
                     default=Path.home() / 'Library/Application Support/sdrpp/channel_bank/models',
@@ -146,6 +148,39 @@ def main():
           f'acceptance limit: {args.max_relative_l2_error:.6f}', flush=True)
     if relative_error > args.max_relative_l2_error:
         raise ValueError(f'Core ML relative L2 error too large: {relative_error}')
+    split_error = None
+    if args.split_encoder:
+        # Large/Turbo encoders can be rejected as a single ANE program.
+        # Keep the exact weights and public ABI; Core ML executes both stages.
+        del checked, ml
+        gc.collect()
+        with tempfile.TemporaryDirectory(dir=args.output_dir) as split_tmp:
+            ct.models.utils.bisect_model(str(package), split_tmp,
+                merge_chunks_to_pipeline=True, check_output_correctness=False)
+            split_path = Path(split_tmp) / (name + '_chunked_pipeline.mlpackage')
+            split = ct.models.MLModel(str(split_path), compute_units=ct.ComputeUnit.CPU_ONLY)
+            split_result = split.predict({'logmel_data': sample.numpy()})['output']
+            if split_result.shape != result.shape or not np.isfinite(split_result).all():
+                raise ValueError('Invalid split encoder output')
+            split_error = float(np.linalg.norm(split_result - result) / max(np.linalg.norm(result), 1e-12))
+            if split_error > 1e-4:
+                raise ValueError(f'Splitting changed encoder output: relative L2 {split_error}')
+            relative_error = float(np.linalg.norm(split_result - ref) / max(np.linalg.norm(ref), 1e-12))
+            if relative_error > args.max_relative_l2_error:
+                raise ValueError(f'Split Core ML/FP32 relative L2 error too large: {relative_error}')
+            original = ct.models.MLModel(str(package), skip_model_load=True)
+            split.user_defined_metadata.update(original.user_defined_metadata)
+            split.user_defined_metadata['encoder_stages'] = '2'
+            # Save separately before replacing this run's intermediate package.
+            final_split = Path(split_tmp) / 'validated.mlpackage'
+            split.save(str(final_split))
+            # Release native model proxies while the GIL is held and their
+            # source packages still exist, before spawning the compiler.
+            del split, original
+            gc.collect()
+            shutil.move(str(package), str(Path(split_tmp) / 'original.mlpackage'))
+            shutil.move(str(final_split), str(package))
+            print(f'Split/original relative L2 error: {split_error:.8f}', flush=True)
     with tempfile.TemporaryDirectory(dir=args.output_dir) as tmp:
         subprocess.run(['xcrun', 'coremlc', 'compile', str(package.resolve()), tmp], check=True)
         shutil.move(str(Path(tmp) / compiled.name), str(compiled))
@@ -153,6 +188,7 @@ def main():
         encoder_weights_sha256=digest.hexdigest(), whisper_cpp_revision=VENDOR,
         matching_ggml_name=args.ggml_name, encoder_dimensions=dims,
         coreml_relative_l2_error=relative_error,
+        encoder_stages=2 if args.split_encoder else 1, split_relative_l2_error=split_error,
         validation_max_relative_l2_error=args.max_relative_l2_error, precision='float16', torch=torch.__version__, coremltools=ct.__version__), indent=2) + '\n')
     print(f'Validated encoder: {compiled}\nProvenance: {manifest}')
 
