@@ -23,7 +23,8 @@ elseif (ANDROID)
 else (MSVC)
     find_package(PkgConfig)
 
-    pkg_check_modules(LIBHYDRASDR REQUIRED libhydrasdr)
+    # The vendor 1.1.x SDK advertises Version: 1.1 in its pkg-config file.
+    pkg_check_modules(LIBHYDRASDR REQUIRED libhydrasdr>=1.1)
 
     target_include_directories(hydrasdr_source PRIVATE ${LIBHYDRASDR_INCLUDE_DIRS})
     target_link_directories(hydrasdr_source PRIVATE ${LIBHYDRASDR_LIBRARY_DIRS})

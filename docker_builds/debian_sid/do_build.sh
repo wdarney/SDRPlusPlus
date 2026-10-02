@@ -47,7 +47,7 @@ make install
 cd ../../
 
 # Install libhydrasdr
-git clone https://github.com/hydrasdr/rfone_host
+git clone --depth 1 --branch v1.1.3 https://github.com/hydrasdr/hydrasdr-host rfone_host
 cd rfone_host
 mkdir build
 cd build

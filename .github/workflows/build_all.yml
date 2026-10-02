@@ -80,7 +80,7 @@ jobs:
           run: git clone https://github.com/AlexandreRouma/libfobos ; cd libfobos ; mkdir build ; cd build ; cmake .. -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ; cmake --build . --config Release ; cmake --install .
 
         - name: Install libhydrasdr
-          run: git clone https://github.com/hydrasdr/rfone_host; cd rfone_host/ ; mkdir build ; cd build ; cmake .. -DCMAKE_BUILD_TYPE=Release "-DLIBUSB_LIBRARIES=C:\Program Files\PothosSDR\lib\libusb-1.0.lib" "-DLIBUSB_INCLUDE_DIR=C:\Program Files\PothosSDR\include\libusb-1.0" "-DTHREADS_PTHREADS_WIN32_LIBRARY=C:\Program Files\PothosSDR\lib\pthreadVC2.lib" "-DTHREADS_PTHREADS_INCLUDE_DIR=C:\Program Files\PothosSDR\include" ; cmake --build . --config Release ; cmake --install .
+          run: git clone --depth 1 --branch v1.1.3 https://github.com/hydrasdr/hydrasdr-host rfone_host; cd rfone_host/ ; mkdir build ; cd build ; cmake .. -DCMAKE_BUILD_TYPE=Release "-DLIBUSB_LIBRARIES=C:\Program Files\PothosSDR\lib\libusb-1.0.lib" "-DLIBUSB_INCLUDE_DIR=C:\Program Files\PothosSDR\include\libusb-1.0" "-DTHREADS_PTHREADS_WIN32_LIBRARY=C:\Program Files\PothosSDR\lib\pthreadVC2.lib" "-DTHREADS_PTHREADS_INCLUDE_DIR=C:\Program Files\PothosSDR\include" ; cmake --build . --config Release ; cmake --install .
 
         - name: Prepare CMake
           working-directory: ${{runner.workspace}}/build
@@ -140,7 +140,7 @@ jobs:
           run: git clone https://github.com/osmocom/rtl-sdr && cd rtl-sdr && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 LIBRARY_PATH=$(pkg-config --libs-only-L libusb-1.0 | sed 's/\-L//') && sudo make install && cd ../../
 
         - name: Install libhydrasdr
-          run: git clone https://github.com/hydrasdr/rfone_host && cd rfone_host && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install && cd ../../
+          run: git clone --depth 1 --branch v1.1.3 https://github.com/hydrasdr/hydrasdr-host rfone_host && cd rfone_host && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install && cd ../../
 
         - name: Install libdlcr
           run: wget https://dragnlabs.com/host-tools/dlcr_host_v0.3.0.zip && mkdir dlcr_host && cd dlcr_host && 7z x ../dlcr_host_v0.3.0.zip && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 .. -DCMAKE_BUILD_TYPE=Release && make -j2 && sudo make install && cd ../../
@@ -203,7 +203,7 @@ jobs:
           run: git clone https://github.com/osmocom/rtl-sdr && cd rtl-sdr && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 LIBRARY_PATH=$(pkg-config --libs-only-L libusb-1.0 | sed 's/\-L//') && sudo make install && cd ../../
 
         - name: Install libhydrasdr
-          run: git clone https://github.com/hydrasdr/rfone_host && cd rfone_host && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install && cd ../../
+          run: git clone --depth 1 --branch v1.1.3 https://github.com/hydrasdr/hydrasdr-host rfone_host && cd rfone_host && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install && cd ../../
 
         - name: Install libdlcr
           run: wget https://dragnlabs.com/host-tools/dlcr_host_v0.3.0.zip && mkdir dlcr_host && cd dlcr_host && 7z x ../dlcr_host_v0.3.0.zip && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 .. -DCMAKE_BUILD_TYPE=Release && make -j2 && sudo make install && cd ../../
