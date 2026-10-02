@@ -266,7 +266,7 @@ struct ChannelSlot {
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
     int fadeOutRemaining   = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
     int audioHoldRemaining = 0;    // independent post-detection hold before fade starts;
-                                   // AM bypasses it to suppress carrier-AGC release noise
+                                   // AM bypasses it to suppress AGC release noise
 
     // Pre-roll circular buffer — always running once warmup is done (DSP thread only).
     // When a file opens we flush the last PREROLL_SAMPLES of audio first so we
@@ -361,6 +361,7 @@ public:
     static constexpr int    SPAWN_VOTES      = 3;    // FFT frames above threshold before spawning
     static constexpr int    MAX_VOTES        = 8;    // vote cap (controls how fast channel drops out)
     static constexpr double SPEC_ANALYSIS_HZ = 20.0; // target spectrum analysis rate (Hz)
+    static constexpr float  AM_AUDIO_LEVEL   = 0.25f; // AM audio-AGC output → recording level (see audioHandler)
     static constexpr int    MAX_CHANNELS_HARD_LIMIT = 64;
     static constexpr int    MAX_CONCURRENT_TRANSCRIPTION_JOBS = 1;
 
@@ -7725,9 +7726,14 @@ self.addEventListener("fetch", event => {
         // SSB/FM use narrower audio bandwidth.
         const double audioBw = bw / 2.0;
         if (demodMode == DEMOD_AM) {
+            // Audio AGC, the radio module's default.  Carrier AGC winds its gain up on
+            // noise between transmissions, so on a slot that is still running from the
+            // last one the next key-up overshoots — a spike of up to ~12x the speech
+            // peaks that lands in the file via the pre-roll.  Audio AGC caps the key-up
+            // at about speech level (it then recovers over ~300 ms, as the live VFO does).
             slot.amDemod = new dsp::demod::AM<dsp::stereo_t>();
             slot.amDemod->init(&slot.vfo->out,
-                dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER,
+                dsp::demod::AM<dsp::stereo_t>::AGCMode::AUDIO,
                 bw, 50.0 / audioSr, 5.0 / audioSr, 100.0 / audioSr, audioSr);
             slot.amDemod->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         }
@@ -7931,13 +7937,18 @@ self.addEventListener("fetch", event => {
             return;
         }
 
+        // AM's audio AGC levels speech with peaks around 4x full scale, 12-20 dB
+        // hotter than the carrier AGC it replaced.  Scale it back so recGain keeps
+        // roughly its old meaning and peaks don't hit the clamp below.
+        const float demodLevel = slot->amDemod ? AM_AUDIO_LEVEL : 1.0f;
+
         // Pre-roll: mix stereo→mono and push into the circular buffer.
         // This runs continuously so we always have the last PREROLL_SAMPLES
         // of audio ready to prepend when a file opens.  Runs before the
         // file-open check so the samples that arrived just before detection
         // fired are captured — that's where the call sign lives.
         for (int i = 0; i < count; i++) {
-            slot->preRollBuf[slot->preRollHead] = (data[i].l + data[i].r) * 0.5f;
+            slot->preRollBuf[slot->preRollHead] = (data[i].l + data[i].r) * 0.5f * demodLevel;
             slot->preRollHead = (slot->preRollHead + 1) % ChannelSlot::PREROLL_SAMPLES;
             if (slot->preRollCount < ChannelSlot::PREROLL_SAMPLES) slot->preRollCount++;
         }
@@ -8193,13 +8204,13 @@ self.addEventListener("fetch", event => {
         const int totalFade = 4800;
 
         // Fade-out: raised-cosine from 1→0 driven by raw RF signal absence. The
-        // AM-specific detector debounce and audio-hold bypass below remove carrier
-        // AGC release noise without changing the other demodulators' tail behavior.
+        // AM-specific detector debounce and audio-hold bypass below remove AGC
+        // release noise without changing the other demodulators' tail behavior.
         // This runs entirely on the DSP thread (no mutex needed).
         float tailFade = 1.0f;
         // Audio fade is driven by rawSignalPresent plus a short independent hold.
         // AM bypasses that hold because its keyed carrier remains present through
-        // speech pauses; after unkey, holding full gain records the carrier AGC's
+        // speech pauses; after unkey, holding full gain records the AGC's
         // recovery as a rising burst of static. Other modes retain the established
         // hold unchanged so this fix remains strictly AM-specific.
         //
@@ -8258,7 +8269,7 @@ self.addEventListener("fetch", event => {
                 gain *= 0.5f * (1.0f - cosf(M_PI * progress));
                 slot->recFadeRemaining--;
             }
-            mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * gain, -1.0f, 1.0f);
+            mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * demodLevel * gain, -1.0f, 1.0f);
         }
 
         writeRecordingSamples(slot, mono, count);
