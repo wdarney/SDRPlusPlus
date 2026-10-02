@@ -1077,6 +1077,20 @@ public:
         int outCount = outEnd - outStart;
         if (outCount <= 0) return;
 
+        // Both trim points land mid-signal (the onset trim deliberately cuts where
+        // energy is already above the floor), and the samples there have just been
+        // boosted by the scale + compressor.  Butting them straight against the
+        // digital-silence pad is a step discontinuity, heard as a pop at the start
+        // and end of every normalized recording.  Taper 10 ms at each edge.
+        {
+            const int EDGE_FADE = std::min(480, outCount / 2);  // 10 ms @ 48 kHz
+            for (int i = 0; i < EDGE_FADE; i++) {
+                float g = 0.5f * (1.0f - cosf(M_PI * (float)(i + 1) / (float)(EDGE_FADE + 1)));
+                samples[outStart + i]   = (int16_t)std::lround(samples[outStart + i] * g);
+                samples[outEnd - 1 - i] = (int16_t)std::lround(samples[outEnd - 1 - i] * g);
+            }
+        }
+
         // 500ms silence on each side — prevents Apple Speech error 1110 ("no speech")
         // on short clips by ensuring total duration >= ~1.5s. Inaudible during playback.
         const int silencePad = 24000; // 500ms @ 48kHz
@@ -1244,6 +1258,18 @@ public:
         slot.noiseGuardWidthSum      = 0.0;
         slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
         slot.audioHoldRemaining   = 0;    // never carry a previous recording's tail state forward
+#ifndef CB_NO_RNNOISE
+        // A partial RNNoise frame and the denoiser's overlap/GRU history are left
+        // over from the previous recording on this slot.  Carrying them forward
+        // splices a few ms of the last transmission into the start of this one.
+        // The pre-roll is fed through the fresh state, so it has adapted by the
+        // time the live audio arrives.
+        slot.nrInPos = 0;
+        if (slot.nrState) {
+            rnnoise_destroy(slot.nrState);
+            slot.nrState = rnnoise_create(nullptr);
+        }
+#endif
         // NOTE: deliberately do NOT register the frequency in permanent history here.
         // Doing so created an entry for every file-open — including the flood of opens
         // from broadband/drifting interference whose recordings are then discarded by the
@@ -7980,19 +8006,30 @@ self.addEventListener("fetch", event => {
                 // arrived before detection fired.  This recovers the ~100-300ms
                 // of transmission that happened before the file opened.
                 // Gain is applied; the buffer already contains mixed mono.
-                if (slot->preRollCount > 0) {
-                    int avail = slot->preRollCount;
-                    int startIdx = (slot->preRollHead - avail + ChannelSlot::PREROLL_SAMPLES)
+                //
+                // The current block was pushed into the ring above and is
+                // written by the normal path below, so leave it out here.
+                // Flushing it too repeated the block in the file — an audible
+                // splice right where the transmission starts.
+                int avail = slot->preRollCount - std::min(count, slot->preRollCount);
+                if (avail > 0) {
+                    int startIdx = (slot->preRollHead - slot->preRollCount + ChannelSlot::PREROLL_SAMPLES)
                                    % ChannelSlot::PREROLL_SAMPLES;
+                    // The ring starts mid-waveform; taper the first 10 ms so the
+                    // file doesn't open on a step.
+                    const int onsetFade = std::min(480, avail);
                     for (int i = 0; i < avail; i++) {
                         int idx = (startIdx + i) % ChannelSlot::PREROLL_SAMPLES;
-                        slot->preRollTmp[i] = std::clamp(
-                            slot->preRollBuf[idx] * _this->recGain, -1.0f, 1.0f);
+                        float g = _this->recGain;
+                        if (i < onsetFade)
+                            g *= 0.5f * (1.0f - cosf(M_PI * (float)(i + 1) / (float)(onsetFade + 1)));
+                        slot->preRollTmp[i] = std::clamp(slot->preRollBuf[idx] * g, -1.0f, 1.0f);
                     }
-                    slot->writer.write(slot->preRollTmp.data(), avail);
-                    slot->audioSamplesWritten += avail;
-                    slot->preRollCount = 0;   // consumed; don't re-write on next call
+                    // Same NR/write path as live audio, so there is no dry→wet
+                    // or latency jump where the pre-roll meets the live block.
+                    writeRecordingSamples(slot, slot->preRollTmp.data(), avail, false);
                 }
+                slot->preRollCount = 0;   // consumed; don't re-write on next call
             }
         }
         else {
@@ -8188,21 +8225,32 @@ self.addEventListener("fetch", event => {
         // but once raw detection falls away we should let the written audio fade
         // down instead of holding full-volume static until close.
         bool signalAlive = rawAudioQualified || (slot->audioHoldRemaining > 0);
-        if (signalAlive) {
-            slot->fadeOutRemaining = 2400;   // hold at max while signal (or hold) is present
-        } else {
-            if (slot->fadeOutRemaining > 0) {
-                // progress: 1.0 (just started fading) → 0.0 (fully faded)
-                float progress = (float)slot->fadeOutRemaining / 2400.0f;
-                tailFade = 0.5f * (1.0f + cosf(M_PI * (1.0f - progress)));  // 1.0 → 0.0
-                slot->fadeOutRemaining = std::max(0, slot->fadeOutRemaining - count);
-            } else {
-                tailFade = 0.0f;  // fully faded — write silence until file closes
-            }
-        }
+
+        // fadeOutRemaining is the fade position (2400 = full gain, 0 = silent) and
+        // moves per sample.  It used to be evaluated once per block and snapped
+        // straight back to 2400 when the signal returned, so every raw-detection
+        // dropout that re-qualified mid-recording jumped the gain from silence (or
+        // part-way down the fade) to full in one sample — a pop.  AM, which has no
+        // audio hold, hit this on almost every speech pause.  Now the gain ramps
+        // down over 50 ms and back up over 10 ms.
+        const int FADE_LEN     = 2400;          // 50 ms fade-out
+        const int FADE_UP_STEP = FADE_LEN / 480; // 10 ms fade back in
 
         float* mono = (float*)data;  // safe: mono[i] written before data[i] is needed
         for (int i = 0; i < count; i++) {
+            if (signalAlive)
+                slot->fadeOutRemaining = std::min(FADE_LEN, slot->fadeOutRemaining + FADE_UP_STEP);
+            else if (slot->fadeOutRemaining > 0)
+                slot->fadeOutRemaining--;
+            if (slot->fadeOutRemaining >= FADE_LEN) {
+                tailFade = 1.0f;
+            } else if (slot->fadeOutRemaining <= 0) {
+                tailFade = 0.0f;  // fully faded — write silence until file closes
+            } else {
+                // progress: 1.0 (full) → 0.0 (silent), raised cosine
+                float progress = (float)slot->fadeOutRemaining / (float)FADE_LEN;
+                tailFade = 0.5f * (1.0f + cosf(M_PI * (1.0f - progress)));
+            }
             float gain = _this->recGain * tailFade;
             if (slot->recFadeRemaining > 0) {
                 // Raised-cosine taper: zero slope at both ends — prevents onset pop
@@ -8213,6 +8261,16 @@ self.addEventListener("fetch", event => {
             mono[i] = std::clamp((data[i].l + data[i].r) * 0.5f * gain, -1.0f, 1.0f);
         }
 
+        writeRecordingSamples(slot, mono, count);
+    }
+
+    // Writes gain-applied mono samples to the open WAV, through RNNoise when the
+    // slot has a denoiser.  Shared by the pre-roll flush and the live path so
+    // both see the same processing and latency.  countVad=false keeps the
+    // pre-roll (mostly pre-detection noise) out of the RNNoise voice-gate tally.
+    static void writeRecordingSamples(ChannelSlot* slot, float* mono, int count, bool countVad = true) {
+        ChannelBankModule* _this = slot->module;
+        (void)_this; (void)countVad;
         // RNNoise processing — accumulate into 480-sample frames, process,
         // and write each completed frame to WAV individually.
         // RNNoise expects/returns samples in int16 range (-32768..32767).
@@ -8230,10 +8288,12 @@ self.addEventListener("fetch", event => {
                 if (slot->nrInPos >= 480) {
                     float outBuf[480];
                     float vadProb = rnnoise_process_frame(slot->nrState, outBuf, slot->nrInBuf);
-                    slot->rnVadFrames++;
-                    slot->rnVadSum += vadProb;
-                    if (vadProb >= _this->rnVoiceGateFrameThreshold)
-                        slot->rnVadVoiceFrames++;
+                    if (countVad) {
+                        slot->rnVadFrames++;
+                        slot->rnVadSum += vadProb;
+                        if (vadProb >= _this->rnVoiceGateFrameThreshold)
+                            slot->rnVadVoiceFrames++;
+                    }
                     float mix = _this->nrMix;
                     float nrMono[480];
                     for (int i = 0; i < 480; i++) {
