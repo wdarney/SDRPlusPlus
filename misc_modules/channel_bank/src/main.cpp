@@ -11,6 +11,7 @@
 #include <frequency_manager_interface.h>
 #include <dsp/stream.h>
 #include "stream_buffer_sizes.h"
+#include "am_audio_demod.h"
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
 #include <dsp/channel/frequency_xlator.h>
@@ -229,7 +230,7 @@ struct ChannelSlot {
     // DSP chain
     dsp::stream<dsp::complex_t>*               iqIn           = nullptr;
     dsp::channel::RxVFO*                       vfo            = nullptr;
-    dsp::demod::AM<dsp::stereo_t>*             amDemod        = nullptr;
+    channel_bank_audio::AmDemod*             amDemod        = nullptr;
     dsp::demod::FM<dsp::stereo_t>*             fmDemod        = nullptr;
     dsp::demod::SSB<dsp::stereo_t>*            ssbDemod       = nullptr;
     dsp::routing::Splitter<dsp::stereo_t>*     splitter       = nullptr;
@@ -265,6 +266,7 @@ struct ChannelSlot {
 
     // Sample-accurate fade-out driven by rawSignalPresent (DSP thread only — no locking needed)
     int fadeOutRemaining   = 2400; // counts down from 50ms-worth of samples; reset to max while signal present
+    channel_bank_audio::AmRecordingEnvelope amRecordingEnvelope;
     int audioHoldRemaining = 0;    // independent post-detection hold before fade starts;
                                    // AM bypasses it to suppress carrier-AGC release noise
 
@@ -1244,6 +1246,7 @@ public:
         slot.noiseGuardWidthSum      = 0.0;
         slot.fadeOutRemaining     = 2400; // 50ms at 48kHz — signal is present at file open
         slot.audioHoldRemaining   = 0;    // never carry a previous recording's tail state forward
+        slot.amRecordingEnvelope.reset();
         // NOTE: deliberately do NOT register the frequency in permanent history here.
         // Doing so created an entry for every file-open — including the flood of opens
         // from broadband/drifting interference whose recordings are then discarded by the
@@ -7699,10 +7702,8 @@ self.addEventListener("fetch", event => {
         // SSB/FM use narrower audio bandwidth.
         const double audioBw = bw / 2.0;
         if (demodMode == DEMOD_AM) {
-            slot.amDemod = new dsp::demod::AM<dsp::stereo_t>();
-            slot.amDemod->init(&slot.vfo->out,
-                dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER,
-                bw, 50.0 / audioSr, 5.0 / audioSr, 100.0 / audioSr, audioSr);
+            slot.amDemod = new channel_bank_audio::AmDemod();
+            slot.amDemod->init(&slot.vfo->out, bw, audioSr);
             slot.amDemod->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         }
         else if (demodMode == DEMOD_USB || demodMode == DEMOD_LSB) {
@@ -7981,8 +7982,8 @@ self.addEventListener("fetch", event => {
                 // of transmission that happened before the file opened.
                 // Gain is applied; the buffer already contains mixed mono.
                 if (slot->preRollCount > 0) {
-                    int avail = slot->preRollCount;
-                    int startIdx = (slot->preRollHead - avail + ChannelSlot::PREROLL_SAMPLES)
+                    int avail = channel_bank_audio::preRollHistoryCount(slot->preRollCount, count);
+                    int startIdx = (slot->preRollHead - slot->preRollCount + ChannelSlot::PREROLL_SAMPLES)
                                    % ChannelSlot::PREROLL_SAMPLES;
                     for (int i = 0; i < avail; i++) {
                         int idx = (startIdx + i) % ChannelSlot::PREROLL_SAMPLES;
@@ -8172,7 +8173,8 @@ self.addEventListener("fetch", event => {
         const int AUDIO_HOLD_SAMPLES = slot->amDemod ? 0 : 16800; // 350 ms @ 48 kHz outside AM
         const int POST_FADE_REOPEN_HITS = 2;  // same 100 ms qualifier used for file-open
         bool rawAlive = slot->rawSignalPresent.load();
-        bool fullyFaded = (slot->fadeOutRemaining <= 0 && slot->audioHoldRemaining <= 0);
+        bool fullyFaded = slot->amDemod ? slot->amRecordingEnvelope.silent()
+            : (slot->fadeOutRemaining <= 0 && slot->audioHoldRemaining <= 0);
         // Once audio is already at digital silence, still require a qualified raw
         // detection before unmuting again. Keep this at the same 2-frame threshold
         // as file-open; stricter post-fade gating clipped resumed voice after
@@ -8203,7 +8205,8 @@ self.addEventListener("fetch", event => {
 
         float* mono = (float*)data;  // safe: mono[i] written before data[i] is needed
         for (int i = 0; i < count; i++) {
-            float gain = _this->recGain * tailFade;
+            float gain = _this->recGain * (slot->amDemod
+                ? slot->amRecordingEnvelope.next(rawAudioQualified) : tailFade);
             if (slot->recFadeRemaining > 0) {
                 // Raised-cosine taper: zero slope at both ends — prevents onset pop
                 float progress = 1.0f - (float)slot->recFadeRemaining / totalFade;

@@ -102,6 +102,10 @@ if (BUILD_TESTING)
     target_compile_features(channel_bank_stream_buffer_capacity_test PRIVATE cxx_std_17)
     target_link_libraries(channel_bank_stream_buffer_capacity_test PRIVATE sdrpp_core)
     add_test(NAME channel_bank_stream_buffer_capacity COMMAND channel_bank_stream_buffer_capacity_test)
+    add_executable(channel_bank_am_audio_samples_test tests/am_audio_samples_test.cpp)
+    target_compile_features(channel_bank_am_audio_samples_test PRIVATE cxx_std_17)
+    target_link_libraries(channel_bank_am_audio_samples_test PRIVATE sdrpp_core)
+    add_test(NAME channel_bank_am_audio_samples COMMAND channel_bank_am_audio_samples_test)
 endif()
 
 # Desktop modules are loaded with dlsym/GetProcAddress using the legacy
