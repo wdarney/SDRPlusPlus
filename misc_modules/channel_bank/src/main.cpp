@@ -12,6 +12,7 @@
 #include <dsp/stream.h>
 #include "stream_buffer_sizes.h"
 #include "sample_diagnostics.h"
+#include "continuous_iq_splitter.h"
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
 #include <dsp/channel/frequency_xlator.h>
@@ -220,7 +221,7 @@ struct ChannelSlot {
     // channel.  Same as freqHz in manual mode (no centroid).
     double gridFreqHz = 0.0;
     std::string streamName;
-    dsp::routing::Splitter<dsp::complex_t>* iqSourceSplitter = nullptr;
+    channel_bank::ContinuousIQSplitter<dsp::complex_t>* iqSourceSplitter = nullptr;
     bool multiReceiver = false;
     std::string assignedReceiver;
     std::chrono::steady_clock::time_point allocationStarted;
@@ -719,7 +720,7 @@ public:
         // binding an undrained stream can stop IQ delivery to the waterfall,
         // main VFO, audio, and network flow control.
         sharedIqIn = new dsp::stream<dsp::complex_t>();
-        iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
+        iqSplitter = new channel_bank::ContinuousIQSplitter<dsp::complex_t>(sharedIqIn);
         specStream = new dsp::stream<dsp::complex_t>();
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
@@ -7053,7 +7054,7 @@ self.addEventListener("fetch", event => {
                 sigpath::sourceManager.releaseIndependentSource(receiver, owner);
                 continue;
             }
-            runtime.splitter = new dsp::routing::Splitter<dsp::complex_t>(stream);
+            runtime.splitter = new channel_bank::ContinuousIQSplitter<dsp::complex_t>(stream);
             runtime.splitter->start(); // drains the warm SDR even with no assigned VFO
             if (!sigpath::sourceManager.startIndependentSource(receiver, owner)) {
                 sigpath::sourceManager.stopIndependentSource(receiver, owner);
@@ -7510,7 +7511,11 @@ self.addEventListener("fetch", event => {
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
                     if (!isInActiveSpan(slotFreq)) continue;
-                    if (isBlocked(slotFreq) || isRnVoiceQuarantined(slotFreq)) { blkSkip++; continue; }
+                    // initSlot stores a snapped grid identity. Use that exact identity
+                    // here too, so a blocked carrier cannot be spawned then removed
+                    // on every management cycle when the SDR center is off-grid.
+                    const double gridFrequency = channel_bank::channelGridFrequency(slotFreq, channelSpacing);
+                    if (isBlocked(gridFrequency) || isRnVoiceQuarantined(gridFrequency)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
                     slot->lastDetected      = now;
@@ -7632,7 +7637,7 @@ self.addEventListener("fetch", event => {
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz,
                   double exactOffsetHz = NAN,
-                  dsp::routing::Splitter<dsp::complex_t>* sourceSplitter = nullptr,
+                  channel_bank::ContinuousIQSplitter<dsp::complex_t>* sourceSplitter = nullptr,
                   double sourceSampleRate = NAN,
                   double sourceCenterHz = NAN,
                   double gridFrequencyOverride = NAN) {
@@ -7667,7 +7672,7 @@ self.addEventListener("fetch", event => {
         // of the SDR center frequency — retuning won't invalidate blocks.
         double rawGrid = isManual ? slot.freqHz : (inputCenter + gridOffset);
         slot.gridFreqHz = std::isfinite(gridFrequencyOverride)
-            ? gridFrequencyOverride : std::round(rawGrid / channelSpacing) * channelSpacing;
+            ? gridFrequencyOverride : channel_bank::channelGridFrequency(rawGrid, channelSpacing);
 
         char freqBuf[64];
         snprintf(freqBuf, sizeof(freqBuf), "%.3fMHz", slot.freqHz / 1e6);
@@ -11999,7 +12004,7 @@ self.addEventListener("fetch", event => {
         std::string id;
         double sampleRate = 0.0;
         double centerHz = 0.0;
-        dsp::routing::Splitter<dsp::complex_t>* splitter = nullptr;
+        channel_bank::ContinuousIQSplitter<dsp::complex_t>* splitter = nullptr;
         std::unique_ptr<ReceiverDetector> detector;
         bool started = false;
     };
@@ -12095,7 +12100,7 @@ self.addEventListener("fetch", event => {
     // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
     // keeping the main signal-path thread's memcpy cost at O(1) regardless of slot count.
     dsp::stream<dsp::complex_t>*            sharedIqIn  = nullptr;
-    dsp::routing::Splitter<dsp::complex_t>* iqSplitter  = nullptr;
+    channel_bank::ContinuousIQSplitter<dsp::complex_t>* iqSplitter  = nullptr;
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
