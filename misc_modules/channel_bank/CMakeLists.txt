@@ -84,6 +84,10 @@ include(${SDRPP_MODULE_CMAKE})
 
 if (BUILD_TESTING)
     enable_testing()
+    add_executable(channel_bank_sample_diagnostics_test tests/sample_diagnostics_test.cpp)
+    target_compile_features(channel_bank_sample_diagnostics_test PRIVATE cxx_std_17)
+    target_link_libraries(channel_bank_sample_diagnostics_test PRIVATE sdrpp_core)
+    add_test(NAME channel_bank_sample_diagnostics COMMAND channel_bank_sample_diagnostics_test)
     add_executable(channel_bank_multi_receiver_allocator_test
         tests/multi_receiver_allocator_test.cpp)
     target_compile_features(channel_bank_multi_receiver_allocator_test PRIVATE cxx_std_17)
