@@ -7813,7 +7813,7 @@ self.addEventListener("fetch", event => {
             const auto* audio = static_cast<cbdiag::Stream<dsp::stereo_t>*>(slot.recFeedStream);
             const auto* vfo = static_cast<cbdiag::VFO*>(slot.vfo);
             const auto report = [&](const char* stage, const auto* stream) {
-                flog::info("[CB samples] freq={} stage={} published={} received={} released={} blocks={}/{} cancelled_samples={} cancelled_blocks={} repeated_reads={} unpaired_flushes={} max_publish_ms={:.3f} max_hold_ms={:.3f}",
+                flog::info("[CB samples] freq={} stage={} published={} received={} released={} blocks={}/{} cancelled_samples={} cancelled_blocks={} repeated_reads={} unpaired_flushes={} max_publish_ms={} max_hold_ms={}",
                     slot.gridFreqHz, stage, stream->published, stream->received, stream->released,
                     stream->publishedBlocks, stream->receivedBlocks, stream->cancelledSamples,
                     stream->cancelledBlocks, stream->repeatedReads, stream->unpairedFlushes,
@@ -7821,12 +7821,12 @@ self.addEventListener("fetch", event => {
             };
             report("iq", iq);
             report("recording_feed", audio);
-            flog::info("[CB samples] freq={} stage=vfo input_rate={} input={} generated={} published={} expected_audio={:.3f} max_process_ms={:.3f} max_output_wait_ms={:.3f}",
+            flog::info("[CB samples] freq={} stage=vfo input_rate={} input={} generated={} published={} expected_audio={} max_process_ms={} max_output_wait_ms={}",
                 slot.gridFreqHz, slot.diagnosticInputRate, vfo->inputSamples, vfo->outputSamples,
                 vfo->publishedSamples, vfo->inputSamples * 48000.0 / slot.diagnosticInputRate,
                 vfo->maxProcessMs, vfo->maxOutputWaitMs);
             const auto& h = slot.sampleHandler;
-            flog::info("[CB samples] freq={} stage=handler input={} warmup={} no_file={} trim={} eligible={} preroll={} write_requested={} max_callback_ms={:.3f}",
+            flog::info("[CB samples] freq={} stage=handler input={} warmup={} no_file={} trim={} eligible={} preroll={} write_requested={} max_callback_ms={}",
                 slot.gridFreqHz, h.input, h.warmup, h.noFile, h.trim, h.eligible, h.preroll,
                 h.writeRequested, h.maxCallbackMs);
         }
