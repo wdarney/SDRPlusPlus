@@ -11,6 +11,8 @@
 #include <frequency_manager_interface.h>
 #include <dsp/stream.h>
 #include "stream_buffer_sizes.h"
+#include "sample_diagnostics.h"
+#include "continuous_iq_splitter.h"
 #include <dsp/types.h>
 #include <dsp/channel/rx_vfo.h>
 #include <dsp/channel/frequency_xlator.h>
@@ -207,6 +209,10 @@ struct ChannelSlot {
         meterStream.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
     }
 
+    bool sampleDiagnostics = cbdiag::enabled();
+    cbdiag::Handler sampleHandler;
+    double diagnosticInputRate = 0;
+
     int    gridIdx = 0;
     double freqHz  = 0.0;   // centroid-aligned (auto mode) — for VFO placement + display
     // Grid-aligned channel freq (lastKnownCenter + gridOffset).  Stable across the
@@ -215,7 +221,7 @@ struct ChannelSlot {
     // channel.  Same as freqHz in manual mode (no centroid).
     double gridFreqHz = 0.0;
     std::string streamName;
-    dsp::routing::Splitter<dsp::complex_t>* iqSourceSplitter = nullptr;
+    channel_bank::ContinuousIQSplitter<dsp::complex_t>* iqSourceSplitter = nullptr;
     bool multiReceiver = false;
     std::string assignedReceiver;
     std::chrono::steady_clock::time_point allocationStarted;
@@ -714,7 +720,7 @@ public:
         // binding an undrained stream can stop IQ delivery to the waterfall,
         // main VFO, audio, and network flow control.
         sharedIqIn = new dsp::stream<dsp::complex_t>();
-        iqSplitter = new dsp::routing::Splitter<dsp::complex_t>(sharedIqIn);
+        iqSplitter = new channel_bank::ContinuousIQSplitter<dsp::complex_t>(sharedIqIn);
         specStream = new dsp::stream<dsp::complex_t>();
         specSink = new dsp::sink::Handler<dsp::complex_t>(specStream, spectrumHandler, this);
         specSink->start();
@@ -7048,7 +7054,7 @@ self.addEventListener("fetch", event => {
                 sigpath::sourceManager.releaseIndependentSource(receiver, owner);
                 continue;
             }
-            runtime.splitter = new dsp::routing::Splitter<dsp::complex_t>(stream);
+            runtime.splitter = new channel_bank::ContinuousIQSplitter<dsp::complex_t>(stream);
             runtime.splitter->start(); // drains the warm SDR even with no assigned VFO
             if (!sigpath::sourceManager.startIndependentSource(receiver, owner)) {
                 sigpath::sourceManager.stopIndependentSource(receiver, owner);
@@ -7505,7 +7511,11 @@ self.addEventListener("fetch", event => {
                     double peakOffHz  = (pit != localPeakOffsets.end()) ? pit->second : slotOffset;
                     double slotFreq   = lastKnownCenter + slotOffset;
                     if (!isInActiveSpan(slotFreq)) continue;
-                    if (isBlocked(slotFreq) || isRnVoiceQuarantined(slotFreq)) { blkSkip++; continue; }
+                    // initSlot stores a snapped grid identity. Use that exact identity
+                    // here too, so a blocked carrier cannot be spawned then removed
+                    // on every management cycle when the SDR center is off-grid.
+                    const double gridFrequency = channel_bank::channelGridFrequency(slotFreq, channelSpacing);
+                    if (isBlocked(gridFrequency) || isRnVoiceQuarantined(gridFrequency)) { blkSkip++; continue; }
                     flog::info("[ChannelBank] Spawning slot {0} at {1:.3f}MHz", idx, slotFreq / 1e6);
                     auto* slot = new ChannelSlot();
                     slot->lastDetected      = now;
@@ -7627,7 +7637,7 @@ self.addEventListener("fetch", event => {
     // disables spectral-centroid / BFO adjustment (used by manual mode).
     void initSlot(ChannelSlot& slot, int gridIdx, int numSlots, double peakOffsetHz,
                   double exactOffsetHz = NAN,
-                  dsp::routing::Splitter<dsp::complex_t>* sourceSplitter = nullptr,
+                  channel_bank::ContinuousIQSplitter<dsp::complex_t>* sourceSplitter = nullptr,
                   double sourceSampleRate = NAN,
                   double sourceCenterHz = NAN,
                   double gridFrequencyOverride = NAN) {
@@ -7662,7 +7672,7 @@ self.addEventListener("fetch", event => {
         // of the SDR center frequency — retuning won't invalidate blocks.
         double rawGrid = isManual ? slot.freqHz : (inputCenter + gridOffset);
         slot.gridFreqHz = std::isfinite(gridFrequencyOverride)
-            ? gridFrequencyOverride : std::round(rawGrid / channelSpacing) * channelSpacing;
+            ? gridFrequencyOverride : channel_bank::channelGridFrequency(rawGrid, channelSpacing);
 
         char freqBuf[64];
         snprintf(freqBuf, sizeof(freqBuf), "%.3fMHz", slot.freqHz / 1e6);
@@ -7690,9 +7700,17 @@ self.addEventListener("fetch", event => {
                 ? peakOffsetHz - (double)ssbBfoHz
                 : peakOffsetHz;  // centroid: centers VFO on actual carrier, not grid slot
 
-        slot.iqIn = new dsp::stream<dsp::complex_t>();
+        slot.sampleHandler = {};
+        slot.diagnosticInputRate = inputSampleRate;
+        if (slot.sampleDiagnostics)
+            flog::info("[CB samples] start freq={} input_rate={} audio_rate={} (summary on channel teardown)",
+                slot.gridFreqHz, inputSampleRate, audioSr);
+        slot.iqIn = slot.sampleDiagnostics
+            ? new cbdiag::Stream<dsp::complex_t>() : new dsp::stream<dsp::complex_t>();
         slot.iqIn->setBufferSize(CB_RF_STREAM_BUFFER_SAMPLES);
-        slot.vfo  = new dsp::channel::RxVFO(slot.iqIn, inputSampleRate, audioSr, bw, vfoOff);
+        slot.vfo = slot.sampleDiagnostics
+            ? new cbdiag::VFO(slot.iqIn, inputSampleRate, audioSr, bw, vfoOff)
+            : new dsp::channel::RxVFO(slot.iqIn, inputSampleRate, audioSr, bw, vfoOff);
         slot.vfo->out.setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
 
         // AM demod bandwidth = full channel width (same as VFO), matching SDR++ radio module.
@@ -7726,7 +7744,8 @@ self.addEventListener("fetch", event => {
 
         slot.splitter = new dsp::routing::Splitter<dsp::stereo_t>(demodOut);
         slot.splitter->bindStream(&slot.meterStream);
-        slot.recFeedStream = new dsp::stream<dsp::stereo_t>();
+        slot.recFeedStream = slot.sampleDiagnostics
+            ? new cbdiag::Stream<dsp::stereo_t>() : new dsp::stream<dsp::stereo_t>();
         slot.recFeedStream->setBufferSize(CB_AUDIO_STREAM_BUFFER_SAMPLES);
         slot.splitter->bindStream(slot.recFeedStream);
 
@@ -7792,6 +7811,30 @@ self.addEventListener("fetch", event => {
         slot.splitter->stop();
         slot.meter->stop();
         slot.recSink->stop();
+
+        // All producer/consumer threads are stopped before reading their counters.
+        if (slot.sampleDiagnostics) {
+            const auto* iq = static_cast<cbdiag::Stream<dsp::complex_t>*>(slot.iqIn);
+            const auto* audio = static_cast<cbdiag::Stream<dsp::stereo_t>*>(slot.recFeedStream);
+            const auto* vfo = static_cast<cbdiag::VFO*>(slot.vfo);
+            const auto report = [&](const char* stage, const auto* stream) {
+                flog::info("[CB samples] freq={} stage={} published={} received={} released={} blocks={}/{} cancelled_samples={} cancelled_blocks={} repeated_reads={} unpaired_flushes={} max_publish_ms={} max_hold_ms={}",
+                    slot.gridFreqHz, stage, stream->published, stream->received, stream->released,
+                    stream->publishedBlocks, stream->receivedBlocks, stream->cancelledSamples,
+                    stream->cancelledBlocks, stream->repeatedReads, stream->unpairedFlushes,
+                    stream->maxPublishMs, stream->maxHoldMs);
+            };
+            report("iq", iq);
+            report("recording_feed", audio);
+            flog::info("[CB samples] freq={} stage=vfo input_rate={} input={} generated={} published={} expected_audio={} max_process_ms={} max_output_wait_ms={}",
+                slot.gridFreqHz, slot.diagnosticInputRate, vfo->inputSamples, vfo->outputSamples,
+                vfo->publishedSamples, vfo->inputSamples * 48000.0 / slot.diagnosticInputRate,
+                vfo->maxProcessMs, vfo->maxOutputWaitMs);
+            const auto& h = slot.sampleHandler;
+            flog::info("[CB samples] freq={} stage=handler input={} warmup={} no_file={} trim={} eligible={} preroll={} write_requested={} max_callback_ms={}",
+                slot.gridFreqHz, h.input, h.warmup, h.noFile, h.trim, h.eligible, h.preroll,
+                h.writeRequested, h.maxCallbackMs);
+        }
 
         if (slot.fileOpen) {
             slot.writer.close();
@@ -7890,11 +7933,14 @@ self.addEventListener("fetch", event => {
     static void audioHandler(dsp::stereo_t* data, int count, void* ctx) {
         ChannelSlot* slot = (ChannelSlot*)ctx;
         ChannelBankModule* _this = slot->module;
+        auto* diag = slot->sampleDiagnostics ? &slot->sampleHandler : nullptr;
+        cbdiag::CallbackScope callbackScope(diag, count);
 
         // Discard audio until the AGC has had 200ms of *continuous* signal to
         // settle on.  If the signal drops during warmup the AGC ramps back up,
         // so we reset the clock each time it comes back — no pop on recording start.
         if (slot->warmupSamples > 0) {
+            if (diag) diag->warmup += count;
             if (!slot->signalPresent.load()) {
                 slot->warmupSignalLost = true;
             } else if (slot->warmupSignalLost) {
@@ -7989,6 +8035,7 @@ self.addEventListener("fetch", event => {
                         slot->preRollTmp[i] = std::clamp(
                             slot->preRollBuf[idx] * _this->recGain, -1.0f, 1.0f);
                     }
+                    if (diag) { diag->preroll += avail; diag->writeRequested += avail; }
                     slot->writer.write(slot->preRollTmp.data(), avail);
                     slot->audioSamplesWritten += avail;
                     slot->preRollCount = 0;   // consumed; don't re-write on next call
@@ -8139,16 +8186,19 @@ self.addEventListener("fetch", event => {
                     }
                 }
             }
-            if (!slot->fileOpen) { return; }
+            if (!slot->fileOpen) { if (diag) diag->noFile += count; return; }
         }
-        if (!slot->fileOpen) { return; }
+        if (!slot->fileOpen) { if (diag) diag->noFile += count; return; }
 
         // Discard the first 200ms after file open — by that point the AGC has
         // settled on the carrier so there's no spike written into the file.
         if (slot->fileTrimSamples > 0) {
+            if (diag) diag->trim += count;
             slot->fileTrimSamples = std::max(0, slot->fileTrimSamples - count);
             return;
         }
+
+        if (diag) diag->eligible += count;
 
         // Apply recording gain + fade-in + fade-out, then mix stereo down to mono in-place.
         // AM output is identical on L and R so averaging is lossless; it also
@@ -8243,6 +8293,7 @@ self.addEventListener("fetch", event => {
                             ? std::clamp(dry * (1.0f - mix) + wet * mix, -1.0f, 1.0f)
                             : std::clamp(dry, -1.0f, 1.0f);
                     }
+                    if (diag) diag->writeRequested += 480;
                     slot->writer.write(nrMono, 480);
                     slot->audioSamplesWritten += 480;
                     slot->nrInPos = 0;
@@ -8251,6 +8302,7 @@ self.addEventListener("fetch", event => {
         } else
 #endif
         {
+            if (diag) diag->writeRequested += count;
             slot->writer.write(mono, count);
             slot->audioSamplesWritten += count;
         }
@@ -11952,7 +12004,7 @@ self.addEventListener("fetch", event => {
         std::string id;
         double sampleRate = 0.0;
         double centerHz = 0.0;
-        dsp::routing::Splitter<dsp::complex_t>* splitter = nullptr;
+        channel_bank::ContinuousIQSplitter<dsp::complex_t>* splitter = nullptr;
         std::unique_ptr<ReceiverDetector> detector;
         bool started = false;
     };
@@ -12048,7 +12100,7 @@ self.addEventListener("fetch", event => {
     // Shared IQ bus — one frontend binding fans out to all consumers via iqSplitter,
     // keeping the main signal-path thread's memcpy cost at O(1) regardless of slot count.
     dsp::stream<dsp::complex_t>*            sharedIqIn  = nullptr;
-    dsp::routing::Splitter<dsp::complex_t>* iqSplitter  = nullptr;
+    channel_bank::ContinuousIQSplitter<dsp::complex_t>* iqSplitter  = nullptr;
 
     // FFT spectrum monitor
     dsp::stream<dsp::complex_t>*            specStream     = nullptr;
