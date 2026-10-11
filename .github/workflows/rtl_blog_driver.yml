@@ -1,0 +1,29 @@
+name: RTL-SDR Blog Driver
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  driver:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux USB dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev pkg-config
+      - name: Install macOS USB dependency
+        if: runner.os == 'macOS'
+        run: brew install libusb pkgconf
+      - name: Install Windows USB dependency
+        if: runner.os == 'Windows'
+        run: vcpkg install libusb:x64-windows
+      - name: Configure Unix
+        if: runner.os != 'Windows'
+        run: cmake -S vendor/rtl-sdr-blog -B build-driver -DCMAKE_BUILD_TYPE=Release -DSDRPP_RTL_LINK_CHECK=ON
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        run: cmake -S vendor/rtl-sdr-blog -B build-driver -DSDRPP_RTL_LINK_CHECK=ON "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+      - name: Build
+        run: cmake --build build-driver --config Release --parallel
+      - name: Verify link without hardware
+        run: ctest --test-dir build-driver -C Release --output-on-failure
