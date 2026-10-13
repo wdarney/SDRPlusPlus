@@ -104,6 +104,9 @@ public:
     }
 
     void selectById(int id) {
+        if (id < 0 || static_cast<size_t>(id) >= devList.size()) {
+            return;
+        }
         devId = id;
         bool created = false;
         config.acquire();
@@ -144,6 +147,10 @@ public:
     }
 
     void menuHandler() {
+        if (devList.empty()) {
+            ImGui::TextDisabled("No audio output devices available");
+            return;
+        }
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         ImGui::SetNextItemWidth(menuWidth);
@@ -186,6 +193,10 @@ public:
 
 private:
     bool doStart() {
+        if (devId < 0 || static_cast<size_t>(devId) >= deviceIds.size()) {
+            flog::warn("Cannot start audio: no output device available");
+            return false;
+        }
         RtAudio::StreamParameters parameters;
         parameters.deviceId = deviceIds[devId];
         parameters.nChannels = 2;

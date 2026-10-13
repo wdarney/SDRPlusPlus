@@ -39,6 +39,10 @@ set(JANSSON_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(JANSSON_WITHOUT_TESTS ON CACHE BOOL "" FORCE)
 set(JANSSON_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(3rdparty/jansson EXCLUDE_FROM_ALL)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    # Both static dependencies are linked into the VDL2 shared module.
+    set_target_properties(zlibstatic jansson PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 set(JANSSON_VENDORED_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/jansson/src"
     "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/jansson/include"

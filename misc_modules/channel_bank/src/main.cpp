@@ -375,6 +375,10 @@ public:
         root = (std::string)core::args["root"];
 
         config.acquire();
+        // A new instance has no saved object yet. json::value() rejects null.
+        if (config.conf[name].is_null()) {
+            config.conf[name] = json::object();
+        }
         if (config.conf[name].contains("spacingId"))
             spacingId = config.conf[name]["spacingId"];
         if (config.conf[name].contains("demodMode"))

@@ -9,7 +9,9 @@ project(channel_bank)
 
 file(GLOB SRC "src/*.cpp")
 list(FILTER SRC EXCLUDE REGEX "src/main_ios\\.cpp$")
-if (ANDROID)
+if (ANDROID OR (CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    # The desktop Linux UI does not enable Whisper, and no Linux Whisper
+    # target is linked below. Do not compile its unused implementation.
     list(FILTER SRC EXCLUDE REGEX "src/transcription_whisper\\.cpp$")
 endif()
 if (APPLE AND NOT ANDROID)
@@ -81,6 +83,11 @@ elseif (MSVC)
 endif()
 
 include(${SDRPP_MODULE_CMAKE})
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    # RNNoise uses M_PI while compiling as strict C11 on glibc.
+    target_compile_definitions(channel_bank PRIVATE _DEFAULT_SOURCE)
+endif()
 
 if (BUILD_TESTING)
     enable_testing()
